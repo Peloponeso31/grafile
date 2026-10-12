@@ -11,6 +11,7 @@
 //! stored as records in a B+tree, giving fast neighbor iteration, edge
 //! existence checks and bitmap set operations.
 
+pub mod btree;
 pub mod error;
 pub mod pager;
 pub mod vfs;
