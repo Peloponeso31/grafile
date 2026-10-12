@@ -205,6 +205,11 @@ impl Catalog {
         &self.schema
     }
 
+    /// Mutable access to the decoded schema (root pointers after splits).
+    pub fn schema_mut(&mut self) -> &mut Schema {
+        &mut self.schema
+    }
+
     /// Label id for a name, if registered.
     pub fn label_id(&self, name: &str) -> Option<u32> {
         self.schema.label_ids.get(name).copied()
@@ -316,6 +321,16 @@ impl Catalog {
         Ok(id)
     }
 
+    /// Rewrite the catalog entry for a node index (root may have moved).
+    pub fn update_node_index(&mut self, pager: &mut Pager, def: &NodeIndexDef) -> Result<()> {
+        self.insert_entry(pager, kind::NODE_INDEX, def.id, &encode_node_index(def))
+    }
+
+    /// Rewrite the catalog entry for an edge index (root may have moved).
+    pub fn update_edge_index(&mut self, pager: &mut Pager, def: &EdgeIndexDef) -> Result<()> {
+        self.insert_entry(pager, kind::EDGE_INDEX, def.id, &encode_edge_index(def))
+    }
+
     fn insert_entry(
         &mut self,
         pager: &mut Pager,
@@ -324,7 +339,10 @@ impl Catalog {
         value: &[u8],
     ) -> Result<()> {
         let key = ((entry_kind as u64) << 32) | u64::from(id);
-        self.tree.insert(pager, &key.to_be_bytes(), value)?;
+        let key_bytes = key.to_be_bytes();
+        // Upsert: rewriting an entry (e.g. an index root) must not conflict.
+        self.tree.delete(pager, &key_bytes)?;
+        self.tree.insert(pager, &key_bytes, value)?;
         let root = self.tree.root();
         pager.update_header(|header| header.catalog_root = root);
         Ok(())
