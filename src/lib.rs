@@ -12,8 +12,11 @@
 //! existence checks and bitmap set operations.
 
 pub mod btree;
+pub mod catalog;
 pub mod error;
+pub mod matrix;
 pub mod pager;
+pub mod record;
 pub mod vfs;
 
 pub use error::{Error, ErrorCode, Result};

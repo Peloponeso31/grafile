@@ -18,8 +18,8 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::vfs::{File, LockLevel, OpenMode, Vfs, journal_path};
 
 pub use header::{
-    DB_HEADER_END, DatabaseHeader, INVALID_PAGE, MAX_PAGE_SIZE, MIN_PAGE_SIZE, PageHeader, PageNo,
-    PageType, verify_page_checksum, write_page_checksum,
+    DB_HEADER_END, DatabaseHeader, INVALID_PAGE, MAX_PAGE_SIZE, MIN_PAGE_SIZE, PAGE_HEADER_SIZE,
+    PageHeader, PageNo, PageType, verify_page_checksum, write_page_checksum,
 };
 
 /// Default number of pages kept in the cache (16 MiB at 8 KiB pages).
