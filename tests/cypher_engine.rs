@@ -360,3 +360,34 @@ fn create_with_bound_variables() {
     );
     assert_eq!(rows, vec![vec!["acme"]]);
 }
+
+#[test]
+fn second_connection_sees_committed_changes() {
+    let store = grafile::vfs::mem::new_store();
+    let mut writer = Connection::create_with_vfs(
+        Arc::new(MemVfs::from_store(store.clone())),
+        Path::new("two-conn.db"),
+        4096,
+    )
+    .expect("create");
+    writer
+        .execute("CREATE (:Person {name: 'alice'})")
+        .expect("seed");
+
+    let mut reader = Connection::open_with_vfs(
+        Arc::new(MemVfs::from_store(store)),
+        Path::new("two-conn.db"),
+        grafile::vfs::OpenMode::ReadWrite,
+    )
+    .expect("open");
+    let rows = query(&mut reader, "MATCH (n:Person) RETURN count(*) AS n");
+    assert_eq!(rows, vec![vec!["1"]]);
+
+    // The writer commits another node; the reader's next statement sees it
+    // (its page cache is invalidated by the change counter).
+    writer
+        .execute("CREATE (:Person {name: 'bob'})")
+        .expect("seed");
+    let rows = query(&mut reader, "MATCH (n:Person) RETURN count(*) AS n");
+    assert_eq!(rows, vec![vec!["2"]]);
+}

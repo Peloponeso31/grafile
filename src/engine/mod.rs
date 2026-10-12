@@ -138,6 +138,20 @@ impl Database {
         self.pager.begin_write()
     }
 
+    /// Acquire the shared read lock for one statement (idempotent).
+    ///
+    /// On the first acquisition the pager recovers a hot journal left by a
+    /// crashed writer and refreshes stale cache entries after another
+    /// connection's commit.
+    pub fn begin_read(&mut self) -> Result<()> {
+        self.pager.begin_read()
+    }
+
+    /// Release the shared read lock if held.
+    pub fn end_read(&mut self) -> Result<()> {
+        self.pager.end_read()
+    }
+
     /// Commit the active write transaction, persisting tree roots.
     pub fn commit(&mut self) -> Result<()> {
         let (catalog_root, node_root, edge_root, fragment_root) = (

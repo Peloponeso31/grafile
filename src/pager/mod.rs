@@ -7,6 +7,7 @@
 
 pub mod header;
 pub mod journal;
+mod writer_lock;
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -97,6 +98,8 @@ pub struct Pager {
     writable: bool,
     txn: Option<WriteTxn>,
     lock: LockState,
+    /// Process-global writer slot held while a write transaction is active.
+    writer_claim: Option<std::sync::Arc<writer_lock::PathClaim>>,
 }
 
 impl Pager {
@@ -137,6 +140,7 @@ impl Pager {
             writable: true,
             txn: None,
             lock: LockState::None,
+            writer_claim: None,
         })
     }
 
@@ -193,6 +197,7 @@ impl Pager {
             writable: mode.is_writable(),
             txn: None,
             lock: LockState::None,
+            writer_claim: None,
         })
     }
 
@@ -257,15 +262,111 @@ impl Pager {
     }
 
     /// Acquire the shared lock for a read snapshot (idempotent).
+    ///
+    /// On the first acquisition the pager recovers a hot journal left by a
+    /// crashed writer and drops its page cache if another connection has
+    /// committed since the cache was filled, so readers never observe stale
+    /// or partially committed state.
     pub fn begin_read(&mut self) -> Result<()> {
         match self.lock {
             LockState::None => {
                 self.file.lock(LockLevel::Shared)?;
                 self.lock = LockState::Shared;
+                self.ensure_no_hot_journal()?;
+                self.refresh_if_changed()?;
             }
             LockState::Shared | LockState::Exclusive => {}
         }
         Ok(())
+    }
+
+    /// Recover a hot journal before reading. Assumes the shared lock is held
+    /// and leaves it held afterwards.
+    fn ensure_no_hot_journal(&mut self) -> Result<()> {
+        if !self.vfs.exists(&self.journal_path)? {
+            return Ok(());
+        }
+        if !self.writable {
+            if Self::journal_is_hot(self.vfs.as_ref(), &self.journal_path)? {
+                return Err(Error::new(
+                    ErrorCode::ReadOnly,
+                    "database needs journal recovery but was opened read-only",
+                ));
+            }
+            return Ok(());
+        }
+        // Replay requires the exclusive lock.
+        self.file.unlock(LockLevel::Shared)?;
+        self.lock = LockState::None;
+        self.file.lock(LockLevel::Exclusive)?;
+        let result: Result<bool> = (|| {
+            if !self.vfs.exists(&self.journal_path)? {
+                // Another process recovered and removed it first.
+                return Ok(false);
+            }
+            let journal_file = self.vfs.open(&self.journal_path, OpenMode::ReadWrite)?;
+            journal::recover(&*self.file, &*journal_file)?;
+            drop(journal_file);
+            self.vfs.remove(&self.journal_path)?;
+            Ok(true)
+        })();
+        let unlock = self.file.unlock(LockLevel::Exclusive);
+        self.file.lock(LockLevel::Shared)?;
+        self.lock = LockState::Shared;
+        let recovered = result?;
+        unlock?;
+        if recovered {
+            self.invalidate_cache()?;
+        }
+        Ok(())
+    }
+
+    /// Whether the journal file carries a valid transaction header.
+    fn journal_is_hot(vfs: &dyn Vfs, path: &Path) -> Result<bool> {
+        let journal_file = vfs.open(path, OpenMode::ReadOnly)?;
+        let mut block = vec![0u8; journal::JOURNAL_HEADER_SIZE];
+        journal_file.read_at(&mut block, 0)?;
+        Ok(journal::JournalHeader::parse(&block)?.is_some())
+    }
+
+    /// Drop the cache when the on-disk change counter has moved past the
+    /// cached header (another connection committed).
+    fn refresh_if_changed(&mut self) -> Result<()> {
+        if self.txn.is_some() {
+            return Ok(());
+        }
+        let mut header_bytes = vec![0u8; DB_HEADER_END];
+        self.file.read_at(&mut header_bytes, 0)?;
+        let on_disk = DatabaseHeader::parse(&header_bytes)?;
+        if on_disk.change_counter != self.header.change_counter {
+            self.invalidate_cache()?;
+        }
+        Ok(())
+    }
+
+    /// Discard every cached page and reload page 1 from disk.
+    fn invalidate_cache(&mut self) -> Result<()> {
+        self.cache.clear();
+        self.header_dirty = false;
+        let mut page_one = vec![0u8; self.page_size];
+        self.file.read_at(&mut page_one, 0)?;
+        verify_page_checksum(&page_one, 1)?;
+        self.header = DatabaseHeader::parse(&page_one)?;
+        self.cache.insert(
+            1,
+            Frame {
+                data: page_one.into_boxed_slice(),
+                dirty: false,
+                generation: 1,
+            },
+        );
+        Ok(())
+    }
+
+    fn release_writer_claim(&mut self) {
+        if let Some(claim) = self.writer_claim.take() {
+            writer_lock::release(&claim);
+        }
     }
 
     /// Release a shared read lock if held.
@@ -278,6 +379,10 @@ impl Pager {
     }
 
     /// Begin a write transaction, acquiring the exclusive lock.
+    ///
+    /// Also claims the process-global writer slot for this path: advisory
+    /// file locks cannot stop two handles in the same process from both
+    /// writing.
     pub fn begin_write(&mut self) -> Result<()> {
         if self.txn.is_some() {
             return Err(Error::misuse("nested write transactions are not supported"));
@@ -288,6 +393,18 @@ impl Pager {
                 "database was opened read-only",
             ));
         }
+        let claim = writer_lock::claim(self.vfs.namespace_id(), &self.path)?;
+        self.writer_claim = Some(claim);
+        match self.start_write_txn() {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.release_writer_claim();
+                Err(err)
+            }
+        }
+    }
+
+    fn start_write_txn(&mut self) -> Result<()> {
         match self.lock {
             LockState::None => {
                 self.file.lock(LockLevel::Exclusive)?;
@@ -295,10 +412,23 @@ impl Pager {
             }
             LockState::Shared => {
                 self.file.unlock(LockLevel::Shared)?;
+                self.lock = LockState::None;
                 self.file.lock(LockLevel::Exclusive)?;
                 self.lock = LockState::Exclusive;
             }
             LockState::Exclusive => {}
+        }
+        // A crashed writer may have left a hot journal; replay it before we
+        // build on top of a partially committed state. Otherwise, pick up
+        // commits made by other connections.
+        if self.vfs.exists(&self.journal_path)? {
+            let journal_file = self.vfs.open(&self.journal_path, OpenMode::ReadWrite)?;
+            journal::recover(&*self.file, &*journal_file)?;
+            drop(journal_file);
+            self.vfs.remove(&self.journal_path)?;
+            self.invalidate_cache()?;
+        } else {
+            self.refresh_if_changed()?;
         }
         let journal = match self.vfs.open(&self.journal_path, OpenMode::Create) {
             Ok(file) => file,
@@ -382,24 +512,31 @@ impl Pager {
 
     fn finish_txn(&mut self, committed: bool) -> Result<()> {
         let txn = self.txn.take().expect("txn present");
-        if committed {
-            // Invalidate the journal so a resurrected file is ignored, then
-            // delete it.
-            txn.journal.write_at(&[0u8; 8], 0)?;
-            txn.journal.sync_all()?;
-        }
-        self.vfs.remove(&self.journal_path)?;
-        if committed {
-            for frame in self.cache.values_mut() {
-                frame.dirty = false;
+        let result: Result<()> = (|| {
+            if committed {
+                // Invalidate the journal so a resurrected file is ignored,
+                // then delete it.
+                txn.journal.write_at(&[0u8; 8], 0)?;
+                txn.journal.sync_all()?;
             }
-        } else {
-            self.header = txn.header_snapshot;
-            self.cache.retain(|_, frame| !frame.dirty);
-            self.header_dirty = false;
-        }
-        self.file.unlock(LockLevel::Exclusive)?;
+            self.vfs.remove(&self.journal_path)?;
+            if committed {
+                for frame in self.cache.values_mut() {
+                    frame.dirty = false;
+                }
+            } else {
+                self.header = txn.header_snapshot;
+                self.cache.retain(|_, frame| !frame.dirty);
+                self.header_dirty = false;
+            }
+            Ok(())
+        })();
+        // Release the writer slot and file lock even when cleanup failed.
+        self.release_writer_claim();
+        let unlock = self.file.unlock(LockLevel::Exclusive);
         self.lock = LockState::None;
+        result?;
+        unlock?;
         Ok(())
     }
 
@@ -640,6 +777,14 @@ impl Pager {
         header.write_to(data);
         write_page_checksum(data);
         Ok(())
+    }
+}
+
+impl Drop for Pager {
+    fn drop(&mut self) {
+        // A handle dropped mid-transaction must not leave its writer slot
+        // claimed; the journal is recovered by the next writer or reader.
+        self.release_writer_claim();
     }
 }
 
@@ -925,5 +1070,149 @@ mod tests {
         let pager = Pager::open(vfs, path, OpenMode::ReadWrite).expect("reopen");
         assert_eq!(pager.header().user_version, 3);
         assert_eq!(pager.header().change_counter, 1);
+    }
+    #[test]
+    fn reader_refreshes_cache_after_other_handle_commits() {
+        let store = new_store();
+        let path = Path::new("refresh.db");
+        {
+            let vfs = Arc::new(MemVfs::from_store(store.clone()));
+            let mut pager = create_pager(vfs, path);
+            pager.begin_write().expect("begin");
+            let page = pager.alloc_page().expect("alloc");
+            init_page(&mut pager, page, PageType::TableLeaf).expect("init");
+            pager.commit().expect("commit");
+        }
+        let vfs = Arc::new(MemVfs::from_store(store.clone()));
+        let mut reader = Pager::open(vfs, path, OpenMode::ReadWrite).expect("reader");
+        reader.begin_read().expect("read");
+        assert_eq!(reader.page(2).expect("page").data()[100], 0);
+        reader.end_read().expect("end read");
+
+        {
+            let vfs = Arc::new(MemVfs::from_store(store.clone()));
+            let mut writer = Pager::open(vfs, path, OpenMode::ReadWrite).expect("writer");
+            writer.begin_write().expect("begin");
+            {
+                let data = writer.page_mut(2).expect("mutate");
+                data[100] = 0xAB;
+                write_page_checksum(data);
+            }
+            writer.commit().expect("commit");
+        }
+
+        // Stale until the reader takes a read lock again.
+        reader.begin_read().expect("refresh");
+        assert_eq!(reader.page(2).expect("page").data()[100], 0xAB);
+        reader.end_read().expect("end read");
+    }
+
+    #[test]
+    fn reader_recovers_hot_journal_on_begin_read() {
+        let store = new_store();
+        let path = Path::new("hot-reader.db");
+        let original;
+        {
+            let vfs = Arc::new(MemVfs::from_store(store.clone()));
+            let mut pager = create_pager(vfs, path);
+            pager.begin_write().expect("begin");
+            let page = pager.alloc_page().expect("alloc");
+            init_page(&mut pager, page, PageType::TableLeaf).expect("init");
+            pager.commit().expect("commit");
+            original = pager.page(page).expect("page").data().to_vec();
+        }
+        let vfs = Arc::new(MemVfs::from_store(store.clone()));
+        let mut reader = Pager::open(vfs, path, OpenMode::ReadWrite).expect("reader");
+        assert_eq!(reader.page(2).expect("page").data(), original.as_slice());
+
+        // A second handle crashes mid-commit after writing database pages.
+        {
+            let vfs = MemVfs::from_store(store.clone());
+            let shared: Arc<dyn Vfs> = Arc::new(vfs.clone());
+            let mut writer = Pager::open(shared, path, OpenMode::ReadWrite).expect("writer");
+            writer.begin_write().expect("begin");
+            {
+                let data = writer.page_mut(2).expect("mutate");
+                data[100] = 0xEE;
+                write_page_checksum(data);
+            }
+            vfs.inject_fault(FaultConfig {
+                fail_after_ops: Some(6),
+                torn_write: false,
+            });
+            writer.commit().expect_err("crash");
+        }
+
+        // The reader detects the hot journal and rolls it back before reading.
+        reader.begin_read().expect("recover");
+        assert_eq!(reader.page(2).expect("page").data(), original.as_slice());
+        reader.end_read().expect("end read");
+    }
+
+    #[test]
+    fn read_only_reader_rejects_hot_journal() {
+        let store = new_store();
+        let path = Path::new("hot-readonly.db");
+        {
+            let vfs = Arc::new(MemVfs::from_store(store.clone()));
+            let mut pager = create_pager(vfs, path);
+            pager.begin_write().expect("begin");
+            let page = pager.alloc_page().expect("alloc");
+            init_page(&mut pager, page, PageType::TableLeaf).expect("init");
+            pager.commit().expect("commit");
+        }
+        let vfs = Arc::new(MemVfs::from_store(store.clone()));
+        let mut reader = Pager::open(vfs, path, OpenMode::ReadOnly).expect("reader");
+        {
+            let vfs = MemVfs::from_store(store.clone());
+            let shared: Arc<dyn Vfs> = Arc::new(vfs.clone());
+            let mut writer = Pager::open(shared, path, OpenMode::ReadWrite).expect("writer");
+            writer.begin_write().expect("begin");
+            {
+                let data = writer.page_mut(2).expect("mutate");
+                data[100] = 0xEE;
+                write_page_checksum(data);
+            }
+            vfs.inject_fault(FaultConfig {
+                fail_after_ops: Some(6),
+                torn_write: false,
+            });
+            writer.commit().expect_err("crash");
+        }
+        let err = reader.begin_read().expect_err("hot journal");
+        assert_eq!(err.code(), ErrorCode::ReadOnly);
+    }
+
+    #[test]
+    fn second_writer_handle_is_busy_until_released() {
+        let store = new_store();
+        let path = Path::new("one-writer.db");
+        {
+            let vfs = Arc::new(MemVfs::from_store(store.clone()));
+            drop(create_pager(vfs, path));
+        }
+        let mut a = Pager::open(
+            Arc::new(MemVfs::from_store(store.clone())),
+            path,
+            OpenMode::ReadWrite,
+        )
+        .expect("a");
+        let mut b = Pager::open(
+            Arc::new(MemVfs::from_store(store.clone())),
+            path,
+            OpenMode::ReadWrite,
+        )
+        .expect("b");
+        a.begin_write().expect("a writes");
+        let err = b.begin_write().expect_err("b blocked");
+        assert_eq!(err.code(), ErrorCode::Busy);
+        a.commit().expect("commit");
+        b.begin_write().expect("b after commit");
+        b.rollback().expect("rollback");
+        // Dropping a handle mid-transaction releases the slot.
+        a.begin_write().expect("a again");
+        drop(a);
+        b.begin_write().expect("b after drop");
+        b.rollback().expect("rollback");
     }
 }

@@ -177,10 +177,17 @@ impl Connection {
         let prepared = planner::plan_query(&mut self.db, &parsed, params.values())?;
         let program = codegen::compile(&self.db, &prepared)?;
         let started = self.db.in_write_txn();
+        let read_lock = !program.mutating && !started;
+        if read_lock {
+            self.db.begin_read()?;
+        }
         if program.mutating && !started && self.auto_commit {
             self.db.begin_write()?;
         }
         let result = vdbe::execute(&mut self.db, &program);
+        if read_lock {
+            let _ = self.db.end_read();
+        }
         match result {
             Ok(rows) => {
                 if program.mutating && !started && self.auto_commit {

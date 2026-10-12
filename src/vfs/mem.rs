@@ -186,6 +186,10 @@ impl Vfs for MemVfs {
         }
         Ok(())
     }
+
+    fn namespace_id(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.store) as usize
+    }
 }
 
 struct MemFile {

@@ -228,6 +228,18 @@ Crash recovery, performed under an exclusive lock on open:
 Because database pages are only written after a valid, synced journal header,
 a torn journal can never correspond to a partially written database.
 
+### Multi-connection behavior
+
+- Readers take a shared file lock for the duration of each statement. On
+  acquiring it they replay a hot journal left by a crashed writer and drop
+  cached pages when the header's change counter has moved, so a connection
+  never observes stale or partially committed state.
+- Writers take the exclusive file lock plus a process-global writer slot
+  keyed by the file path: advisory `fcntl` locks are per-process, so they
+  cannot exclude two handles inside the same process on their own.
+- A handle dropped mid-transaction releases its writer slot; the next writer
+  or reader recovers the abandoned journal.
+
 ## Growth and durability
 
 - The file grows one page at a time when the freelist is empty.

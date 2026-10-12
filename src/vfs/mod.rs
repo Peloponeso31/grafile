@@ -102,6 +102,17 @@ pub trait Vfs: Send + Sync {
 
     /// Rename `from` to `to`, replacing `to` if it exists.
     fn rename(&self, from: &Path, to: &Path) -> Result<()>;
+
+    /// Identifier of the file namespace this VFS resolves paths in.
+    ///
+    /// Two handles can only refer to the same file when they share both the
+    /// namespace id and the path. The real filesystem uses 0 for every
+    /// instance; in-memory VFSes return a per-store id so that two distinct
+    /// in-memory databases with the same path do not collide in the
+    /// process-global writer registry.
+    fn namespace_id(&self) -> usize {
+        0
+    }
 }
 
 /// Path of the rollback journal that accompanies database `path`.
