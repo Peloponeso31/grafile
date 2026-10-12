@@ -159,6 +159,13 @@ impl Connection {
         self.db.schema()
     }
 
+    /// Direct access to the underlying engine, for bulk loading and
+    /// introspection. Mutations must run inside [`Connection::begin`] /
+    /// [`Connection::commit`].
+    pub fn database_mut(&mut self) -> &mut Database {
+        &mut self.db
+    }
+
     /// Run a Cypher query and return all result rows.
     pub fn query(&mut self, source: &str, params: &Params) -> Result<Rows> {
         let parsed = cypher::parse(source)?;

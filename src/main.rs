@@ -101,7 +101,10 @@ fn repl(conn: &mut Connection) -> Result<()> {
     let mut editor = DefaultEditor::new()?;
     let mut timer = false;
     let mut buffer = String::new();
-    println!("grafile {} (type .help for commands)", env!("CARGO_PKG_VERSION"));
+    println!(
+        "grafile {} (type .help for commands)",
+        env!("CARGO_PKG_VERSION")
+    );
     loop {
         let prompt = if buffer.is_empty() {
             "grafile> "
@@ -157,11 +160,7 @@ enum DotOutcome {
     Quit,
 }
 
-fn run_dot_command(
-    conn: &mut Connection,
-    line: &str,
-    timer: &mut bool,
-) -> Result<DotOutcome> {
+fn run_dot_command(conn: &mut Connection, line: &str, timer: &mut bool) -> Result<DotOutcome> {
     let mut parts = line.splitn(2, char::is_whitespace);
     let command = parts.next().unwrap_or("");
     let argument = parts.next().unwrap_or("").trim();
@@ -242,7 +241,11 @@ fn print_rows(rows: &Rows) {
             .collect();
         println!("{}", line.join(" | "));
     }
-    println!("({} row{})", rows.len(), if rows.len() == 1 { "" } else { "s" });
+    println!(
+        "({} row{})",
+        rows.len(),
+        if rows.len() == 1 { "" } else { "s" }
+    );
 }
 
 fn cell(value: &Value) -> String {
@@ -254,7 +257,10 @@ fn cell(value: &Value) -> String {
 
 fn print_schema(conn: &Connection) {
     let schema = conn.schema();
-    println!("labels: {}", join_or_dash(schema.labels.iter().map(String::as_str)));
+    println!(
+        "labels: {}",
+        join_or_dash(schema.labels.iter().map(String::as_str))
+    );
     println!(
         "edge types: {}",
         join_or_dash(schema.edge_types.iter().map(String::as_str))
@@ -272,16 +278,11 @@ fn print_indexes(conn: &Connection) {
         return;
     }
     for index in &schema.node_indexes {
-        let key = schema
-            .property_key_name(index.key_id)
-            .unwrap_or("?");
+        let key = schema.property_key_name(index.key_id).unwrap_or("?");
         let label = if index.label_id == 0 {
             "*".to_owned()
         } else {
-            schema
-                .label_name(index.label_id)
-                .unwrap_or("?")
-                .to_owned()
+            schema.label_name(index.label_id).unwrap_or("?").to_owned()
         };
         println!(
             "node index {} on {label}({key}){}",
@@ -290,9 +291,7 @@ fn print_indexes(conn: &Connection) {
         );
     }
     for index in &schema.edge_indexes {
-        let key = schema
-            .property_key_name(index.key_id)
-            .unwrap_or("?");
+        let key = schema.property_key_name(index.key_id).unwrap_or("?");
         let edge_type = if index.type_id == 0 {
             "*".to_owned()
         } else {

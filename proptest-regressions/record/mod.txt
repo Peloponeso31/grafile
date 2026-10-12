@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc cca2405ca2100a647cb3aa414784fb74edf24ac8f1500ecc6a88e105ea7b7712 # shrinks to a = Int(0), b = Float(0.0)
+cc 263c060112f0091308ad1232ff84b27e2569c59dbe7e2de41fb299567e742ae0 # shrinks to value = List([Null])
+cc 386f16aa11ee24a8404c5ab5ad976b1f08c6e928dcd04fafa0748ac7cf35f439 # shrinks to mut labels = [], props = [(1, List([Null]))]
