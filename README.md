@@ -31,7 +31,8 @@ grafile> MATCH (n:Person) RETURN n.name;
 ```
 
 REPL dot commands: `.help`, `.schema`, `.indexes`, `.read FILE`,
-`.timer on|off`, `.quit`. Scripts can also be passed as a file argument.
+`.timer on|off`, `.clear` (alias `.cls`), `.quit`. Scripts can also be passed
+as a file argument.
 
 ## Library
 

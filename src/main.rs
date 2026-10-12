@@ -7,8 +7,9 @@
 //! ```
 //!
 //! Dot commands: `.help`, `.schema`, `.indexes`, `.read FILE`, `.timer on|off`,
-//! `.quit`.
+//! `.clear`, `.quit`.
 
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -180,6 +181,7 @@ fn run_dot_command(conn: &mut Connection, line: &str, timer: &mut bool) -> Resul
         },
         ".schema" => print_schema(conn),
         ".indexes" => print_indexes(conn),
+        ".clear" | ".cls" => clear_screen(),
         ".read" => {
             let text = std::fs::read_to_string(argument)
                 .with_context(|| format!("cannot read `{argument}`"))?;
@@ -193,6 +195,18 @@ fn run_dot_command(conn: &mut Connection, line: &str, timer: &mut bool) -> Resul
         other => println!("unknown command `{other}`; try .help"),
     }
     Ok(DotOutcome::Continue)
+}
+
+/// ANSI sequence: clear the visible screen and home the cursor.
+const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
+
+/// Clear the terminal screen. A no-op when stdout is not a terminal, so
+/// piped or redirected sessions never see escape codes.
+fn clear_screen() {
+    if std::io::stdout().is_terminal() {
+        print!("{CLEAR_SCREEN}");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
 }
 
 fn run_query(conn: &mut Connection, source: &str, timer: bool) -> Result<()> {
@@ -376,6 +390,7 @@ repl:
   .indexes          index definitions
   .read FILE        run statements from a file
   .timer on|off     show query timing
+  .clear (.cls)     clear the terminal screen
   .quit             exit
 
 cypher (v1): MATCH, WHERE, RETURN, WITH, UNWIND, CREATE, MERGE,
@@ -384,4 +399,36 @@ cypher (v1): MATCH, WHERE, RETURN, WITH, UNWIND, CREATE, MERGE,
              parameters ($name)
 ddl (extension): CREATE INDEX ON :Label(prop) / :TYPE(prop) via API"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use grafile::vfs::mem::MemVfs;
+    use std::sync::Arc;
+
+    #[test]
+    fn clear_and_cls_are_dispatched_without_output_when_not_a_tty() {
+        let mut conn =
+            Connection::create_with_vfs(Arc::new(MemVfs::new()), Path::new("clear.db"), 4096)
+                .expect("connection");
+        let mut timer = false;
+        for command in [".clear", ".cls"] {
+            let outcome = run_dot_command(&mut conn, command, &mut timer).expect("command");
+            assert!(matches!(outcome, DotOutcome::Continue));
+        }
+    }
+
+    #[test]
+    fn unknown_command_continues() {
+        let mut conn = Connection::create_with_vfs(
+            Arc::new(MemVfs::new()),
+            Path::new("clear-unknown.db"),
+            4096,
+        )
+        .expect("connection");
+        let mut timer = false;
+        let outcome = run_dot_command(&mut conn, ".nope", &mut timer).expect("command");
+        assert!(matches!(outcome, DotOutcome::Continue));
+    }
 }
