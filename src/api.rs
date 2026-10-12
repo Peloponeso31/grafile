@@ -159,6 +159,11 @@ impl Connection {
         self.db.schema()
     }
 
+    /// Shared access to the underlying engine, for introspection.
+    pub fn database(&self) -> &Database {
+        &self.db
+    }
+
     /// Direct access to the underlying engine, for bulk loading and
     /// introspection. Mutations must run inside [`Connection::begin`] /
     /// [`Connection::commit`].

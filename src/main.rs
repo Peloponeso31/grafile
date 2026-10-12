@@ -173,6 +173,15 @@ impl OutputMode {
     }
 }
 
+/// How the `.meta` command presents the database header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderView {
+    /// Raw values as stored in the file.
+    Raw,
+    /// Interpreted, human-readable view.
+    Human,
+}
+
 /// Session settings shared by the REPL, dot commands and renderers.
 struct Settings {
     colors: Rc<Cell<bool>>,
@@ -426,6 +435,11 @@ fn run_dot_command(
                     print_modes();
                 }
             },
+        },
+        ".meta" => match argument {
+            "" | "human" => print!("{}", render_header(conn, HeaderView::Human)),
+            "raw" => print!("{}", render_header(conn, HeaderView::Raw)),
+            other => println!("unknown option `{other}`; usage: .meta [raw|human]"),
         },
         ".schema" => print_schema(conn),
         ".indexes" => print_indexes(conn),
@@ -1107,6 +1121,160 @@ fn paint(colors: bool, code: &'static str, text: &str) -> String {
 
 // ---- introspection and help ----
 
+/// Render the database header for the `.meta` command.
+fn render_header(conn: &Connection, view: HeaderView) -> String {
+    let header = conn.database().header();
+    let mut out = String::new();
+    match view {
+        HeaderView::Raw => {
+            out.push_str("magic: GRAFILE\\0\n");
+            out.push_str(&format!("format_major: {}\n", header.format_major));
+            out.push_str(&format!("format_minor: {}\n", header.format_minor));
+            out.push_str(&format!("page_size: {}\n", header.page_size));
+            out.push_str(&format!(
+                "reserved_per_page: {}\n",
+                header.reserved_per_page
+            ));
+            out.push_str(&format!("encoding: {}\n", header.encoding));
+            out.push_str(&format!("page_count: {}\n", header.page_count));
+            out.push_str(&format!("freelist_trunk: {}\n", header.freelist_trunk));
+            out.push_str(&format!("freelist_count: {}\n", header.freelist_count));
+            out.push_str(&format!("catalog_root: {}\n", header.catalog_root));
+            out.push_str(&format!("node_root: {}\n", header.node_root));
+            out.push_str(&format!("edge_root: {}\n", header.edge_root));
+            out.push_str(&format!("fragment_root: {}\n", header.fragment_root));
+            out.push_str(&format!("next_node_id: {}\n", header.next_node_id));
+            out.push_str(&format!("next_edge_id: {}\n", header.next_edge_id));
+            out.push_str(&format!("next_label_id: {}\n", header.next_label_id));
+            out.push_str(&format!("next_type_id: {}\n", header.next_type_id));
+            out.push_str(&format!("next_key_id: {}\n", header.next_key_id));
+            out.push_str(&format!("change_counter: {}\n", header.change_counter));
+            out.push_str(&format!(
+                "schema_generation: {}\n",
+                header.schema_generation
+            ));
+            out.push_str(&format!("created_at: {}\n", header.created_at));
+            out.push_str(&format!("uuid: {}\n", hex(&header.uuid)));
+            out.push_str(&format!("user_version: {}\n", header.user_version));
+            out.push_str(&format!("application_id: {}\n", header.application_id));
+        }
+        HeaderView::Human => {
+            let logical_size = header.page_count * u64::from(header.page_size);
+            let uuid = uuid::Uuid::from_bytes(header.uuid);
+            let freelist = if header.freelist_count == 0 {
+                "empty".to_owned()
+            } else {
+                format!(
+                    "{} free page{} (trunk page {})",
+                    header.freelist_count,
+                    if header.freelist_count == 1 { "" } else { "s" },
+                    header.freelist_trunk
+                )
+            };
+            out.push_str("grafile database header\n");
+            let rows: [(&str, String); 12] = [
+                (
+                    "file",
+                    format!(
+                        "{} ({}, {} page{} of {} bytes)",
+                        conn.database().path().display(),
+                        format_size(logical_size),
+                        header.page_count,
+                        if header.page_count == 1 { "" } else { "s" },
+                        header.page_size
+                    ),
+                ),
+                (
+                    "format version",
+                    format!("{}.{}", header.format_major, header.format_minor),
+                ),
+                (
+                    "encoding",
+                    match header.encoding {
+                        0 => "UTF-8".to_owned(),
+                        other => format!("unknown ({other})"),
+                    },
+                ),
+                ("created", format_unix_utc(header.created_at)),
+                ("database uuid", uuid.to_string()),
+                ("change counter", header.change_counter.to_string()),
+                ("schema generation", header.schema_generation.to_string()),
+                ("user version", header.user_version.to_string()),
+                ("application id", header.application_id.to_string()),
+                ("freelist", freelist),
+                (
+                    "roots",
+                    format!(
+                        "catalog {}, nodes {}, edges {}, fragments {}",
+                        header.catalog_root,
+                        header.node_root,
+                        header.edge_root,
+                        header.fragment_root
+                    ),
+                ),
+                (
+                    "allocated",
+                    format!(
+                        "nodes {}, edges {}, labels {}, types {}, keys {}",
+                        header.next_node_id.saturating_sub(1),
+                        header.next_edge_id.saturating_sub(1),
+                        header.next_label_id.saturating_sub(1),
+                        header.next_type_id.saturating_sub(1),
+                        header.next_key_id.saturating_sub(1)
+                    ),
+                ),
+            ];
+            for (label, value) in rows {
+                out.push_str(&format!("  {:<20}{}\n", format!("{label}:"), value));
+            }
+            out.push_str(&format!(
+                "  {:<20}{} bytes\n",
+                "reserved per page:", header.reserved_per_page
+            ));
+        }
+    }
+    out
+}
+
+/// Format a Unix timestamp as UTC without external date libraries.
+fn format_unix_utc(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let remainder = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (remainder / 3600, (remainder % 3600) / 60, remainder % 60);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
+}
+
+/// Days since the Unix epoch to a civil date (Howard Hinnant's algorithm).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (year + i64::from(month <= 2), month, day)
+}
+
+/// Format a byte count with binary units.
+fn format_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * 1024 * 1024;
+    if bytes >= GIB {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 fn print_schema(conn: &Connection) {
     let schema = conn.schema();
     println!(
@@ -1238,6 +1406,7 @@ repl:
   .help             this message
   .schema           labels, edge types and property keys
   .indexes          index definitions
+  .meta [raw|human] database header metadata (default human)
   .mode [NAME]      output mode (.mode --list to see all)
   .headers on|off   show column titles (default on)
   .separators on|off  lines between table rows (default on)
@@ -1579,5 +1748,77 @@ mod tests {
         let mut settings = settings(OutputMode::Table);
         let outcome = run_dot_command(&mut conn, ".nope", &mut settings).expect("command");
         assert!(matches!(outcome, DotOutcome::Continue));
+    }
+    #[test]
+    fn unix_utc_formatting_handles_epoch_leap_day_and_negative() {
+        assert_eq!(format_unix_utc(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(format_unix_utc(1_700_000_000), "2023-11-14 22:13:20 UTC");
+        assert_eq!(format_unix_utc(1_709_164_800), "2024-02-29 00:00:00 UTC");
+        assert_eq!(format_unix_utc(-1), "1969-12-31 23:59:59 UTC");
+    }
+
+    #[test]
+    fn size_formatting_uses_binary_units() {
+        assert_eq!(format_size(512), "512 bytes");
+        assert_eq!(format_size(8192), "8.0 KiB");
+        assert_eq!(format_size(32 * 1024), "32.0 KiB");
+        assert_eq!(format_size(3 * 1024 * 1024), "3.0 MiB");
+    }
+
+    #[test]
+    fn meta_raw_lists_stored_values() {
+        let conn = connection("meta-raw.db");
+        let header = conn.database().header();
+        let raw = render_header(&conn, HeaderView::Raw);
+        assert!(raw.contains("magic: GRAFILE\\0"), "{raw}");
+        assert!(
+            raw.contains(&format!("page_size: {}\n", header.page_size)),
+            "{raw}"
+        );
+        assert!(raw.contains("encoding: 0\n"), "{raw}");
+        assert!(
+            raw.contains(&format!("created_at: {}\n", header.created_at)),
+            "{raw}"
+        );
+        assert!(
+            raw.contains(&format!("uuid: {}\n", hex(&header.uuid))),
+            "{raw}"
+        );
+        assert!(
+            raw.contains(&format!("change_counter: {}\n", header.change_counter)),
+            "{raw}"
+        );
+    }
+
+    #[test]
+    fn meta_human_interpretation() {
+        let conn = connection("meta-human.db");
+        let header = conn.database().header();
+        let human = render_header(&conn, HeaderView::Human);
+        assert!(human.contains("grafile database header"), "{human}");
+        assert!(human.contains("UTF-8"), "{human}");
+        assert!(human.contains("meta-human.db"), "{human}");
+        assert!(human.contains("KiB"), "{human}");
+        assert!(human.contains("catalog"), "{human}");
+        assert!(
+            human.contains(&format_unix_utc(header.created_at)),
+            "{human}"
+        );
+        assert!(human.contains("freelist:"), "{human}");
+        assert!(human.contains("empty"), "{human}");
+        // Default-constructed database: only catalog/nodes/edges/fragments roots
+        // exist, no user nodes yet.
+        assert!(human.contains("allocated:"), "{human}");
+        assert!(human.contains("nodes 0"), "{human}");
+    }
+
+    #[test]
+    fn meta_dot_command_accepts_views_and_rejects_unknown() {
+        let mut conn = connection("meta-dot.db");
+        let mut settings = settings(OutputMode::Table);
+        for command in [".meta", ".meta human", ".meta raw", ".meta nope"] {
+            let outcome = run_dot_command(&mut conn, command, &mut settings).expect("command");
+            assert!(matches!(outcome, DotOutcome::Continue));
+        }
     }
 }

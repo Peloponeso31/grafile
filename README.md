@@ -30,10 +30,16 @@ $ cargo run -- graph.grafile          # interactive REPL
 grafile> MATCH (n:Person) RETURN n.name;
 ```
 
-REPL dot commands: `.help`, `.schema`, `.indexes`, `.read FILE`,
-`.timer on|off`, `.mode [NAME]`, `.headers on|off`, `.separators on|off`,
-`.colors on|off`, `.pretty on|off`, `.clear` (alias `.cls`), `.quit`. Scripts
-can also be passed as a file argument.
+REPL dot commands: `.help`, `.schema`, `.indexes`, `.meta [raw|human]`,
+`.read FILE`, `.timer on|off`, `.mode [NAME]`, `.headers on|off`,
+`.separators on|off`, `.colors on|off`, `.pretty on|off`, `.clear`
+(alias `.cls`), `.quit`. Scripts can also be passed as a file argument.
+
+`.meta` prints the database header — interpreted by default (page size,
+creation time, UUID, freelist, tree roots, allocated counts, file path and
+size) or with `.meta raw` as the exact stored values. Because the header is
+the in-memory authoritative copy, `.meta` inside an open transaction shows
+uncommitted changes.
 
 Input is syntax-highlighted while typing (disabled with `.colors off` or the
 `NO_COLOR` environment variable). Results can be printed in the modes SQLite

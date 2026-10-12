@@ -13,7 +13,7 @@ use crate::btree::{Btree, TreeKind};
 use crate::catalog::{Catalog, Schema};
 use crate::error::{Error, ErrorCode, Result};
 use crate::matrix::{ANY_TYPE, Direction, FragmentKey, FragmentStore};
-use crate::pager::Pager;
+use crate::pager::{DatabaseHeader, Pager};
 use crate::record::{EdgeRecord, NodeRecord, Value, encode_index_key};
 use crate::vfs::{OpenMode, Vfs};
 
@@ -81,6 +81,16 @@ impl Database {
     /// The database schema.
     pub fn schema(&self) -> &Schema {
         self.catalog.schema()
+    }
+
+    /// The current database header (the in-memory authoritative copy).
+    pub fn header(&self) -> &DatabaseHeader {
+        self.pager.header()
+    }
+
+    /// Path of the database file.
+    pub fn path(&self) -> &Path {
+        self.pager.path()
     }
 
     /// The catalog (for id lookups and DDL).
