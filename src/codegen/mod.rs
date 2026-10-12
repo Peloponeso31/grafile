@@ -75,7 +75,7 @@ impl<'a> Codegen<'a> {
         (self.ops.len() - 1) as u32
     }
 
-    fn patch(&mut self, at: u32, target: u32) {
+    fn patch(&mut self, at: u32, target: u32) -> Result<()> {
         match &mut self.ops[at as usize] {
             Op::Rewind { target: t, .. }
             | Op::Next { target: t, .. }
@@ -84,8 +84,13 @@ impl<'a> Codegen<'a> {
             | Op::CtxRewind { target: t, .. }
             | Op::CtxNext { target: t, .. }
             | Op::UnwindNext { target: t, .. } => *t = target,
-            other => panic!("cannot patch {other:?}"),
+            other => {
+                return Err(Error::internal(format!(
+                    "attempted to patch a non-jump instruction: {other:?}"
+                )));
+            }
         }
+        Ok(())
     }
 
     fn alloc_reg(&mut self) -> u32 {
@@ -178,13 +183,13 @@ impl<'a> Codegen<'a> {
                     out(cg, ctx)?;
                     let skip_target = cg.ops.len() as u32;
                     for jump in skip_jumps {
-                        cg.patch(jump, skip_target);
+                        cg.patch(jump, skip_target)?;
                     }
                     let next = cg.emit(Op::Next { cursor, target: 0 });
                     cg.emit(Op::Goto { target: loop_start });
                     let end = cg.ops.len() as u32;
-                    cg.patch(rewind, end);
-                    cg.patch(next, end);
+                    cg.patch(rewind, end)?;
+                    cg.patch(next, end)?;
                     Ok(())
                 })
             }
@@ -218,8 +223,8 @@ impl<'a> Codegen<'a> {
                 let next = cg.emit(Op::Next { cursor, target: 0 });
                 cg.emit(Op::Goto { target: loop_start });
                 let end = cg.ops.len() as u32;
-                cg.patch(rewind, end);
-                cg.patch(next, end);
+                cg.patch(rewind, end)?;
+                cg.patch(next, end)?;
                 Ok(())
             }),
             Plan::Expand {
@@ -263,13 +268,13 @@ impl<'a> Codegen<'a> {
                 out(cg, ctx)?;
                 let skip_target = cg.ops.len() as u32;
                 for jump in skip_jumps {
-                    cg.patch(jump, skip_target);
+                    cg.patch(jump, skip_target)?;
                 }
                 let next = cg.emit(Op::Next { cursor, target: 0 });
                 cg.emit(Op::Goto { target: loop_start });
                 let end = cg.ops.len() as u32;
-                cg.patch(rewind, end);
-                cg.patch(next, end);
+                cg.patch(rewind, end)?;
+                cg.patch(next, end)?;
                 Ok(())
             }),
             Plan::Filter { input, predicate } => self.compile(input, ctx, &mut |cg, ctx| {
@@ -280,7 +285,7 @@ impl<'a> Codegen<'a> {
                 });
                 out(cg, ctx)?;
                 let end = cg.ops.len() as u32;
-                cg.patch(jump, end);
+                cg.patch(jump, end)?;
                 Ok(())
             }),
             Plan::Project { input, items } => {
@@ -389,8 +394,8 @@ impl<'a> Codegen<'a> {
                 let next = self.emit(Op::CtxNext { cursor, target: 0 });
                 self.emit(Op::Goto { target: loop_start });
                 let end = self.ops.len() as u32;
-                self.patch(rewind, end);
-                self.patch(next, end);
+                self.patch(rewind, end)?;
+                self.patch(next, end)?;
                 Ok(())
             }
             Plan::Distinct { input } => {
@@ -424,8 +429,8 @@ impl<'a> Codegen<'a> {
                 let next = self.emit(Op::CtxNext { cursor, target: 0 });
                 self.emit(Op::Goto { target: loop_start });
                 let end = self.ops.len() as u32;
-                self.patch(rewind, end);
-                self.patch(next, end);
+                self.patch(rewind, end)?;
+                self.patch(next, end)?;
                 Ok(())
             }
             Plan::Sort { input, keys } => {
@@ -472,8 +477,8 @@ impl<'a> Codegen<'a> {
                 let next = self.emit(Op::CtxNext { cursor, target: 0 });
                 self.emit(Op::Goto { target: loop_start });
                 let end = self.ops.len() as u32;
-                self.patch(rewind, end);
-                self.patch(next, end);
+                self.patch(rewind, end)?;
+                self.patch(next, end)?;
                 Ok(())
             }
             Plan::Skip { input, count } => {
@@ -503,7 +508,7 @@ impl<'a> Codegen<'a> {
                 out(cg, ctx)?;
                 cg.emit(Op::Goto { target: loop_start });
                 let end = cg.ops.len() as u32;
-                cg.patch(jump, end);
+                cg.patch(jump, end)?;
                 Ok(())
             }),
             Plan::Create { input, items } => self.compile(input, ctx, &mut |cg, ctx| {
@@ -558,7 +563,7 @@ impl<'a> Codegen<'a> {
                         });
                         cg.compile_set_item(set_item, ctx)?;
                         let end = cg.ops.len() as u32;
-                        cg.patch(skip, end);
+                        cg.patch(skip, end)?;
                     }
                     for set_item in on_match {
                         let not_created = cg.alloc_reg();
@@ -573,7 +578,7 @@ impl<'a> Codegen<'a> {
                         });
                         cg.compile_set_item(set_item, ctx)?;
                         let end = cg.ops.len() as u32;
-                        cg.patch(skip, end);
+                        cg.patch(skip, end)?;
                     }
                     out(cg, ctx)
                 })
@@ -678,8 +683,8 @@ impl<'a> Codegen<'a> {
         let next = self.emit(Op::CtxNext { cursor, target: 0 });
         self.emit(Op::Goto { target: loop_start });
         let end = self.ops.len() as u32;
-        self.patch(rewind, end);
-        self.patch(next, end);
+        self.patch(rewind, end)?;
+        self.patch(next, end)?;
         Ok(())
     }
 
@@ -1007,7 +1012,7 @@ impl<'a> Codegen<'a> {
                     self.compile_expr_into(then, ctx, dest)?;
                     end_jumps.push(self.emit(Op::Goto { target: 0 }));
                     let next = self.ops.len() as u32;
-                    self.patch(skip, next);
+                    self.patch(skip, next)?;
                 }
                 match default {
                     Some(default) => self.compile_expr_into(default, ctx, dest)?,
@@ -1017,7 +1022,7 @@ impl<'a> Codegen<'a> {
                 }
                 let end = self.ops.len() as u32;
                 for jump in end_jumps {
-                    self.patch(jump, end);
+                    self.patch(jump, end)?;
                 }
             }
             Expr::IsNull { expr, negated } => {
