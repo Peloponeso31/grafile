@@ -31,8 +31,45 @@ grafile> MATCH (n:Person) RETURN n.name;
 ```
 
 REPL dot commands: `.help`, `.schema`, `.indexes`, `.read FILE`,
-`.timer on|off`, `.clear` (alias `.cls`), `.quit`. Scripts can also be passed
+`.timer on|off`, `.mode [NAME]`, `.headers on|off`, `.colors on|off`,
+`.pretty on|off`, `.clear` (alias `.cls`), `.quit`. Scripts can also be passed
 as a file argument.
+
+Input is syntax-highlighted while typing (disabled with `.colors off` or the
+`NO_COLOR` environment variable). Results can be printed in the modes SQLite
+users know: `table` (default), `box`, `qbox`, `psql`, `markdown`, `column`,
+`list`, `tabs`, `csv`, `quote`, `line`, and `json` (NDJSON, one object per
+row):
+
+```console
+grafile> .mode json
+grafile> MATCH (n:Person) RETURN n;
+{"n":{"id":1,"labels":["Person"],"properties":{"name":"alice","age":30}}}
+```
+
+With `.pretty on`, node and edge values expand to indented, highlighted JSON
+with their attributes (labels, type, endpoints, properties), also inside
+table cells:
+
+```console
+grafile> .pretty on
+grafile> MATCH (n:Person) RETURN n;
++----------------------+
+| n                    |
++----------------------+
+| {                    |
+|   "id": 1,           |
+|   "labels": [        |
+|     "Person"         |
+|   ],                 |
+|   "properties": {    |
+|     "name": "alice", |
+|     "age": 30        |
+|   }                  |
+| }                    |
++----------------------+
+```
+
 
 ## Library
 
