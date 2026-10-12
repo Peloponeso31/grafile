@@ -195,7 +195,3 @@ extensions — lives in [docs/roadmap.md](docs/roadmap.md).
 Storage-side work tracked alongside it: WAL mode for concurrent readers,
 delete rebalancing and `VACUUM`-style compaction, bulk loading, and
 streaming scans.
-
-## License
-
-Apache-2.0 (planned; the openCypher grammar/TCK are Apache-2.0 as well).
