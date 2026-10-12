@@ -31,9 +31,9 @@ grafile> MATCH (n:Person) RETURN n.name;
 ```
 
 REPL dot commands: `.help`, `.schema`, `.indexes`, `.read FILE`,
-`.timer on|off`, `.mode [NAME]`, `.headers on|off`, `.colors on|off`,
-`.pretty on|off`, `.clear` (alias `.cls`), `.quit`. Scripts can also be passed
-as a file argument.
+`.timer on|off`, `.mode [NAME]`, `.headers on|off`, `.separators on|off`,
+`.colors on|off`, `.pretty on|off`, `.clear` (alias `.cls`), `.quit`. Scripts
+can also be passed as a file argument.
 
 Input is syntax-highlighted while typing (disabled with `.colors off` or the
 `NO_COLOR` environment variable). Results can be printed in the modes SQLite

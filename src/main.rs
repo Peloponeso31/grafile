@@ -178,6 +178,7 @@ struct Settings {
     colors: Rc<Cell<bool>>,
     mode: OutputMode,
     headers: bool,
+    row_separators: bool,
     pretty: bool,
     timer: bool,
 }
@@ -190,6 +191,7 @@ impl Settings {
             colors: Rc::new(Cell::new(default_colors(is_tty, no_color))),
             mode: OutputMode::Table,
             headers: true,
+            row_separators: true,
             pretty: false,
             timer: false,
         }
@@ -388,6 +390,17 @@ fn run_dot_command(
                 println!("headers off");
             }
             _ => println!("usage: .headers on|off"),
+        },
+        ".separators" => match argument {
+            "on" => {
+                settings.row_separators = true;
+                println!("row separators on");
+            }
+            "off" => {
+                settings.row_separators = false;
+                println!("row separators off");
+            }
+            _ => println!("usage: .separators on|off"),
         },
         ".pretty" => match argument {
             "on" => {
@@ -712,7 +725,11 @@ fn render_grid(
                 out.push_str(&border);
                 out.push('\n');
             }
-            for row in &cells {
+            for (index, row) in cells.iter().enumerate() {
+                if index > 0 && settings.row_separators {
+                    out.push_str(&border);
+                    out.push('\n');
+                }
                 push_bordered_row(&mut out, row, &widths, '|', '|', '|');
             }
             out.push_str(&border);
@@ -726,7 +743,12 @@ fn render_grid(
                 out.push_str(&unicode_border(&widths, '╞', '═', '╪', '╡'));
                 out.push('\n');
             }
-            for row in &cells {
+            let row_separator = unicode_border(&widths, '├', '─', '┼', '┤');
+            for (index, row) in cells.iter().enumerate() {
+                if index > 0 && settings.row_separators {
+                    out.push_str(&row_separator);
+                    out.push('\n');
+                }
                 push_bordered_row(&mut out, row, &widths, '│', '│', '│');
             }
             out.push_str(&unicode_border(&widths, '╰', '─', '┴', '╯'));
@@ -1218,6 +1240,7 @@ repl:
   .indexes          index definitions
   .mode [NAME]      output mode (.mode --list to see all)
   .headers on|off   show column titles (default on)
+  .separators on|off  lines between table rows (default on)
   .colors on|off    syntax highlighting (default: on when a terminal)
   .pretty on|off    render nodes/edges as highlighted JSON
   .read FILE        run statements from a file
@@ -1252,6 +1275,7 @@ mod tests {
             colors: Rc::new(Cell::new(false)),
             mode,
             headers: true,
+            row_separators: true,
             pretty: false,
             timer: false,
         }
@@ -1283,6 +1307,23 @@ mod tests {
              | x | ten |\n\
              +---+-----+\n\
              | 1 | 10  |\n\
+             +---+-----+\n\
+             | 2 | 20  |\n\
+             +---+-----+\n"
+        );
+        let mut plain = settings(OutputMode::Table);
+        plain.row_separators = false;
+        let out = render(
+            &mut conn,
+            "UNWIND [1, 2] AS x RETURN x, x * 10 AS ten",
+            &plain,
+        );
+        assert_eq!(
+            out,
+            "+---+-----+\n\
+             | x | ten |\n\
+             +---+-----+\n\
+             | 1 | 10  |\n\
              | 2 | 20  |\n\
              +---+-----+\n"
         );
@@ -1297,6 +1338,12 @@ mod tests {
             &settings(OutputMode::Box),
         );
         assert_eq!(out, "╭───╮\n│ x │\n╞═══╡\n│ 1 │\n╰───╯\n");
+        let out = render(
+            &mut conn,
+            "UNWIND [1, 2] AS x RETURN x",
+            &settings(OutputMode::Box),
+        );
+        assert_eq!(out, "╭───╮\n│ x │\n╞═══╡\n│ 1 │\n├───┤\n│ 2 │\n╰───╯\n");
     }
 
     #[test]
@@ -1504,6 +1551,10 @@ mod tests {
         assert_eq!(settings.mode, OutputMode::Markdown);
         run_dot_command(&mut conn, ".headers off", &mut settings).expect("headers");
         assert!(!settings.headers);
+        run_dot_command(&mut conn, ".separators off", &mut settings).expect("separators");
+        assert!(!settings.row_separators);
+        run_dot_command(&mut conn, ".separators on", &mut settings).expect("separators");
+        assert!(settings.row_separators);
         run_dot_command(&mut conn, ".pretty on", &mut settings).expect("pretty");
         assert!(settings.pretty);
         run_dot_command(&mut conn, ".colors on", &mut settings).expect("colors");
