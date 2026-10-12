@@ -1,0 +1,36 @@
+name: ffi
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build library
+        run: cargo build -p grafile-ffi --release
+      - name: Rust tests
+        run: cargo test -p grafile-ffi
+      - name: C and Python smoke tests
+        if: runner.os != 'Windows'
+        run: bash scripts/ffi-smoke.sh
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: libgrafile-${{ matrix.os }}
+          path: |
+            target/release/libgrafile.so
+            target/release/libgrafile.dylib
+            target/release/libgrafile.a
+            target/release/grafile.dll
+            target/release/grafile.lib
+            ffi/include/grafile.h
+          if-no-files-found: ignore
