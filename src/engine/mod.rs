@@ -207,7 +207,7 @@ impl Database {
         labels.dedup();
         let record = NodeRecord {
             labels,
-            props: normalize_props(props),
+            props: normalize_props(props)?,
         };
         let id = self.pager.update_header(|header| {
             let id = header.next_node_id;
@@ -250,7 +250,7 @@ impl Database {
             edge_type,
             src,
             dst,
-            props: normalize_props(props),
+            props: normalize_props(props)?,
         };
         let id = self.pager.update_header(|header| {
             let id = header.next_edge_id;
@@ -549,6 +549,196 @@ impl Database {
         Ok(index_id)
     }
 
+    /// All node ids in ascending order.
+    pub fn all_node_ids(&mut self) -> Result<Vec<u64>> {
+        let mut cursor = self.nodes.cursor();
+        let mut ids = Vec::new();
+        let mut ok = cursor.first(&mut self.pager)?;
+        while ok {
+            let key: [u8; 8] = cursor
+                .key()
+                .try_into()
+                .map_err(|_| Error::corrupt("node key is not 8 bytes"))?;
+            ids.push(u64::from_be_bytes(key));
+            ok = cursor.next(&mut self.pager)?;
+        }
+        Ok(ids)
+    }
+
+    /// All edge ids in ascending order.
+    pub fn all_edge_ids(&mut self) -> Result<Vec<u64>> {
+        let mut cursor = self.edges.cursor();
+        let mut ids = Vec::new();
+        let mut ok = cursor.first(&mut self.pager)?;
+        while ok {
+            let key: [u8; 8] = cursor
+                .key()
+                .try_into()
+                .map_err(|_| Error::corrupt("edge key is not 8 bytes"))?;
+            ids.push(u64::from_be_bytes(key));
+            ok = cursor.next(&mut self.pager)?;
+        }
+        Ok(ids)
+    }
+
+    /// Find nodes matching all labels and properties (using an index when
+    /// available), creating one when none exists.
+    pub fn match_or_create_node(
+        &mut self,
+        labels: &[u32],
+        props: Vec<(u32, Value)>,
+    ) -> Result<(u64, bool)> {
+        let props = normalize_props(props)?;
+        let candidates = self.match_nodes(labels, &props)?;
+        if let Some(id) = candidates.first() {
+            return Ok((*id, false));
+        }
+        let id = self.create_node(labels, props)?;
+        Ok((id, true))
+    }
+
+    /// Find edges matching `(type, src, dst, props)`, creating one when none
+    /// exists.
+    pub fn match_or_create_edge(
+        &mut self,
+        edge_type: u32,
+        src: u64,
+        dst: u64,
+        props: Vec<(u32, Value)>,
+    ) -> Result<(u64, bool)> {
+        let props = normalize_props(props)?;
+        let candidates: Vec<u64> = self
+            .expand(src, Direction::Out, &[edge_type])?
+            .into_iter()
+            .filter(|(_, neighbor)| *neighbor == dst)
+            .map(|(edge, _)| edge)
+            .collect();
+        for edge_id in candidates {
+            if let Some(record) = self.get_edge(edge_id)?
+                && props_match(&record.props, &props)
+            {
+                return Ok((edge_id, false));
+            }
+        }
+        let id = self.create_edge(edge_type, src, dst, props)?;
+        Ok((id, true))
+    }
+
+    /// Nodes matching all labels and properties.
+    pub fn match_nodes(&mut self, labels: &[u32], props: &[(u32, Value)]) -> Result<Vec<u64>> {
+        let mut candidates: Option<Vec<u64>> = None;
+        for (key_id, value) in props {
+            let index = self
+                .schema()
+                .node_indexes
+                .iter()
+                .find(|index| {
+                    index.key_id == *key_id
+                        && (index.label_id == 0 || labels.contains(&index.label_id))
+                })
+                .cloned();
+            if let Some(index) = index {
+                let ids = self.index_lookup(index.id, value)?;
+                candidates = Some(match candidates {
+                    None => ids,
+                    Some(previous) => intersect_ids(previous, ids),
+                });
+                break;
+            }
+        }
+        let candidates = match candidates {
+            Some(ids) => ids,
+            None => match labels.first() {
+                Some(label) => self.label_nodes(*label)?,
+                None => self.all_node_ids()?,
+            },
+        };
+        let mut out = Vec::new();
+        for id in candidates {
+            if let Some(record) = self.get_node(id)?
+                && labels.iter().all(|label| record.labels.contains(label))
+                && props_match(&record.props, props)
+            {
+                out.push(id);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Add labels to a node, updating bitmaps and indexes.
+    pub fn add_node_labels(&mut self, node_id: u64, labels: &[u32]) -> Result<()> {
+        self.require_write()?;
+        let Some(mut record) = self.get_node(node_id)? else {
+            return Err(Error::new(
+                ErrorCode::NotFound,
+                format!("node {node_id} does not exist"),
+            ));
+        };
+        self.unindex_node(&record, node_id)?;
+        for label in labels {
+            if !record.labels.contains(label) {
+                record.labels.push(*label);
+            }
+        }
+        record.labels.sort_unstable();
+        record.labels.dedup();
+        let key_bytes = node_id.to_be_bytes();
+        self.nodes.delete(&mut self.pager, &key_bytes)?;
+        self.nodes
+            .insert(&mut self.pager, &key_bytes, &record.encode())?;
+        for label in labels {
+            let key = FragmentKey::label(*label, node_id);
+            self.fragments
+                .set_bit(&mut self.pager, &key, FragmentKey::label_bit(node_id))?;
+        }
+        self.index_node(&record, node_id)
+    }
+
+    /// Remove labels from a node, updating bitmaps and indexes.
+    pub fn remove_node_labels(&mut self, node_id: u64, labels: &[u32]) -> Result<()> {
+        self.require_write()?;
+        let Some(mut record) = self.get_node(node_id)? else {
+            return Err(Error::new(
+                ErrorCode::NotFound,
+                format!("node {node_id} does not exist"),
+            ));
+        };
+        self.unindex_node(&record, node_id)?;
+        record.labels.retain(|label| !labels.contains(label));
+        let key_bytes = node_id.to_be_bytes();
+        self.nodes.delete(&mut self.pager, &key_bytes)?;
+        self.nodes
+            .insert(&mut self.pager, &key_bytes, &record.encode())?;
+        for label in labels {
+            let key = FragmentKey::label(*label, node_id);
+            self.fragments
+                .clear_bit(&mut self.pager, &key, FragmentKey::label_bit(node_id))?;
+        }
+        self.index_node(&record, node_id)
+    }
+
+    /// Replace every property of a node.
+    pub fn replace_node_properties(
+        &mut self,
+        node_id: u64,
+        props: Vec<(u32, Value)>,
+    ) -> Result<()> {
+        self.require_write()?;
+        let Some(mut record) = self.get_node(node_id)? else {
+            return Err(Error::new(
+                ErrorCode::NotFound,
+                format!("node {node_id} does not exist"),
+            ));
+        };
+        self.unindex_node(&record, node_id)?;
+        record.props = normalize_props(props)?;
+        let key_bytes = node_id.to_be_bytes();
+        self.nodes.delete(&mut self.pager, &key_bytes)?;
+        self.nodes
+            .insert(&mut self.pager, &key_bytes, &record.encode())?;
+        self.index_node(&record, node_id)
+    }
+
     fn require_write(&self) -> Result<()> {
         if !self.pager.in_write_txn() {
             return Err(Error::misuse(
@@ -821,13 +1011,46 @@ impl Database {
     }
 }
 
-fn normalize_props(props: Vec<(u32, Value)>) -> Vec<(u32, Value)> {
+fn normalize_props(props: Vec<(u32, Value)>) -> Result<Vec<(u32, Value)>> {
+    for (_, value) in &props {
+        validate_property_value(value)?;
+    }
     let mut props: Vec<(u32, Value)> = props
         .into_iter()
         .filter(|(_, value)| !value.is_null())
         .collect();
     props.sort_by_key(|(key, _)| *key);
-    props
+    Ok(props)
+}
+
+/// Property values may be primitives or flat lists of primitives; entity
+/// references and maps are rejected, matching openCypher.
+fn validate_property_value(value: &Value) -> Result<()> {
+    match value {
+        Value::Null
+        | Value::Bool(_)
+        | Value::Int(_)
+        | Value::Float(_)
+        | Value::Text(_)
+        | Value::Bytes(_) => Ok(()),
+        Value::List(items) => {
+            for item in items.iter() {
+                if matches!(
+                    item,
+                    Value::List(_) | Value::Map(_) | Value::Node(_) | Value::Edge(_)
+                ) {
+                    return Err(Error::type_error(
+                        "lists stored as properties may only contain primitive values",
+                    ));
+                }
+            }
+            Ok(())
+        }
+        Value::Map(_) | Value::Node(_) | Value::Edge(_) => Err(Error::type_error(format!(
+            "{} values cannot be stored as properties",
+            value.type_name()
+        ))),
+    }
 }
 
 /// Index key for a node: order-preserving value encoding plus node id.
@@ -851,6 +1074,34 @@ fn index_value_prefix(value: &Value) -> Vec<u8> {
     let mut prefix = Vec::with_capacity(16);
     encode_index_key(&mut prefix, value);
     prefix
+}
+
+/// Intersection of two ascending id lists.
+fn intersect_ids(a: Vec<u64>, b: Vec<u64>) -> Vec<u64> {
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                out.push(a[i]);
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Whether every expected `(key, value)` is present and equal in `actual`.
+fn props_match(actual: &[(u32, Value)], expected: &[(u32, Value)]) -> bool {
+    expected.iter().all(|(key, value)| {
+        actual
+            .binary_search_by_key(key, |(k, _)| *k)
+            .ok()
+            .is_some_and(|idx| crate::record::value_equals(&actual[idx].1, value) == Some(true))
+    })
 }
 
 #[cfg(test)]

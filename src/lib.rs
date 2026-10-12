@@ -11,14 +11,18 @@
 //! stored as records in a B+tree, giving fast neighbor iteration, edge
 //! existence checks and bitmap set operations.
 
+pub mod api;
 pub mod btree;
 pub mod catalog;
+pub mod codegen;
 pub mod cypher;
 pub mod engine;
 pub mod error;
 pub mod matrix;
 pub mod pager;
+pub mod planner;
 pub mod record;
+pub mod vdbe;
 pub mod vfs;
 
 pub use error::{Error, ErrorCode, Result};

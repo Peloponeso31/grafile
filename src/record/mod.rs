@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 ///
 /// Strings, byte arrays and lists are reference-counted so cloning a value
 /// (for registers, result rows, or index entries) is cheap.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub enum Value {
     /// The absence of a value.
     Null,
@@ -34,6 +34,12 @@ pub enum Value {
     Bytes(Arc<[u8]>),
     /// Ordered list of values.
     List(Arc<[Value]>),
+    /// Map of string keys to values (engine-internal; not storable).
+    Map(Arc<[(Arc<str>, Value)]>),
+    /// Reference to a node by id (engine-internal; not storable).
+    Node(u64),
+    /// Reference to an edge by id (engine-internal; not storable).
+    Edge(u64),
 }
 
 impl Value {
@@ -47,6 +53,9 @@ impl Value {
             Self::Text(_) => "string",
             Self::Bytes(_) => "bytes",
             Self::List(_) => "list",
+            Self::Map(_) => "map",
+            Self::Node(_) => "node",
+            Self::Edge(_) => "relationship",
         }
     }
 
@@ -87,6 +96,114 @@ impl Value {
             Self::Float(value) => Some(*value),
             _ => None,
         }
+    }
+}
+
+impl PartialEq for Value {
+    /// Equality with NaN equal to itself so that `Eq` and `Ord` are
+    /// consistent (needed for sorting and grouping).
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Null, Self::Null) => true,
+            (Self::Bool(a), Self::Bool(b)) => a == b,
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a == b || (a.is_nan() && b.is_nan()),
+            (Self::Text(a), Self::Text(b)) => a == b,
+            (Self::Bytes(a), Self::Bytes(b)) => a == b,
+            (Self::List(a), Self::List(b)) => a == b,
+            (Self::Map(a), Self::Map(b)) => a == b,
+            (Self::Node(a), Self::Node(b)) => a == b,
+            (Self::Edge(a), Self::Edge(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Value {}
+
+impl PartialOrd for Value {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Value {
+    /// Total order used for sorting, grouping and index-style comparisons.
+    ///
+    /// Across types the order is `null < boolean < number < string < bytes <
+    /// list < node < edge`; numbers compare numerically across integers and
+    /// floats; NaN sorts consistently via `total_cmp`.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            (Self::Null, Self::Null) => Ordering::Equal,
+            (Self::Bool(a), Self::Bool(b)) => a.cmp(b),
+            (Self::Int(a), Self::Int(b)) => a.cmp(b),
+            (Self::Float(a), Self::Float(b)) => float_cmp(*a, *b),
+            (Self::Int(a), Self::Float(b)) => float_cmp(*a as f64, *b),
+            (Self::Float(a), Self::Int(b)) => float_cmp(*a, *b as f64),
+            (Self::Text(a), Self::Text(b)) => a.as_bytes().cmp(b.as_bytes()),
+            (Self::Bytes(a), Self::Bytes(b)) => a.cmp(b),
+            (Self::List(a), Self::List(b)) => a.cmp(b),
+            (Self::Map(a), Self::Map(b)) => a.cmp(b),
+            (Self::Node(a), Self::Node(b)) => a.cmp(b),
+            (Self::Edge(a), Self::Edge(b)) => a.cmp(b),
+            _ => rank(self).cmp(&rank(other)),
+        }
+    }
+}
+
+fn float_cmp(a: f64, b: f64) -> std::cmp::Ordering {
+    if a == b {
+        // Treat -0.0 and 0.0 as equal, matching `PartialEq`.
+        return std::cmp::Ordering::Equal;
+    }
+    a.total_cmp(&b)
+}
+
+fn rank(value: &Value) -> u8 {
+    match value {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Int(_) | Value::Float(_) => 2,
+        Value::Text(_) => 3,
+        Value::Bytes(_) => 4,
+        Value::List(_) => 5,
+        Value::Map(_) => 6,
+        Value::Node(_) => 7,
+        Value::Edge(_) => 8,
+    }
+}
+
+/// Cypher equality: `None` when either side is null or the types are
+/// incomparable; integers and floats compare numerically.
+pub fn value_equals(a: &Value, b: &Value) -> Option<bool> {
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => None,
+        (Value::Int(x), Value::Int(y)) => Some(x == y),
+        (Value::Float(x), Value::Float(y)) => Some(x == y),
+        (Value::Int(x), Value::Float(y)) => Some(*x as f64 == *y),
+        (Value::Float(x), Value::Int(y)) => Some(*x == *y as f64),
+        (Value::Bool(x), Value::Bool(y)) => Some(x == y),
+        (Value::Text(x), Value::Text(y)) => Some(x == y),
+        (Value::Bytes(x), Value::Bytes(y)) => Some(x == y),
+        (Value::Node(x), Value::Node(y)) => Some(x == y),
+        (Value::Edge(x), Value::Edge(y)) => Some(x == y),
+        (Value::List(x), Value::List(y)) => {
+            if x.len() != y.len() {
+                return Some(false);
+            }
+            let mut unknown = false;
+            for (item_a, item_b) in x.iter().zip(y.iter()) {
+                match value_equals(item_a, item_b) {
+                    Some(true) => {}
+                    Some(false) => return Some(false),
+                    None => unknown = true,
+                }
+            }
+            if unknown { None } else { Some(true) }
+        }
+        _ => None,
     }
 }
 
@@ -205,6 +322,12 @@ pub fn encode_value(out: &mut Vec<u8>, value: &Value) {
             for item in values.iter() {
                 encode_value(out, item);
             }
+        }
+        // Maps and entity references are engine-internal and never stored;
+        // the engine validates property values before encoding.
+        Value::Map(_) | Value::Node(_) | Value::Edge(_) => {
+            debug_assert!(false, "attempted to encode an unstorable value");
+            out.push(tag::NULL);
         }
     }
 }
@@ -486,6 +609,10 @@ pub fn encode_index_key(out: &mut Vec<u8>, value: &Value) {
             }
             out.extend_from_slice(&[0x00, 0x01]);
         }
+        Value::Map(_) | Value::Node(_) | Value::Edge(_) => {
+            debug_assert!(false, "attempted to index an unstorable value");
+            out.push(index_tag::NULL);
+        }
     }
 }
 
@@ -611,6 +738,7 @@ mod tests {
             Value::Text(_) => 5,
             Value::Bytes(_) => 6,
             Value::List(_) => 7,
+            Value::Map(_) | Value::Node(_) | Value::Edge(_) => 8,
         }
     }
 
