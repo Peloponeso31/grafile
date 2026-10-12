@@ -447,6 +447,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
  "uuid",
 ]
 

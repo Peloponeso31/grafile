@@ -9,8 +9,6 @@ use logos::Logos;
 /// A Cypher token.
 #[derive(Logos, Debug, Clone, Copy, PartialEq, Eq)]
 #[logos(skip r"[ \t\r\n]+")]
-#[logos(skip(r"//[^\n]*", allow_greedy = true))]
-#[logos(skip r"/\*([^*]|\*+[^*/])*\*+/")]
 pub enum Token {
     /// `MATCH`
     #[token("MATCH", ignore(case))]
@@ -242,6 +240,13 @@ pub enum Token {
     /// `}`
     #[token("}")]
     RBrace,
+
+    /// `// ...` line comment.
+    #[regex(r"//[^\n]*", allow_greedy = true)]
+    LineComment,
+    /// `/* ... */` block comment.
+    #[regex(r"/\*([^*]|\*+[^*/])*\*+/")]
+    BlockComment,
 }
 
 /// A lexed token with its byte span.
@@ -263,6 +268,11 @@ pub fn lex(source: &str) -> Result<Vec<Spanned>, (usize, usize)> {
     while let Some(result) = lexer.next() {
         match result {
             Ok(token) => {
+                // Comments are lexed so the highlighter can color them, but
+                // the parser never sees them.
+                if matches!(token, Token::LineComment | Token::BlockComment) {
+                    continue;
+                }
                 let span = lexer.span();
                 tokens.push(Spanned {
                     token,
@@ -295,6 +305,96 @@ pub fn line_column(source: &str, offset: usize) -> (usize, usize) {
         }
     }
     (line, column)
+}
+
+/// Classification of a lexed token for syntax highlighting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenClass {
+    /// Cypher keywords (`MATCH`, `RETURN`, ...).
+    Keyword,
+    /// Function and aggregation names (`count`, `collect`, ...).
+    Function,
+    /// String literals.
+    String,
+    /// Numeric literals.
+    Number,
+    /// `$parameters`.
+    Parameter,
+    /// Line and block comments.
+    Comment,
+    /// Operators and arrows.
+    Operator,
+    /// Label and edge type names (after `:` or `|`).
+    Label,
+    /// Property keys (after `.`).
+    Property,
+    /// Punctuation (`(`, `)`, `,`, ...).
+    Punctuation,
+    /// Plain identifiers.
+    Variable,
+}
+
+/// Lex `line` tolerantly and classify each token for highlighting.
+///
+/// Unlike [`lex`], invalid characters are skipped rather than reported, so
+/// half-typed input (`MATCH (n:Person`, unterminated strings) still
+/// highlights. Returned spans are ordered, non-overlapping and byte-aligned.
+pub fn highlight_spans(line: &str) -> Vec<(usize, usize, TokenClass)> {
+    let mut tokens: Vec<(usize, usize, Token)> = Vec::new();
+    let mut lexer = Token::lexer(line);
+    while let Some(result) = lexer.next() {
+        if let Ok(token) = result {
+            let span = lexer.span();
+            tokens.push((span.start, span.end, token));
+        }
+        // On error logos advances at least one byte, so iteration terminates.
+    }
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(index, (start, end, token))| (*start, *end, classify(*token, &tokens, index)))
+        .collect()
+}
+
+fn classify(token: Token, tokens: &[(usize, usize, Token)], index: usize) -> TokenClass {
+    use Token::*;
+    match token {
+        Match | Optional | Where | Return | With | Unwind | Create | Merge | Set | Remove
+        | Delete | Detach | Order | By | Skip | Limit | As | And | Or | Xor | Not | In | Is
+        | Null | True | False | Distinct | Starts | Ends | Contains | Asc | Ascending | Desc
+        | Descending | On | Case | When | Then | Else | End | Union | All => TokenClass::Keyword,
+        LineComment | BlockComment => TokenClass::Comment,
+        StringSingle | StringDouble => TokenClass::String,
+        Integer | Float => TokenClass::Number,
+        Param => TokenClass::Parameter,
+        Ident => {
+            // `name(` is a function or aggregation call.
+            if matches!(tokens.get(index + 1).map(|entry| entry.2), Some(LParen)) {
+                TokenClass::Function
+            } else {
+                context_class(tokens, index)
+            }
+        }
+        EscapedIdent => context_class(tokens, index),
+        Plus | Minus | Star | Slash | Percent | Caret | Equals | Less | Greater | NotEquals
+        | LessEquals | GreaterEquals | RegexMatch | ArrowRight | ArrowLeft | DotDot => {
+            TokenClass::Operator
+        }
+        LParen | RParen | LBracket | RBracket | LBrace | RBrace | Comma | Semicolon | Colon
+        | Pipe | Dot => TokenClass::Punctuation,
+    }
+}
+
+fn context_class(tokens: &[(usize, usize, Token)], index: usize) -> TokenClass {
+    match index
+        .checked_sub(1)
+        .and_then(|previous| tokens.get(previous))
+        .map(|entry| entry.2)
+    {
+        Some(Token::Colon) | Some(Token::Pipe) => TokenClass::Label,
+        Some(Token::Dot) => TokenClass::Property,
+        _ => TokenClass::Variable,
+    }
 }
 
 #[cfg(test)]
@@ -385,5 +485,104 @@ mod tests {
         assert_eq!(line_column("ab\ncd", 0), (1, 1));
         assert_eq!(line_column("ab\ncd", 3), (2, 1));
         assert_eq!(line_column("ab\ncd", 4), (2, 2));
+    }
+}
+
+#[cfg(test)]
+mod highlight_tests {
+    use super::*;
+
+    fn classes(line: &str) -> Vec<TokenClass> {
+        highlight_spans(line)
+            .into_iter()
+            .map(|(_, _, class)| class)
+            .collect()
+    }
+
+    fn class_of(line: &str, needle: &str) -> TokenClass {
+        let start = line.find(needle).expect("needle in line");
+        highlight_spans(line)
+            .into_iter()
+            .find(|(s, _, _)| *s == start)
+            .map(|(_, _, class)| class)
+            .expect("token at needle")
+    }
+
+    #[test]
+    fn classifies_keywords_functions_and_literals() {
+        assert_eq!(
+            classes("MATCH (n) RETURN count(*)"),
+            vec![
+                TokenClass::Keyword,
+                TokenClass::Punctuation,
+                TokenClass::Variable,
+                TokenClass::Punctuation,
+                TokenClass::Keyword,
+                TokenClass::Function,
+                TokenClass::Punctuation,
+                TokenClass::Operator,
+                TokenClass::Punctuation,
+            ]
+        );
+        assert_eq!(class_of("RETURN 'x'", "'x'"), TokenClass::String);
+        assert_eq!(class_of("RETURN 42", "42"), TokenClass::Number);
+        assert_eq!(class_of("RETURN $p", "$p"), TokenClass::Parameter);
+    }
+
+    #[test]
+    fn classifies_labels_properties_and_comments() {
+        assert_eq!(class_of("MATCH (n:Person)", "Person"), TokenClass::Label);
+        assert_eq!(
+            class_of("MATCH ()-[:KNOWS|LIKES]->()", "LIKES"),
+            TokenClass::Label
+        );
+        assert_eq!(class_of("RETURN n.name", "name"), TokenClass::Property);
+        assert_eq!(
+            class_of("MATCH (n) // comment", "// comment"),
+            TokenClass::Comment
+        );
+        assert_eq!(
+            class_of("MATCH (n) /* block */ RETURN n", "/* block */"),
+            TokenClass::Comment
+        );
+    }
+
+    #[test]
+    fn tolerates_incomplete_input() {
+        // Unterminated string: no panic, spans stay in bounds.
+        let line = "MATCH (n {name: 'abc";
+        for (start, end, _) in highlight_spans(line) {
+            assert!(start < end && end <= line.len());
+        }
+        // Invalid character.
+        assert!(!highlight_spans("MATCH @@ RETURN").is_empty());
+    }
+
+    #[test]
+    fn spans_are_ordered_and_non_overlapping() {
+        let line = "MATCH (a:Person {name: 'x'})-[:KNOWS]->(b) RETURN a.name, b.age";
+        let spans = highlight_spans(line);
+        let mut previous_end = 0usize;
+        for (start, end, _) in &spans {
+            assert!(*start >= previous_end, "spans overlap: {spans:?}");
+            assert!(start < end, "empty span");
+            previous_end = *end;
+        }
+        // Concatenating the source slices reproduces the line exactly.
+        let joined: String = spans.iter().map(|(s, e, _)| &line[*s..*e]).collect();
+        let without_whitespace: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+        let joined_without_whitespace: String =
+            joined.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(joined_without_whitespace, without_whitespace);
+    }
+
+    #[test]
+    fn lex_still_filters_comments() {
+        let tokens: Vec<Token> = lex("MATCH // hi\nRETURN /* x */ 1")
+            .expect("lex")
+            .into_iter()
+            .map(|spanned| spanned.token)
+            .collect();
+        assert_eq!(tokens, vec![Token::Match, Token::Return, Token::Integer]);
     }
 }
