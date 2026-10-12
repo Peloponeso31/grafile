@@ -60,6 +60,7 @@ struct WriteTxn {
 }
 
 /// Borrowed page contents plus the frame generation.
+#[derive(Debug)]
 pub struct PageRef<'a> {
     data: &'a [u8],
     generation: u64,
@@ -93,6 +94,7 @@ pub struct Pager {
     page_size: usize,
     cache: LinkedHashMap<u32, Frame>,
     cache_capacity: usize,
+    writable: bool,
     txn: Option<WriteTxn>,
     lock: LockState,
 }
@@ -132,6 +134,7 @@ impl Pager {
             header_dirty: false,
             cache,
             cache_capacity: DEFAULT_CACHE_PAGES,
+            writable: true,
             txn: None,
             lock: LockState::None,
         })
@@ -187,17 +190,13 @@ impl Pager {
             header_dirty: false,
             cache,
             cache_capacity: DEFAULT_CACHE_PAGES,
+            writable: mode.is_writable(),
             txn: None,
             lock: LockState::None,
         })
     }
 
-    fn recover_journal(
-        vfs: &dyn Vfs,
-        file: &dyn File,
-        jpath: &Path,
-        mode: OpenMode,
-    ) -> Result<()> {
+    fn recover_journal(vfs: &dyn Vfs, file: &dyn File, jpath: &Path, mode: OpenMode) -> Result<()> {
         if !mode.is_writable() {
             let journal_file = vfs.open(jpath, OpenMode::ReadOnly)?;
             let mut block = vec![0u8; journal::JOURNAL_HEADER_SIZE];
@@ -283,7 +282,7 @@ impl Pager {
         if self.txn.is_some() {
             return Err(Error::misuse("nested write transactions are not supported"));
         }
-        if !self.file_lock_writable() {
+        if !self.writable {
             return Err(Error::new(
                 ErrorCode::ReadOnly,
                 "database was opened read-only",
@@ -326,31 +325,13 @@ impl Pager {
         Ok(())
     }
 
-    fn file_lock_writable(&self) -> bool {
-        // A read-only handle cannot be probed directly; the VFS open mode is
-        // tracked by attempting a no-op write only in tests. Instead we rely
-        // on the file handle: ReadOnly opens are created by `open`, and
-        // `begin_write` is rejected earlier by the exclusive lock failing on
-        // some platforms. Track explicitly via a flag.
-        self.writable
-    }
-
     /// Commit the active write transaction.
     pub fn commit(&mut self) -> Result<()> {
         if self.txn.is_none() {
             return Err(Error::misuse("no write transaction to commit"));
         }
-        let dirty_pages: Vec<u32> = {
-            let mut pages: Vec<u32> = self
-                .cache
-                .iter()
-                .filter(|(_, frame)| frame.dirty)
-                .map(|(page_no, _)| *page_no)
-                .collect();
-            pages.sort_unstable();
-            pages
-        };
-        if dirty_pages.is_empty() {
+        let any_dirty = self.header_dirty || self.cache.values().any(|frame| frame.dirty);
+        if !any_dirty {
             return self.finish_txn(true);
         }
         // Page 1 must reflect the new change counter; serialize it now so the
@@ -512,7 +493,9 @@ impl Pager {
     /// caller is responsible for initializing and checksumming it.
     pub fn alloc_page(&mut self) -> Result<u32> {
         if self.txn.is_none() {
-            return Err(Error::misuse("alloc_page called outside a write transaction"));
+            return Err(Error::misuse(
+                "alloc_page called outside a write transaction",
+            ));
         }
         if self.header.freelist_trunk != INVALID_PAGE {
             return self.alloc_from_freelist();
@@ -590,7 +573,9 @@ impl Pager {
     /// Return a page to the freelist.
     pub fn free_page(&mut self, page_no: u32) -> Result<()> {
         if self.txn.is_none() {
-            return Err(Error::misuse("free_page called outside a write transaction"));
+            return Err(Error::misuse(
+                "free_page called outside a write transaction",
+            ));
         }
         if page_no <= 1 || page_no as u64 > self.header.page_count {
             return Err(Error::corrupt(format!("cannot free page {page_no}")));
@@ -618,13 +603,14 @@ impl Pager {
             }
         }
         // `page_no` becomes a new trunk pointing at the previous head.
+        let page_size = self.page_size;
         let data = self.page_mut(page_no)?;
         data.fill(0);
         let header = PageHeader {
             page_type: PageType::FreelistTrunk,
             flags: 0,
             cell_count: 0,
-            content_start: self.page_size as u16,
+            content_start: page_size as u16,
             fragmented_free: 0,
             page_no,
             rightmost: 0,
@@ -639,13 +625,14 @@ impl Pager {
     }
 
     fn mark_freelist_leaf(&mut self, page_no: u32) -> Result<()> {
+        let page_size = self.page_size;
         let data = self.page_mut(page_no)?;
         data.fill(0);
         let header = PageHeader {
             page_type: PageType::FreelistLeaf,
             flags: 0,
             cell_count: 0,
-            content_start: self.page_size as u16,
+            content_start: page_size as u16,
             fragmented_free: 0,
             page_no,
             rightmost: 0,
@@ -674,4 +661,269 @@ fn write_header_page(page: &mut [u8], header: &DatabaseHeader) -> Result<()> {
     header.write_to(page);
     write_page_checksum(page);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vfs::mem::{FaultConfig, MemVfs, new_store};
+
+    const PAGE_SIZE: u32 = 4096;
+
+    fn init_page(pager: &mut Pager, page_no: u32, page_type: PageType) -> Result<()> {
+        let page_size = pager.page_size();
+        let data = pager.page_mut(page_no)?;
+        data.fill(0);
+        let header = PageHeader {
+            page_type,
+            flags: 0,
+            cell_count: 0,
+            content_start: page_size as u16,
+            fragmented_free: 0,
+            page_no,
+            rightmost: 0,
+        };
+        header.write_to(data);
+        write_page_checksum(data);
+        Ok(())
+    }
+
+    fn create_pager(vfs: Arc<dyn Vfs>, path: &Path) -> Pager {
+        Pager::create(vfs, path, PAGE_SIZE).expect("create pager")
+    }
+
+    #[test]
+    fn create_commit_reopen_roundtrip() {
+        let store = new_store();
+        let path = Path::new("roundtrip.db");
+        {
+            let vfs = Arc::new(MemVfs::from_store(store.clone()));
+            let mut pager = create_pager(vfs, path);
+            assert_eq!(pager.header().change_counter, 0);
+            pager.begin_write().expect("begin");
+            pager.update_header(|header| header.user_version = 7);
+            pager.commit().expect("commit");
+            assert_eq!(pager.header().change_counter, 1);
+        }
+        let vfs = Arc::new(MemVfs::from_store(store));
+        let pager = Pager::open(vfs, path, OpenMode::ReadWrite).expect("reopen");
+        assert_eq!(pager.header().user_version, 7);
+        assert_eq!(pager.header().change_counter, 1);
+        assert_eq!(pager.header().page_size, PAGE_SIZE);
+    }
+
+    #[test]
+    fn alloc_and_free_reuse_pages() {
+        let store = new_store();
+        let path = Path::new("alloc.db");
+        let vfs = Arc::new(MemVfs::from_store(store));
+        let mut pager = create_pager(vfs, path);
+
+        pager.begin_write().expect("begin");
+        let p1 = pager.alloc_page().expect("alloc");
+        init_page(&mut pager, p1, PageType::TableLeaf).expect("init");
+        let p2 = pager.alloc_page().expect("alloc");
+        init_page(&mut pager, p2, PageType::TableLeaf).expect("init");
+        pager.commit().expect("commit");
+        assert_eq!(pager.header().page_count, 3);
+        assert_eq!((p1, p2), (2, 3));
+
+        pager.begin_write().expect("begin");
+        pager.free_page(p2).expect("free");
+        pager.commit().expect("commit");
+        assert_eq!(pager.header().freelist_count, 1);
+
+        pager.begin_write().expect("begin");
+        let reused = pager.alloc_page().expect("alloc");
+        pager.commit().expect("commit");
+        assert_eq!(reused, p2);
+        assert_eq!(pager.header().freelist_count, 0);
+    }
+
+    #[test]
+    fn rollback_restores_header_and_pages() {
+        let store = new_store();
+        let path = Path::new("rollback.db");
+        let vfs = Arc::new(MemVfs::from_store(store));
+        let mut pager = create_pager(vfs, path);
+
+        pager.begin_write().expect("begin");
+        let p1 = pager.alloc_page().expect("alloc");
+        init_page(&mut pager, p1, PageType::TableLeaf).expect("init");
+        pager.commit().expect("commit");
+        let original = pager.page(p1).expect("page").data().to_vec();
+
+        pager.begin_write().expect("begin");
+        {
+            let data = pager.page_mut(p1).expect("mutate");
+            data[100] = 0xAB;
+            write_page_checksum(data);
+        }
+        pager.update_header(|header| header.user_version = 99);
+        pager.rollback().expect("rollback");
+
+        assert_eq!(pager.header().user_version, 0);
+        assert_eq!(pager.header().page_count, 2);
+        assert_eq!(pager.page(p1).expect("page").data(), original.as_slice());
+    }
+
+    #[test]
+    fn commit_failure_after_db_writes_recovers_on_reopen() {
+        let store = new_store();
+        let path = Path::new("crash-replay.db");
+        let original;
+        {
+            let vfs = MemVfs::from_store(store.clone());
+            let shared: Arc<dyn Vfs> = Arc::new(vfs.clone());
+            let mut pager = create_pager(shared, path);
+            pager.begin_write().expect("begin");
+            let p1 = pager.alloc_page().expect("alloc");
+            init_page(&mut pager, p1, PageType::TableLeaf).expect("init");
+            pager.commit().expect("commit");
+            original = pager.page(p1).expect("page").data().to_vec();
+
+            pager.begin_write().expect("begin");
+            {
+                let data = pager.page_mut(p1).expect("mutate");
+                data[200] = 0xFF;
+                write_page_checksum(data);
+            }
+            // Op sequence after arming: 1 page-1 journal record, 2 journal
+            // header, 3 journal sync, 4 db page 1, 5 db page 2, 6 db sync,
+            // 7 journal magic zeroing (fails here).
+            vfs.inject_fault(FaultConfig {
+                fail_after_ops: Some(6),
+                torn_write: false,
+            });
+            let err = pager.commit().expect_err("commit fails");
+            assert_eq!(err.code(), ErrorCode::Io);
+        }
+        let vfs = Arc::new(MemVfs::from_store(store));
+        let mut pager = Pager::open(vfs, path, OpenMode::ReadWrite).expect("reopen recovers");
+        assert_eq!(pager.page(2).expect("page").data(), original.as_slice());
+        assert_eq!(pager.header().change_counter, 1);
+    }
+
+    #[test]
+    fn torn_write_during_commit_recovers_on_reopen() {
+        let store = new_store();
+        let path = Path::new("crash-torn.db");
+        let original;
+        {
+            let vfs = MemVfs::from_store(store.clone());
+            let shared: Arc<dyn Vfs> = Arc::new(vfs.clone());
+            let mut pager = create_pager(shared, path);
+            pager.begin_write().expect("begin");
+            let p1 = pager.alloc_page().expect("alloc");
+            init_page(&mut pager, p1, PageType::TableLeaf).expect("init");
+            pager.commit().expect("commit");
+            original = pager.page(p1).expect("page").data().to_vec();
+
+            pager.begin_write().expect("begin");
+            {
+                let data = pager.page_mut(p1).expect("mutate");
+                data[300] = 0xEE;
+                write_page_checksum(data);
+            }
+            // Op 5 is the db write of page 2; make it a torn write.
+            vfs.inject_fault(FaultConfig {
+                fail_after_ops: Some(4),
+                torn_write: true,
+            });
+            pager.commit().expect_err("commit fails");
+        }
+        let vfs = Arc::new(MemVfs::from_store(store));
+        let mut pager = Pager::open(vfs, path, OpenMode::ReadWrite).expect("reopen recovers");
+        assert_eq!(pager.page(2).expect("page").data(), original.as_slice());
+    }
+
+    #[test]
+    fn crash_before_journal_header_leaves_db_untouched() {
+        let store = new_store();
+        let path = Path::new("crash-early.db");
+        let original;
+        {
+            let vfs = MemVfs::from_store(store.clone());
+            let shared: Arc<dyn Vfs> = Arc::new(vfs.clone());
+            let mut pager = create_pager(shared, path);
+            pager.begin_write().expect("begin");
+            let p1 = pager.alloc_page().expect("alloc");
+            init_page(&mut pager, p1, PageType::TableLeaf).expect("init");
+            pager.commit().expect("commit");
+            original = pager.page(p1).expect("page").data().to_vec();
+
+            pager.begin_write().expect("begin");
+            {
+                let data = pager.page_mut(p1).expect("mutate");
+                data[400] = 0x11;
+                write_page_checksum(data);
+            }
+            // Op 2 is the journal header write; failing there leaves a journal
+            // with zeroed magic, so the database is never modified.
+            vfs.inject_fault(FaultConfig {
+                fail_after_ops: Some(1),
+                torn_write: false,
+            });
+            pager.commit().expect_err("commit fails");
+        }
+        let vfs = Arc::new(MemVfs::from_store(store));
+        let mut pager = Pager::open(vfs, path, OpenMode::ReadWrite).expect("reopen");
+        assert_eq!(pager.page(2).expect("page").data(), original.as_slice());
+        assert_eq!(pager.header().change_counter, 1);
+    }
+
+    #[test]
+    fn checksum_corruption_is_detected_on_read() {
+        let store = new_store();
+        let path = Path::new("corrupt.db");
+        {
+            let vfs = Arc::new(MemVfs::from_store(store.clone()));
+            let mut pager = create_pager(vfs, path);
+            pager.begin_write().expect("begin");
+            let p1 = pager.alloc_page().expect("alloc");
+            init_page(&mut pager, p1, PageType::TableLeaf).expect("init");
+            pager.commit().expect("commit");
+        }
+        {
+            let mut guard = store.lock().expect("store");
+            let bytes = guard.get_mut(path).expect("file");
+            bytes[PAGE_SIZE as usize + 100] ^= 0xFF;
+        }
+        let vfs = Arc::new(MemVfs::from_store(store));
+        let mut pager = Pager::open(vfs, path, OpenMode::ReadWrite).expect("open");
+        let err = pager.page(2).expect_err("corrupt page");
+        assert!(err.code().is_corruption());
+    }
+
+    #[test]
+    fn read_only_open_rejects_writes() {
+        let store = new_store();
+        let path = Path::new("readonly.db");
+        {
+            let vfs = Arc::new(MemVfs::from_store(store.clone()));
+            let pager = create_pager(vfs, path);
+            drop(pager);
+        }
+        let vfs = Arc::new(MemVfs::from_store(store));
+        let mut pager = Pager::open(vfs, path, OpenMode::ReadOnly).expect("open");
+        let err = pager.begin_write().expect_err("read-only");
+        assert_eq!(err.code(), ErrorCode::ReadOnly);
+    }
+
+    #[test]
+    fn header_only_commit_persists_change_counter() {
+        let store = new_store();
+        let path = Path::new("headeronly.db");
+        {
+            let vfs = Arc::new(MemVfs::from_store(store.clone()));
+            let mut pager = create_pager(vfs, path);
+            pager.begin_write().expect("begin");
+            pager.update_header(|header| header.user_version = 3);
+            pager.commit().expect("commit");
+        }
+        let vfs = Arc::new(MemVfs::from_store(store));
+        let pager = Pager::open(vfs, path, OpenMode::ReadWrite).expect("reopen");
+        assert_eq!(pager.header().user_version, 3);
+        assert_eq!(pager.header().change_counter, 1);
+    }
 }

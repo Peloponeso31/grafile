@@ -12,7 +12,7 @@ pub const FORMAT_MINOR: u16 = 1;
 /// Size of the common page header in bytes.
 pub const PAGE_HEADER_SIZE: usize = 20;
 /// Size of the database header inside page 1.
-pub const DB_HEADER_SIZE: usize = 124;
+pub const DB_HEADER_SIZE: usize = 128;
 /// Offset of the database header inside page 1.
 pub const DB_HEADER_OFFSET: usize = PAGE_HEADER_SIZE;
 /// End offset of the database header inside page 1.
@@ -338,7 +338,9 @@ pub fn page_checksum(page: &[u8]) -> u32 {
 /// Verify the page checksum; returns an error describing the page on failure.
 pub fn verify_page_checksum(page: &[u8], page_no: u32) -> Result<()> {
     if page.len() < PAGE_HEADER_SIZE {
-        return Err(Error::corrupt(format!("page {page_no}: shorter than header")));
+        return Err(Error::corrupt(format!(
+            "page {page_no}: shorter than header"
+        )));
     }
     let stored = u32::from_le_bytes([page[16], page[17], page[18], page[19]]);
     let computed = page_checksum(page);

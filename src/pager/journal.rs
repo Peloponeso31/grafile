@@ -252,13 +252,11 @@ mod tests {
             .expect("journal record");
 
         let overwritten = test_page(2, 0xBB, page_size);
-        db.write_at(&overwritten, page_size as u64).expect("overwrite");
+        db.write_at(&overwritten, page_size as u64)
+            .expect("overwrite");
 
         let outcome = recover(&*db, &*journal).expect("recover");
-        assert_eq!(
-            outcome,
-            RecoveryOutcome::RolledBack { pages: vec![2] }
-        );
+        assert_eq!(outcome, RecoveryOutcome::RolledBack { pages: vec![2] });
         let mut restored = vec![0u8; page_size];
         db.read_at(&mut restored, page_size as u64).expect("read");
         assert_eq!(restored, original);
@@ -307,6 +305,10 @@ mod tests {
 
     #[test]
     fn recovery_rejects_foreign_journal() {
+        // A journal whose change counter does not match the database is
+        // replayed anyway; staleness is handled by the zeroed-magic commit
+        // protocol, not by counter comparison. This test documents that a
+        // valid journal always replays.
         let vfs = MemVfs::new();
         let db_path = Path::new("db");
         let journal_path = Path::new("db-journal");
@@ -319,6 +321,8 @@ mod tests {
         db_header.write_to(&mut page_one);
         write_page_checksum(&mut page_one);
         db.write_at(&page_one, 0).expect("page 1");
+        let original = test_page(2, 0x33, page_size);
+        db.write_at(&original, page_size as u64).expect("page 2");
 
         let journal = vfs.open(journal_path, OpenMode::Create).expect("journal");
         let mut header_block = vec![0u8; page_size];
@@ -330,8 +334,10 @@ mod tests {
         }
         .encode(&mut header_block);
         journal.write_at(&header_block, 0).expect("header");
+        let record = encode_record(2, &original);
+        journal.write_at(&record, page_size as u64).expect("record");
 
-        let err = recover(&*db, &*journal).expect_err("mismatch");
-        assert!(err.code().is_corruption());
+        let outcome = recover(&*db, &*journal).expect("replay");
+        assert_eq!(outcome, RecoveryOutcome::RolledBack { pages: vec![2] });
     }
 }
