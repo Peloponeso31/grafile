@@ -160,10 +160,13 @@ models with `proptest`.
 
 ## Roadmap
 
-- Streaming scans (no materialization), WAL mode for concurrent readers
-- Variable-length paths, `OPTIONAL MATCH`, `UNION`, shortest paths
-- Rebalancing deletes, bulk loading, `VACUUM`-style compaction
-- openCypher TCK conformance harness
+The openCypher completeness plan — TCK harness first, then core language,
+function library, temporal/spatial types, a semantic sweep and Neo4j
+extensions — lives in [docs/roadmap.md](docs/roadmap.md).
+
+Storage-side work tracked alongside it: WAL mode for concurrent readers,
+delete rebalancing and `VACUUM`-style compaction, bulk loading, and
+streaming scans.
 
 ## License
 
