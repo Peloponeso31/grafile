@@ -18,6 +18,7 @@ pub mod codegen;
 pub mod cypher;
 pub mod engine;
 pub mod error;
+pub mod json;
 pub mod matrix;
 pub mod pager;
 pub mod planner;

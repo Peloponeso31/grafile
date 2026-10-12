@@ -21,6 +21,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use grafile::api::{Connection, Params, Rows};
 use grafile::cypher::lexer::{TokenClass, highlight_spans};
+use grafile::json::{JsonColors, JsonOptions, format_unix_utc, row_object_json, value_json};
 use grafile::record::Value;
 use grafile::vdbe::format_value;
 use rustyline::completion::Completer;
@@ -256,6 +257,22 @@ fn highlight_line(line: &str) -> String {
         out.push_str(&line[cursor..]);
     }
     out
+}
+
+/// CLI palette for JSON token classes.
+const JSON_COLORS: JsonColors = JsonColors {
+    key: "\x1b[1;34m",
+    string: "\x1b[32m",
+    number: "\x1b[33m",
+    literal: "\x1b[35m",
+    reset: RESET,
+};
+
+fn json_options(settings: &Settings) -> JsonOptions {
+    JsonOptions {
+        pretty: settings.pretty,
+        colors: settings.colors_enabled().then_some(JSON_COLORS),
+    }
 }
 
 /// rustyline helper providing Cypher syntax highlighting.
@@ -505,7 +522,8 @@ fn cell_lines(
     let pretty_json =
         settings.pretty && (value_contains_entity(value) || matches!(value, Value::Map(_)));
     if pretty_json {
-        return Ok(json_value(conn, value, settings, 0)?
+        let options = json_options(settings);
+        return Ok(value_json(conn.database_mut(), value, options, 0)?
             .split('\n')
             .map(str::to_owned)
             .collect());
@@ -679,15 +697,16 @@ fn render_line(conn: &mut Connection, rows: &Rows, settings: &Settings) -> Resul
 }
 
 fn render_json(conn: &mut Connection, rows: &Rows, settings: &Settings) -> Result<String> {
+    let options = json_options(settings);
     let mut out = String::new();
     for row in rows.rows() {
-        let fields: Vec<(String, Value)> = rows
-            .columns()
-            .iter()
-            .cloned()
-            .zip(row.iter().cloned())
-            .collect();
-        out.push_str(&json_fields_object(conn, &fields, settings, 0)?);
+        out.push_str(&row_object_json(
+            conn.database_mut(),
+            rows.columns(),
+            row,
+            options,
+            0,
+        )?);
         out.push('\n');
     }
     Ok(out)
@@ -930,195 +949,6 @@ fn pad_to(text: &str, width: usize) -> String {
     format!("{text}{}", " ".repeat(padding))
 }
 
-// ---- JSON rendering ----
-
-fn json_value(
-    conn: &mut Connection,
-    value: &Value,
-    settings: &Settings,
-    indent: usize,
-) -> Result<String> {
-    let colors = settings.colors_enabled();
-    Ok(match value {
-        Value::Null => paint(colors, "\x1b[35m", "null"),
-        Value::Bool(value) => paint(colors, "\x1b[35m", if *value { "true" } else { "false" }),
-        Value::Int(value) => paint(colors, "\x1b[33m", &value.to_string()),
-        Value::Float(value) => {
-            if value.is_finite() {
-                let mut buffer = ryu::Buffer::new();
-                paint(colors, "\x1b[33m", buffer.format(*value))
-            } else {
-                // JSON has no NaN/Infinity.
-                paint(colors, "\x1b[35m", "null")
-            }
-        }
-        Value::Text(text) => paint(colors, "\x1b[32m", &json_escape(text)),
-        Value::Bytes(bytes) => paint(
-            colors,
-            "\x1b[32m",
-            &json_escape(&format!("0x{}", hex(bytes))),
-        ),
-        Value::List(items) => {
-            if items.is_empty() {
-                "[]".to_owned()
-            } else {
-                let pretty = settings.pretty;
-                let mut out = String::from("[");
-                for (index, item) in items.iter().enumerate() {
-                    if index > 0 {
-                        out.push(',');
-                    }
-                    if pretty {
-                        out.push('\n');
-                        out.push_str(&indent_str(indent + 1));
-                    }
-                    out.push_str(&json_value(conn, item, settings, indent + 1)?);
-                }
-                if pretty {
-                    out.push('\n');
-                    out.push_str(&indent_str(indent));
-                }
-                out.push(']');
-                out
-            }
-        }
-        Value::Map(entries) => {
-            let fields: Vec<(String, Value)> = entries
-                .iter()
-                .map(|(key, item)| (key.to_string(), item.clone()))
-                .collect();
-            json_fields_object(conn, &fields, settings, indent)?
-        }
-        Value::Node(id) => {
-            let fields = node_fields(conn, *id)?;
-            json_fields_object(conn, &fields, settings, indent)?
-        }
-        Value::Edge(id) => {
-            let fields = edge_fields(conn, *id)?;
-            json_fields_object(conn, &fields, settings, indent)?
-        }
-    })
-}
-
-fn node_fields(conn: &mut Connection, id: u64) -> Result<Vec<(String, Value)>> {
-    let record = conn.database_mut().get_node(id)?;
-    let mut labels = Vec::new();
-    let mut properties: Vec<(std::sync::Arc<str>, Value)> = Vec::new();
-    if let Some(record) = &record {
-        for label in &record.labels {
-            if let Some(name) = conn.schema().label_name(*label) {
-                labels.push(Value::from(name));
-            }
-        }
-        for (key, value) in &record.props {
-            if let Some(name) = conn.schema().property_key_name(*key) {
-                properties.push((std::sync::Arc::from(name), value.clone()));
-            }
-        }
-    }
-    Ok(vec![
-        ("id".to_owned(), Value::Int(id as i64)),
-        ("labels".to_owned(), Value::List(labels.into())),
-        ("properties".to_owned(), Value::Map(properties.into())),
-    ])
-}
-
-fn edge_fields(conn: &mut Connection, id: u64) -> Result<Vec<(String, Value)>> {
-    let record = conn.database_mut().get_edge(id)?;
-    let mut edge_type = Value::Null;
-    let mut start = Value::Null;
-    let mut end = Value::Null;
-    let mut properties: Vec<(std::sync::Arc<str>, Value)> = Vec::new();
-    if let Some(record) = &record {
-        edge_type = conn
-            .schema()
-            .edge_type_name(record.edge_type)
-            .map(Value::from)
-            .unwrap_or(Value::Null);
-        start = Value::Int(record.src as i64);
-        end = Value::Int(record.dst as i64);
-        for (key, value) in &record.props {
-            if let Some(name) = conn.schema().property_key_name(*key) {
-                properties.push((std::sync::Arc::from(name), value.clone()));
-            }
-        }
-    }
-    Ok(vec![
-        ("id".to_owned(), Value::Int(id as i64)),
-        ("type".to_owned(), edge_type),
-        ("start".to_owned(), start),
-        ("end".to_owned(), end),
-        ("properties".to_owned(), Value::Map(properties.into())),
-    ])
-}
-
-fn json_fields_object(
-    conn: &mut Connection,
-    fields: &[(String, Value)],
-    settings: &Settings,
-    indent: usize,
-) -> Result<String> {
-    if fields.is_empty() {
-        return Ok("{}".to_owned());
-    }
-    let pretty = settings.pretty;
-    let colors = settings.colors_enabled();
-    let mut out = String::from("{");
-    for (index, (key, value)) in fields.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        if pretty {
-            out.push('\n');
-            out.push_str(&indent_str(indent + 1));
-        }
-        out.push_str(&paint(colors, "\x1b[1;34m", &json_escape(key)));
-        out.push(':');
-        if pretty {
-            out.push(' ');
-        }
-        out.push_str(&json_value(conn, value, settings, indent + 1)?);
-    }
-    if pretty {
-        out.push('\n');
-        out.push_str(&indent_str(indent));
-    }
-    out.push('}');
-    Ok(out)
-}
-
-fn indent_str(level: usize) -> String {
-    "  ".repeat(level)
-}
-
-fn json_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len() + 2);
-    out.push('"');
-    for ch in text.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{8}' => out.push_str("\\b"),
-            '\u{c}' => out.push_str("\\f"),
-            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
-            ch => out.push(ch),
-        }
-    }
-    out.push('"');
-    out
-}
-
-fn paint(colors: bool, code: &'static str, text: &str) -> String {
-    if colors {
-        format!("{code}{text}{RESET}")
-    } else {
-        text.to_owned()
-    }
-}
-
 // ---- introspection and help ----
 
 /// Render the database header for the `.meta` command.
@@ -1234,29 +1064,6 @@ fn render_header(conn: &Connection, view: HeaderView) -> String {
         }
     }
     out
-}
-
-/// Format a Unix timestamp as UTC without external date libraries.
-fn format_unix_utc(secs: i64) -> String {
-    let days = secs.div_euclid(86_400);
-    let remainder = secs.rem_euclid(86_400);
-    let (hour, minute, second) = (remainder / 3600, (remainder % 3600) / 60, remainder % 60);
-    let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} UTC")
-}
-
-/// Days since the Unix epoch to a civil date (Howard Hinnant's algorithm).
-fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let year = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (year + i64::from(month <= 2), month, day)
 }
 
 /// Format a byte count with binary units.
@@ -1749,14 +1556,6 @@ mod tests {
         let outcome = run_dot_command(&mut conn, ".nope", &mut settings).expect("command");
         assert!(matches!(outcome, DotOutcome::Continue));
     }
-    #[test]
-    fn unix_utc_formatting_handles_epoch_leap_day_and_negative() {
-        assert_eq!(format_unix_utc(0), "1970-01-01 00:00:00 UTC");
-        assert_eq!(format_unix_utc(1_700_000_000), "2023-11-14 22:13:20 UTC");
-        assert_eq!(format_unix_utc(1_709_164_800), "2024-02-29 00:00:00 UTC");
-        assert_eq!(format_unix_utc(-1), "1969-12-31 23:59:59 UTC");
-    }
-
     #[test]
     fn size_formatting_uses_binary_units() {
         assert_eq!(format_size(512), "512 bytes");
