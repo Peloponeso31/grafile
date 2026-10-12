@@ -255,6 +255,7 @@ dependencies = [
  "crc32c",
  "fs4",
  "hashbrown",
+ "hashlink",
  "indicatif",
  "itoa",
  "proptest",
@@ -279,6 +280,15 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
+]
+
+[[package]]
+name = "hashlink"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a596f1b20ed2cc5ecac41a164aaebc7258057060f06c0cf7a2ba3991ee7990fb"
+dependencies = [
+ "hashbrown",
 ]
 
 [[package]]
