@@ -452,6 +452,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "grafile-ffi"
+version = "0.1.0"
+dependencies = [
+ "grafile",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
