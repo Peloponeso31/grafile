@@ -13,6 +13,7 @@
 
 pub mod btree;
 pub mod catalog;
+pub mod cypher;
 pub mod engine;
 pub mod error;
 pub mod matrix;
