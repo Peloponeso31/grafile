@@ -92,10 +92,10 @@ pub trait Vfs: Send + Sync {
 
     /// Create every missing parent directory of `path`.
     fn create_dir_all(&self, path: &Path) -> Result<()> {
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         Ok(())
     }

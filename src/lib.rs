@@ -12,6 +12,7 @@
 //! existence checks and bitmap set operations.
 
 pub mod error;
+pub mod pager;
 pub mod vfs;
 
 pub use error::{Error, ErrorCode, Result};

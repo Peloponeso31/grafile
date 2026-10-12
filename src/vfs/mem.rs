@@ -106,18 +106,12 @@ impl MemVfs {
 
     /// Number of I/O operations observed since the last fault reset.
     pub fn op_count(&self) -> u64 {
-        self.faults
-            .lock()
-            .expect("fault mutex poisoned")
-            .ops
+        self.faults.lock().expect("fault mutex poisoned").ops
     }
 
     /// Whether an injected fault has tripped.
     pub fn fault_tripped(&self) -> bool {
-        self.faults
-            .lock()
-            .expect("fault mutex poisoned")
-            .tripped
+        self.faults.lock().expect("fault mutex poisoned").tripped
     }
 
     fn check_fault(&self, is_write: bool) -> Result<Option<u64>> {
@@ -130,20 +124,20 @@ impl MemVfs {
             Some(config) => config.fail_after_ops,
             None => None,
         };
-        if let Some(limit) = limit {
-            if faults.ops > limit {
-                faults.tripped = true;
-                let torn = is_write
-                    && faults
-                        .config
-                        .map(|config| config.torn_write)
-                        .unwrap_or(false);
-                return if torn {
-                    Ok(Some(0))
-                } else {
-                    Err(simulated_failure())
-                };
-            }
+        if let Some(limit) = limit
+            && faults.ops > limit
+        {
+            faults.tripped = true;
+            let torn = is_write
+                && faults
+                    .config
+                    .map(|config| config.torn_write)
+                    .unwrap_or(false);
+            return if torn {
+                Ok(Some(0))
+            } else {
+                Err(simulated_failure())
+            };
         }
         Ok(None)
     }
@@ -210,8 +204,8 @@ impl File for MemFile {
                 format!("no such file: {}", self.path.display()),
             )
         })?;
-        let start = usize::try_from(offset)
-            .map_err(|_| Error::new(ErrorCode::Range, "offset overflow"))?;
+        let start =
+            usize::try_from(offset).map_err(|_| Error::new(ErrorCode::Range, "offset overflow"))?;
         let end = start
             .checked_add(buf.len())
             .ok_or_else(|| Error::new(ErrorCode::Range, "read range overflow"))?;
@@ -230,8 +224,8 @@ impl File for MemFile {
         let torn = self.vfs.check_fault(true)?;
         let mut store = self.vfs.store.lock().expect("store mutex poisoned");
         let data = store.entry(self.path.clone()).or_default();
-        let start = usize::try_from(offset)
-            .map_err(|_| Error::new(ErrorCode::Range, "offset overflow"))?;
+        let start =
+            usize::try_from(offset).map_err(|_| Error::new(ErrorCode::Range, "offset overflow"))?;
         let end = start
             .checked_add(buf.len())
             .ok_or_else(|| Error::new(ErrorCode::Range, "write range overflow"))?;
@@ -282,13 +276,13 @@ impl File for MemFile {
         let mut locks = self.vfs.locks.lock().expect("lock mutex poisoned");
         match level {
             LockLevel::Shared => {
-                if let Some(owner) = locks.exclusive {
-                    if owner != self.id {
-                        return Err(Error::new(
-                            ErrorCode::Busy,
-                            format!("exclusive lock held on {}", self.path.display()),
-                        ));
-                    }
+                if let Some(owner) = locks.exclusive
+                    && owner != self.id
+                {
+                    return Err(Error::new(
+                        ErrorCode::Busy,
+                        format!("exclusive lock held on {}", self.path.display()),
+                    ));
                 }
                 *locks.shared.entry(self.id).or_insert(0) += 1;
             }
