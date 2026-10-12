@@ -106,6 +106,33 @@ conn.create_node_index("name", Some("Person"), true)?; // unique index
 `conn.explain(query)` prints the logical plan; `conn.explain_program(query)`
 prints the VDBE bytecode.
 
+## Embedding (C ABI)
+
+`grafile-ffi` builds `libgrafile.so` / `libgrafile.dylib` / `grafile.dll` plus
+a hand-written `grafile.h`, so any language with C FFI can embed the engine
+in-process: C/C++, Go (cgo), Python (ctypes), Ruby, Node, Java, C#, Dart,
+Swift, PHP.
+
+```console
+$ cargo build -p grafile-ffi --release   # or scripts/build-ffi.sh
+```
+
+```c
+GrafileDb *db = NULL;
+char *err = NULL;
+grafile_open("graph.grafile", &db, &err);
+char *json = NULL;
+grafile_query_json(db, "MATCH (n:Person) RETURN n.name AS name", NULL, &json);
+puts(json);
+grafile_free(json);
+grafile_close(db);
+```
+
+The API follows SQLite's shape (`prepare`/`step`/`column`, JSON in/out
+helpers, SQLite-compatible result codes). See [docs/ffi.md](docs/ffi.md) for
+the full reference, ownership and threading rules, and C/Go/Python/Dart
+examples.
+
 ## Cypher v1
 
 Implemented: `MATCH` (node and relationship patterns, directions, inline
@@ -140,6 +167,7 @@ and then the relationship.
 | VDBE | `vdbe` | register machine with cursor loops, sort/aggregate row cursors |
 | API | `api` | `Connection`, `Params`, `Rows` |
 | Shell | `bin` | REPL, dot commands, script runner |
+| C ABI | `ffi` | `libgrafile` cdylib/staticlib plus `grafile.h` for any language |
 
 Transactions use a SQLite-style rollback journal: a transient
 `<db>-journal` sidecar is created for each write transaction and removed on
