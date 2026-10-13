@@ -11,7 +11,7 @@ pub mod plan;
 
 use std::collections::HashMap;
 
-use hashbrown::HashMap as FastMap;
+use hashlink::LinkedHashMap as FastMap;
 
 use crate::cypher::{
     Clause, Expr, MatchClause, NodePattern, PatternPath, Query, RelDirection, ReturnItem, SetItem,
@@ -583,8 +583,13 @@ impl<'a> Planner<'a> {
         scope: &FastMap<String, VarKind>,
     ) -> Result<Vec<CreateItem>> {
         if path.segments.is_empty() {
-            let item = self.create_node_item(&path.start, scope)?;
-            return Ok(item.into_iter().collect());
+            let Some(item) = self.create_node_item(&path.start, scope)? else {
+                let name = path.start.variable.as_deref().unwrap_or("?");
+                return Err(Error::syntax(format!(
+                    "variable `{name}` is already bound and cannot be merged"
+                )));
+            };
+            return Ok(vec![item]);
         }
         if path.segments.len() > 1 {
             return Err(Error::unsupported(
