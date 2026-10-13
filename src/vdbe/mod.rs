@@ -999,7 +999,9 @@ impl<'a> Executor<'a> {
                 let src_id = self.reg_node(*src)?;
                 let dst_id = self.reg_node(*dst)?;
                 let props = self.resolve_props(*props)?;
-                let id = self.db.create_edge(type_id, src_id, dst_id, props)?;
+                let id = self
+                    .db
+                    .create_edge_unchecked(type_id, src_id, dst_id, props)?;
                 self.regs[*dest as usize] = Reg::Edge(id);
             }
             Op::MergeNode {

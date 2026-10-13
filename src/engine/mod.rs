@@ -154,6 +154,9 @@ impl Database {
 
     /// Commit the active write transaction, persisting tree roots.
     pub fn commit(&mut self) -> Result<()> {
+        // Flush cached fragments first: the flush may split the fragment
+        // B+tree and move its root.
+        self.fragments.flush(&mut self.pager)?;
         let (catalog_root, node_root, edge_root, fragment_root) = (
             self.catalog.root(),
             self.nodes.root(),
@@ -270,6 +273,32 @@ impl Database {
                 format!("destination node {dst} does not exist"),
             ));
         }
+        self.create_edge_inner(edge_type, src, dst, props)
+    }
+
+    /// Create an edge without verifying that the endpoints exist.
+    ///
+    /// Compiled Cypher patterns always bind existing nodes, so the VDBE uses
+    /// this to skip two B+tree lookups per edge; callers that cannot
+    /// guarantee endpoint existence must use [`Self::create_edge`].
+    pub fn create_edge_unchecked(
+        &mut self,
+        edge_type: u32,
+        src: u64,
+        dst: u64,
+        props: Vec<(u32, Value)>,
+    ) -> Result<u64> {
+        self.require_write()?;
+        self.create_edge_inner(edge_type, src, dst, props)
+    }
+
+    fn create_edge_inner(
+        &mut self,
+        edge_type: u32,
+        src: u64,
+        dst: u64,
+        props: Vec<(u32, Value)>,
+    ) -> Result<u64> {
         let record = EdgeRecord {
             edge_type,
             src,
@@ -848,6 +877,8 @@ impl Database {
         let mut tree = Btree::from_root(def.root, TreeKind::Index);
         let key = node_index_key(value, node_id);
         if def.unique {
+            // Index keys embed the entity id, so key uniqueness cannot
+            // enforce value uniqueness: probe the value prefix instead.
             let prefix = index_value_prefix(value);
             let mut cursor = tree.cursor();
             if cursor.seek_ge(&mut self.pager, &prefix)? && cursor.key().starts_with(&prefix) {
@@ -882,6 +913,17 @@ impl Database {
     }
 
     fn replace_node_index_root(&mut self, index_id: u32, root: u32) -> Result<()> {
+        let unchanged = self
+            .schema()
+            .node_indexes
+            .iter()
+            .find(|index| index.id == index_id)
+            .is_some_and(|index| index.root == root);
+        if unchanged {
+            // Roots only move on splits; rewriting the catalog entry on every
+            // insert would cost two extra B+tree operations per row.
+            return Ok(());
+        }
         if let Some(def) = self
             .catalog
             .schema_mut()
@@ -1013,6 +1055,15 @@ impl Database {
     }
 
     fn replace_edge_index_root(&mut self, index_id: u32, root: u32) -> Result<()> {
+        let unchanged = self
+            .schema()
+            .edge_indexes
+            .iter()
+            .find(|index| index.id == index_id)
+            .is_some_and(|index| index.root == root);
+        if unchanged {
+            return Ok(());
+        }
         if let Some(def) = self
             .catalog
             .schema_mut()

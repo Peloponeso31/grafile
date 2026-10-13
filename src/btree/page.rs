@@ -6,7 +6,7 @@
 //! equals numeric order.
 
 use crate::error::{Error, Result};
-use crate::pager::{PAGE_HEADER_SIZE, PageHeader, PageNo, PageType, Pager, write_page_checksum};
+use crate::pager::{PAGE_HEADER_SIZE, PageHeader, PageNo, PageType, Pager};
 
 use super::TreeKind;
 
@@ -327,7 +327,6 @@ pub(crate) fn write_overflow_chain(pager: &mut Pager, bytes: &[u8]) -> Result<Pa
         header.write_to(data);
         data[PAGE_HEADER_SIZE..PAGE_HEADER_SIZE + 4].copy_from_slice(&next.to_le_bytes());
         data[OVERFLOW_OVERHEAD..OVERFLOW_OVERHEAD + chunk.len()].copy_from_slice(chunk);
-        write_page_checksum(data);
     }
     Ok(pages[0])
 }
@@ -430,7 +429,6 @@ fn try_place_cell(
     header.cell_count += 1;
     header.content_start = content_start_stored(new_start);
     header.write_to(data);
-    write_page_checksum(data);
     Ok(true)
 }
 
@@ -462,7 +460,6 @@ pub(crate) fn remove_cell_at(
         .fragmented_free
         .saturating_add((size + 2).min(u16::MAX as usize) as u16);
     header.write_to(data);
-    write_page_checksum(data);
     Ok(())
 }
 
@@ -494,7 +491,6 @@ pub(crate) fn defragment(pager: &mut Pager, page_no: PageNo, kind: TreeKind) -> 
     header.content_start = content_start_stored(write);
     header.fragmented_free = 0;
     header.write_to(data);
-    write_page_checksum(data);
     Ok(())
 }
 
@@ -530,7 +526,6 @@ pub(crate) fn rebuild_page(
         let offset = PAGE_HEADER_SIZE + 2 * idx;
         data[offset..offset + 2].copy_from_slice(&ptr.to_le_bytes());
     }
-    write_page_checksum(data);
     Ok(())
 }
 

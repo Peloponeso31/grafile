@@ -178,13 +178,29 @@ file lock, writers an exclusive one.
 
 ```console
 $ cargo test          # unit + property + crash-recovery + Cypher integration tests
-$ cargo bench         # criterion: storage and end-to-end query benchmarks
+$ cargo bench         # criterion: storage, insert and end-to-end query benchmarks
 ```
 
 Crash recovery is exercised with a fault-injecting in-memory VFS that fails
 (or tears) writes at every operation boundary; reopened databases are checked
 for integrity. B+tree and fragment codecs are verified against reference
 models with `proptest`.
+
+Insert throughput (10 000 inserts in one transaction, Apple silicon, release
+build), `cargo bench --bench insert`:
+
+| Workload | grafile | SQLite (rusqlite, bundled) |
+|---|---:|---:|
+| nodes, in-memory | 2.9 ms | 1.2 ms |
+| nodes + unique index, in-memory | 10.5 ms | 2.3 ms |
+| chain edges, in-memory | 6.7 ms | — |
+| `UNWIND … CREATE` (20 batches) | 6.4 ms | — |
+| nodes, real file (2 transactions) | 13.0 ms | 1.8 ms (1 transaction) |
+
+Before the insert-path work these workloads took 52 ms, 73 ms, 145 ms, 80 ms
+and 58 ms respectively (4–22× slower); the remaining gap is dominated by the
+richer record format and the fragment bitmap index, and by transaction syncs
+on real files.
 
 ## Roadmap
 

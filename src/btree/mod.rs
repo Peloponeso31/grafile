@@ -98,7 +98,35 @@ impl Btree {
         if !pager.in_write_txn() {
             return Err(Error::misuse("Btree::insert outside a write transaction"));
         }
-        match self.insert_rec(pager, self.root, key, value)? {
+        match self.insert_rec(pager, self.root, key, value, false)? {
+            None => Ok(()),
+            Some(split) => {
+                let cell = build_interior_cell(self.kind, self.root, &split.max_left)?;
+                let new_root = pager.alloc_page()?;
+                rebuild_page(
+                    pager,
+                    new_root,
+                    self.kind.interior_type(),
+                    split.right_page,
+                    &[cell],
+                )?;
+                self.root = new_root;
+                Ok(())
+            }
+        }
+    }
+
+    /// Insert `key`/`value`, replacing any existing value.
+    ///
+    /// Replacing costs a single descent: the old cell is removed and the new
+    /// one written back into the same leaf (overflow chains are freed and
+    /// rewritten as needed), falling back to a split only when the new cell
+    /// does not fit.
+    pub fn replace(&mut self, pager: &mut Pager, key: &[u8], value: &[u8]) -> Result<()> {
+        if !pager.in_write_txn() {
+            return Err(Error::misuse("Btree::replace outside a write transaction"));
+        }
+        match self.insert_rec(pager, self.root, key, value, true)? {
             None => Ok(()),
             Some(split) => {
                 let cell = build_interior_cell(self.kind, self.root, &split.max_left)?;
@@ -122,6 +150,7 @@ impl Btree {
         page_no: PageNo,
         key: &[u8],
         value: &[u8],
+        replace: bool,
     ) -> Result<Option<Split>> {
         let (page_type, rightmost) = {
             let page = pager.page(page_no)?;
@@ -130,13 +159,19 @@ impl Btree {
         };
         if page_type == self.kind.leaf_type() {
             let pos = leaf_position(pager, page_no, self.kind, key)?;
-            if leaf_key_at(pager, page_no, self.kind, pos)? == Some(key.to_vec()) {
+            let duplicate = leaf_key_at(pager, page_no, self.kind, pos)? == Some(key.to_vec());
+            if duplicate && !replace {
                 return Err(Error::constraint(format!(
                     "duplicate key {}",
                     hex_preview(key)
                 )));
             }
             let cell = build_leaf_cell(pager, self.kind, key, value)?;
+            if duplicate {
+                // Free the old cell and its overflow chain, then reuse the
+                // freed space in the same leaf.
+                remove_cell_at(pager, page_no, self.kind, pos)?;
+            }
             if insert_cell_bytes(pager, page_no, self.kind, pos, &cell)? {
                 return Ok(None);
             }
@@ -154,7 +189,7 @@ impl Btree {
         }
 
         let (child, is_rightmost, child_idx, divider) = find_child(pager, page_no, self.kind, key)?;
-        let Some(split) = self.insert_rec(pager, child, key, value)? else {
+        let Some(split) = self.insert_rec(pager, child, key, value, replace)? else {
             return Ok(None);
         };
         // Materialize the parent cells with the child update applied, then try
@@ -886,5 +921,136 @@ mod tests {
             ok = cursor.next(pager).expect("next");
         }
         count
+    }
+    #[test]
+    fn replace_overwrites_and_inserts() {
+        let mut pager = test_pager();
+        pager.begin_write().expect("begin");
+        let mut tree = Btree::create(&mut pager, TreeKind::Table).expect("create");
+        tree.insert(&mut pager, &1u64.to_be_bytes(), b"one")
+            .expect("insert");
+        tree.insert(&mut pager, &2u64.to_be_bytes(), b"two")
+            .expect("insert");
+        // Replace an existing key with a longer value.
+        tree.replace(&mut pager, &1u64.to_be_bytes(), b"one-longer")
+            .expect("replace");
+        assert_eq!(
+            tree.get(&mut pager, &1u64.to_be_bytes()).expect("get"),
+            Some(b"one-longer".to_vec())
+        );
+        // Replace with an overflowing value and back again.
+        let big = vec![0x5A; 30_000];
+        tree.replace(&mut pager, &1u64.to_be_bytes(), &big)
+            .expect("replace big");
+        assert_eq!(
+            tree.get(&mut pager, &1u64.to_be_bytes()).expect("get"),
+            Some(big)
+        );
+        tree.replace(&mut pager, &1u64.to_be_bytes(), b"small")
+            .expect("replace small");
+        assert_eq!(
+            tree.get(&mut pager, &1u64.to_be_bytes()).expect("get"),
+            Some(b"small".to_vec())
+        );
+        // Replace a missing key inserts it.
+        tree.replace(&mut pager, &3u64.to_be_bytes(), b"three")
+            .expect("replace missing");
+        assert_eq!(
+            tree.get(&mut pager, &3u64.to_be_bytes()).expect("get"),
+            Some(b"three".to_vec())
+        );
+        // Other keys are untouched and the tree stays valid.
+        assert_eq!(
+            tree.get(&mut pager, &2u64.to_be_bytes()).expect("get"),
+            Some(b"two".to_vec())
+        );
+        let stats = tree.integrity_check(&mut pager).expect("integrity");
+        assert_eq!(stats.keys, 3);
+        pager.commit().expect("commit");
+    }
+
+    #[test]
+    fn replace_works_across_splits() {
+        let mut pager = test_pager();
+        pager.begin_write().expect("begin");
+        let mut tree = Btree::create(&mut pager, TreeKind::Table).expect("create");
+        for key in 0..3000u64 {
+            tree.insert(&mut pager, &key.to_be_bytes(), b"x")
+                .expect("insert");
+        }
+        // Rewrite every key with a differently sized value, exercising leaves
+        // and interior routing.
+        for key in (0..3000u64).step_by(2) {
+            let value = vec![key as u8; 1 + (key as usize % 64)];
+            tree.replace(&mut pager, &key.to_be_bytes(), &value)
+                .expect("replace");
+        }
+        for key in 0..3000u64 {
+            let expected: Vec<u8> = if key % 2 == 0 {
+                vec![key as u8; 1 + (key as usize % 64)]
+            } else {
+                b"x".to_vec()
+            };
+            assert_eq!(
+                tree.get(&mut pager, &key.to_be_bytes()).expect("get"),
+                Some(expected)
+            );
+        }
+        tree.integrity_check(&mut pager).expect("integrity");
+        pager.commit().expect("commit");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
+
+        #[test]
+        fn replace_matches_btreemap(
+            ops in prop::collection::vec(
+                (0u8..3, any::<u64>(), prop::collection::vec(any::<u8>(), 0..64)),
+                1..300,
+            ),
+        ) {
+            let mut pager = test_pager();
+            pager.begin_write().expect("begin");
+            let mut tree = Btree::create(&mut pager, TreeKind::Table).expect("create");
+            let mut model: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
+            for (op, key, value) in ops {
+                let key_bytes = key.to_be_bytes();
+                match op % 3 {
+                    0 => {
+                        let result = tree.insert(&mut pager, &key_bytes, &value);
+                        if let std::collections::btree_map::Entry::Vacant(entry) =
+                            model.entry(key)
+                        {
+                            result.expect("insert");
+                            entry.insert(value);
+                        } else {
+                            prop_assert!(result.is_err());
+                        }
+                    }
+                    1 => {
+                        let deleted = tree.delete(&mut pager, &key_bytes).expect("delete");
+                        prop_assert_eq!(deleted, model.remove(&key).is_some());
+                    }
+                    _ => {
+                        tree.replace(&mut pager, &key_bytes, &value).expect("replace");
+                        model.insert(key, value);
+                    }
+                }
+            }
+            let mut cursor = tree.cursor();
+            let mut found = Vec::new();
+            let mut ok = cursor.first(&mut pager).expect("first");
+            while ok {
+                found.push((
+                    u64::from_be_bytes(cursor.key().try_into().expect("key")),
+                    cursor.value(&mut pager).expect("value"),
+                ));
+                ok = cursor.next(&mut pager).expect("next");
+            }
+            prop_assert_eq!(found, model.into_iter().collect::<Vec<_>>());
+            tree.integrity_check(&mut pager).expect("integrity");
+            pager.commit().expect("commit");
+        }
     }
 }
