@@ -100,6 +100,9 @@ pub struct Pager {
     lock: LockState,
     /// Process-global writer slot held while a write transaction is active.
     writer_claim: Option<std::sync::Arc<writer_lock::PathClaim>>,
+    /// Bumped whenever a write transaction begins or ends; caches layered on
+    /// top of the pager use it to invalidate themselves after rollback.
+    txn_generation: u64,
 }
 
 impl Pager {
@@ -116,6 +119,7 @@ impl Pager {
         let file = vfs.open(path, OpenMode::Create)?;
         let mut page_one = vec![0u8; header.page_size as usize];
         write_header_page(&mut page_one, &header)?;
+        write_page_checksum(&mut page_one);
         file.write_at(&page_one, 0)?;
         file.sync_all()?;
         let mut cache = LinkedHashMap::new();
@@ -141,6 +145,7 @@ impl Pager {
             txn: None,
             lock: LockState::None,
             writer_claim: None,
+            txn_generation: 0,
         })
     }
 
@@ -198,6 +203,7 @@ impl Pager {
             txn: None,
             lock: LockState::None,
             writer_claim: None,
+            txn_generation: 0,
         })
     }
 
@@ -253,6 +259,11 @@ impl Pager {
     /// Whether a write transaction is active.
     pub fn in_write_txn(&self) -> bool {
         self.txn.is_some()
+    }
+
+    /// Counter bumped when a write transaction begins or ends.
+    pub fn txn_generation(&self) -> u64 {
+        self.txn_generation
     }
 
     /// Configure the page cache capacity in pages.
@@ -395,6 +406,7 @@ impl Pager {
         }
         let claim = writer_lock::claim(self.vfs.namespace_id(), &self.path)?;
         self.writer_claim = Some(claim);
+        self.txn_generation = self.txn_generation.wrapping_add(1);
         match self.start_write_txn() {
             Ok(()) => Ok(()),
             Err(err) => {
@@ -493,12 +505,20 @@ impl Pager {
             pages.sort_unstable();
             pages
         };
-        for page_no in dirty_pages {
-            let frame = self.cache.get(&page_no).expect("dirty page in cache");
-            let offset = (page_no as u64 - 1) * self.page_size as u64;
+        // Checksums are computed once per page here rather than on every
+        // mutation: intermediate page states never reach the disk.
+        for page_no in &dirty_pages {
+            let frame = self.cache.get_mut(page_no).expect("dirty page in cache");
+            write_page_checksum(&mut frame.data);
+        }
+        for page_no in &dirty_pages {
+            let frame = self.cache.get(page_no).expect("dirty page in cache");
+            let offset = (*page_no as u64 - 1) * self.page_size as u64;
             self.file.write_at(&frame.data, offset)?;
         }
-        self.file.sync_all()?;
+        // Normal sync: the fully flushed journal is what guarantees
+        // crash-consistency, as in SQLite.
+        self.file.sync_data()?;
         self.finish_txn(true)
     }
 
@@ -515,9 +535,11 @@ impl Pager {
         let result: Result<()> = (|| {
             if committed {
                 // Invalidate the journal so a resurrected file is ignored,
-                // then delete it.
+                // then delete it. A normal sync is enough: if the zeroing is
+                // durable the resurrected journal is stale, and if it is not
+                // the unlink was not durable either.
                 txn.journal.write_at(&[0u8; 8], 0)?;
-                txn.journal.sync_all()?;
+                txn.journal.sync_data()?;
             }
             self.vfs.remove(&self.journal_path)?;
             if committed {
@@ -533,6 +555,7 @@ impl Pager {
         })();
         // Release the writer slot and file lock even when cleanup failed.
         self.release_writer_claim();
+        self.txn_generation = self.txn_generation.wrapping_add(1);
         let unlock = self.file.unlock(LockLevel::Exclusive);
         self.lock = LockState::None;
         result?;
@@ -563,9 +586,13 @@ impl Pager {
         let frame = self.cache.get_mut(&page_no).expect("fetched");
         if !frame.dirty {
             if !txn.journaled.contains(&page_no) {
-                let record = journal::encode_record(page_no, &frame.data);
-                txn.journal.write_at(&record, txn.journal_offset)?;
-                txn.journal_offset += record.len() as u64;
+                let written = journal::write_record(
+                    txn.journal.as_ref(),
+                    page_no,
+                    &frame.data,
+                    txn.journal_offset,
+                )?;
+                txn.journal_offset += written;
                 txn.record_count += 1;
                 txn.journaled.insert(page_no);
             }
@@ -755,7 +782,6 @@ impl Pager {
         header.write_to(data);
         data[FREELIST_NEXT_OFFSET..FREELIST_NEXT_OFFSET + 4].copy_from_slice(&head.to_le_bytes());
         data[FREELIST_COUNT_OFFSET..FREELIST_COUNT_OFFSET + 4].copy_from_slice(&0u32.to_le_bytes());
-        write_page_checksum(data);
         self.header.freelist_trunk = page_no;
         self.header.freelist_count += 1;
         Ok(())
@@ -775,7 +801,6 @@ impl Pager {
             rightmost: 0,
         };
         header.write_to(data);
-        write_page_checksum(data);
         Ok(())
     }
 }
@@ -804,7 +829,6 @@ fn write_header_page(page: &mut [u8], header: &DatabaseHeader) -> Result<()> {
     };
     page_header.write_to(page);
     header.write_to(page);
-    write_page_checksum(page);
     Ok(())
 }
 

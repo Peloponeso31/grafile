@@ -104,6 +104,30 @@ fn write_all_at(file: &StdFile, buf: &[u8], offset: u64) -> std::io::Result<()> 
     Ok(())
 }
 
+/// Flush file data with normal `fsync` semantics.
+///
+/// `std::fs::File::sync_data` maps to `F_FULLFSYNC` on macOS, which also
+/// flushes the drive's write cache and costs milliseconds per call. The
+/// journal is flushed with [`std::fs::File::sync_all`] (full durability);
+/// database pages and journal invalidation use this cheaper sync, matching
+/// SQLite's `SQLITE_SYNC_NORMAL` for the same steps.
+#[cfg(unix)]
+fn sync_data(file: &StdFile) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: the descriptor belongs to `file` and stays open for the call.
+    let result = unsafe { libc::fsync(file.as_raw_fd()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_data(file: &StdFile) -> std::io::Result<()> {
+    file.sync_data()
+}
+
 impl File for StdFileHandle {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
         read_exact_at(&self.file, buf, offset)?;
@@ -125,7 +149,7 @@ impl File for StdFileHandle {
     }
 
     fn sync_data(&self) -> Result<()> {
-        self.file.sync_data()?;
+        sync_data(&self.file)?;
         Ok(())
     }
 
