@@ -186,6 +186,11 @@ Crash recovery is exercised with a fault-injecting in-memory VFS that fails
 for integrity. B+tree and fragment codecs are verified against reference
 models with `proptest`.
 
+Conformance is measured against the vendored openCypher TCK (pinned submodule
+plus an allow-list of known gaps): `cargo run -p tck-runner --release`. The
+gate fails on unexpected failures, harness errors and stale allow-list
+entries; see `docs/tck.md` for the semantics and the current pass rate.
+
 Insert throughput (10 000 inserts in one transaction, Apple silicon, release
 build), `cargo bench --bench insert`:
 
@@ -204,9 +209,10 @@ on real files.
 
 ## Roadmap
 
-The openCypher completeness plan — TCK harness first, then core language,
-function library, temporal/spatial types, a semantic sweep and Neo4j
-extensions — lives in [docs/roadmap.md](docs/roadmap.md).
+The openCypher completeness plan — TCK harness first (now live, see
+[docs/tck.md](docs/tck.md)), then core language, function library,
+temporal/spatial types, a semantic sweep and Neo4j extensions — lives in
+[docs/roadmap.md](docs/roadmap.md).
 
 Storage-side work tracked alongside it: WAL mode for concurrent readers,
 delete rebalancing and `VACUUM`-style compaction, bulk loading, and

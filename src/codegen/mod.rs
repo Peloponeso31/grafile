@@ -530,7 +530,11 @@ impl<'a> Codegen<'a> {
                         cg.compile_merge_item(item, ctx, flag)?;
                         created_flags.push(flag);
                     }
-                    let created = if created_flags.len() == 1 {
+                    let created = if created_flags.is_empty() {
+                        // Unreachable through the planner; keep the compiler
+                        // panic-free if a plan ever carries an empty merge.
+                        cg.const_reg(Value::Bool(false))
+                    } else if created_flags.len() == 1 {
                         created_flags[0]
                     } else {
                         let combined = cg.alloc_reg();

@@ -1,0 +1,18 @@
+[package]
+name = "tck-runner"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+anyhow = "1.0.104"
+gherkin = "0.16.0"
+grafile = { path = ".." }
+indicatif = "0.18.6"
+rayon = "1.11.0"
+ryu = "1.0.23"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+
+[dev-dependencies]
+tempfile = "3.27.0"

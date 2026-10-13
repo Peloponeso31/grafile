@@ -12,6 +12,7 @@
 //! ```
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -52,6 +53,71 @@ impl Params {
     /// The underlying map.
     pub fn values(&self) -> &HashMap<String, Value> {
         &self.values
+    }
+}
+
+/// The pipeline stage that produced a query failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Phase {
+    /// Parsing, planning or compilation.
+    Compile,
+    /// Execution, including the commit of an auto-committed write.
+    Runtime,
+}
+
+impl Phase {
+    /// Stable name of the phase, used in error reports.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Compile => "compile time",
+            Self::Runtime => "runtime",
+        }
+    }
+}
+
+impl fmt::Display for Phase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A query failure tagged with the stage that produced it.
+///
+/// [`Connection::query`] collapses this into the underlying [`Error`]; use
+/// [`Connection::query_with_phase`] when the distinction matters, for example
+/// when checking a query against an expected error phase.
+#[derive(Debug)]
+pub struct PhaseError {
+    phase: Phase,
+    error: Error,
+}
+
+impl PhaseError {
+    /// The stage that produced the error.
+    pub fn phase(&self) -> Phase {
+        self.phase
+    }
+
+    /// The underlying error.
+    pub fn error(&self) -> &Error {
+        &self.error
+    }
+
+    /// Consume the wrapper and return the underlying error.
+    pub fn into_error(self) -> Error {
+        self.error
+    }
+}
+
+impl fmt::Display for PhaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.phase, self.error)
+    }
+}
+
+impl std::error::Error for PhaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
     }
 }
 
@@ -173,16 +239,39 @@ impl Connection {
 
     /// Run a Cypher query and return all result rows.
     pub fn query(&mut self, source: &str, params: &Params) -> Result<Rows> {
-        let parsed = cypher::parse(source)?;
-        let prepared = planner::plan_query(&mut self.db, &parsed, params.values())?;
-        let program = codegen::compile(&self.db, &prepared)?;
+        self.query_with_phase(source, params)
+            .map_err(PhaseError::into_error)
+    }
+
+    /// Run a Cypher query, tagging any failure with the stage that produced it.
+    ///
+    /// Behaves exactly like [`Connection::query`], but distinguishes
+    /// compile-time failures (parse, plan, compile) from runtime failures
+    /// (execution, commit).
+    pub fn query_with_phase(
+        &mut self,
+        source: &str,
+        params: &Params,
+    ) -> std::result::Result<Rows, PhaseError> {
+        let compile = |error: Error| PhaseError {
+            phase: Phase::Compile,
+            error,
+        };
+        let runtime = |error: Error| PhaseError {
+            phase: Phase::Runtime,
+            error,
+        };
+        let parsed = cypher::parse(source).map_err(compile)?;
+        let prepared =
+            planner::plan_query(&mut self.db, &parsed, params.values()).map_err(compile)?;
+        let program = codegen::compile(&self.db, &prepared).map_err(compile)?;
         let started = self.db.in_write_txn();
         let read_lock = !program.mutating && !started;
         if read_lock {
-            self.db.begin_read()?;
+            self.db.begin_read().map_err(runtime)?;
         }
         if program.mutating && !started && self.auto_commit {
-            self.db.begin_write()?;
+            self.db.begin_write().map_err(runtime)?;
         }
         let result = vdbe::execute(&mut self.db, &program);
         if read_lock {
@@ -191,7 +280,7 @@ impl Connection {
         match result {
             Ok(rows) => {
                 if program.mutating && !started && self.auto_commit {
-                    self.db.commit()?;
+                    self.db.commit().map_err(runtime)?;
                 }
                 Ok(Rows {
                     columns: program.columns,
@@ -199,11 +288,11 @@ impl Connection {
                     position: 0,
                 })
             }
-            Err(err) => {
+            Err(error) => {
                 if program.mutating && !started && self.auto_commit {
                     let _ = self.db.rollback();
                 }
-                Err(err)
+                Err(runtime(error))
             }
         }
     }
@@ -298,4 +387,44 @@ pub fn require_columns(rows: &Rows) -> Result<()> {
         return Err(Error::misuse("query does not return rows"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::ErrorCode;
+    use crate::vfs::mem::MemVfs;
+
+    fn connection() -> Connection {
+        Connection::create_with_vfs(Arc::new(MemVfs::new()), Path::new("test.db"), 4096)
+            .expect("create connection")
+    }
+
+    #[test]
+    fn syntax_error_is_compile_time() {
+        let mut conn = connection();
+        let err = conn
+            .query_with_phase("MATCH", &Params::new())
+            .expect_err("syntax error");
+        assert_eq!(err.phase(), Phase::Compile);
+        assert_eq!(err.error().code(), ErrorCode::Syntax);
+        assert!(err.to_string().contains("compile time"));
+    }
+
+    #[test]
+    fn execution_failure_is_runtime() {
+        let mut conn = connection();
+        let err = conn
+            .query_with_phase("RETURN 1 + 'x'", &Params::new())
+            .expect_err("type error");
+        assert_eq!(err.phase(), Phase::Runtime);
+        assert_eq!(err.error().code(), ErrorCode::Type);
+    }
+
+    #[test]
+    fn query_still_reports_plain_errors() {
+        let mut conn = connection();
+        let err = conn.query("MATCH", &Params::new()).expect_err("syntax");
+        assert_eq!(err.code(), ErrorCode::Syntax);
+    }
 }
