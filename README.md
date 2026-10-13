@@ -209,9 +209,10 @@ on real files.
 
 ## Roadmap
 
-The openCypher completeness plan — TCK harness first, then core language,
-function library, temporal/spatial types, a semantic sweep and Neo4j
-extensions — lives in [docs/roadmap.md](docs/roadmap.md).
+The openCypher completeness plan — TCK harness first (now live, see
+[docs/tck.md](docs/tck.md)), then core language, function library,
+temporal/spatial types, a semantic sweep and Neo4j extensions — lives in
+[docs/roadmap.md](docs/roadmap.md).
 
 Storage-side work tracked alongside it: WAL mode for concurrent readers,
 delete rebalancing and `VACUUM`-style compaction, bulk loading, and
