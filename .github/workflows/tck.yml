@@ -1,0 +1,24 @@
+name: tck
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  tck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run the TCK gate
+        run: cargo run -p tck-runner --release -- --quiet
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tck-report
+          path: tck/report.json
+          if-no-files-found: ignore

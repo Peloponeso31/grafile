@@ -186,6 +186,11 @@ Crash recovery is exercised with a fault-injecting in-memory VFS that fails
 for integrity. B+tree and fragment codecs are verified against reference
 models with `proptest`.
 
+Conformance is measured against the vendored openCypher TCK (pinned submodule
+plus an allow-list of known gaps): `cargo run -p tck-runner --release`. The
+gate fails on unexpected failures, harness errors and stale allow-list
+entries; see `docs/tck.md` for the semantics and the current pass rate.
+
 Insert throughput (10 000 inserts in one transaction, Apple silicon, release
 build), `cargo bench --bench insert`:
 

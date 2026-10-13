@@ -67,6 +67,13 @@ Conformance work starts by making progress measurable:
 4. Publish a pass-rate report and wire it into CI so later phases cannot
    regress.
 
+**Status: implemented.** `tck-runner` runs the vendored suite
+(`third_party/opencypher`, tag `2024.3`) and gates CI on it; see
+`docs/tck.md`. Baseline: 3897 scenarios, 948 passing, 2949 allow-listed
+(24.3% of the suite, 100% of applicable scenarios), zero harness errors.
+The allow-list contains only language gaps; the gate fails on stale entries
+so fixes must prune the list in the same commit.
+
 ## Phases
 
 ### Phase 1 — Core language completion (large)
