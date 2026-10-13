@@ -244,5 +244,9 @@ a torn journal can never correspond to a partially written database.
 
 - The file grows one page at a time when the freelist is empty.
 - Every page carries a CRC32C; reads fail with `Corrupt` on mismatch.
-- Committed transactions are durable: journal and database are `sync_all`ed
-  before the commit is acknowledged.
+  Checksums are computed once per page when it is written at commit, not on
+  every in-memory mutation.
+- Committed transactions are durable: the journal is flushed with a full
+  sync (drive-cache flush on macOS), database pages and the journal
+  invalidation use a normal `fsync`, mirroring SQLite's `SQLITE_SYNC_FULL`
+  for the journal and `SQLITE_SYNC_NORMAL` for the rest.
