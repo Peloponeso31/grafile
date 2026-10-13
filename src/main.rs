@@ -21,6 +21,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use grafile::api::{Connection, Params, Rows};
 use grafile::cypher::lexer::{TokenClass, highlight_spans};
+use grafile::cypher::split_statements;
 use grafile::json::{JsonColors, JsonOptions, format_unix_utc, row_object_json, value_json};
 use grafile::record::Value;
 use grafile::vdbe::format_value;
@@ -1154,49 +1155,6 @@ fn clear_screen() {
         print!("{CLEAR_SCREEN}");
         let _ = std::io::stdout().flush();
     }
-}
-
-/// Split a script into statements at top-level semicolons.
-fn split_statements(text: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_backtick = false;
-    let mut escaped = false;
-    for ch in text.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' if in_single || in_double => {
-                current.push(ch);
-                escaped = true;
-            }
-            '\'' if !in_double && !in_backtick => {
-                in_single = !in_single;
-                current.push(ch);
-            }
-            '"' if !in_single && !in_backtick => {
-                in_double = !in_double;
-                current.push(ch);
-            }
-            '`' if !in_single && !in_double => {
-                in_backtick = !in_backtick;
-                current.push(ch);
-            }
-            ';' if !in_single && !in_double && !in_backtick => {
-                statements.push(std::mem::take(&mut current));
-            }
-            _ => current.push(ch),
-        }
-    }
-    if !current.trim().is_empty() {
-        statements.push(current);
-    }
-    statements
 }
 
 fn print_help() {
