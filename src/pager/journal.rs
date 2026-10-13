@@ -68,6 +68,21 @@ impl JournalHeader {
     }
 }
 
+/// Write one journal record at `offset` without allocating a page-sized
+/// buffer.
+///
+/// Record layout: `[page_no u32][page bytes][crc32c over both]`. Returns the
+/// number of bytes written.
+pub fn write_record(journal: &dyn File, page_no: u32, page: &[u8], offset: u64) -> Result<u64> {
+    let page_no_bytes = page_no.to_le_bytes();
+    journal.write_at(&page_no_bytes, offset)?;
+    journal.write_at(page, offset + 4)?;
+    let mut crc = crc32c::crc32c(&page_no_bytes);
+    crc = crc32c::crc32c_append(crc, page);
+    journal.write_at(&crc.to_le_bytes(), offset + 4 + page.len() as u64)?;
+    Ok(4 + page.len() as u64 + 4)
+}
+
 /// Encode one journal record into a fresh buffer.
 ///
 /// Record layout: `[page_no u32][page bytes][crc32c over both]`.
