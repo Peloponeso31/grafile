@@ -40,7 +40,7 @@ name = "queries"
 harness = false
 
 [workspace]
-members = ["ffi"]
+members = ["ffi", "tck-runner"]
 
 [[bench]]
 name = "insert"
