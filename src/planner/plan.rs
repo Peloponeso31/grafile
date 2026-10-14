@@ -85,6 +85,27 @@ pub enum Plan {
         /// Edge type id, or `None` for any type.
         edge_type: Option<u32>,
     },
+    /// Expand from a bound node through trails of bounded length.
+    VarExpand {
+        /// Input rows (cross-product nesting).
+        input: Box<Plan>,
+        /// Bound source variable.
+        src: String,
+        /// Optional variable for the edge list.
+        edge: Option<String>,
+        /// Variable for the end node.
+        dst: String,
+        /// Pattern direction.
+        direction: RelDirection,
+        /// Restricting edge type ids (empty = any).
+        types: Vec<u32>,
+        /// Literal property filters applied at every hop.
+        props: Vec<(u32, crate::record::Value)>,
+        /// Minimum hops.
+        min: u32,
+        /// Maximum hops; `None` is unbounded.
+        max: Option<u32>,
+    },
     /// Expand from a bound node to its neighbors.
     Expand {
         /// Input rows (cross-product nesting).
@@ -292,6 +313,23 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
             edge_type,
         } => {
             out.push_str(&format!("{pad}EdgeScan {var} type={edge_type:?}\n"));
+            explain(input, indent + 1, out);
+        }
+        Plan::VarExpand {
+            input,
+            src,
+            edge,
+            dst,
+            direction,
+            types,
+            props,
+            min,
+            max,
+        } => {
+            out.push_str(&format!(
+                "{pad}VarExpand {src}-[{edge:?}:{types:?} {direction:?} {min}..{max:?}]->{dst} props={}\n",
+                props.len()
+            ));
             explain(input, indent + 1, out);
         }
         Plan::Expand {

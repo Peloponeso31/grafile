@@ -363,6 +363,34 @@ pub enum Op {
         /// Value register.
         value: u32,
     },
+    /// Open a variable-length expansion from a node.
+    VarExpandOpen {
+        /// Cursor slot.
+        cursor: u32,
+        /// Source node register.
+        src: u32,
+        /// Direction code: 0 out, 1 in, 2 both.
+        direction: u8,
+        /// Restricting edge type ids (empty = any).
+        types: Vec<u32>,
+        /// Literal property filters applied at every hop.
+        props: Vec<(u32, Value)>,
+        /// Minimum hops.
+        min: u32,
+        /// Maximum hops; `None` is unbounded.
+        max: Option<u32>,
+    },
+    /// Advance a variable-length expansion; jump when exhausted.
+    VarExpandNext {
+        /// Cursor slot.
+        cursor: u32,
+        /// Destination register for the edge list.
+        edges: u32,
+        /// Destination register for the end node.
+        node: u32,
+        /// Jump target when exhausted.
+        target: u32,
+    },
     /// Start unwinding a list.
     UnwindInit {
         /// Cursor slot.
@@ -544,6 +572,10 @@ enum Cursor {
     },
     Expand {
         items: Vec<(u64, u64)>,
+        pos: usize,
+    },
+    Trails {
+        items: Vec<(Vec<u64>, u64)>,
         pos: usize,
     },
     Rows {
@@ -1109,6 +1141,56 @@ impl<'a> Executor<'a> {
                         .ok_or_else(|| Error::internal("row shorter than window"))?
                         .clone();
                     self.regs[(*start as usize) + idx] = value;
+                }
+            }
+            Op::VarExpandOpen {
+                cursor,
+                src,
+                direction,
+                types,
+                props,
+                min,
+                max,
+            } => {
+                // Expanding from a null binding matches nothing.
+                let items = if matches!(self.regs[*src as usize], Reg::Value(Value::Null)) {
+                    Vec::new()
+                } else {
+                    let node = self.reg_node(*src)?;
+                    let directions: Vec<Direction> = match direction {
+                        0 => vec![Direction::Out],
+                        1 => vec![Direction::In],
+                        _ => vec![Direction::Out, Direction::In],
+                    };
+                    self.db
+                        .var_expand(node, &directions, types, props, *min, *max)?
+                };
+                self.cursors[*cursor as usize] = Cursor::Trails { items, pos: 0 };
+            }
+            Op::VarExpandNext {
+                cursor,
+                edges,
+                node,
+                target,
+            } => {
+                let next = match &mut self.cursors[*cursor as usize] {
+                    Cursor::Trails { items, pos } => {
+                        let next = items.get(*pos).cloned();
+                        if next.is_some() {
+                            *pos += 1;
+                        }
+                        next
+                    }
+                    _ => return Err(Error::internal("VarExpandNext on a non-trail cursor")),
+                };
+                match next {
+                    Some((edge_ids, end)) => {
+                        let values: Vec<Value> =
+                            edge_ids.iter().map(|id| Value::Edge(*id)).collect();
+                        self.regs[*edges as usize] = Reg::Value(Value::List(values.into()));
+                        self.regs[*node as usize] = Reg::Node(end);
+                    }
+                    None => self.pc = *target as usize,
                 }
             }
             Op::ListPush { list, value } => {

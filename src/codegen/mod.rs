@@ -83,7 +83,8 @@ impl<'a> Codegen<'a> {
             | Op::Goto { target: t }
             | Op::CtxRewind { target: t, .. }
             | Op::CtxNext { target: t, .. }
-            | Op::UnwindNext { target: t, .. } => *t = target,
+            | Op::UnwindNext { target: t, .. }
+            | Op::VarExpandNext { target: t, .. } => *t = target,
             other => {
                 return Err(Error::internal(format!(
                     "attempted to patch a non-jump instruction: {other:?}"
@@ -231,6 +232,53 @@ impl<'a> Codegen<'a> {
                 let end = cg.ops.len() as u32;
                 cg.patch(rewind, end)?;
                 cg.patch(next, end)?;
+                Ok(())
+            }),
+            Plan::VarExpand {
+                input,
+                src,
+                edge,
+                dst,
+                direction,
+                types,
+                props,
+                min,
+                max,
+            } => self.compile(input, ctx, &mut |cg, ctx| {
+                let src_reg = *ctx.vars.get(src).ok_or_else(|| undefined(src))?;
+                let cursor = cg.alloc_cursor();
+                let direction_code = match direction {
+                    crate::cypher::RelDirection::Outgoing => 0u8,
+                    crate::cypher::RelDirection::Incoming => 1u8,
+                    crate::cypher::RelDirection::Undirected => 2u8,
+                };
+                cg.emit(Op::VarExpandOpen {
+                    cursor,
+                    src: src_reg,
+                    direction: direction_code,
+                    types: types.clone(),
+                    props: props.clone(),
+                    min: *min,
+                    max: *max,
+                });
+                let loop_start = cg.ops.len() as u32;
+                let edge_reg = cg.alloc_reg();
+                let node_reg = cg.alloc_reg();
+                let jump = cg.emit(Op::VarExpandNext {
+                    cursor,
+                    edges: edge_reg,
+                    node: node_reg,
+                    target: 0,
+                });
+                if let Some(edge_var) = edge {
+                    ctx.vars.insert(edge_var.clone(), edge_reg);
+                }
+                ctx.vars.insert(dst.clone(), node_reg);
+                ctx.window_len = cg.next_reg - ctx.window_start;
+                out(cg, ctx)?;
+                cg.emit(Op::Goto { target: loop_start });
+                let end = cg.ops.len() as u32;
+                cg.patch(jump, end)?;
                 Ok(())
             }),
             Plan::Expand {

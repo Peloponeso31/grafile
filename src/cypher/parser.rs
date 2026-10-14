@@ -447,14 +447,17 @@ impl<'a> Parser<'a> {
     fn parse_var_length(&mut self) -> Result<VarLength> {
         let mut min = 1u32;
         let mut max = None;
+        let mut explicit = false;
         if self.peek() == Some(Token::Integer) {
             min = self.parse_u32("relationship length")?;
+            explicit = true;
         }
         if self.eat(Token::DotDot) {
             if self.peek() == Some(Token::Integer) {
                 max = Some(self.parse_u32("relationship length")?);
             }
-        } else {
+        } else if explicit {
+            // `*2` means exactly two hops.
             max = Some(min);
         }
         Ok(VarLength { min, max })

@@ -794,3 +794,56 @@ fn aggregations_inside_comprehensions_are_rejected() {
         .expect_err("aggregation in comprehension");
     assert_eq!(err.code(), grafile::ErrorCode::Syntax);
 }
+
+// ---- variable-length paths ----
+
+#[test]
+fn variable_length_paths() {
+    let mut conn = connection();
+    conn.execute("CREATE (a:A)-[:T]->(b:B)-[:T]->(c:C)-[:T]->(d:D)")
+        .expect("create");
+    let rows = query(&mut conn, "MATCH (a:A)-[*1..2]->(x) RETURN x.name");
+    assert_eq!(rows.len(), 2);
+    let rows = query(&mut conn, "MATCH (a:A)-[*]->(x) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["3"]]);
+    let rows = query(&mut conn, "MATCH (a:A)-[*2]->(x) RETURN x.name");
+    assert_eq!(rows, vec![vec!["null"]]);
+}
+
+#[test]
+fn zero_length_variable_paths_include_the_start() {
+    let mut conn = connection();
+    conn.execute("CREATE (a:A)-[:T]->(b:B)").expect("create");
+    let rows = query(&mut conn, "MATCH (a:A)-[*0..1]->(x) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["2"]]);
+}
+
+#[test]
+fn variable_length_binds_a_relationship_list() {
+    let mut conn = connection();
+    conn.execute("CREATE (a:A)-[:T]->(:B)-[:T]->(:C)")
+        .expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH (a:A)-[r*2]->(x) RETURN size(r) AS n, labels(x) AS t",
+    );
+    assert_eq!(rows, vec![vec!["2", "[C]"]]);
+}
+
+#[test]
+fn variable_length_trails_do_not_repeat_relationships() {
+    let mut conn = connection();
+    conn.execute("CREATE (a:A)-[:T]->(b:B)-[:T]->(a)")
+        .expect("create");
+    // The trail may not reuse the edge back to the start, so the only
+    // trails are one and two hops.
+    let rows = query(&mut conn, "MATCH (a:A)-[*]->(x) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["2"]]);
+}
+
+#[test]
+fn optional_variable_length_from_null_is_null() {
+    let mut conn = connection();
+    let rows = query(&mut conn, "OPTIONAL MATCH (a:Missing)-[*]->(x) RETURN x");
+    assert_eq!(rows, vec![vec!["null"]]);
+}

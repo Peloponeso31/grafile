@@ -313,15 +313,11 @@ impl<'a> Planner<'a> {
             types: Vec<u32>,
             direction: RelDirection,
             props: Vec<(u32, Value)>,
+            var_length: Option<crate::cypher::VarLength>,
         }
         let mut rels: Vec<RelInfo> = Vec::new();
         for segment in &path.segments {
             let rel = &segment.relationship;
-            if rel.var_length.is_some() {
-                return Err(Error::unsupported(
-                    "variable-length relationship patterns are not supported yet",
-                ));
-            }
             let node = self.planned_node(&segment.node, scope)?;
             nodes.push(node);
             let var = match &rel.variable {
@@ -340,6 +336,7 @@ impl<'a> Planner<'a> {
                 types,
                 direction: rel.direction,
                 props,
+                var_length: rel.var_length,
             });
         }
 
@@ -377,14 +374,27 @@ impl<'a> Planner<'a> {
                     scope.insert(rel.var.clone(), VarKind::Edge);
                     rel.var.clone()
                 };
-                *plan = Plan::Expand {
-                    input: Box::new(plan.clone()),
-                    src: nodes[from_idx].var.clone(),
-                    edge: Some(edge_var.clone()),
-                    dst: nodes[to_idx].var.clone(),
-                    direction,
-                    types: rel.types.clone(),
-                    props: rel.props.clone(),
+                *plan = match rel.var_length {
+                    Some(bounds) => Plan::VarExpand {
+                        input: Box::new(plan.clone()),
+                        src: nodes[from_idx].var.clone(),
+                        edge: Some(edge_var.clone()),
+                        dst: nodes[to_idx].var.clone(),
+                        direction,
+                        types: rel.types.clone(),
+                        props: rel.props.clone(),
+                        min: bounds.min,
+                        max: bounds.max,
+                    },
+                    None => Plan::Expand {
+                        input: Box::new(plan.clone()),
+                        src: nodes[from_idx].var.clone(),
+                        edge: Some(edge_var.clone()),
+                        dst: nodes[to_idx].var.clone(),
+                        direction,
+                        types: rel.types.clone(),
+                        props: rel.props.clone(),
+                    },
                 };
                 constrain_edge(plan, &edge_var, &rel.var, edge_bound);
                 scope.insert(nodes[to_idx].var.clone(), VarKind::Node);
@@ -414,14 +424,27 @@ impl<'a> Planner<'a> {
                     scope.insert(rel.var.clone(), VarKind::Edge);
                     rel.var.clone()
                 };
-                *plan = Plan::Expand {
-                    input: Box::new(plan.clone()),
-                    src: nodes[from].var.clone(),
-                    edge: Some(edge_var.clone()),
-                    dst: fresh_node.clone(),
-                    direction: rel.direction,
-                    types: rel.types.clone(),
-                    props: rel.props.clone(),
+                *plan = match rel.var_length {
+                    Some(bounds) => Plan::VarExpand {
+                        input: Box::new(plan.clone()),
+                        src: nodes[from].var.clone(),
+                        edge: Some(edge_var.clone()),
+                        dst: fresh_node.clone(),
+                        direction: rel.direction,
+                        types: rel.types.clone(),
+                        props: rel.props.clone(),
+                        min: bounds.min,
+                        max: bounds.max,
+                    },
+                    None => Plan::Expand {
+                        input: Box::new(plan.clone()),
+                        src: nodes[from].var.clone(),
+                        edge: Some(edge_var.clone()),
+                        dst: fresh_node.clone(),
+                        direction: rel.direction,
+                        types: rel.types.clone(),
+                        props: rel.props.clone(),
+                    },
                 };
                 scope.insert(fresh_node.clone(), VarKind::Node);
                 *plan = Plan::Filter {

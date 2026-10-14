@@ -433,6 +433,83 @@ impl Database {
 
     /// Edge ids incident to `node_id` in `direction`, optionally filtered by
     /// edge types. An empty `types` slice uses the combined "any" plane.
+    /// Enumerate every trail from `src` whose length is within `min..=max`
+    /// (`max` of `None` is unbounded), returning `(edge ids, end node)`.
+    /// Relationships never repeat within a trail; nodes may.
+    ///
+    /// # Errors
+    ///
+    /// Propagates storage errors while expanding.
+    pub fn var_expand(
+        &mut self,
+        src: u64,
+        directions: &[Direction],
+        types: &[u32],
+        props: &[(u32, Value)],
+        min: u32,
+        max: Option<u32>,
+    ) -> Result<Vec<(Vec<u64>, u64)>> {
+        let mut out = Vec::new();
+        if min == 0 {
+            out.push((Vec::new(), src));
+        }
+        let mut trail = Vec::new();
+        self.var_expand_rec(
+            src, directions, types, props, min, max, &mut trail, &mut out,
+        )?;
+        Ok(out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn var_expand_rec(
+        &mut self,
+        node: u64,
+        directions: &[Direction],
+        types: &[u32],
+        props: &[(u32, Value)],
+        min: u32,
+        max: Option<u32>,
+        trail: &mut Vec<u64>,
+        out: &mut Vec<(Vec<u64>, u64)>,
+    ) -> Result<()> {
+        if let Some(max) = max
+            && trail.len() as u32 >= max
+        {
+            return Ok(());
+        }
+        let mut neighbours = Vec::new();
+        for direction in directions {
+            neighbours.extend(self.expand(node, *direction, types)?);
+        }
+        neighbours.sort_unstable();
+        neighbours.dedup();
+        for (edge, next) in neighbours {
+            if trail.contains(&edge) || !self.edge_matches(edge, props)? {
+                continue;
+            }
+            trail.push(edge);
+            if trail.len() as u32 >= min {
+                out.push((trail.clone(), next));
+            }
+            self.var_expand_rec(next, directions, types, props, min, max, trail, out)?;
+            trail.pop();
+        }
+        Ok(())
+    }
+
+    /// Whether an edge carries all the literal property filters.
+    fn edge_matches(&mut self, edge_id: u64, props: &[(u32, Value)]) -> Result<bool> {
+        if props.is_empty() {
+            return Ok(true);
+        }
+        let Some(record) = self.get_edge(edge_id)? else {
+            return Ok(false);
+        };
+        Ok(props
+            .iter()
+            .all(|(key, value)| record.get(*key) == Some(value)))
+    }
+
     pub fn node_edges(
         &mut self,
         node_id: u64,
