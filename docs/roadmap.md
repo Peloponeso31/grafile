@@ -55,7 +55,7 @@ Known semantic deviations to close:
 
 ## Phases
 
-Where the allow-list stood after 1A (2024.3, 2008 scenarios):
+Where the allow-list stood after 1A (2024.3, 1849 scenarios):
 temporal types 1004 (Phase 3), error-kind and validation mismatches ~340
 (Phase 4), ordering/comparison/precedence semantics ~350 (Phase 4), paths ~250 (Phase 1B), CALL
 procedure registration 52 (unreachable: the TCK registers test procedures),
@@ -75,17 +75,12 @@ allow-list sizes measured after `OPTIONAL MATCH`.
 
 #### 1B — Paths
 
-- List comprehensions, quantifiers (`all`, `any`, `none`, `single`) and
-  `reduce()` are done; pattern comprehensions still need pattern predicates
-  below.
-- Variable-length paths: bounded and unbounded expansion with a per-path
-  trail set, driven by the incidence matrix; the relationship variable binds
-  a list (~85).
-- Named paths and path values: `p = (a)-[…]→(b)` plus `nodes(p)`,
-  `relationships(p)`, `length(p)`; new value representation across the
-  value, JSON and display layers (~111).
+- List comprehensions, quantifiers (`all`, `any`, `none`, `single`),
+  `reduce()`, variable-length paths and named paths (`p = …`, `nodes(p)`,
+  `relationships(p)`, `length(p)`) are done.
 - Pattern predicates in `WHERE`, `exists()`, and `shortestPath()` /
-  `allShortestPaths()` (early-exit BFS over the incidence planes) (~50).
+  `allShortestPaths()` (early-exit BFS over the incidence planes) (~50);
+  pattern comprehensions depend on them.
 
 #### 1D — Write-side completeness
 
