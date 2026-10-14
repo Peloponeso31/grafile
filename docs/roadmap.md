@@ -4,11 +4,13 @@ This document is the execution plan for taking grafile from its v1 Cypher
 subset to full conformance with openCypher 9, plus the Neo4j extensions the
 project has chosen to support. The [openCypher TCK](https://github.com/opencypher/openCypher/tree/main/tck)
 is the conformance contract: a feature is "done" when the applicable TCK
-scenarios pass without allow-list entries.
+scenarios pass without allow-list entries. Features the TCK does not exercise
+are done when their unit and integration tests pass and the report does not
+regress.
 
-## Current state (v1)
+## Current state
 
-Implemented:
+Implemented and gated (see `docs/tck.md` for the pass rate):
 
 - Clauses: `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN`, `WITH` (with
   `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`, trailing `WHERE`), `UNWIND`,
@@ -16,32 +18,33 @@ Implemented:
   `DELETE`, `DETACH DELETE`, `UNION` / `UNION ALL`.
 - Patterns: node and relationship patterns, directions, type disjunction
   (`:A|B`), inline literal property filters, multiple labels, pre-bound
-  elements (nodes and relationships verified instead of re-bound).
-- Expressions: parameters, list/map literals, `CASE`, `IS [NOT] NULL`,
-  `STARTS WITH` / `ENDS WITH` / `CONTAINS` / `=~`, `IN`, label predicates,
-  three-valued logic, numeric cross-type comparison.
-- Aggregations: `count`, `sum`, `avg`, `min`, `max`, `collect`.
+  elements (verified instead of re-bound), variable-length paths (`*`, `*2`,
+  `*1..3`, `*0..`) with trail semantics, named paths (`p = …`) with
+  `nodes()`, `relationships()` and `length()`.
+- Expressions: parameters, list/map literals, map access, list indexing and
+  slicing, list comprehensions, quantifiers (`all`, `any`, `none`, `single`),
+  `reduce()`, `CASE`, `IS [NOT] NULL`, `STARTS WITH` / `ENDS WITH` /
+  `CONTAINS` / `=~`, `IN`, label predicates, three-valued logic, numeric
+  cross-type comparison.
+- Aggregations: `count`, `sum`, `avg`, `min`, `max`, `collect`, with
+  `DISTINCT` and expressions over aggregations.
 - Scalar functions: `id`, `labels`, `type`, `startNode`, `endNode`,
   `coalesce`, `toString`, `toInteger`, `toFloat`, `size`, `properties`,
-  `keys`.
+  `keys`, `nodes`, `relationships`, `length`.
 
 Explicit gaps (currently clear `Unsupported` errors):
 
 | Gap | Where rejected |
 |-----|----------------|
-| Variable-length paths (`*min..max`) | planner |
+| Non-literal property values in `MATCH` patterns (`{key: expr}`) | planner |
+| Pattern predicates and pattern comprehensions | parser |
 | `MERGE` with multiple relationships | planner |
-| Expressions mixing aggregation and grouping keys | planner |
-| `DISTINCT` inside aggregations | planner |
 | `REMOVE n = {…}` | codegen |
+| Map projections (`n{.name}`) | parser |
 | Unknown functions | codegen |
 
-Silently absent areas: named paths and path values (`nodes()`,
-`relationships()`, `length()`), shortest paths, pattern predicates and
-`exists()`, list/pattern comprehensions, quantifiers, `reduce()`, map
-property access / subscript / slicing / projections, `FOREACH`, `CALL`,
-`SET n += {…}`, most of the built-in function library, and temporal/spatial
-value types.
+Silently absent areas: shortest paths, `exists()`, `FOREACH`, `CALL`, most
+of the built-in function library, and temporal/spatial value types.
 
 Known semantic deviations to close:
 
@@ -52,44 +55,56 @@ Known semantic deviations to close:
   `percentileCont`/`percentileDisc`, Phase 2).
 - Errors that Neo4j detects statically (for example `NOT {true: true}`) are
   raised at runtime instead, so their phase differs from the TCK.
+- `+` does not coerce the non-string operand to text, so `'p-' + 1` errors.
 
 ## Phases
 
-Where the allow-list stood after 1A (2024.3, 1849 scenarios):
-temporal types 1004 (Phase 3), error-kind and validation mismatches ~340
-(Phase 4), ordering/comparison/precedence semantics ~350 (Phase 4), paths ~250 (Phase 1B), CALL
-procedure registration 52 (unreachable: the TCK registers test procedures),
-and the rest spread over functions (Phase 2), error phases (Phase 4) and
-clause corner cases.
+Status markers: `[done]` implemented and gated, `[partial]` some items
+finished, `[pending]` not started. Items the TCK does not exercise are
+verified by unit and integration tests and must not regress the report.
 
-### Phase 1 — Core language completion (large)
+Current baseline: 2020 of 3897 scenarios passing (51.8%), 1877 allow-listed.
+The remaining list is dominated by temporal types (~1000, Phase 3), the
+error-kind/phase and ordering/comparison sweeps (~690, Phase 4), the function
+library (Phase 2), pattern predicates (~50, Phase 1B), MERGE conformance
+(~21, Phase 1D) and CALL procedure registration (52, unreachable: the TCK
+registers test procedures).
 
-Four sub-phases, each verified by the TCK gate; scenario counts are the
-allow-list sizes measured after `OPTIONAL MATCH`.
+### Phase 1 — Core language completion (large) [partial]
 
-#### 1A — Statement and expression surface
+#### 1A — Statement and expression surface [done]
 
-- Map property access (`m.k`), subscript (`m['k']`) and list slicing
-  (`list[1..3]`) are done; map projections (`n{.name}`) have no TCK coverage
-  and stay unimplemented.
+- `UNION` / `UNION ALL` (10 scenarios), `SET n += {…}` and runtime property
+  key resolution (55), aggregation completeness with `DISTINCT` and
+  post-aggregation expressions (21), map access, subscript, list slicing and
+  list concatenation (64).
 
-#### 1B — Paths
+#### 1B — Patterns and paths [partial]
 
-- List comprehensions, quantifiers (`all`, `any`, `none`, `single`),
-  `reduce()`, variable-length paths and named paths (`p = …`, `nodes(p)`,
-  `relationships(p)`, `length(p)`) are done.
-- Pattern predicates in `WHERE`, `exists()`, and `shortestPath()` /
-  `allShortestPaths()` (early-exit BFS over the incidence planes) (~50);
-  pattern comprehensions depend on them.
+- [done] Variable-length paths: trails with `*`, `*2`, `*1..3`, `*0..`; the
+  relationship variable binds a list (41 scenarios).
+- [done] Named paths and path values: `p = …`, `nodes(p)`,
+  `relationships(p)`, `length(p)`, plus the variable re-binding validations
+  (93 scenarios).
+- [ ] Pattern predicates in `WHERE`, `exists()`, and `shortestPath()` /
+  `allShortestPaths()`; pattern comprehensions depend on them (~50).
+- [ ] Non-literal property values in `MATCH` patterns (`{key: expr}`) compile
+  to runtime filters while literals keep index seeks; `MERGE` already
+  supports expressions. TCK-blind: unit and integration tests only.
 
-#### 1D — Write-side completeness
+#### 1C — Comprehensions, quantifiers, reduce [done]
 
-- MERGE conformance: whole-path match-or-create and multiple relationships;
-  removes the documented deviation (~21).
-- `FOREACH` and `CALL … YIELD` for built-in procedures (`db.labels()`,
-  `db.propertyKeys()`, …); no TCK coverage, verified by unit tests only.
+- List comprehensions, quantifiers with three-valued logic and `reduce()`
+  (556 scenarios).
 
-### Phase 2 — Function library (medium)
+#### 1D — Write-side completeness [pending]
+
+- [ ] MERGE conformance: whole-path match-or-create and multiple
+  relationships; removes the documented deviation (~21).
+- [ ] `FOREACH` and `CALL … YIELD` for built-in procedures (`db.labels()`,
+  `db.propertyKeys()`, …). TCK-blind: unit tests only.
+
+### Phase 2 — Function library (medium) [pending]
 
 - String: `substring`, `replace`, `split`, `trim`/`ltrim`/`rtrim`,
   `left`/`right`, `toUpper`/`toLower`, `reverse`.
@@ -100,7 +115,7 @@ allow-list sizes measured after `OPTIONAL MATCH`.
 - Conversions: `toBoolean`, `toString` for every type.
 - Aggregation: `stDev`, `stDevP`, `percentileCont`, `percentileDisc`.
 
-### Phase 3 — Temporal and spatial types (large, cross-cutting)
+### Phase 3 — Temporal and spatial types (large, cross-cutting) [pending]
 
 The biggest value-system change:
 
@@ -115,14 +130,20 @@ The biggest value-system change:
 Storage stays backward compatible (new tags only); the format minor version
 is bumped.
 
-### Phase 4 — Semantic conformance sweep (medium, iterative)
+### Phase 4 — Semantic conformance sweep (medium, iterative) [pending]
 
 TCK-driven fixes: null semantics corners, cross-type comparison and
 ordering, `IN` with nulls, list equality, error-vs-null decisions, scope
 boundaries across `WITH`, `SKIP`/`LIMIT` expression rules, and removal of
 the remaining documented deviations.
 
-### Phase 5 — Neo4j extensions (medium)
+- Operator coercion: `+` with a string operand converts the other side to
+  text (`'p-' + 1`), matching openCypher; list concatenation follows the
+  same rules. TCK-blind: unit and integration tests only.
+- Statically detectable errors (for example `NOT {true: true}`,
+  `labels(path)`) are reported at compile time instead of runtime.
+
+### Phase 5 — Neo4j extensions (medium) [pending]
 
 - Cypher DDL for indexes and constraints (today they exist only through the
   Rust API, and the shell cannot create or drop them):
@@ -146,7 +167,7 @@ the remaining documented deviations.
 
 These stay allow-listed as `neo4j-extension` until this phase.
 
-### Phase 6 — Performance for the new surface (medium, interleaved)
+### Phase 6 — Performance for the new surface (medium, interleaved) [pending]
 
 - Streaming cursors for `OPTIONAL MATCH` and variable-length expansion
   (avoid full materialization).
@@ -176,3 +197,6 @@ These stay allow-listed as `neo4j-extension` until this phase.
    not regress between phases.
 3. Storage-format changes follow `docs/format.md` and bump the format minor
    version; readers remain backward compatible.
+4. Features the TCK does not exercise (DDL, non-literal pattern properties,
+   operator coercions, `FOREACH`) are planned here explicitly and verified by
+   unit and integration tests; they must not regress the TCK report either.
