@@ -124,6 +124,22 @@ the remaining documented deviations.
 
 ### Phase 5 — Neo4j extensions (medium)
 
+- Cypher DDL for indexes and constraints (today they exist only through the
+  Rust API, and the shell cannot create or drop them):
+  - `CREATE [CONSTRAINT|INDEX] name [IF NOT EXISTS] FOR (n:Label) …` and the
+    edge form `FOR ()-[r:TYPE]-() …`, plus `DROP … name [IF EXISTS]`.
+  - Constraint kinds: `IS UNIQUE`, `IS NOT NULL` (existence, enforced on
+    create, property removal, label addition and whole-map replacement) and
+    `REQUIRE (n.a, n.b) IS NODE KEY` (existence plus tuple uniqueness over
+    composite index keys). Composite indexes stay non-seekable initially.
+  - Reject the Neo4j 3.x forms (`CREATE INDEX ON :L(p)`, `… ASSERT …`) with a
+    message pointing at the modern syntax; `SHOW INDEXES`/`SHOW CONSTRAINTS`
+    remain unsupported.
+  - Storage: index definitions gain a name, key list and kind; the catalog
+    entry encoding changes with a format minor bump and stays readable in
+    both directions. Dropping an index frees its B+tree pages.
+  - No TCK coverage (openCypher defines no DDL): verified by unit and
+    integration tests, and the conformance gate must not regress.
 - `LOAD CSV [WITH HEADERS] FROM …` for local file paths.
 - Label expressions in patterns: `:A|B`, `:!A`.
 - `EXISTS { … }` subqueries.
@@ -158,5 +174,5 @@ These stay allow-listed as `neo4j-extension` until this phase.
    same commit.
 2. Each phase lands as conventional commits with tests; the TCK report must
    not regress between phases.
-3. Storage-format changes (Phase 3) follow `docs/format.md` and bump the
-   format minor version; readers remain backward compatible.
+3. Storage-format changes follow `docs/format.md` and bump the format minor
+   version; readers remain backward compatible.

@@ -238,7 +238,9 @@ for row in rows.iter() {
 ```
 
 Property indexes are a DDL extension (openCypher has no DDL, and the shell
-does not expose index creation yet):
+does not expose index creation yet; Cypher `CREATE INDEX` / `CREATE
+CONSTRAINT` statements are scheduled in [docs/roadmap.md](docs/roadmap.md)
+Phase 5):
 
 ```rust
 conn.create_node_index("name", Some("Person"), true)?; // unique index
