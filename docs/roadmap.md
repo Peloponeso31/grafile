@@ -51,29 +51,6 @@ Known semantic deviations to close:
 - `ORDER BY` after aggregation may only reference projected values.
 - Aggregations with multiple arguments are rejected.
 
-## Measurement: the TCK harness (Phase 0)
-
-Conformance work starts by making progress measurable:
-
-1. Vendor the openCypher TCK (Cucumber `.feature` files, Apache-2.0) with
-   NOTICE attribution.
-2. Implement a small Gherkin step-runner that maps scenarios onto the public
-   API: execute the scenario's setup Cypher, run the query, compare result
-   tables (order-sensitive where the scenario says so), and map expected
-   error types onto grafile's `ErrorCode`.
-3. Maintain an allow-list of skipped scenarios with a reason
-   (`not-implemented`, `neo4j-extension`, `out-of-scope`), so the report is
-   "passing / applicable" rather than "passing / everything".
-4. Publish a pass-rate report and wire it into CI so later phases cannot
-   regress.
-
-**Status: implemented.** `tck-runner` runs the vendored suite
-(`third_party/opencypher`, tag `2024.3`) and gates CI on it; see
-`docs/tck.md`. Baseline: 3897 scenarios, 948 passing, 2949 allow-listed
-(24.3% of the suite, 100% of applicable scenarios), zero harness errors.
-The allow-list contains only language gaps; the gate fails on stale entries
-so fixes must prune the list in the same commit.
-
 ## Phases
 
 ### Phase 1 — Core language completion (large)
@@ -156,7 +133,6 @@ These stay allow-listed as `neo4j-extension` until this phase.
 
 | Milestone | Target |
 |-----------|--------|
-| After Phase 0 | Baseline pass-rate report in CI; allow-list covers all known gaps |
 | After Phases 1–2 | ≥ 80% of applicable TCK scenarios pass |
 | After Phase 4 | ≥ 95% of applicable TCK scenarios pass; deviations closed |
 | After Phase 5 | Allow-list contains only non-goals |
@@ -169,7 +145,9 @@ These stay allow-listed as `neo4j-extension` until this phase.
 
 ## Sequencing rules
 
-1. Phase 0 before any language work: no feature ships without TCK coverage.
+1. No feature ships without TCK coverage: a feature is done when its
+   applicable scenarios pass and its allow-list entries are pruned in the
+   same commit.
 2. Each phase lands as conventional commits with tests; the TCK report must
    not regress between phases.
 3. Storage-format changes (Phase 3) follow `docs/format.md` and bump the
