@@ -67,6 +67,8 @@ pub struct AggSpec {
     pub func: AggFn,
     /// Whether the argument is `*` (only meaningful for `count`).
     pub star: bool,
+    /// Whether only distinct argument values are aggregated.
+    pub distinct: bool,
 }
 
 /// A VDBE instruction.
@@ -1323,12 +1325,12 @@ impl<'a> Executor<'a> {
         let rows = std::mem::take(rows);
         let prefix = prefix as usize;
         let group_count = groups as usize;
-        let mut table: BTreeMap<Vec<Reg>, Vec<Accumulator>> = BTreeMap::new();
+        let mut table: BTreeMap<Vec<Reg>, Vec<AggState>> = BTreeMap::new();
         for row in &rows {
             let key: Vec<Reg> = row[prefix..prefix + group_count].to_vec();
             let accumulators = table
                 .entry(key)
-                .or_insert_with(|| aggs.iter().map(|spec| Accumulator::new(*spec)).collect());
+                .or_insert_with(|| aggs.iter().map(|spec| AggState::new(*spec)).collect());
             for (idx, spec) in aggs.iter().enumerate() {
                 let input = &row[prefix + group_count + idx];
                 accumulators[idx].step(spec, input);
@@ -1339,15 +1341,15 @@ impl<'a> Executor<'a> {
             // the aggregations' default values (e.g. count(*) = 0).
             table.insert(
                 Vec::new(),
-                aggs.iter().map(|spec| Accumulator::new(*spec)).collect(),
+                aggs.iter().map(|spec| AggState::new(*spec)).collect(),
             );
         }
         let mut output = Vec::with_capacity(table.len());
         for (key, mut accumulators) in table {
             let mut row = key;
             for (idx, spec) in aggs.iter().enumerate() {
-                let accumulator = std::mem::replace(&mut accumulators[idx], Accumulator::Count(0));
-                row.push(Reg::Value(accumulator.finish(spec)));
+                let state = std::mem::replace(&mut accumulators[idx], AggState::new(*spec));
+                row.push(Reg::Value(state.finish(spec)));
             }
             output.push(row);
         }
@@ -1502,6 +1504,36 @@ impl<'a> Executor<'a> {
                     .map(|name| Value::Text(std::sync::Arc::from(name)))
             })
             .collect()
+    }
+}
+
+/// One group's aggregation state: the accumulator plus, for `DISTINCT`
+/// aggregations, the values already seen.
+struct AggState {
+    accumulator: Accumulator,
+    seen: std::collections::BTreeSet<Value>,
+}
+
+impl AggState {
+    fn new(spec: AggSpec) -> Self {
+        Self {
+            accumulator: Accumulator::new(spec),
+            seen: std::collections::BTreeSet::new(),
+        }
+    }
+
+    fn step(&mut self, spec: &AggSpec, input: &Reg) {
+        if spec.distinct {
+            let value = input.to_value();
+            if value.is_null() || !self.seen.insert(value) {
+                return;
+            }
+        }
+        self.accumulator.step(spec, input);
+    }
+
+    fn finish(self, spec: &AggSpec) -> Value {
+        self.accumulator.finish(spec)
     }
 }
 

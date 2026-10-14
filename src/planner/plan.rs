@@ -24,6 +24,19 @@ pub enum AggFn {
     Collect,
 }
 
+/// One aggregation in an [`Plan::Aggregate`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggItem {
+    /// Aggregation function.
+    pub func: AggFn,
+    /// Argument expression.
+    pub argument: Expr,
+    /// Whether `DISTINCT` was written.
+    pub distinct: bool,
+    /// Output name.
+    pub name: String,
+}
+
 /// A property index seek chosen by the planner.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexSeek {
@@ -126,8 +139,8 @@ pub enum Plan {
         input: Box<Plan>,
         /// `(expression, output name)` grouping keys.
         groups: Vec<(Expr, String)>,
-        /// `(function, argument, output name)` aggregations.
-        aggs: Vec<(AggFn, Expr, String)>,
+        /// Aggregations.
+        aggs: Vec<AggItem>,
     },
     /// Remove duplicate rows.
     Distinct {
@@ -327,7 +340,7 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
                 "{pad}Aggregate groups={} aggs={}\n",
                 names(groups),
                 aggs.iter()
-                    .map(|(_, _, name)| name.clone())
+                    .map(|item| item.name.clone())
                     .collect::<Vec<_>>()
                     .join(", ")
             ));

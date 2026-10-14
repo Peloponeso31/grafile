@@ -401,8 +401,8 @@ impl<'a> Codegen<'a> {
                         group_values.push(cg.compile_expr(expr, in_ctx)?);
                     }
                     let mut agg_values = Vec::with_capacity(aggs.len());
-                    for (_, argument, _) in aggs {
-                        agg_values.push(cg.compile_expr(argument, in_ctx)?);
+                    for item in aggs {
+                        agg_values.push(cg.compile_expr(&item.argument, in_ctx)?);
                     }
                     let prefix = cg.next_reg - in_ctx.window_start;
                     let group_base = cg.next_reg;
@@ -432,9 +432,10 @@ impl<'a> Codegen<'a> {
                     layout.ok_or_else(|| Error::internal("empty aggregate input"))?;
                 let specs: Vec<AggSpec> = aggs
                     .iter()
-                    .map(|(func, _, _)| AggSpec {
-                        func: *func,
+                    .map(|item| AggSpec {
+                        func: item.func,
                         star: false,
+                        distinct: item.distinct,
                     })
                     .collect();
                 self.emit(Op::HashAggregate {
@@ -459,10 +460,11 @@ impl<'a> Codegen<'a> {
                 for (idx, (_, name)) in groups.iter().enumerate() {
                     new_ctx.vars.insert(name.clone(), group_base + idx as u32);
                 }
-                for (idx, (_, _, name)) in aggs.iter().enumerate() {
-                    new_ctx
-                        .vars
-                        .insert(name.clone(), group_base + groups.len() as u32 + idx as u32);
+                for (idx, item) in aggs.iter().enumerate() {
+                    new_ctx.vars.insert(
+                        item.name.clone(),
+                        group_base + groups.len() as u32 + idx as u32,
+                    );
                 }
                 out(self, &mut new_ctx)?;
                 let next = self.emit(Op::CtxNext { cursor, target: 0 });

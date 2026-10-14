@@ -21,7 +21,7 @@ use crate::engine::Database;
 use crate::error::{Error, ErrorCode, Result};
 use crate::record::Value;
 use crate::vdbe::NO_KEY;
-use plan::{AggFn, CreateItem, IndexSeek, Plan};
+use plan::{AggFn, AggItem, CreateItem, IndexSeek, Plan};
 
 pub use plan::explain;
 
@@ -911,24 +911,66 @@ impl<'a> Planner<'a> {
             }
         }
 
-        let mut groups = Vec::new();
-        let mut aggs: Vec<(AggFn, Expr, String)> = Vec::new();
+        // Partition the projection items: plain expressions become grouping
+        // keys, plain aggregation calls become aggregations, and expressions
+        // containing aggregations are evaluated after aggregation over
+        // references to the grouping keys and aggregations.
+        let mut groups: Vec<(Expr, String)> = Vec::new();
+        let mut aggs: Vec<AggItem> = Vec::new();
+        let mut post: Vec<(Expr, String)> = Vec::new();
         for (expr, name) in &expanded {
-            if let Some((func, argument, star)) = aggregate_call(expr)? {
-                if star {
-                    aggs.push((func, Expr::Literal(Value::Int(1)), name.clone()));
-                } else {
-                    let argument = argument
-                        .ok_or_else(|| Error::syntax(format!("{func:?} requires an argument")))?;
-                    validate_expr(argument, scope)?;
-                    aggs.push((func, argument.clone(), name.clone()));
-                }
+            if let Some((func, argument, star, distinct)) = aggregate_call(expr)? {
+                aggs.push(AggItem {
+                    func,
+                    argument: aggregate_argument(func, argument, star, scope)?,
+                    distinct,
+                    name: name.clone(),
+                });
             } else if contains_aggregation(expr) {
-                return Err(Error::unsupported(
-                    "expressions mixing aggregation and non-aggregated values are not supported yet",
-                ));
+                let mut residual = rewrite_expr(expr, &mut |sub| {
+                    let Some((func, argument, star, distinct)) = aggregate_call(sub)? else {
+                        return Ok(None);
+                    };
+                    let hidden = format!("  agg{}", aggs.len());
+                    aggs.push(AggItem {
+                        func,
+                        argument: aggregate_argument(func, argument, star, scope)?,
+                        distinct,
+                        name: hidden.clone(),
+                    });
+                    Ok(Some(Expr::Variable(hidden)))
+                })?;
+                residual = rewrite_expr(&residual, &mut |sub| {
+                    if let Some((_, group)) = groups.iter().find(|(group, _)| group == sub) {
+                        return Ok(Some(Expr::Variable(group.clone())));
+                    }
+                    if references_unresolved(sub, &groups, &aggs)
+                        && !references_aggregation(sub, &aggs)
+                    {
+                        let hidden = format!("  grp{}", groups.len());
+                        validate_expr(sub, scope)?;
+                        groups.push((sub.clone(), hidden.clone()));
+                        return Ok(Some(Expr::Variable(hidden)));
+                    }
+                    Ok(None)
+                })?;
+                post.push((residual, name.clone()));
             } else {
                 groups.push((expr.clone(), name.clone()));
+            }
+        }
+        // Post-aggregation expressions may only reference grouping keys,
+        // aggregations and constants.
+        if !post.is_empty() {
+            let mut post_scope: FastMap<String, VarKind> = FastMap::new();
+            for (_, group) in &groups {
+                post_scope.insert(group.clone(), VarKind::Value);
+            }
+            for item in &aggs {
+                post_scope.insert(item.name.clone(), VarKind::Value);
+            }
+            for (residual, _) in &post {
+                validate_expr(residual, &post_scope)?;
             }
         }
 
@@ -987,26 +1029,43 @@ impl<'a> Planner<'a> {
             for (_, name) in &groups {
                 new_scope.insert(name.clone(), VarKind::Value);
             }
-            for (_, _, name) in &aggs {
-                new_scope.insert(name.clone(), VarKind::Value);
+            for item in &aggs {
+                new_scope.insert(item.name.clone(), VarKind::Value);
             }
-            // The aggregate window holds groups before aggregations; reorder
-            // it to the written item order so values line up with columns.
+            // The aggregate window holds groups before aggregations; project
+            // the items in written order when that differs or when a
+            // post-aggregation expression has to be evaluated.
             let window_names: Vec<&str> = groups
                 .iter()
                 .map(|(_, name)| name.as_str())
-                .chain(aggs.iter().map(|(_, _, name)| name.as_str()))
+                .chain(aggs.iter().map(|item| item.name.as_str()))
                 .collect();
             let item_names: Vec<&str> = expanded.iter().map(|(_, name)| name.as_str()).collect();
-            if window_names != item_names {
-                let visible: Vec<(Expr, String)> = expanded
+            if window_names != item_names || !post.is_empty() {
+                let items: Vec<(Expr, String)> = expanded
                     .iter()
-                    .map(|(_, name)| (Expr::Variable(name.clone()), name.clone()))
+                    .map(|(expr, name)| {
+                        let rewritten = if let Some((residual, _)) =
+                            post.iter().find(|(_, item_name)| item_name == name)
+                        {
+                            residual.clone()
+                        } else if groups.iter().any(|(_, group)| group == name)
+                            || aggs.iter().any(|item| &item.name == name)
+                        {
+                            Expr::Variable(name.clone())
+                        } else {
+                            expr.clone()
+                        };
+                        (rewritten, name.clone())
+                    })
                     .collect();
                 plan = Plan::Project {
                     input: Box::new(plan),
-                    items: visible,
+                    items,
                 };
+            }
+            for (_, name) in &post {
+                new_scope.insert(name.clone(), VarKind::Value);
             }
         }
 
@@ -1322,7 +1381,8 @@ fn binary_text(op: BinaryOp) -> &'static str {
 
 /// Whether an expression is exactly an aggregation call, returning the
 /// function, optional argument and star flag.
-fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool)>> {
+#[allow(clippy::type_complexity)]
+fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool, bool)>> {
     let Expr::Function {
         name,
         distinct,
@@ -1341,22 +1401,172 @@ fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool)>> {
         "collect" => AggFn::Collect,
         _ => return Ok(None),
     };
-    if *distinct {
-        return Err(Error::unsupported(
-            "DISTINCT inside aggregations is not supported yet",
-        ));
-    }
     if *star {
         if func != AggFn::Count {
             return Err(Error::syntax("only count(*) accepts *"));
         }
-        return Ok(Some((func, None, true)));
+        if *distinct {
+            return Err(Error::syntax("count(DISTINCT *) is not valid"));
+        }
+        return Ok(Some((func, None, true, false)));
     }
     match args.len() {
-        1 => Ok(Some((func, Some(&args[0]), false))),
+        1 => Ok(Some((func, Some(&args[0]), false, *distinct))),
         0 => Err(Error::syntax(format!("{name} requires an argument"))),
         _ => Err(Error::unsupported("aggregations with multiple arguments")),
     }
+}
+
+/// The argument of an aggregation, with `count(*)` becoming `count(1)`.
+fn aggregate_argument(
+    func: AggFn,
+    argument: Option<&Expr>,
+    star: bool,
+    scope: &FastMap<String, VarKind>,
+) -> Result<Expr> {
+    if star {
+        return Ok(Expr::Literal(Value::Int(1)));
+    }
+    let argument =
+        argument.ok_or_else(|| Error::syntax(format!("{func:?} requires an argument")))?;
+    validate_expr(argument, scope)?;
+    Ok(argument.clone())
+}
+
+/// Rewrite an expression top-down; `f` may replace a subexpression and stop
+/// the descent by returning `Some`.
+fn rewrite_expr(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>) -> Result<Expr> {
+    if let Some(replacement) = f(expr)? {
+        return Ok(replacement);
+    }
+    Ok(match expr {
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => expr.clone(),
+        Expr::Property { base, key } => Expr::Property {
+            base: Box::new(rewrite_expr(base, f)?),
+            key: key.clone(),
+        },
+        Expr::Subscript { base, index } => Expr::Subscript {
+            base: Box::new(rewrite_expr(base, f)?),
+            index: Box::new(rewrite_expr(index, f)?),
+        },
+        Expr::Unary { op, expr: inner } => Expr::Unary {
+            op: *op,
+            expr: Box::new(rewrite_expr(inner, f)?),
+        },
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(rewrite_expr(left, f)?),
+            right: Box::new(rewrite_expr(right, f)?),
+        },
+        Expr::Function {
+            name,
+            distinct,
+            star,
+            args,
+        } => Expr::Function {
+            name: name.clone(),
+            distinct: *distinct,
+            star: *star,
+            args: args
+                .iter()
+                .map(|arg| rewrite_expr(arg, f))
+                .collect::<Result<_>>()?,
+        },
+        Expr::List(items) => Expr::List(
+            items
+                .iter()
+                .map(|item| rewrite_expr(item, f))
+                .collect::<Result<_>>()?,
+        ),
+        Expr::Map(entries) => Expr::Map(
+            entries
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), rewrite_expr(value, f)?)))
+                .collect::<Result<_>>()?,
+        ),
+        Expr::Case {
+            subject,
+            alternatives,
+            default,
+        } => Expr::Case {
+            subject: subject
+                .as_ref()
+                .map(|subject| rewrite_expr(subject, f).map(Box::new))
+                .transpose()?,
+            alternatives: alternatives
+                .iter()
+                .map(|(when, then)| Ok((rewrite_expr(when, f)?, rewrite_expr(then, f)?)))
+                .collect::<Result<_>>()?,
+            default: default
+                .as_ref()
+                .map(|default| rewrite_expr(default, f).map(Box::new))
+                .transpose()?,
+        },
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => Expr::IsNull {
+            expr: Box::new(rewrite_expr(inner, f)?),
+            negated: *negated,
+        },
+        Expr::LabelCheck {
+            expr: inner,
+            labels,
+        } => Expr::LabelCheck {
+            expr: Box::new(rewrite_expr(inner, f)?),
+            labels: labels.clone(),
+        },
+    })
+}
+
+/// Whether any variable reference in `expr` satisfies `pred`.
+fn expr_references(expr: &Expr, pred: &mut dyn FnMut(&str) -> bool) -> bool {
+    match expr {
+        Expr::Variable(name) => pred(name),
+        Expr::Literal(_) | Expr::Parameter(_) => false,
+        Expr::Property { base, .. } => expr_references(base, pred),
+        Expr::Subscript { base, index } => {
+            expr_references(base, pred) || expr_references(index, pred)
+        }
+        Expr::Unary { expr, .. } => expr_references(expr, pred),
+        Expr::Binary { left, right, .. } => {
+            expr_references(left, pred) || expr_references(right, pred)
+        }
+        Expr::Function { args, .. } => args.iter().any(|arg| expr_references(arg, pred)),
+        Expr::List(items) => items.iter().any(|item| expr_references(item, pred)),
+        Expr::Map(entries) => entries
+            .iter()
+            .any(|(_, value)| expr_references(value, pred)),
+        Expr::Case {
+            subject,
+            alternatives,
+            default,
+        } => {
+            subject
+                .as_deref()
+                .is_some_and(|subject| expr_references(subject, pred))
+                || alternatives
+                    .iter()
+                    .any(|(when, then)| expr_references(when, pred) || expr_references(then, pred))
+                || default
+                    .as_deref()
+                    .is_some_and(|default| expr_references(default, pred))
+        }
+        Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => expr_references(expr, pred),
+    }
+}
+
+/// Whether `expr` references a variable that is not a grouping key or an
+/// aggregation output.
+fn references_unresolved(expr: &Expr, groups: &[(Expr, String)], aggs: &[AggItem]) -> bool {
+    expr_references(expr, &mut |name| {
+        !groups.iter().any(|(_, group)| group == name) && !aggs.iter().any(|item| item.name == name)
+    })
+}
+
+/// Whether `expr` references an aggregation output.
+fn references_aggregation(expr: &Expr, aggs: &[AggItem]) -> bool {
+    expr_references(expr, &mut |name| aggs.iter().any(|item| item.name == name))
 }
 
 fn contains_aggregation(expr: &Expr) -> bool {

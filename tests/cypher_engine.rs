@@ -629,3 +629,47 @@ fn set_append_merges_relationship_properties() {
     );
     assert_eq!(rows, vec![vec!["2", "3"]]);
 }
+
+// ---- aggregation completeness ----
+
+#[test]
+fn distinct_inside_aggregations() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "UNWIND [1, 1, 2, null] AS x RETURN count(DISTINCT x) AS c, collect(DISTINCT x) AS l",
+    );
+    assert_eq!(rows, vec![vec!["2", "[1, 2]"]]);
+}
+
+#[test]
+fn post_aggregation_expressions() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A), (:X), (:X)").expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH (a:A), (b:X) RETURN count(a) * 10 + count(b) * 5 AS x",
+    );
+    assert_eq!(rows, vec![vec!["30"]]);
+}
+
+#[test]
+fn post_aggregation_with_grouping_keys() {
+    let mut conn = connection();
+    conn.execute("CREATE ({id: 42})").expect("create");
+    let rows = query(&mut conn, "MATCH (a) RETURN a, count(a) + 3");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1], "4");
+}
+
+#[test]
+fn aggregation_inside_map_projection() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A)-[:T]->(:B), (:A)-[:T]->(:B2)")
+        .expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH (a:A)-[:T]->(b) RETURN {name: count(b)} AS m",
+    );
+    assert_eq!(rows, vec![vec!["{name: 2}"]]);
+}
