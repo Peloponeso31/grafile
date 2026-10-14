@@ -527,3 +527,67 @@ fn default_column_names_render_the_expression() {
     assert_eq!(columns, vec!["n.name", "count(*)"]);
     assert_eq!(rows_to_strings(&mut rows).len(), 3);
 }
+
+// ---- UNION ----
+
+#[test]
+fn union_deduplicates_rows() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN 1 AS x UNION RETURN 2 AS x UNION RETURN 1 AS x",
+    );
+    assert_eq!(rows, vec![vec!["1"], vec!["2"]]);
+}
+
+#[test]
+fn union_all_keeps_duplicates() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "UNWIND [2, 1, 2] AS x RETURN x UNION ALL UNWIND [2, 3] AS x RETURN x",
+    );
+    assert_eq!(rows.len(), 5);
+}
+
+#[test]
+fn union_over_matches() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A), (:B)").expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH (a:A) RETURN a AS a UNION MATCH (b:B) RETURN b AS a",
+    );
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn union_uses_first_part_column_names() {
+    let mut conn = connection();
+    let mut rows = conn
+        .query("RETURN 1 AS x UNION RETURN 2 AS x", &Params::new())
+        .expect("query");
+    assert_eq!(rows.columns(), &["x".to_owned()]);
+    assert_eq!(rows_to_strings(&mut rows).len(), 2);
+}
+
+#[test]
+fn union_rejects_different_columns() {
+    let mut conn = connection();
+    let err = conn
+        .query("RETURN 1 AS a UNION RETURN 2 AS b", &Params::new())
+        .expect_err("different columns");
+    assert_eq!(err.code(), grafile::ErrorCode::Syntax);
+}
+
+#[test]
+fn union_rejects_mixed_kinds() {
+    let mut conn = connection();
+    let err = conn
+        .query(
+            "RETURN 1 AS a UNION RETURN 2 AS a UNION ALL RETURN 3 AS a",
+            &Params::new(),
+        )
+        .expect_err("mixed kinds");
+    assert_eq!(err.code(), grafile::ErrorCode::Syntax);
+}

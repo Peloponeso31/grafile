@@ -277,6 +277,14 @@ impl<'a> Codegen<'a> {
                 cg.patch(next, end)?;
                 Ok(())
             }),
+            Plan::Union { parts, all: _ } => {
+                // Each part produces the same output columns; concatenating
+                // their rows is just compiling them in sequence.
+                for part in parts {
+                    self.compile(part, ctx, out)?;
+                }
+                Ok(())
+            }
             Plan::Filter { input, predicate } => self.compile(input, ctx, &mut |cg, ctx| {
                 let condition = cg.compile_expr(predicate, ctx)?;
                 let jump = cg.emit(Op::IfNot {

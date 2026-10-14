@@ -322,9 +322,19 @@ pub enum Clause {
     },
 }
 
-/// A parsed query: a pipeline of clauses.
+/// A parsed query: one or more union parts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
+    /// Query parts; more than one means `UNION` / `UNION ALL`.
+    pub parts: Vec<QueryPart>,
+}
+
+/// One part of a query, a pipeline of clauses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryPart {
+    /// Whether this part is joined to the previous one with `UNION ALL`
+    /// (meaningless for the first part).
+    pub union_all: bool,
     /// Clauses in order.
     pub clauses: Vec<Clause>,
 }

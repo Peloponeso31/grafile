@@ -78,23 +78,46 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_query(&mut self) -> Result<Query> {
-        let mut clauses = Vec::new();
-        while self.peek().is_some() && self.peek() != Some(Token::Semicolon) {
-            if self.peek() == Some(Token::Union) {
-                return self.fail("UNION is not supported yet");
+        let mut parts = vec![QueryPart {
+            union_all: false,
+            clauses: self.parse_clauses()?,
+        }];
+        let mut union_all = None;
+        while self.eat(Token::Union) {
+            let all = self.eat(Token::All);
+            match union_all {
+                None => union_all = Some(all),
+                Some(previous) if previous != all => {
+                    return self.fail("UNION and UNION ALL cannot be mixed");
+                }
+                Some(_) => {}
             }
-            let clause = self.parse_clause()?;
-            clauses.push(clause);
+            parts.push(QueryPart {
+                union_all: all,
+                clauses: self.parse_clauses()?,
+            });
         }
         // Optional trailing semicolon.
         self.eat(Token::Semicolon);
         if self.peek().is_some() {
             return self.fail("unexpected input after end of query");
         }
+        Ok(Query { parts })
+    }
+
+    /// Parse the clauses of one query part, up to `UNION` or the end.
+    fn parse_clauses(&mut self) -> Result<Vec<Clause>> {
+        let mut clauses = Vec::new();
+        while self.peek().is_some()
+            && self.peek() != Some(Token::Semicolon)
+            && self.peek() != Some(Token::Union)
+        {
+            clauses.push(self.parse_clause()?);
+        }
         if clauses.is_empty() {
             return self.fail("empty query");
         }
-        Ok(Query { clauses })
+        Ok(clauses)
     }
 
     fn parse_clause(&mut self) -> Result<Clause> {
@@ -853,16 +876,44 @@ mod tests {
 
     fn expr_of(query: &str) -> Expr {
         let parsed = parse(query).expect("parse");
-        match &parsed.clauses[0] {
+        match &parsed.parts[0].clauses[0] {
             Clause::Return { items, .. } => items[0].expr.clone(),
             other => panic!("unexpected clause {other:?}"),
         }
     }
 
     #[test]
+    fn parses_union_parts() {
+        let query =
+            parse("RETURN 1 AS x UNION ALL RETURN 2 AS x UNION ALL RETURN 3 AS x").expect("parse");
+        assert_eq!(query.parts.len(), 3);
+        assert!(!query.parts[0].union_all);
+        assert!(query.parts[1].union_all);
+        assert!(query.parts[2].union_all);
+        assert_eq!(query.parts[0].clauses.len(), 1);
+
+        let distinct = parse("RETURN 1 AS x UNION RETURN 2 AS x").expect("parse");
+        assert_eq!(distinct.parts.len(), 2);
+        assert!(!distinct.parts[1].union_all);
+    }
+
+    #[test]
+    fn rejects_mixed_union_kinds() {
+        assert!(parse("RETURN 1 AS x UNION RETURN 2 AS x UNION RETURN 3 AS x").is_ok());
+        assert!(parse("RETURN 1 AS x UNION RETURN 2 AS x UNION ALL RETURN 3 AS x").is_err());
+        assert!(parse("RETURN 1 AS x UNION ALL RETURN 2 AS x UNION RETURN 3 AS x").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_union_part() {
+        assert!(parse("RETURN 1 AS x UNION").is_err());
+        assert!(parse("UNION RETURN 1 AS x").is_err());
+    }
+
+    #[test]
     fn parses_optional_match() {
         let query = parse("OPTIONAL MATCH (n)-[:T]->(m) WHERE m.x = 1 RETURN n").expect("parse");
-        let Clause::Match(matched) = &query.clauses[0] else {
+        let Clause::Match(matched) = &query.parts[0].clauses[0] else {
             panic!("expected MATCH");
         };
         assert!(matched.optional);
@@ -872,7 +923,7 @@ mod tests {
     #[test]
     fn parses_remove_without_equals() {
         let query = parse("MATCH (n) REMOVE n.name, n:Label RETURN n").expect("parse");
-        let Clause::Remove(items) = &query.clauses[1] else {
+        let Clause::Remove(items) = &query.parts[0].clauses[1] else {
             panic!("expected REMOVE");
         };
         assert_eq!(items.len(), 2);
@@ -888,8 +939,8 @@ mod tests {
     fn parses_simple_match_return() {
         let query = parse("MATCH (n:Person {name: 'alice'})-[r:KNOWS]->(m) WHERE n.age > 30 RETURN n, m.name AS friend LIMIT 10")
             .expect("parse");
-        assert_eq!(query.clauses.len(), 2);
-        let Clause::Match(matched) = &query.clauses[0] else {
+        assert_eq!(query.parts[0].clauses.len(), 2);
+        let Clause::Match(matched) = &query.parts[0].clauses[0] else {
             panic!("expected MATCH");
         };
         assert_eq!(matched.patterns.len(), 1);
@@ -970,7 +1021,7 @@ mod tests {
     #[test]
     fn unwind_with_parameters() {
         let query = parse("UNWIND $names AS name RETURN name").expect("parse");
-        let Clause::Unwind { expr, alias } = &query.clauses[0] else {
+        let Clause::Unwind { expr, alias } = &query.parts[0].clauses[0] else {
             panic!("expected UNWIND");
         };
         assert_eq!(expr, &Expr::Parameter("names".to_owned()));
@@ -982,7 +1033,7 @@ mod tests {
         let query =
             parse("CREATE (a:Person {name: 'a'})-[:KNOWS]->(b:Person {name: 'b'}) RETURN a")
                 .expect("parse");
-        assert!(matches!(query.clauses[0], Clause::Create(_)));
+        assert!(matches!(query.parts[0].clauses[0], Clause::Create(_)));
 
         let query =
             parse("MERGE (n:Person {name: 'a'}) ON CREATE SET n.age = 1 ON MATCH SET n.age = 2")
@@ -991,7 +1042,7 @@ mod tests {
             on_create,
             on_match,
             ..
-        } = &query.clauses[0]
+        } = &query.parts[0].clauses[0]
         else {
             panic!("expected MERGE");
         };
@@ -999,7 +1050,7 @@ mod tests {
         assert_eq!(on_match.len(), 1);
 
         let query = parse("MATCH (n) SET n.age = 1, n:Label RETURN n").expect("parse");
-        let Clause::Set(items) = &query.clauses[1] else {
+        let Clause::Set(items) = &query.parts[0].clauses[1] else {
             panic!("expected SET");
         };
         assert_eq!(items.len(), 2);
@@ -1008,11 +1059,11 @@ mod tests {
     #[test]
     fn detach_delete_and_with_where() {
         let query = parse("MATCH (n) WITH n WHERE n.age > 1 DETACH DELETE n").expect("parse");
-        let Clause::With { where_clause, .. } = &query.clauses[1] else {
+        let Clause::With { where_clause, .. } = &query.parts[0].clauses[1] else {
             panic!("expected WITH");
         };
         assert!(where_clause.is_some());
-        let Clause::Delete { detach, .. } = &query.clauses[2] else {
+        let Clause::Delete { detach, .. } = &query.parts[0].clauses[2] else {
             panic!("expected DELETE");
         };
         assert!(detach);
@@ -1021,7 +1072,7 @@ mod tests {
     #[test]
     fn relationship_directions_and_var_length() {
         let query = parse("MATCH (a)<-[r:KNOWS*1..3]-(b) RETURN r").expect("parse");
-        let Clause::Match(matched) = &query.clauses[0] else {
+        let Clause::Match(matched) = &query.parts[0].clauses[0] else {
             panic!("expected MATCH");
         };
         let rel = &matched.patterns[0].segments[0].relationship;

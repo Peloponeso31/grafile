@@ -96,6 +96,13 @@ pub enum Plan {
         /// Predicate expression.
         predicate: Expr,
     },
+    /// Concatenate the rows of several query parts (`UNION` / `UNION ALL`).
+    Union {
+        /// Query parts, each producing the same output columns.
+        parts: Vec<Plan>,
+        /// Whether this is `UNION ALL` (keep duplicates).
+        all: bool,
+    },
     /// Match a pattern per input row, keeping the row with null bindings when
     /// the pattern does not match.
     OptionalMatch {
@@ -292,6 +299,15 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
         Plan::Filter { input, .. } => {
             out.push_str(&format!("{pad}Filter\n"));
             explain(input, indent + 1, out);
+        }
+        Plan::Union { parts, all } => {
+            out.push_str(&format!(
+                "{pad}Union {}\n",
+                if *all { "all" } else { "distinct" }
+            ));
+            for part in parts {
+                explain(part, indent + 1, out);
+            }
         }
         Plan::OptionalMatch { input, inner, vars } => {
             out.push_str(&format!("{pad}OptionalMatch {}\n", vars.join(", ")));

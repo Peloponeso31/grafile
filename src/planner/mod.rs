@@ -66,11 +66,51 @@ pub fn plan_query(
 
 impl<'a> Planner<'a> {
     fn run(&mut self, query: &Query) -> Result<Prepared> {
+        let mut plans = Vec::with_capacity(query.parts.len());
+        let mut columns: Option<Vec<String>> = None;
+        let mut mutating = false;
+        for part in &query.parts {
+            let (plan, part_columns, part_mutating) = self.plan_part(&part.clauses)?;
+            match &columns {
+                Some(first) if *first != part_columns => {
+                    return Err(Error::syntax(
+                        "all subqueries in a UNION must have the same column names",
+                    ));
+                }
+                Some(_) => {}
+                None => columns = Some(part_columns),
+            }
+            mutating |= part_mutating;
+            plans.push(plan);
+        }
+        let columns = columns.unwrap_or_default();
+        let plan = if plans.len() == 1 {
+            plans.pop().expect("single query part")
+        } else {
+            let all = query.parts[1].union_all;
+            let union = Plan::Union { parts: plans, all };
+            if all {
+                union
+            } else {
+                Plan::Distinct {
+                    input: Box::new(union),
+                }
+            }
+        };
+        Ok(Prepared {
+            plan,
+            columns,
+            mutating,
+        })
+    }
+
+    /// Plan one query part (a pipeline of clauses) on its own scope.
+    fn plan_part(&mut self, clauses: &[Clause]) -> Result<(Plan, Vec<String>, bool)> {
         let mut plan = Plan::Empty;
         let mut scope: FastMap<String, VarKind> = FastMap::new();
         let mut columns = Vec::new();
         let mut mutating = false;
-        for clause in &query.clauses {
+        for clause in clauses {
             match clause {
                 Clause::Match(matched) => {
                     self.plan_match(matched, &mut plan, &mut scope)?;
@@ -197,11 +237,7 @@ impl<'a> Planner<'a> {
                 }
             }
         }
-        Ok(Prepared {
-            plan,
-            columns,
-            mutating,
-        })
+        Ok((plan, columns, mutating))
     }
 
     // ---- MATCH ----
@@ -1355,8 +1391,10 @@ fn contains_aggregation(expr: &Expr) -> bool {
 
 fn substitute_query(query: &Query, params: &HashMap<String, Value>) -> Result<Query> {
     let mut out = query.clone();
-    for clause in &mut out.clauses {
-        substitute_clause(clause, params)?;
+    for part in &mut out.parts {
+        for clause in &mut part.clauses {
+            substitute_clause(clause, params)?;
+        }
     }
     Ok(out)
 }
