@@ -96,6 +96,16 @@ pub enum Plan {
         /// Predicate expression.
         predicate: Expr,
     },
+    /// Match a pattern per input row, keeping the row with null bindings when
+    /// the pattern does not match.
+    OptionalMatch {
+        /// Input plan.
+        input: Box<Plan>,
+        /// Pattern plan, rooted at `Empty`, referencing input variables.
+        inner: Box<Plan>,
+        /// Variables the pattern introduces; null-filled when it misses.
+        vars: Vec<String>,
+    },
     /// Compute output columns.
     Project {
         /// Input plan.
@@ -281,6 +291,11 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
         }
         Plan::Filter { input, .. } => {
             out.push_str(&format!("{pad}Filter\n"));
+            explain(input, indent + 1, out);
+        }
+        Plan::OptionalMatch { input, inner, vars } => {
+            out.push_str(&format!("{pad}OptionalMatch {}\n", vars.join(", ")));
+            explain(inner, indent + 1, out);
             explain(input, indent + 1, out);
         }
         Plan::Project { input, items } => {
