@@ -131,19 +131,15 @@
         "reason": "not-implemented",
         "note": "setup failed: Unsupported: function `range` is not supported yet"
       },
-      "[3] Delete relationship with bidirectional matching": {
-        "reason": "not-implemented",
-        "note": "expected no rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident); expected -relationships 1, got 0; expected -properties 1, got 0"
-      },
       "[5] Failing when deleting a relationship type": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got TypeError at runtime"
       }
     },
     "clauses/delete/Delete3.feature": {
-      "*": {
+      "[1] Detach deleting paths": {
         "reason": "not-implemented",
-        "note": "expected no rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident); expected -4 nodes, got +0; expected -3 relationships, got +0; e..."
+        "note": "expected no rows, got a runtime error: runtime: Type: DELETE expects a node or relationship, got list; expected -nodes 4, got 0; expected -relationships 3, got 0; expected -labels 1, got 0"
       }
     },
     "clauses/delete/Delete4.feature": {
@@ -175,13 +171,9 @@
       }
     },
     "clauses/match-where/MatchWhere1.feature": {
-      "[12] Filter path with path length predicate on multi variables with one binding": {
+      "[14] Fail when filtering path with property predicate": {
         "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[13] Filter path with false path length predicate on multi variables with one binding": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
+        "note": "expected SyntaxError at compile time, got TypeError at runtime"
       },
       "[15] Fail on aggregation in WHERE": {
         "reason": "not-implemented",
@@ -237,121 +229,13 @@
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 1 rows"
       },
-      "[7] Fail when a relationship has the same variable in a preceding MATCH (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      },
-      "[7] Fail when a relationship has the same variable in a preceding MATCH (example 10)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 51584 rows"
-      },
-      "[7] Fail when a relationship has the same variable in a preceding MATCH (example 11)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 6656 rows"
-      },
-      "[7] Fail when a relationship has the same variable in a preceding MATCH (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 16 rows"
-      },
-      "[7] Fail when a relationship has the same variable in a preceding MATCH (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 16 rows"
-      },
-      "[7] Fail when a relationship has the same variable in a preceding MATCH (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 416 rows"
-      },
-      "[7] Fail when a relationship has the same variable in a preceding MATCH (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 416 rows"
-      },
-      "[7] Fail when a relationship has the same variable in a preceding MATCH (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1024 rows"
-      },
-      "[7] Fail when a relationship has the same variable in a preceding MATCH (example 7)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 124 rows"
-      },
-      "[7] Fail when a relationship has the same variable in a preceding MATCH (example 8)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 3968 rows"
-      },
-      "[7] Fail when a relationship has the same variable in a preceding MATCH (example 9)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 51584 rows"
-      },
       "[9] Fail when a relationship has the same variable in the same pattern (example 1)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 32 rows"
       },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 10)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 11)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 12)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 13)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 416 rows"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 14)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 416 rows"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 15)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 416 rows"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 16)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1024 rows"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 17)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 18)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 3968 rows"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 19)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 3968 rows"
-      },
       "[9] Fail when a relationship has the same variable in the same pattern (example 2)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 16 rows"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 20)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 21)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 22)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 23)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 24)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 25)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 5408 rows"
       },
       "[9] Fail when a relationship has the same variable in the same pattern (example 3)": {
         "reason": "not-implemented",
@@ -364,97 +248,9 @@
       "[9] Fail when a relationship has the same variable in the same pattern (example 5)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 7)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 16 rows"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 8)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 16 rows"
-      },
-      "[9] Fail when a relationship has the same variable in the same pattern (example 9)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
       }
     },
     "clauses/match/Match2.feature": {
-      "[10] Fail when a path has the same variable in a preceding MATCH (example 16)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 605696 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 10)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 11)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 416 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 12)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1024 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 13)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1024 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 14)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 124 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 15)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 124 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 16)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 13312 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 17)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 6656 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 16 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 16 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 16 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 16 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 7)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 124 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 8)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 124 rows"
-      },
-      "[11] Fail when a node has the same variable in the same pattern (example 9)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
       "[13] Fail when matching a relationship variable bound to a value (example 1)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 32 rows"
@@ -490,110 +286,6 @@
       "[5] Match relationship with inline property value": {
         "reason": "not-implemented",
         "note": "rows differ: expected (:A), got ()"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 416 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 10)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 512 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 11)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 3968 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 12)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 3968 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 13)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 14)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 15)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 13312 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 16)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32768 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 17)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32768 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 18)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32768 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 19)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32768 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1024 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 20)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 3968 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 21)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 3968 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 22)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 3968 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 23)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 3968 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 24)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 425984 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 25)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 212992 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 26)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 212992 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 512 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 512 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1024 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 512 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 7)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 512 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 8)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1024 rows"
-      },
-      "[9] Fail when a node has the same variable in a preceding MATCH (example 9)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 512 rows"
       }
     },
     "clauses/match/Match3.feature": {
@@ -612,10 +304,6 @@
       "[19] Two bound nodes pointing to the same node": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: invalid relationship direction at line 3 column 20 (found LParen)"
-      },
-      "[29] Fail when re-using a relationship in the same pattern": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 24 rows"
       },
       "[30] Fail when using a list or nodes as a node": {
         "reason": "not-implemented",
@@ -707,10 +395,6 @@
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       },
-      "[4] Respecting direction when matching non-existent path": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
       "[5] Path query should return results in written order": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
@@ -733,25 +417,9 @@
       }
     },
     "clauses/match/Match7.feature": {
-      "[16] Optionally matching named paths - null result": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 3 column 16 (found Ident)"
-      },
       "[17] Optionally matching named paths - existing result": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 4 column 16 (found Ident)"
-      },
-      "[18] Named paths inside optional matches with node predicates": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 3 column 16 (found Ident)"
-      },
-      "[19] Optionally matching named paths with single and variable length patterns": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 3 column 16 (found Ident)"
-      },
-      "[20] Variable length optional relationships with bound nodes, no matches": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 3 column 16 (found Ident)"
       }
     },
     "clauses/match/Match8.feature": {
@@ -1023,10 +691,6 @@
         "reason": "not-implemented",
         "note": "setup failed: Unsupported: function `range` is not supported yet"
       },
-      "[13] Returning the minimum length of paths": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
       "[14] Aggregates in aggregates": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
@@ -1062,10 +726,6 @@
       "[6] Handle aggregates inside non-aggregate expressions": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      },
-      "[8] Handle aggregation on functions": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       }
     },
     "clauses/return/Return7.feature": {
@@ -1613,10 +1273,6 @@
       }
     },
     "clauses/with/With6.feature": {
-      "[4] Implicit grouping with single path variable as grouping key and single aggregation": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
       "[8] Fail if not projected variables are used inside an expression which contains an aggregation expression": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
@@ -2127,10 +1783,6 @@
       }
     },
     "expressions/comparison/Comparison1.feature": {
-      "[14] Direction of traversed relationship is not significant for path equality, simple": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
       "[6] Comparing lists to lists (example 3)": {
         "reason": "not-implemented",
         "note": "rows differ: expected false, got null"
@@ -2297,6 +1949,10 @@
       }
     },
     "expressions/graph/Graph3.feature": {
+      "[8] `labels()` failing on a path": {
+        "reason": "not-implemented",
+        "note": "expected SyntaxError at compile time, but the query returned 2 rows"
+      },
       "[9] `labels()` failing on invalid arguments": {
         "reason": "not-implemented",
         "note": "expected TypeError at runtime, but the query returned 2 rows"
@@ -2513,6 +2169,10 @@
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 3 column 19 (found Colon)"
       },
+      "[5] Fail for `size()` on paths": {
+        "reason": "not-implemented",
+        "note": "expected SyntaxError at compile time, but the query returned 116 rows"
+      },
       "[7] Using size of pattern comprehension to test existence": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 3 column 23 (found RParen)"
@@ -2710,22 +2370,20 @@
         "note": "expected column `12 / 4 * (3 - 2 * 4)`, got `12 / 4 * 3 - 2 * 4`"
       }
     },
-    "expressions/path/Path1.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 3 column 16 (found Ident)"
-      }
-    },
     "expressions/path/Path2.feature": {
-      "*": {
+      "[2] Return relationships by fetching them from the path - starting from the end": {
         "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
+        "note": "setup failed: Syntax: expected an identifier at line 2 column 57 (found End)"
       }
     },
     "expressions/path/Path3.feature": {
-      "*": {
+      "[2] Failing when using `length()` on a node": {
         "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
+        "note": "expected SyntaxError at compile time, but the query returned 13 rows"
+      },
+      "[3] Failing when using `length()` on a relationship": {
+        "reason": "not-implemented",
+        "note": "expected SyntaxError at compile time, but the query returned 16 rows"
       }
     },
     "expressions/pattern/Pattern1.feature": {
