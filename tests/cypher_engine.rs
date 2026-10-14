@@ -847,3 +847,66 @@ fn optional_variable_length_from_null_is_null() {
     let rows = query(&mut conn, "OPTIONAL MATCH (a:Missing)-[*]->(x) RETURN x");
     assert_eq!(rows, vec![vec!["null"]]);
 }
+
+// ---- named paths ----
+
+#[test]
+fn named_paths_bind_alternating_values() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A {name: 'A'})-[:KNOWS]->(:B {name: 'B'})")
+        .expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH p = (a {name: 'A'})-[:KNOWS]->(b) RETURN length(p) AS l, size(nodes(p)) AS n, size(relationships(p)) AS r, p IS NULL AS nil",
+    );
+    assert_eq!(rows, vec![vec!["1", "2", "1", "false"]]);
+}
+
+#[test]
+fn named_paths_with_variable_length_splice_edges() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A)-[:T]->(:B)-[:T]->(:C)")
+        .expect("create");
+    let rows = query(&mut conn, "MATCH p = (a:A)-[*2]->(c) RETURN length(p) AS l");
+    assert_eq!(rows, vec![vec!["2"]]);
+    let rows = query(
+        &mut conn,
+        "MATCH p = (a:A)-[*0..1]->(x) RETURN length(p) AS l",
+    );
+    assert_eq!(rows.len(), 2);
+}
+
+#[test]
+fn optional_named_path_miss_is_null() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "OPTIONAL MATCH p = (a:Missing)-[:T]->(b) RETURN p IS NULL AS missing",
+    );
+    assert_eq!(rows, vec![vec!["true"]]);
+}
+
+#[test]
+fn rebinding_a_path_variable_is_rejected() {
+    let mut conn = connection();
+    let err = conn
+        .query("MATCH p = ()-->() MATCH (p) RETURN p", &Params::new())
+        .expect_err("path variable rebound");
+    assert_eq!(err.code(), grafile::ErrorCode::Syntax);
+}
+
+#[test]
+fn rebinding_a_relationship_in_the_same_section_is_rejected() {
+    let mut conn = connection();
+    let err = conn
+        .query("MATCH ()-[r]->() MATCH ()-[r]->() RETURN r", &Params::new())
+        .expect_err("relationship rebound");
+    assert_eq!(err.code(), grafile::ErrorCode::Syntax);
+    // Through WITH it constrains the pattern instead.
+    conn.execute("CREATE (:A)-[:T]->(:B)").expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH ()-[r]->() WITH r LIMIT 1 MATCH (a)-[r]->(b) RETURN a IS NOT NULL AS ok",
+    );
+    assert_eq!(rows, vec![vec!["true"]]);
+}

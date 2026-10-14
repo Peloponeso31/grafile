@@ -350,6 +350,25 @@ impl<'a> Codegen<'a> {
                 cg.patch(jump, end)?;
                 Ok(())
             }),
+            Plan::BindPath {
+                input,
+                var,
+                elements,
+            } => self.compile(input, ctx, &mut |cg, ctx| {
+                let mut regs = Vec::with_capacity(elements.len());
+                for (name, splice) in elements {
+                    let reg = *ctx.vars.get(name).ok_or_else(|| undefined(name))?;
+                    regs.push((reg, *splice));
+                }
+                let dest = cg.alloc_reg();
+                cg.emit(Op::BuildPath {
+                    dest,
+                    elements: regs,
+                });
+                ctx.vars.insert(var.clone(), dest);
+                ctx.window_len = cg.next_reg - ctx.window_start;
+                out(cg, ctx)
+            }),
             Plan::OptionalMatch { input, inner, vars } => {
                 self.compile(input, ctx, &mut |cg, outer_ctx| {
                     let cursor = cg.alloc_cursor();
@@ -1585,6 +1604,9 @@ fn scalar_function(name: &str) -> Result<u8> {
         "size" => Ok(func::SIZE),
         "properties" => Ok(func::PROPERTIES),
         "keys" => Ok(func::KEYS),
+        "nodes" => Ok(func::NODES),
+        "relationships" => Ok(func::RELATIONSHIPS),
+        "length" => Ok(func::LENGTH),
         other => Err(Error::unsupported(format!(
             "function `{other}` is not supported yet"
         ))),

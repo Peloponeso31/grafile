@@ -137,6 +137,16 @@ pub enum Plan {
         /// Whether this is `UNION ALL` (keep duplicates).
         all: bool,
     },
+    /// Bind a variable to the path built from already bound elements.
+    BindPath {
+        /// Input plan.
+        input: Box<Plan>,
+        /// Variable to bind.
+        var: String,
+        /// `(variable, splice)` elements in path order; splice extends
+        /// variable-length relationship lists into individual edges.
+        elements: Vec<(String, bool)>,
+    },
     /// Match a pattern per input row, keeping the row with null bindings when
     /// the pattern does not match.
     OptionalMatch {
@@ -359,6 +369,17 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
             for part in parts {
                 explain(part, indent + 1, out);
             }
+        }
+        Plan::BindPath {
+            input,
+            var,
+            elements,
+        } => {
+            out.push_str(&format!(
+                "{pad}BindPath {var} ({} elements)\n",
+                elements.len()
+            ));
+            explain(input, indent + 1, out);
         }
         Plan::OptionalMatch { input, inner, vars } => {
             out.push_str(&format!("{pad}OptionalMatch {}\n", vars.join(", ")));

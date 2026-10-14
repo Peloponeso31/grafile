@@ -373,6 +373,14 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_path(&mut self) -> Result<PatternPath> {
+        // `p = (a)-->(b)` names the path.
+        let mut variable = None;
+        if matches!(self.peek(), Some(Token::Ident) | Some(Token::EscapedIdent))
+            && self.tokens.get(self.pos + 1).map(|entry| entry.token) == Some(Token::Equals)
+        {
+            variable = Some(self.parse_name()?);
+            self.expect(Token::Equals, "'=' after the path variable")?;
+        }
         let start = self.parse_node_pattern()?;
         let mut segments = Vec::new();
         while matches!(self.peek(), Some(Token::Minus) | Some(Token::ArrowLeft)) {
@@ -380,7 +388,11 @@ impl<'a> Parser<'a> {
             let node = self.parse_node_pattern()?;
             segments.push(PathSegment { relationship, node });
         }
-        Ok(PatternPath { start, segments })
+        Ok(PatternPath {
+            variable,
+            start,
+            segments,
+        })
     }
 
     fn parse_node_pattern(&mut self) -> Result<NodePattern> {

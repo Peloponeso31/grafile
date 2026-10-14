@@ -262,6 +262,8 @@ pub struct PathSegment {
 /// A path pattern starting at a node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatternPath {
+    /// Optional path variable (`p = (a)-->(b)`).
+    pub variable: Option<String>,
     /// Starting node.
     pub start: NodePattern,
     /// Steps.

@@ -356,6 +356,14 @@ pub enum Op {
         /// Destination register.
         dest: u32,
     },
+    /// Build a path value: an alternating node/relationship list, splicing
+    /// variable-length relationship lists into individual edges.
+    BuildPath {
+        /// Destination register.
+        dest: u32,
+        /// `(register, splice)` elements in path order.
+        elements: Vec<(u32, bool)>,
+    },
     /// Append a value to a list register (rebuilding the list).
     ListPush {
         /// List register, updated in place.
@@ -525,6 +533,12 @@ pub mod func {
     pub const PROPERTIES: u8 = 10;
     /// `keys(x)`
     pub const KEYS: u8 = 11;
+    /// `nodes(path)`
+    pub const NODES: u8 = 12;
+    /// `relationships(path)`
+    pub const RELATIONSHIPS: u8 = 13;
+    /// `length(path)`
+    pub const LENGTH: u8 = 14;
 }
 
 /// A compiled VDBE program.
@@ -1193,6 +1207,17 @@ impl<'a> Executor<'a> {
                     None => self.pc = *target as usize,
                 }
             }
+            Op::BuildPath { dest, elements } => {
+                let mut items: Vec<Value> = Vec::new();
+                for (reg, splice) in elements {
+                    let value = self.reg_value(*reg)?;
+                    match (splice, value) {
+                        (true, Value::List(inner)) => items.extend(inner.iter().cloned()),
+                        (_, value) => items.push(value),
+                    }
+                }
+                self.regs[*dest as usize] = Reg::Value(Value::List(items.into()));
+            }
             Op::ListPush { list, value } => {
                 let value = self.reg_value(*value)?;
                 let items = match self.reg_value(*list)? {
@@ -1628,6 +1653,37 @@ impl<'a> Executor<'a> {
             func::SIZE => Ok(match args.first() {
                 Some(Value::List(items)) => Value::Int(items.len() as i64),
                 Some(Value::Text(text)) => Value::Int(text.chars().count() as i64),
+                _ => Value::Null,
+            }),
+            func::NODES => Ok(match args.first() {
+                Some(Value::List(items)) => Value::List(
+                    items
+                        .iter()
+                        .filter(|item| matches!(item, Value::Node(_)))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                _ => Value::Null,
+            }),
+            func::RELATIONSHIPS => Ok(match args.first() {
+                Some(Value::List(items)) => Value::List(
+                    items
+                        .iter()
+                        .filter(|item| matches!(item, Value::Edge(_)))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                _ => Value::Null,
+            }),
+            func::LENGTH => Ok(match args.first() {
+                Some(Value::List(items)) => Value::Int(
+                    items
+                        .iter()
+                        .filter(|item| matches!(item, Value::Edge(_)))
+                        .count() as i64,
+                ),
                 _ => Value::Null,
             }),
             func::PROPERTIES => match args.first() {

@@ -42,12 +42,18 @@ enum VarKind {
     Node,
     Edge,
     Value,
+    /// A named path; usable neither as a node nor as a relationship.
+    Path,
 }
 
 /// Planner state.
 struct Planner<'a> {
     db: &'a mut Database,
     anon_counter: u32,
+    /// Relationship variables bound by patterns since the last projection;
+    /// re-binding one of these is an error, while a relationship carried
+    /// through `WITH` may constrain a later pattern.
+    pattern_rels: std::collections::HashSet<String>,
 }
 
 /// Plan a parsed query with the given parameter values.
@@ -60,6 +66,7 @@ pub fn plan_query(
     let mut planner = Planner {
         db,
         anon_counter: 0,
+        pattern_rels: std::collections::HashSet::new(),
     };
     planner.run(&query)
 }
@@ -219,6 +226,7 @@ impl<'a> Planner<'a> {
                     )?;
                     plan = new_plan;
                     scope = new_scope;
+                    self.pattern_rels.clear();
                     columns.clear();
                 }
                 Clause::Return {
@@ -234,6 +242,7 @@ impl<'a> Planner<'a> {
                     plan = new_plan;
                     columns = new_columns;
                     scope.clear();
+                    self.pattern_rels.clear();
                 }
             }
         }
@@ -367,11 +376,13 @@ impl<'a> Planner<'a> {
                 let Some((from_idx, to_idx, direction)) = direction else {
                     continue;
                 };
-                let edge_bound = scope.contains_key(&rel.var);
+                let edge_bound =
+                    self.bound_relationship(&rel.var, rel.var_length.is_some(), scope)?;
                 let edge_var = if edge_bound {
                     self.anon_name("rel")
                 } else {
                     scope.insert(rel.var.clone(), VarKind::Edge);
+                    self.pattern_rels.insert(rel.var.clone());
                     rel.var.clone()
                 };
                 *plan = match rel.var_length {
@@ -417,11 +428,13 @@ impl<'a> Planner<'a> {
                     continue;
                 }
                 let fresh_node = self.anon_name("node");
-                let edge_bound = scope.contains_key(&rel.var);
+                let edge_bound =
+                    self.bound_relationship(&rel.var, rel.var_length.is_some(), scope)?;
                 let edge_var = if edge_bound {
                     self.anon_name("rel")
                 } else {
                     scope.insert(rel.var.clone(), VarKind::Edge);
+                    self.pattern_rels.insert(rel.var.clone());
                     rel.var.clone()
                 };
                 *plan = match rel.var_length {
@@ -490,7 +503,62 @@ impl<'a> Planner<'a> {
                 };
             }
         }
+        // `p = (a)-[...]->(b)` binds the alternating node/relationship value.
+        if let Some(path_var) = &path.variable {
+            if scope.contains_key(path_var) {
+                return Err(Error::syntax(format!(
+                    "variable `{path_var}` is already bound"
+                )));
+            }
+            let mut elements = vec![(nodes[0].var.clone(), false)];
+            for (idx, rel) in rels.iter().enumerate() {
+                elements.push((rel.var.clone(), rel.var_length.is_some()));
+                elements.push((nodes[idx + 1].var.clone(), false));
+            }
+            scope.insert(path_var.clone(), VarKind::Path);
+            *plan = Plan::BindPath {
+                input: Box::new(plan.clone()),
+                var: path_var.clone(),
+                elements,
+            };
+        }
         Ok(())
+    }
+
+    /// Whether a relationship variable is already bound. A variable carried
+    /// through a projection may constrain a pattern; one bound by an earlier
+    /// pattern in the same section may not be bound again.
+    fn bound_relationship(
+        &self,
+        var: &str,
+        var_length: bool,
+        scope: &FastMap<String, VarKind>,
+    ) -> Result<bool> {
+        let Some(kind) = scope.get(var) else {
+            return Ok(false);
+        };
+        match kind {
+            // A value may hold a relationship, or a relationship list when
+            // the pattern is variable-length.
+            VarKind::Value => return Ok(true),
+            VarKind::Edge => {}
+            VarKind::Node | VarKind::Path => {
+                return Err(Error::syntax(format!(
+                    "variable `{var}` is already bound to a {}",
+                    if *kind == VarKind::Node {
+                        "node"
+                    } else {
+                        "path"
+                    }
+                )));
+            }
+        }
+        if !var_length && self.pattern_rels.contains(var) {
+            return Err(Error::syntax(format!(
+                "variable `{var}` is already bound in a preceding pattern"
+            )));
+        }
+        Ok(true)
     }
 
     fn best_anchor(&self, nodes: &[PlannedNode], bound: &[bool]) -> usize {
@@ -564,7 +632,21 @@ impl<'a> Planner<'a> {
         scope: &FastMap<String, VarKind>,
     ) -> Result<PlannedNode> {
         let var = match &pattern.variable {
-            Some(var) => var.clone(),
+            Some(var) => {
+                if let Some(kind) = scope.get(var)
+                    && matches!(kind, VarKind::Edge | VarKind::Path)
+                {
+                    return Err(Error::syntax(format!(
+                        "variable `{var}` is already bound to a {}",
+                        if *kind == VarKind::Edge {
+                            "relationship"
+                        } else {
+                            "path"
+                        }
+                    )));
+                }
+                var.clone()
+            }
             None => self.anon_name("node"),
         };
         let mut label_ids = Vec::new();
