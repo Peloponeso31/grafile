@@ -10,12 +10,13 @@ scenarios pass without allow-list entries.
 
 Implemented:
 
-- Clauses: `MATCH`, `WHERE`, `RETURN`, `WITH` (with `DISTINCT`, `ORDER BY`,
-  `SKIP`, `LIMIT`, trailing `WHERE`), `UNWIND`, `CREATE`, `MERGE` (with
-  `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE`,
-  `DETACH DELETE`.
+- Clauses: `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN`, `WITH` (with
+  `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`, trailing `WHERE`), `UNWIND`,
+  `CREATE`, `MERGE` (with `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`,
+  `DELETE`, `DETACH DELETE`.
 - Patterns: node and relationship patterns, directions, type disjunction
-  (`:A|B`), inline literal property filters, multiple labels.
+  (`:A|B`), inline literal property filters, multiple labels, pre-bound
+  elements (nodes and relationships verified instead of re-bound).
 - Expressions: parameters, list/map literals, `CASE`, `IS [NOT] NULL`,
   `STARTS WITH` / `ENDS WITH` / `CONTAINS` / `=~`, `IN`, label predicates,
   three-valued logic, numeric cross-type comparison.
@@ -29,7 +30,6 @@ Explicit gaps (currently clear `Unsupported` errors):
 | Gap | Where rejected |
 |-----|----------------|
 | `UNION` / `UNION ALL` | parser |
-| `OPTIONAL MATCH` | parser |
 | Variable-length paths (`*min..max`) | planner |
 | `MERGE` with multiple relationships | planner |
 | Expressions mixing aggregation and grouping keys | planner |
@@ -57,29 +57,26 @@ Known semantic deviations to close:
 
 Highest TCK scenario share; ordered roughly by dependency:
 
-1. `OPTIONAL MATCH`: compile the inner plan into a collected row cursor
-   (the existing `Collect`/`CtxData` machinery) and emit one null row when
-   the inner plan is empty; merge scoping rules with subsequent clauses.
-2. `UNION` / `UNION ALL`: statement-level concatenation plus deduplication
+1. `UNION` / `UNION ALL`: statement-level concatenation plus deduplication
    for `UNION`.
-3. Variable-length paths: bounded and unbounded expansion with a per-path
+2. Variable-length paths: bounded and unbounded expansion with a per-path
    visited/trail set, driven by the incidence matrix.
-4. Named paths and path values: `p = (a)-[…]→(b)` plus `nodes(p)`,
+3. Named paths and path values: `p = (a)-[…]→(b)` plus `nodes(p)`,
    `relationships(p)`, `length(p)`; new value representation across record,
    JSON and display layers.
-5. Pattern predicates in `WHERE`, `exists()`, and `shortestPath()` /
+4. Pattern predicates in `WHERE`, `exists()`, and `shortestPath()` /
    `allShortestPaths()` (bidirectional BFS over the incidence planes).
-6. List comprehensions, pattern comprehensions, quantifiers
+5. List comprehensions, pattern comprehensions, quantifiers
    (`all`, `any`, `none`, `single`), `reduce()`.
-7. Map property access (`m.k`), subscript (`m['k']`), list slicing
+6. Map property access (`m.k`), subscript (`m['k']`), list slicing
    (`list[1..3]`), and map projections (`n{.name}`).
-8. `FOREACH`, `SET n += {…}`, and `CALL … YIELD` for built-in procedures
+7. `FOREACH`, `SET n += {…}`, and `CALL … YIELD` for built-in procedures
    (`db.labels()`, `db.propertyKeys()`, …).
-9. MERGE conformance: whole-path match-or-create and multiple
+8. MERGE conformance: whole-path match-or-create and multiple
    relationships; removes the documented deviation.
-10. Aggregation completeness: `DISTINCT` inside aggregations,
-    multi-argument aggregations, and grouping-key semantics for
-    expressions that mix aggregation and non-aggregated values.
+9. Aggregation completeness: `DISTINCT` inside aggregations,
+   multi-argument aggregations, and grouping-key semantics for
+   expressions that mix aggregation and non-aggregated values.
 
 ### Phase 2 — Function library (medium)
 

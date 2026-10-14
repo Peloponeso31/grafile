@@ -316,7 +316,7 @@ $ cargo run -p tck-runner --release      # exits 0 when the gate passes
 The gate fails on unexpected failures, harness errors (steps or cells the
 runner cannot evaluate) and **stale allow-list entries**, so a fix must prune
 its allow-list entries in the same commit. Current baseline: 3897 scenarios,
-948 passing (24.3% of the suite, 100% of applicable scenarios), 2949
+1187 passing (30.5% of the suite, 100% of applicable scenarios), 2710
 allow-listed, zero harness errors. Run instructions, error mapping and
 comparison semantics are documented in [docs/tck.md](docs/tck.md).
 
