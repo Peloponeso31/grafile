@@ -50,10 +50,12 @@ Known semantic deviations to close:
 - `ORDER BY` after aggregation may only reference projected values.
 - Aggregations with multiple arguments are rejected (needed for
   `percentileCont`/`percentileDisc`, Phase 2).
+- Errors that Neo4j detects statically (for example `NOT {true: true}`) are
+  raised at runtime instead, so their phase differs from the TCK.
 
 ## Phases
 
-Where the allow-list stood after `UNION` (2024.3, 2626 scenarios):
+Where the allow-list stood after `UNION` (2024.3, 2564 scenarios):
 temporal types 1004 (Phase 3), error-kind and validation mismatches ~340
 (Phase 4), ordering/comparison/precedence semantics ~350 (Phase 4), quantifier
 and list/map/pattern expressions ~860 (Phase 1C), paths ~250 (Phase 1B),
@@ -68,8 +70,9 @@ allow-list sizes measured after `OPTIONAL MATCH`.
 
 #### 1A — Statement and expression surface
 
-- Map property access (`m.k`), subscript (`m['k']`), list slicing
-  (`list[1..3]`), and map projections (`n{.name}`) (~91).
+- Map property access (`m.k`), subscript (`m['k']`) and list slicing
+  (`list[1..3]`) are done; map projections (`n{.name}`) have no TCK coverage
+  and stay unimplemented.
 
 #### 1B — Paths
 

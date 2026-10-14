@@ -287,7 +287,8 @@ disjunction, inline property filters), `WHERE`, `RETURN` and `WITH` (with
 `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`), `UNWIND`, `CREATE`, `MERGE` (with
 `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE` /
 `DETACH DELETE`, `UNION` / `UNION ALL`, `SET n += {…}`, parameters
-(`$name`), list and map literals, `CASE`,
+(`$name`), list and map literals, map field access and subscript
+(`m.k`, `m['k']`), list indexing and slicing (`list[1..3]`), `CASE`,
 `IS [NOT] NULL`, string predicates (`STARTS WITH`, `ENDS WITH`, `CONTAINS`,
 `=~`), label predicates, three-valued logic, and the aggregations `count`,
 `sum`, `avg`, `min`, `max`, `collect` (with `DISTINCT` and expressions over
@@ -318,7 +319,7 @@ $ cargo run -p tck-runner --release      # exits 0 when the gate passes
 The gate fails on unexpected failures, harness errors (steps or cells the
 runner cannot evaluate) and **stale allow-list entries**, so a fix must prune
 its allow-list entries in the same commit. Current baseline: 3897 scenarios,
-1271 passing (32.6% of the suite, 100% of applicable scenarios), 2626
+1333 passing (34.2% of the suite, 100% of applicable scenarios), 2564
 allow-listed, zero harness errors. Run instructions, error mapping and
 comparison semantics are documented in [docs/tck.md](docs/tck.md).
 
