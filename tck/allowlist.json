@@ -2059,6 +2059,14 @@
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got TypeError at runtime"
       },
+      "[4] Fail when using NOT on a non-boolean literal (example 31)": {
+        "reason": "not-implemented",
+        "note": "expected SyntaxError at compile time, got TypeError at runtime"
+      },
+      "[4] Fail when using NOT on a non-boolean literal (example 32)": {
+        "reason": "not-implemented",
+        "note": "expected SyntaxError at compile time, got TypeError at runtime"
+      },
       "[4] Fail when using NOT on a non-boolean literal (example 33)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got TypeError at runtime"
@@ -2359,14 +2367,6 @@
       }
     },
     "expressions/graph/Graph6.feature": {
-      "[4] Statically access a property of a node resulting from an expression": {
-        "reason": "not-implemented",
-        "note": "expected column `(list[1]).missing`, got `list[1].missing`"
-      },
-      "[8] Statically access a property of a relationship resulting from an expression": {
-        "reason": "not-implemented",
-        "note": "expected column `(list[1]).missing`, got `list[1].missing`"
-      },
       "[9] Fail when performing property access on a non-graph element (example 1)": {
         "reason": "not-implemented",
         "note": "expected TypeError at compile time, but the query returned 1 rows"
@@ -2416,84 +2416,6 @@
         "note": "expected SyntaxError at compile time, but the query returned 1 rows"
       }
     },
-    "expressions/list/List1.feature": {
-      "[2] Indexing into nested literal lists": {
-        "reason": "not-implemented",
-        "note": "expected column `[[1]][0][0]`, got `Subscript { base: Subscript { base: List([List([Literal(Int(1))])]), index: Literal(Int(0)) }, index: Literal(Int(0)) }`"
-      },
-      "[6] Fail when indexing a non-list #Example: <exampleName> (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[6] Fail when indexing a non-list #Example: <exampleName> (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[6] Fail when indexing a non-list #Example: <exampleName> (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[6] Fail when indexing a non-list #Example: <exampleName> (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[7] Fail when indexing a non-list given by a parameter #Example: <exampleName> (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[7] Fail when indexing a non-list given by a parameter #Example: <exampleName> (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[7] Fail when indexing a non-list given by a parameter #Example: <exampleName> (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[7] Fail when indexing a non-list given by a parameter #Example: <exampleName> (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[8] Fail when indexing with a non-integer #Example: <exampleName> (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[8] Fail when indexing with a non-integer #Example: <exampleName> (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[8] Fail when indexing with a non-integer #Example: <exampleName> (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[8] Fail when indexing with a non-integer #Example: <exampleName> (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[8] Fail when indexing with a non-integer #Example: <exampleName> (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[9] Fail when indexing with a non-integer given by a parameter #Example: <exampleName> (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[9] Fail when indexing with a non-integer given by a parameter #Example: <exampleName> (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[9] Fail when indexing with a non-integer given by a parameter #Example: <exampleName> (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[9] Fail when indexing with a non-integer given by a parameter #Example: <exampleName> (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      },
-      "[9] Fail when indexing with a non-integer given by a parameter #Example: <exampleName> (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at any time, but the query returned 1 rows"
-      }
-    },
     "expressions/list/List11.feature": {
       "*": {
         "reason": "not-implemented",
@@ -2526,12 +2448,6 @@
         "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 3 column 33 (found Pipe)"
       }
     },
-    "expressions/list/List2.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' after subscript at line 3 column 14 (found DotDot)"
-      }
-    },
     "expressions/list/List3.feature": {
       "[1] Equality between list and literal should return false": {
         "reason": "not-implemented",
@@ -2544,12 +2460,6 @@
       "[6] Equality between different nested lists with null should return false": {
         "reason": "not-implemented",
         "note": "rows differ: expected false, got null"
-      }
-    },
-    "expressions/list/List4.feature": {
-      "[2] Concatenating a list with a scalar of same type": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: cannot apply arithmetic to list and boolean"
       }
     },
     "expressions/list/List5.feature": {
@@ -2589,10 +2499,6 @@
         "reason": "not-implemented",
         "note": "rows differ: expected false, got null"
       },
-      "[3] IN should work with list slices": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' after subscript at line 3 column 19 (found DotDot)"
-      },
       "[42] Failing when using IN on a non-list literal (example 1)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 1 rows"
@@ -2612,10 +2518,6 @@
       "[42] Failing when using IN on a non-list literal (example 5)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 1 rows"
-      },
-      "[4] IN should work with literal list slices": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' after subscript at line 2 column 24 (found DotDot)"
       },
       "[5] IN should return false when matching a number with a string": {
         "reason": "not-implemented",
@@ -2793,18 +2695,6 @@
       }
     },
     "expressions/map/Map1.feature": {
-      "[3] Statically access a field of a map resulting from an expression": {
-        "reason": "not-implemented",
-        "note": "expected column `(list[1]).missing`, got `missing`"
-      },
-      "[5] Statically access a field with a delimited identifier (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an identifier at line 2 column 7 (found Null)"
-      },
-      "[5] Statically access a field with a delimited identifier (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an identifier at line 2 column 7 (found Null)"
-      },
       "[6] Fail when performing property access on a non-map (example 1)": {
         "reason": "not-implemented",
         "note": "expected TypeError at compile time, but the query returned 1 rows"
@@ -2828,90 +2718,6 @@
       "[6] Fail when performing property access on a non-map (example 6)": {
         "reason": "not-implemented",
         "note": "expected TypeError at compile time, but the query returned 1 rows"
-      }
-    },
-    "expressions/map/Map2.feature": {
-      "[1] Dynamically access a field based on parameters when there is no type information": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 'Apa', got null"
-      },
-      "[2] Dynamically access a field based on parameters when there is rhs type information": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 'Apa', got null"
-      },
-      "[5] Dynamically access a field is case-sensitive (example 1)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 'Mats', got null"
-      },
-      "[5] Dynamically access a field is case-sensitive (example 2)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 'Mats', got null"
-      },
-      "[5] Dynamically access a field is case-sensitive (example 3)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 'Pontus', got null"
-      },
-      "[5] Dynamically access a field is case-sensitive (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an identifier at line 2 column 7 (found Null)"
-      },
-      "[5] Dynamically access a field is case-sensitive (example 7)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an identifier at line 2 column 7 (found Null)"
-      },
-      "[6] Fail at runtime when attempting to index with an Int into a Map": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, but the query returned 1 rows"
-      },
-      "[7] Fail at runtime when trying to index into a map with a non-string": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, but the query returned 1 rows"
-      },
-      "[8] Fail at runtime when trying to index something which is not a map": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, but the query returned 1 rows"
-      }
-    },
-    "expressions/map/Map3.feature": {
-      "[1] Using `keys()` on a literal map": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected ['name', 'age', 'address'], got null"
-      },
-      "[2] Using `keys()` on a parameter map": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected ['address', 'name', 'age'], got null"
-      },
-      "[4] Using `keys()` on map with null values (example 1)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected [], got null"
-      },
-      "[4] Using `keys()` on map with null values (example 2)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected ['k'], got null"
-      },
-      "[4] Using `keys()` on map with null values (example 3)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected ['k'], got null"
-      },
-      "[4] Using `keys()` on map with null values (example 4)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected ['k', 'l'], got null"
-      },
-      "[4] Using `keys()` on map with null values (example 5)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected ['k', 'l'], got null"
-      },
-      "[4] Using `keys()` on map with null values (example 6)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected ['k', 'l'], got null"
-      },
-      "[4] Using `keys()` on map with null values (example 7)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected ['k', 'l', 'm'], got null"
-      },
-      "[5] Using `keys()` and `IN` to check field existence": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true | true | false, got null | null | null"
       }
     },
     "expressions/mathematical/Mathematical11.feature": {
@@ -3311,14 +3117,6 @@
       }
     },
     "expressions/precedence/Precedence3.feature": {
-      "[1] List element access takes precedence over list appending": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: cannot apply arithmetic to list and integer"
-      },
-      "[3] List slicing takes precedence over list concatenation": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' after subscript at line 2 column 57 (found DotDot)"
-      },
       "[4] List appending takes precedence over list element containment": {
         "reason": "not-implemented",
         "note": "expected rows, got a runtime error: runtime: Type: cannot apply arithmetic to list and integer"
