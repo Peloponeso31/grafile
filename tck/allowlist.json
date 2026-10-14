@@ -165,14 +165,6 @@
         "reason": "not-implemented",
         "note": "expected -2 relationships, got +0"
       },
-      "[5] Detach delete nodes from nested map/list": {
-        "reason": "not-implemented",
-        "note": "expected no rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet; expected -1 nodes, got +0; expected -2 relationsh..."
-      },
-      "[6] Delete relationships from nested map/list": {
-        "reason": "not-implemented",
-        "note": "expected no rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet; expected -1 relationships, got +0"
-      },
       "[7] Delete paths from nested map/list": {
         "reason": "not-implemented",
         "note": "expected no rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident); expected -2 nodes, got +0; expected -2 relationships, got +0; e..."
@@ -905,10 +897,6 @@
       }
     },
     "clauses/return-orderby/ReturnOrderBy2.feature": {
-      "[11] Aggregates ordered by arithmetics": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      },
       "[12] Aggregation of named paths": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
@@ -999,10 +987,6 @@
       }
     },
     "clauses/return/Return2.feature": {
-      "[10] Return count aggregation over an empty graph": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      },
       "[14] Do not fail when returning type of deleted relationships": {
         "reason": "not-implemented",
         "note": "expected column `type(r)`, got `type`"
@@ -1056,24 +1040,6 @@
       "[8] Support column renaming for aggregations": {
         "reason": "not-implemented",
         "note": "setup failed: Unsupported: function `range` is not supported yet"
-      },
-      "[9] Handle subexpression in aggregation also occurring as standalone expression with nested aggregation in a literal map": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      }
-    },
-    "clauses/return/Return5.feature": {
-      "[1] DISTINCT inside aggregation should work with lists in maps": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: DISTINCT inside aggregations is not supported yet"
-      },
-      "[3] DISTINCT inside aggregation should work with nested lists in maps": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: DISTINCT inside aggregations is not supported yet"
-      },
-      "[4] DISTINCT inside aggregation should work with nested lists of maps in maps": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: DISTINCT inside aggregations is not supported yet"
       }
     },
     "clauses/return/Return6.feature": {
@@ -1101,14 +1067,6 @@
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
       },
-      "[18] Handle returned variables inside an expression which contains an aggregation expression": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      },
-      "[19] Handle returned property accesses inside an expression which contains an aggregation expression": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      },
       "[20] Fail if not returned variables are used inside an expression which contains an aggregation expression": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
@@ -1116,10 +1074,6 @@
       "[21] Fail if more complex expressions, even if returned, are used inside expression which contains an aggregation expression": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[2] Projecting an arithmetic expression with aggregation": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
       },
       "[4] Support multiple divisions in aggregate function": {
         "reason": "not-implemented",
@@ -1136,10 +1090,6 @@
       "[8] Handle aggregation on functions": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[9] Aggregates with arithmetics": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
       }
     },
     "clauses/return/Return7.feature": {
@@ -1695,18 +1645,6 @@
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       },
-      "[5] Handle constants and parameters inside an expression which contains an aggregation expression": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      },
-      "[6] Handle projected variables inside an expression which contains an aggregation expression": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      },
-      "[7] Handle projected property accesses inside an expression which contains an aggregation expression": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      },
       "[8] Fail if not projected variables are used inside an expression which contains an aggregation expression": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
@@ -1732,22 +1670,10 @@
         "note": "expected rows, got a compile time error: compile time: Unsupported: function `range` is not supported yet"
       }
     },
-    "expressions/aggregation/Aggregation5.feature": {
-      "[2] OPTIONAL MATCH and `collect()` on node property": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: DISTINCT inside aggregations is not supported yet"
-      }
-    },
     "expressions/aggregation/Aggregation6.feature": {
       "*": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: function `percentiledisc` is not supported yet"
-      }
-    },
-    "expressions/aggregation/Aggregation8.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
       }
     },
     "expressions/boolean/Boolean1.feature": {
@@ -5326,10 +5252,6 @@
       "[11] Mixing directed and undirected pattern parts with self-relationship, undirected count": {
         "reason": "not-implemented",
         "note": "rows differ: expected 6, got 11"
-      },
-      "[7] Counting distinct undirected self-relationships in self-relationship graph": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: DISTINCT inside aggregations is not supported yet"
       },
       "[9] Counting directed self-relationships": {
         "reason": "not-implemented",
