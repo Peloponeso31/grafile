@@ -286,8 +286,8 @@ Implemented: `MATCH` (node and relationship patterns, directions, type
 disjunction, inline property filters), `WHERE`, `RETURN` and `WITH` (with
 `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`), `UNWIND`, `CREATE`, `MERGE` (with
 `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE` /
-`DETACH DELETE`, `UNION` / `UNION ALL`, parameters (`$name`), list and map
-literals, `CASE`,
+`DETACH DELETE`, `UNION` / `UNION ALL`, `SET n += {…}`, parameters
+(`$name`), list and map literals, `CASE`,
 `IS [NOT] NULL`, string predicates (`STARTS WITH`, `ENDS WITH`, `CONTAINS`,
 `=~`), label predicates, three-valued logic, and the aggregations `count`,
 `sum`, `avg`, `min`, `max`, `collect`. Scalar functions: `id`, `labels`,
@@ -317,7 +317,7 @@ $ cargo run -p tck-runner --release      # exits 0 when the gate passes
 The gate fails on unexpected failures, harness errors (steps or cells the
 runner cannot evaluate) and **stale allow-list entries**, so a fix must prune
 its allow-list entries in the same commit. Current baseline: 3897 scenarios,
-1195 passing (30.7% of the suite, 100% of applicable scenarios), 2702
+1250 passing (32.1% of the suite, 100% of applicable scenarios), 2647
 allow-listed, zero harness errors. Run instructions, error mapping and
 comparison semantics are documented in [docs/tck.md](docs/tck.md).
 

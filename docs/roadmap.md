@@ -49,13 +49,10 @@ Known semantic deviations to close:
   the relationship, instead of matching the whole path atomically.
 - `ORDER BY` after aggregation may only reference projected values.
 - Aggregations with multiple arguments are rejected.
-- Property access resolves the property key at compile time, so reading a
-  property whose key is first created in the same statement returns null
-  (`CREATE (n {num: 12}) RETURN n.num`).
 
 ## Phases
 
-Where the allow-list stood after `UNION` (2024.3, 2702 scenarios):
+Where the allow-list stood after `UNION` (2024.3, 2647 scenarios):
 temporal types 1004 (Phase 3), error-kind and validation mismatches ~340
 (Phase 4), ordering/comparison/precedence semantics ~350 (Phase 4), quantifier
 and list/map/pattern expressions ~860 (Phase 1C), paths ~250 (Phase 1B),
@@ -70,11 +67,8 @@ allow-list sizes measured after `OPTIONAL MATCH`.
 
 #### 1A — Statement and expression surface
 
-- `SET n += {…}` (5).
 - Aggregation completeness: `DISTINCT` inside aggregations, multi-argument
   aggregations, and post-aggregation expressions (21).
-- Runtime property-key resolution, fixing own-write reads such as
-  `CREATE (n {num: 12}) RETURN n.num` (~15).
 - Map property access (`m.k`), subscript (`m['k']`), list slicing
   (`list[1..3]`), and map projections (`n{.name}`) (~91).
 
