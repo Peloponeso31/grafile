@@ -344,6 +344,9 @@ impl<'a> Parser<'a> {
                     labels.push(self.parse_name()?);
                 }
                 items.push(SetItem::Label { variable, labels });
+            } else if !remove && self.eat(Token::PlusEquals) {
+                let value = self.parse_expr()?;
+                items.push(SetItem::Append { variable, value });
             } else if !remove && self.eat(Token::Equals) {
                 let value = self.parse_expr()?;
                 items.push(SetItem::Replace { variable, value });
@@ -351,7 +354,7 @@ impl<'a> Parser<'a> {
                 return self.fail(if remove {
                     "expected '.' or ':' in REMOVE item"
                 } else {
-                    "expected '.', ':' or '=' in SET item"
+                    "expected '.', ':', '+=' or '=' in SET item"
                 });
             }
             if !self.eat(Token::Comma) {
@@ -880,6 +883,15 @@ mod tests {
             Clause::Return { items, .. } => items[0].expr.clone(),
             other => panic!("unexpected clause {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_set_append() {
+        let query = parse("MATCH (n) SET n += {num: 42} RETURN n").expect("parse");
+        let Clause::Set(items) = &query.parts[0].clauses[1] else {
+            panic!("expected SET");
+        };
+        assert!(matches!(&items[0], SetItem::Append { variable, .. } if variable == "n"));
     }
 
     #[test]

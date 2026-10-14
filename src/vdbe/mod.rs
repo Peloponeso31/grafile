@@ -330,6 +330,15 @@ pub enum Op {
         /// Number of registers.
         count: u32,
     },
+    /// Read a property by name from a node, relationship or map.
+    Property {
+        /// Entity or map register.
+        target: u32,
+        /// Constant index of the property key name.
+        name: u32,
+        /// Destination register.
+        dest: u32,
+    },
     /// Start unwinding a list.
     UnwindInit {
         /// Cursor slot.
@@ -419,6 +428,13 @@ pub enum Op {
         /// Register holding a property map.
         props: u32,
     },
+    /// Merge a property map into a node or relationship.
+    MergeProperties {
+        /// Node or edge register.
+        target: u32,
+        /// Register holding a property map.
+        props: u32,
+    },
     /// Delete a node or edge register.
     DeleteAny {
         /// Entity register.
@@ -484,6 +500,7 @@ pub fn execute(db: &mut Database, program: &Program) -> Result<Vec<Vec<Value>>> 
         regs: vec![Reg::Value(Value::Null); program.register_count],
         cursors: (0..program.cursor_count).map(|_| Cursor::Empty).collect(),
         results: Vec::new(),
+        key_ids: vec![None; program.constants.len()],
         pc: 0,
         steps: 0,
     };
@@ -521,6 +538,7 @@ struct Executor<'a> {
     regs: Vec<Reg>,
     cursors: Vec<Cursor>,
     results: Vec<Vec<Value>>,
+    key_ids: Vec<Option<u32>>,
     pc: usize,
     steps: u64,
 }
@@ -746,6 +764,60 @@ impl<'a> Executor<'a> {
                     .map(|reg| self.reg_value(*reg))
                     .collect::<Result<_>>()?;
                 self.regs[*dest as usize] = Reg::Value(Value::List(values.into()));
+            }
+            Op::Property { target, name, dest } => {
+                // Keys may be created by the very statement that reads them,
+                // so resolve lazily and only cache successful lookups.
+                let key = match self.key_ids.get(*name as usize).copied() {
+                    Some(Some(key)) => Some(key),
+                    Some(None) => {
+                        let Value::Text(key_name) = &self.program.constants[*name as usize] else {
+                            return Err(Error::internal("property name is not a string"));
+                        };
+                        let resolved = self.db.property_key_id(key_name);
+                        if resolved.is_some() {
+                            self.key_ids[*name as usize] = resolved;
+                        }
+                        resolved
+                    }
+                    None => return Err(Error::internal("constant index out of range")),
+                };
+                let value = match self.regs[*target as usize].clone() {
+                    Reg::Value(Value::Null) => Value::Null,
+                    Reg::Node(id) | Reg::Value(Value::Node(id)) => match key {
+                        Some(key) => self
+                            .db
+                            .get_node(id)?
+                            .and_then(|record| record.get(key).cloned())
+                            .unwrap_or(Value::Null),
+                        None => Value::Null,
+                    },
+                    Reg::Edge(id) | Reg::Value(Value::Edge(id)) => match key {
+                        Some(key) => self
+                            .db
+                            .get_edge(id)?
+                            .and_then(|record| record.get(key).cloned())
+                            .unwrap_or(Value::Null),
+                        None => Value::Null,
+                    },
+                    Reg::Value(Value::Map(entries)) => {
+                        let Value::Text(name) = &self.program.constants[*name as usize] else {
+                            return Err(Error::internal("property name is not a string"));
+                        };
+                        entries
+                            .iter()
+                            .find(|(entry, _)| entry.as_ref() == name.as_ref())
+                            .map(|(_, value)| value.clone())
+                            .unwrap_or(Value::Null)
+                    }
+                    other => {
+                        return Err(Error::type_error(format!(
+                            "property access on {}",
+                            other.to_value().type_name()
+                        )));
+                    }
+                };
+                self.regs[*dest as usize] = Reg::Value(value);
             }
             Op::IsNull { src, dest } => {
                 let value = self.reg_value(*src)?;
@@ -1083,6 +1155,31 @@ impl<'a> Executor<'a> {
                     let id = self.reg_node(*target)?;
                     let props = self.resolve_props(*props)?;
                     self.db.replace_node_properties(id, props)?;
+                }
+            }
+            Op::MergeProperties { target, props } => {
+                // Merging into a null binding is a no-op. Entries with a null
+                // value remove the property, like `SET n.key = null`.
+                if !matches!(self.regs[*target as usize], Reg::Value(Value::Null)) {
+                    let entries = self.resolve_props(*props)?;
+                    match self.regs[*target as usize] {
+                        Reg::Node(id) => {
+                            for (key, value) in entries {
+                                self.db.set_node_property(id, key, value)?;
+                            }
+                        }
+                        Reg::Edge(id) => {
+                            for (key, value) in entries {
+                                self.db.set_edge_property(id, key, value)?;
+                            }
+                        }
+                        ref other => {
+                            return Err(Error::type_error(format!(
+                                "SET += expects a node or relationship, got {}",
+                                other.to_value().type_name()
+                            )));
+                        }
+                    }
                 }
             }
             Op::DeleteAny { target, detach } => match self.regs[*target as usize].clone() {

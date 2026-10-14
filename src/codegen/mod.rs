@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::planner::Prepared;
 use crate::planner::plan::{CreateItem, Plan};
 use crate::record::Value;
-use crate::vdbe::{AggSpec, NO_KEY, Op, Program, binary_code, func, unary_code};
+use crate::vdbe::{AggSpec, Op, Program, binary_code, func, unary_code};
 
 /// Register/variable context for the row currently being compiled.
 #[derive(Clone)]
@@ -103,6 +103,12 @@ impl<'a> Codegen<'a> {
         let cursor = self.next_cursor;
         self.next_cursor += 1;
         cursor
+    }
+
+    fn const_index(&mut self, value: Value) -> u32 {
+        let index = self.constants.len() as u32;
+        self.constants.push(value);
+        index
     }
 
     fn const_reg(&mut self, value: Value) -> u32 {
@@ -683,7 +689,7 @@ impl<'a> Codegen<'a> {
                                 add: false,
                             });
                         }
-                        SetItem::Replace { .. } => {
+                        SetItem::Replace { .. } | SetItem::Append { .. } => {
                             return Err(Error::unsupported(
                                 "REMOVE with whole-property replacement is not supported",
                             ));
@@ -907,6 +913,15 @@ impl<'a> Codegen<'a> {
                 });
                 Ok(())
             }
+            SetItem::Append { variable, value } => {
+                let target = self.var_reg(ctx, variable)?;
+                let props_reg = self.compile_expr(value, ctx)?;
+                self.emit(Op::MergeProperties {
+                    target,
+                    props: props_reg,
+                });
+                Ok(())
+            }
             SetItem::Label { variable, labels } => {
                 let target = self.var_reg(ctx, variable)?;
                 let labels_reg = self.label_list_reg(labels);
@@ -979,10 +994,12 @@ impl<'a> Codegen<'a> {
             }
             Expr::Property { base, key } => {
                 let base_reg = self.compile_expr(base, ctx)?;
-                let key_id = self.db.property_key_id(key).unwrap_or(NO_KEY);
-                self.emit(Op::Column {
+                // Resolve the key at runtime: it may be created by this very
+                // statement (`CREATE (n {num: 1}) RETURN n.num`).
+                let name = self.const_index(Value::from(key.as_str()));
+                self.emit(Op::Property {
                     target: base_reg,
-                    key: key_id,
+                    name,
                     dest,
                 });
             }

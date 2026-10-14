@@ -180,6 +180,9 @@ pub enum Token {
     /// `..`
     #[token("..")]
     DotDot,
+    /// `+=`
+    #[token("+=")]
+    PlusEquals,
     /// `+`
     #[token("+")]
     Plus,
@@ -376,8 +379,8 @@ fn classify(token: Token, tokens: &[(usize, usize, Token)], index: usize) -> Tok
             }
         }
         EscapedIdent => context_class(tokens, index),
-        Plus | Minus | Star | Slash | Percent | Caret | Equals | Less | Greater | NotEquals
-        | LessEquals | GreaterEquals | RegexMatch | ArrowRight | ArrowLeft | DotDot => {
+        PlusEquals | Plus | Minus | Star | Slash | Percent | Caret | Equals | Less | Greater
+        | NotEquals | LessEquals | GreaterEquals | RegexMatch | ArrowRight | ArrowLeft | DotDot => {
             TokenClass::Operator
         }
         LParen | RParen | LBracket | RBracket | LBrace | RBrace | Comma | Semicolon | Colon

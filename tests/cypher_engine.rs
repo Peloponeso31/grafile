@@ -591,3 +591,41 @@ fn union_rejects_mixed_kinds() {
         .expect_err("mixed kinds");
     assert_eq!(err.code(), grafile::ErrorCode::Syntax);
 }
+
+// ---- SET += ----
+
+#[test]
+fn set_append_merges_properties() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A {name: 'a', keep: 1})")
+        .expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH (n:A) SET n += {name: 'b', extra: 2, gone: null} RETURN n.name AS name, n.keep AS keep, n.extra AS extra",
+    );
+    assert_eq!(rows, vec![vec!["b", "1", "2"]]);
+    let rows = query(&mut conn, "MATCH (n:A) RETURN n.gone IS NULL");
+    assert_eq!(rows, vec![vec!["true"]]);
+}
+
+#[test]
+fn set_append_on_null_is_a_no_op() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "OPTIONAL MATCH (n:Missing) SET n += {num: 1} RETURN n",
+    );
+    assert_eq!(rows, vec![vec!["null"]]);
+}
+
+#[test]
+fn set_append_merges_relationship_properties() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A)-[:T {since: 1}]->(:B)")
+        .expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH ()-[r:T]->() SET r += {since: 2, extra: 3} RETURN r.since AS since, r.extra AS extra",
+    );
+    assert_eq!(rows, vec![vec!["2", "3"]]);
+}

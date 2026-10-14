@@ -249,6 +249,13 @@ pub enum SetItem {
         /// New value (map or entity).
         value: Expr,
     },
+    /// `n += {props}`
+    Append {
+        /// Target variable.
+        variable: String,
+        /// Map of properties to merge.
+        value: Expr,
+    },
     /// `n:Label` (SET) or `n:Label` (REMOVE)
     Label {
         /// Target variable.

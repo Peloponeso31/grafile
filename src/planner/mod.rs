@@ -835,6 +835,12 @@ impl<'a> Planner<'a> {
                 }
                 validate_expr(value, scope)
             }
+            SetItem::Append { variable, value } => {
+                if !scope.contains_key(variable) {
+                    return Err(undefined_variable(variable));
+                }
+                validate_expr(value, scope)
+            }
             SetItem::Label { variable, .. } => {
                 if !scope.contains_key(variable) {
                     return Err(undefined_variable(variable));
@@ -1488,9 +1494,9 @@ fn substitute_items(
 
 fn substitute_set_item(item: &mut SetItem, params: &HashMap<String, Value>) -> Result<()> {
     match item {
-        SetItem::Property { value, .. } | SetItem::Replace { value, .. } => {
-            substitute_expr(value, params)
-        }
+        SetItem::Property { value, .. }
+        | SetItem::Replace { value, .. }
+        | SetItem::Append { value, .. } => substitute_expr(value, params),
         SetItem::Label { .. } => Ok(()),
     }
 }
