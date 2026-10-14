@@ -392,8 +392,12 @@ fn regenerate_allowlist(results: &[ScenarioResult], previous: &AllowList) -> All
             let Status::Failed(message) = &result.status else {
                 continue;
             };
+            // Only inherit an exact scenario entry; a file-level `*` note
+            // would describe a different scenario.
             let detail = previous
-                .detail(file, &result.name)
+                .files
+                .get(file)
+                .and_then(|entries| entries.get(&result.name))
                 .cloned()
                 .unwrap_or_else(|| Detail {
                     reason: Reason::NotImplemented,
