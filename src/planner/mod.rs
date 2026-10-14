@@ -1222,6 +1222,16 @@ fn validate_expr(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
             validate_expr(base, scope)?;
             validate_expr(index, scope)
         }
+        Expr::Slice { base, lower, upper } => {
+            validate_expr(base, scope)?;
+            if let Some(lower) = lower {
+                validate_expr(lower, scope)?;
+            }
+            if let Some(upper) = upper {
+                validate_expr(upper, scope)?;
+            }
+            Ok(())
+        }
         Expr::Unary { expr, .. } => validate_expr(expr, scope),
         Expr::Binary { left, right, .. } => {
             validate_expr(left, scope)?;
@@ -1279,9 +1289,14 @@ fn default_name(expr: &Expr) -> String {
         Expr::Variable(name) => name.clone(),
         Expr::Parameter(name) => format!("${name}"),
         Expr::Literal(value) => literal_text(value),
-        Expr::Property { base, key } => format!("{}.{}", atomic_name(base), key),
+        Expr::Property { base, key } => format!("{}.{}", property_base_name(base), key),
         Expr::Subscript { base, index } => {
-            format!("{}[{}]", atomic_name(base), default_name(index))
+            format!("{}[{}]", subscript_base_name(base), default_name(index))
+        }
+        Expr::Slice { base, lower, upper } => {
+            let lower = lower.as_ref().map(|e| default_name(e)).unwrap_or_default();
+            let upper = upper.as_ref().map(|e| default_name(e)).unwrap_or_default();
+            format!("{}[{lower}..{upper}]", subscript_base_name(base))
         }
         Expr::Function {
             name,
@@ -1335,10 +1350,30 @@ fn default_name(expr: &Expr) -> String {
     }
 }
 
-/// Render a base expression, parenthesising anything that is not atomic.
-fn atomic_name(expr: &Expr) -> String {
+/// Render the base of a property access; indexing expressions are wrapped so
+/// `(list[1]).missing` reads unambiguously.
+fn property_base_name(expr: &Expr) -> String {
     match expr {
-        Expr::Variable(_) | Expr::Property { .. } | Expr::Subscript { .. } => default_name(expr),
+        Expr::Variable(_)
+        | Expr::Property { .. }
+        | Expr::List(_)
+        | Expr::Map(_)
+        | Expr::Function { .. } => default_name(expr),
+        other => format!("({})", default_name(other)),
+    }
+}
+
+/// Render the base of a subscript or slice; literals and indexing chains need
+/// no parentheses.
+fn subscript_base_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Variable(_)
+        | Expr::Property { .. }
+        | Expr::Subscript { .. }
+        | Expr::Slice { .. }
+        | Expr::List(_)
+        | Expr::Map(_)
+        | Expr::Function { .. } => default_name(expr),
         other => format!("({})", default_name(other)),
     }
 }
@@ -1449,6 +1484,17 @@ fn rewrite_expr(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>) -
             base: Box::new(rewrite_expr(base, f)?),
             index: Box::new(rewrite_expr(index, f)?),
         },
+        Expr::Slice { base, lower, upper } => Expr::Slice {
+            base: Box::new(rewrite_expr(base, f)?),
+            lower: lower
+                .as_ref()
+                .map(|lower| rewrite_expr(lower, f).map(Box::new))
+                .transpose()?,
+            upper: upper
+                .as_ref()
+                .map(|upper| rewrite_expr(upper, f).map(Box::new))
+                .transpose()?,
+        },
         Expr::Unary { op, expr: inner } => Expr::Unary {
             op: *op,
             expr: Box::new(rewrite_expr(inner, f)?),
@@ -1528,6 +1574,11 @@ fn expr_references(expr: &Expr, pred: &mut dyn FnMut(&str) -> bool) -> bool {
         Expr::Subscript { base, index } => {
             expr_references(base, pred) || expr_references(index, pred)
         }
+        Expr::Slice { base, lower, upper } => {
+            expr_references(base, pred)
+                || lower.as_deref().is_some_and(|e| expr_references(e, pred))
+                || upper.as_deref().is_some_and(|e| expr_references(e, pred))
+        }
         Expr::Unary { expr, .. } => expr_references(expr, pred),
         Expr::Binary { left, right, .. } => {
             expr_references(left, pred) || expr_references(right, pred)
@@ -1581,6 +1632,11 @@ fn contains_aggregation(expr: &Expr) -> bool {
         Expr::Property { base, .. } | Expr::Unary { expr: base, .. } => contains_aggregation(base),
         Expr::Subscript { base, index } => {
             contains_aggregation(base) || contains_aggregation(index)
+        }
+        Expr::Slice { base, lower, upper } => {
+            contains_aggregation(base)
+                || lower.as_deref().is_some_and(contains_aggregation)
+                || upper.as_deref().is_some_and(contains_aggregation)
         }
         Expr::Binary { left, right, .. } => {
             contains_aggregation(left) || contains_aggregation(right)
@@ -1745,6 +1801,16 @@ fn substitute_expr(expr: &mut Expr, params: &HashMap<String, Value>) -> Result<(
         Expr::Subscript { base, index } => {
             substitute_expr(base, params)?;
             substitute_expr(index, params)
+        }
+        Expr::Slice { base, lower, upper } => {
+            substitute_expr(base, params)?;
+            if let Some(lower) = lower {
+                substitute_expr(lower, params)?;
+            }
+            if let Some(upper) = upper {
+                substitute_expr(upper, params)?;
+            }
+            Ok(())
         }
         Expr::Unary { expr, .. } => substitute_expr(expr, params),
         Expr::Binary { left, right, .. } => {

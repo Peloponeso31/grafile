@@ -1014,6 +1014,25 @@ impl<'a> Codegen<'a> {
                     dest,
                 });
             }
+            Expr::Slice { base, lower, upper } => {
+                let base_reg = self.compile_expr(base, ctx)?;
+                let lower_reg = match lower {
+                    Some(lower) => self.compile_expr(lower, ctx)?,
+                    None => self.null_reg(),
+                };
+                let upper_reg = match upper {
+                    Some(upper) => self.compile_expr(upper, ctx)?,
+                    None => self.null_reg(),
+                };
+                self.emit(Op::Slice {
+                    base: base_reg,
+                    lower: lower_reg,
+                    upper: upper_reg,
+                    open_lower: lower.is_none(),
+                    open_upper: upper.is_none(),
+                    dest,
+                });
+            }
             Expr::Unary { op, expr } => {
                 let src = self.compile_expr(expr, ctx)?;
                 self.emit(Op::Unary {

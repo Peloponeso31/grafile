@@ -310,6 +310,58 @@ pub fn line_column(source: &str, offset: usize) -> (usize, usize) {
     (line, column)
 }
 
+impl Token {
+    /// Whether the token is a reserved word.
+    pub const fn is_keyword(self) -> bool {
+        use Token::*;
+        matches!(
+            self,
+            Match
+                | Optional
+                | Where
+                | Return
+                | With
+                | Unwind
+                | Create
+                | Merge
+                | Set
+                | Remove
+                | Delete
+                | Detach
+                | Order
+                | By
+                | Skip
+                | Limit
+                | As
+                | And
+                | Or
+                | Xor
+                | Not
+                | In
+                | Is
+                | Null
+                | True
+                | False
+                | Distinct
+                | Starts
+                | Ends
+                | Contains
+                | Asc
+                | Ascending
+                | Desc
+                | Descending
+                | On
+                | Case
+                | When
+                | Then
+                | Else
+                | End
+                | Union
+                | All
+        )
+    }
+}
+
 /// Classification of a lexed token for syntax highlighting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenClass {
@@ -361,11 +413,10 @@ pub fn highlight_spans(line: &str) -> Vec<(usize, usize, TokenClass)> {
 
 fn classify(token: Token, tokens: &[(usize, usize, Token)], index: usize) -> TokenClass {
     use Token::*;
+    if token.is_keyword() {
+        return TokenClass::Keyword;
+    }
     match token {
-        Match | Optional | Where | Return | With | Unwind | Create | Merge | Set | Remove
-        | Delete | Detach | Order | By | Skip | Limit | As | And | Or | Xor | Not | In | Is
-        | Null | True | False | Distinct | Starts | Ends | Contains | Asc | Ascending | Desc
-        | Descending | On | Case | When | Then | Else | End | Union | All => TokenClass::Keyword,
         LineComment | BlockComment => TokenClass::Comment,
         StringSingle | StringDouble => TokenClass::String,
         Integer | Float => TokenClass::Number,
@@ -385,6 +436,10 @@ fn classify(token: Token, tokens: &[(usize, usize, Token)], index: usize) -> Tok
         }
         LParen | RParen | LBracket | RBracket | LBrace | RBrace | Comma | Semicolon | Colon
         | Pipe | Dot => TokenClass::Punctuation,
+        other => {
+            debug_assert!(other.is_keyword());
+            TokenClass::Keyword
+        }
     }
 }
 

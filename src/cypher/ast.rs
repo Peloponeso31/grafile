@@ -79,6 +79,15 @@ pub enum Expr {
         /// Index expression.
         index: Box<Expr>,
     },
+    /// `expr[lower..upper]` list slice; omitted bounds are open.
+    Slice {
+        /// Base expression.
+        base: Box<Expr>,
+        /// Inclusive start, from the end when negative.
+        lower: Option<Box<Expr>>,
+        /// Exclusive end, from the end when negative.
+        upper: Option<Box<Expr>>,
+    },
     /// Unary operation.
     Unary {
         /// Operator.

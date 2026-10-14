@@ -673,3 +673,73 @@ fn aggregation_inside_map_projection() {
     );
     assert_eq!(rows, vec![vec!["{name: 2}"]]);
 }
+
+// ---- maps, subscripts and slices ----
+
+#[test]
+fn map_field_access_and_subscript() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH {name: 'Alice', age: 38} AS m RETURN m.name AS a, m['age'] AS b, m.missing AS c",
+    );
+    assert_eq!(rows, vec![vec!["Alice", "38", "null"]]);
+}
+
+#[test]
+fn map_keys_include_null_values() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN size(keys({exists: 42, notMissing: null})) AS n",
+    );
+    assert_eq!(rows, vec![vec!["2"]]);
+}
+
+#[test]
+fn list_slices() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH [1, 2, 3, 4, 5] AS list RETURN list[1..3] AS a, list[1..] AS b, list[..2] AS c, list[-3..-1] AS d, list[3..1] AS e, list[-5..5] AS f",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "[2, 3]",
+            "[2, 3, 4, 5]",
+            "[1, 2]",
+            "[3, 4]",
+            "[]",
+            "[1, 2, 3, 4, 5]"
+        ]]
+    );
+}
+
+#[test]
+fn list_slice_with_null_bound_is_null() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH [1, 2, 3] AS list, null AS bound RETURN list[bound..2] IS NULL",
+    );
+    assert_eq!(rows, vec![vec!["true"]]);
+}
+
+#[test]
+fn indexing_errors_are_type_errors() {
+    let mut conn = connection();
+    for query_text in ["RETURN 1[0]", "RETURN [1]['x']", "RETURN {a: 1}[0]"] {
+        let err = conn
+            .query(query_text, &Params::new())
+            .expect_err("type error");
+        assert_eq!(err.code(), grafile::ErrorCode::Type, "{query_text}");
+    }
+}
+
+#[test]
+fn list_concatenation_with_scalars() {
+    let mut conn = connection();
+    let rows = query(&mut conn, "RETURN [1, 2] + 3 AS a, 0 + [1, 2] AS b");
+    assert_eq!(rows, vec![vec!["[1, 2, 3]", "[0, 1, 2]"]]);
+}

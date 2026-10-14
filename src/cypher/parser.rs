@@ -472,6 +472,25 @@ impl<'a> Parser<'a> {
             .map_err(|_| Error::syntax(format!("invalid {what}")))
     }
 
+    /// Map keys: identifiers, escaped identifiers, quoted strings and
+    /// reserved words (which are plain strings in this position, case kept).
+    fn parse_map_key(&mut self) -> Result<String> {
+        match self.peek() {
+            Some(Token::StringSingle) | Some(Token::StringDouble) => {
+                let spanned = self.tokens[self.pos];
+                self.advance();
+                unescape_string(&self.source[spanned.start + 1..spanned.end - 1])
+            }
+            Some(Token::Ident) | Some(Token::EscapedIdent) => self.parse_name(),
+            Some(token) if token.is_keyword() => {
+                let spanned = self.tokens[self.pos];
+                self.advance();
+                Ok(self.source[spanned.start..spanned.end].to_owned())
+            }
+            _ => self.fail("expected a map key"),
+        }
+    }
+
     fn parse_name(&mut self) -> Result<String> {
         match self.advance() {
             Some(Token::Ident) => {
@@ -645,12 +664,33 @@ impl<'a> Parser<'a> {
                 }
                 Some(Token::LBracket) => {
                     self.advance();
-                    let index = self.parse_expr()?;
-                    self.expect(Token::RBracket, "']' after subscript")?;
-                    expr = Expr::Subscript {
-                        base: Box::new(expr),
-                        index: Box::new(index),
+                    let lower = if self.peek() == Some(Token::DotDot) {
+                        None
+                    } else {
+                        Some(Box::new(self.parse_expr()?))
                     };
+                    if self.eat(Token::DotDot) {
+                        let upper = if self.peek() == Some(Token::RBracket) {
+                            None
+                        } else {
+                            Some(Box::new(self.parse_expr()?))
+                        };
+                        self.expect(Token::RBracket, "']' after slice")?;
+                        expr = Expr::Slice {
+                            base: Box::new(expr),
+                            lower,
+                            upper,
+                        };
+                    } else {
+                        let Some(index) = lower else {
+                            return self.fail("expected an index or a slice");
+                        };
+                        self.expect(Token::RBracket, "']' after subscript")?;
+                        expr = Expr::Subscript {
+                            base: Box::new(expr),
+                            index,
+                        };
+                    }
                 }
                 Some(Token::Colon) => {
                     self.advance();
@@ -767,14 +807,7 @@ impl<'a> Parser<'a> {
         let mut entries = Vec::new();
         if self.peek() != Some(Token::RBrace) {
             loop {
-                let key = match self.peek() {
-                    Some(Token::StringSingle) | Some(Token::StringDouble) => {
-                        let spanned = self.tokens[self.pos];
-                        self.advance();
-                        unescape_string(&self.source[spanned.start + 1..spanned.end - 1])?
-                    }
-                    _ => self.parse_name()?,
-                };
+                let key = self.parse_map_key()?;
                 self.expect(Token::Colon, "':' in map entry")?;
                 let value = self.parse_expr()?;
                 entries.push((key, value));

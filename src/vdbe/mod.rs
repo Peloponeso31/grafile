@@ -341,6 +341,21 @@ pub enum Op {
         /// Destination register.
         dest: u32,
     },
+    /// Slice a list: `base[lower..upper]`.
+    Slice {
+        /// List register.
+        base: u32,
+        /// Lower bound register (ignored when `open_lower`).
+        lower: u32,
+        /// Upper bound register (ignored when `open_upper`).
+        upper: u32,
+        /// Whether the lower bound was omitted.
+        open_lower: bool,
+        /// Whether the upper bound was omitted.
+        open_upper: bool,
+        /// Destination register.
+        dest: u32,
+    },
     /// Start unwinding a list.
     UnwindInit {
         /// Cursor slot.
@@ -747,6 +762,7 @@ impl<'a> Executor<'a> {
                 let base_value = self.reg_value(*base)?;
                 let index_value = self.reg_value(*index)?;
                 let result = match (base_value, index_value) {
+                    (Value::Null, _) | (_, Value::Null) => Value::Null,
                     (Value::List(items), Value::Int(index)) => {
                         let len = items.len() as i64;
                         let resolved = if index < 0 { len + index } else { index };
@@ -756,7 +772,73 @@ impl<'a> Executor<'a> {
                             items[resolved as usize].clone()
                         }
                     }
-                    _ => Value::Null,
+                    (Value::Map(entries), Value::Text(key)) => entries
+                        .iter()
+                        .find(|(entry, _)| entry.as_ref() == key.as_ref())
+                        .map(|(_, value)| value.clone())
+                        .unwrap_or(Value::Null),
+                    (Value::List(_), other) => {
+                        return Err(Error::type_error(format!(
+                            "list index must be an integer, got {}",
+                            other.type_name()
+                        )));
+                    }
+                    (Value::Map(_), other) => {
+                        return Err(Error::type_error(format!(
+                            "map key must be a string, got {}",
+                            other.type_name()
+                        )));
+                    }
+                    (other, _) => {
+                        return Err(Error::type_error(format!(
+                            "cannot index into {}",
+                            other.type_name()
+                        )));
+                    }
+                };
+                self.regs[*dest as usize] = normalize_reg(result);
+            }
+            Op::Slice {
+                base,
+                lower,
+                upper,
+                open_lower,
+                open_upper,
+                dest,
+            } => {
+                let base_value = self.reg_value(*base)?;
+                let result = match base_value {
+                    Value::Null => Value::Null,
+                    Value::List(items) => {
+                        let lower_value = self.reg_value(*lower)?;
+                        let upper_value = self.reg_value(*upper)?;
+                        // An explicitly null bound makes the slice null.
+                        if (!open_lower && lower_value.is_null())
+                            || (!open_upper && upper_value.is_null())
+                        {
+                            Value::Null
+                        } else {
+                            let len = items.len() as i64;
+                            let start = if *open_lower {
+                                0
+                            } else {
+                                slice_bound("lower", &lower_value, len)?
+                            };
+                            let end = if *open_upper {
+                                len as usize
+                            } else {
+                                slice_bound("upper", &upper_value, len)?
+                            };
+                            let end = end.max(start);
+                            Value::List(items[start..end].to_vec().into())
+                        }
+                    }
+                    other => {
+                        return Err(Error::type_error(format!(
+                            "cannot slice {}",
+                            other.type_name()
+                        )));
+                    }
                 };
                 self.regs[*dest as usize] = normalize_reg(result);
             }
@@ -1472,6 +1554,13 @@ impl<'a> Executor<'a> {
                     };
                     Ok(Value::List(self.prop_keys(&record.props).into()))
                 }
+                Some(Value::Map(entries)) => Ok(Value::List(
+                    entries
+                        .iter()
+                        .map(|(key, _)| Value::Text(key.clone()))
+                        .collect::<Vec<_>>()
+                        .into(),
+                )),
                 _ => Ok(Value::Null),
             },
             _ => Err(Error::internal("unknown function code")),
@@ -1799,12 +1888,39 @@ fn numeric_or_concat(
     if let (Value::Text(x), Value::Text(y)) = (a, b) {
         return Ok(Value::Text(format!("{x}{y}").into()));
     }
-    if let (Value::List(x), Value::List(y)) = (a, b) {
-        let mut items = x.to_vec();
-        items.extend(y.iter().cloned());
-        return Ok(Value::List(items.into()));
+    match (a, b) {
+        (Value::List(x), Value::List(y)) => {
+            let mut items = x.to_vec();
+            items.extend(y.iter().cloned());
+            return Ok(Value::List(items.into()));
+        }
+        // A scalar concatenates onto a list on either side.
+        (Value::List(x), other) => {
+            let mut items = x.to_vec();
+            items.push(other.clone());
+            return Ok(Value::List(items.into()));
+        }
+        (other, Value::List(y)) => {
+            let mut items = vec![other.clone()];
+            items.extend(y.iter().cloned());
+            return Ok(Value::List(items.into()));
+        }
+        _ => {}
     }
     numeric(a, b, float_op, int_op)
+}
+
+/// Resolve a slice bound against the list length: negative bounds count from
+/// the end and everything is clamped into range.
+fn slice_bound(which: &str, value: &Value, len: i64) -> Result<usize> {
+    let Value::Int(index) = value else {
+        return Err(Error::type_error(format!(
+            "list slice {which} bound must be an integer, got {}",
+            value.type_name()
+        )));
+    };
+    let resolved = if *index < 0 { len + index } else { *index };
+    Ok(resolved.clamp(0, len) as usize)
 }
 
 fn type_error(operation: &str, a: &Value, b: &Value) -> Error {
