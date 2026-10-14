@@ -627,10 +627,6 @@
       }
     },
     "clauses/match/Match4.feature": {
-      "[1] Handling fixed-length variable length pattern": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet"
-      },
       "[2] Simple variable length pattern": {
         "reason": "not-implemented",
         "note": "setup failed: Syntax: expected an identifier at line 4 column 14 (found Contains)"
@@ -643,27 +639,15 @@
         "reason": "not-implemented",
         "note": "setup failed: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
       },
-      "[5] Matching variable length pattern with property predicate": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet"
-      },
-      "[6] Matching variable length patterns from a bound node": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet"
-      },
       "[7] Matching variable length patterns including a bound relationship": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 3 column 7 (found Ident)"
-      },
-      "[8] Matching relationships into a list and matching variable length using the list": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet"
       }
     },
     "clauses/match/Match5.feature": {
-      "*": {
+      "[27] Handling mixed relationship patterns and directions 2": {
         "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet"
+        "note": "expected rows, got a compile time error: compile time: Syntax: invalid relationship direction at line 3 column 37 (found LParen)"
       }
     },
     "clauses/match/Match6.feature": {
@@ -749,22 +733,6 @@
       }
     },
     "clauses/match/Match7.feature": {
-      "[12] Variable length optional relationships": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet"
-      },
-      "[13] Variable length optional relationships with bound nodes": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet"
-      },
-      "[14] Variable length optional relationships with length predicates": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet"
-      },
-      "[15] Variable length patterns and nulls": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet"
-      },
       "[16] Optionally matching named paths - null result": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 3 column 16 (found Ident)"
@@ -797,9 +765,21 @@
       }
     },
     "clauses/match/Match9.feature": {
-      "*": {
+      "[1] Variable length relationship variables are lists of relationships": {
         "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet"
+        "note": "expected rows, got a compile time error: compile time: Unsupported: function `last` is not supported yet"
+      },
+      "[2] Return relationships by collecting them as a list - directed, one way": {
+        "reason": "not-implemented",
+        "note": "setup failed: Syntax: expected an identifier at line 2 column 57 (found End)"
+      },
+      "[3] Return relationships by collecting them as a list - undirected, starting from two extremes": {
+        "reason": "not-implemented",
+        "note": "setup failed: Syntax: expected an identifier at line 2 column 11 (found End)"
+      },
+      "[9] Optionally matching named paths with variable length patterns": {
+        "reason": "not-implemented",
+        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 4 column 16 (found Ident)"
       }
     },
     "clauses/merge/Merge1.feature": {
