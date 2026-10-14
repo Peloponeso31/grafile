@@ -585,16 +585,22 @@ impl<'a> Executor<'a> {
                 direction,
                 types,
             } => {
-                let node = self.reg_node(*src)?;
-                let items = match direction {
-                    0 => self.db.expand(node, Direction::Out, types)?,
-                    1 => self.db.expand(node, Direction::In, types)?,
-                    _ => {
-                        let mut both = self.db.expand(node, Direction::Out, types)?;
-                        both.extend(self.db.expand(node, Direction::In, types)?);
-                        both.sort_unstable();
-                        both.dedup();
-                        both
+                // Expanding from a null binding (an optional match that
+                // missed) matches nothing instead of failing.
+                let items = if matches!(self.regs[*src as usize], Reg::Value(Value::Null)) {
+                    Vec::new()
+                } else {
+                    let node = self.reg_node(*src)?;
+                    match direction {
+                        0 => self.db.expand(node, Direction::Out, types)?,
+                        1 => self.db.expand(node, Direction::In, types)?,
+                        _ => {
+                            let mut both = self.db.expand(node, Direction::Out, types)?;
+                            both.extend(self.db.expand(node, Direction::In, types)?);
+                            both.sort_unstable();
+                            both.dedup();
+                            both
+                        }
                     }
                 };
                 self.cursors[*cursor as usize] = Cursor::Expand { items, pos: 0 };
@@ -1060,18 +1066,24 @@ impl<'a> Executor<'a> {
                 labels,
                 add,
             } => {
-                let id = self.reg_node(*target)?;
-                let label_ids = self.resolve_labels(*labels)?;
-                if *add {
-                    self.db.add_node_labels(id, &label_ids)?;
-                } else {
-                    self.db.remove_node_labels(id, &label_ids)?;
+                // Setting labels on a null binding is a no-op.
+                if !matches!(self.regs[*target as usize], Reg::Value(Value::Null)) {
+                    let id = self.reg_node(*target)?;
+                    let label_ids = self.resolve_labels(*labels)?;
+                    if *add {
+                        self.db.add_node_labels(id, &label_ids)?;
+                    } else {
+                        self.db.remove_node_labels(id, &label_ids)?;
+                    }
                 }
             }
             Op::ReplaceProperties { target, props } => {
-                let id = self.reg_node(*target)?;
-                let props = self.resolve_props(*props)?;
-                self.db.replace_node_properties(id, props)?;
+                // Replacing properties on a null binding is a no-op.
+                if !matches!(self.regs[*target as usize], Reg::Value(Value::Null)) {
+                    let id = self.reg_node(*target)?;
+                    let props = self.resolve_props(*props)?;
+                    self.db.replace_node_properties(id, props)?;
+                }
             }
             Op::DeleteAny { target, detach } => match self.regs[*target as usize].clone() {
                 Reg::Node(id) => {
@@ -1130,6 +1142,9 @@ impl<'a> Executor<'a> {
 
     fn column_value(&mut self, target: u32, key: u32) -> Result<Value> {
         match self.regs[target as usize].clone() {
+            // Property access on a null binding (an optional match that
+            // missed) is null, not an error.
+            Reg::Value(Value::Null) => Ok(Value::Null),
             Reg::Node(id) | Reg::Value(Value::Node(id)) => Ok(self
                 .db
                 .get_node(id)?

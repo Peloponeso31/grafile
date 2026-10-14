@@ -10,12 +10,13 @@ scenarios pass without allow-list entries.
 
 Implemented:
 
-- Clauses: `MATCH`, `WHERE`, `RETURN`, `WITH` (with `DISTINCT`, `ORDER BY`,
-  `SKIP`, `LIMIT`, trailing `WHERE`), `UNWIND`, `CREATE`, `MERGE` (with
-  `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE`,
-  `DETACH DELETE`.
+- Clauses: `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN`, `WITH` (with
+  `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`, trailing `WHERE`), `UNWIND`,
+  `CREATE`, `MERGE` (with `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`,
+  `DELETE`, `DETACH DELETE`.
 - Patterns: node and relationship patterns, directions, type disjunction
-  (`:A|B`), inline literal property filters, multiple labels.
+  (`:A|B`), inline literal property filters, multiple labels, pre-bound
+  elements (nodes and relationships verified instead of re-bound).
 - Expressions: parameters, list/map literals, `CASE`, `IS [NOT] NULL`,
   `STARTS WITH` / `ENDS WITH` / `CONTAINS` / `=~`, `IN`, label predicates,
   three-valued logic, numeric cross-type comparison.
@@ -29,7 +30,6 @@ Explicit gaps (currently clear `Unsupported` errors):
 | Gap | Where rejected |
 |-----|----------------|
 | `UNION` / `UNION ALL` | parser |
-| `OPTIONAL MATCH` | parser |
 | Variable-length paths (`*min..max`) | planner |
 | `MERGE` with multiple relationships | planner |
 | Expressions mixing aggregation and grouping keys | planner |
@@ -51,58 +51,32 @@ Known semantic deviations to close:
 - `ORDER BY` after aggregation may only reference projected values.
 - Aggregations with multiple arguments are rejected.
 
-## Measurement: the TCK harness (Phase 0)
-
-Conformance work starts by making progress measurable:
-
-1. Vendor the openCypher TCK (Cucumber `.feature` files, Apache-2.0) with
-   NOTICE attribution.
-2. Implement a small Gherkin step-runner that maps scenarios onto the public
-   API: execute the scenario's setup Cypher, run the query, compare result
-   tables (order-sensitive where the scenario says so), and map expected
-   error types onto grafile's `ErrorCode`.
-3. Maintain an allow-list of skipped scenarios with a reason
-   (`not-implemented`, `neo4j-extension`, `out-of-scope`), so the report is
-   "passing / applicable" rather than "passing / everything".
-4. Publish a pass-rate report and wire it into CI so later phases cannot
-   regress.
-
-**Status: implemented.** `tck-runner` runs the vendored suite
-(`third_party/opencypher`, tag `2024.3`) and gates CI on it; see
-`docs/tck.md`. Baseline: 3897 scenarios, 948 passing, 2949 allow-listed
-(24.3% of the suite, 100% of applicable scenarios), zero harness errors.
-The allow-list contains only language gaps; the gate fails on stale entries
-so fixes must prune the list in the same commit.
-
 ## Phases
 
 ### Phase 1 — Core language completion (large)
 
 Highest TCK scenario share; ordered roughly by dependency:
 
-1. `OPTIONAL MATCH`: compile the inner plan into a collected row cursor
-   (the existing `Collect`/`CtxData` machinery) and emit one null row when
-   the inner plan is empty; merge scoping rules with subsequent clauses.
-2. `UNION` / `UNION ALL`: statement-level concatenation plus deduplication
+1. `UNION` / `UNION ALL`: statement-level concatenation plus deduplication
    for `UNION`.
-3. Variable-length paths: bounded and unbounded expansion with a per-path
+2. Variable-length paths: bounded and unbounded expansion with a per-path
    visited/trail set, driven by the incidence matrix.
-4. Named paths and path values: `p = (a)-[…]→(b)` plus `nodes(p)`,
+3. Named paths and path values: `p = (a)-[…]→(b)` plus `nodes(p)`,
    `relationships(p)`, `length(p)`; new value representation across record,
    JSON and display layers.
-5. Pattern predicates in `WHERE`, `exists()`, and `shortestPath()` /
+4. Pattern predicates in `WHERE`, `exists()`, and `shortestPath()` /
    `allShortestPaths()` (bidirectional BFS over the incidence planes).
-6. List comprehensions, pattern comprehensions, quantifiers
+5. List comprehensions, pattern comprehensions, quantifiers
    (`all`, `any`, `none`, `single`), `reduce()`.
-7. Map property access (`m.k`), subscript (`m['k']`), list slicing
+6. Map property access (`m.k`), subscript (`m['k']`), list slicing
    (`list[1..3]`), and map projections (`n{.name}`).
-8. `FOREACH`, `SET n += {…}`, and `CALL … YIELD` for built-in procedures
+7. `FOREACH`, `SET n += {…}`, and `CALL … YIELD` for built-in procedures
    (`db.labels()`, `db.propertyKeys()`, …).
-9. MERGE conformance: whole-path match-or-create and multiple
+8. MERGE conformance: whole-path match-or-create and multiple
    relationships; removes the documented deviation.
-10. Aggregation completeness: `DISTINCT` inside aggregations,
-    multi-argument aggregations, and grouping-key semantics for
-    expressions that mix aggregation and non-aggregated values.
+9. Aggregation completeness: `DISTINCT` inside aggregations,
+   multi-argument aggregations, and grouping-key semantics for
+   expressions that mix aggregation and non-aggregated values.
 
 ### Phase 2 — Function library (medium)
 
@@ -156,7 +130,6 @@ These stay allow-listed as `neo4j-extension` until this phase.
 
 | Milestone | Target |
 |-----------|--------|
-| After Phase 0 | Baseline pass-rate report in CI; allow-list covers all known gaps |
 | After Phases 1–2 | ≥ 80% of applicable TCK scenarios pass |
 | After Phase 4 | ≥ 95% of applicable TCK scenarios pass; deviations closed |
 | After Phase 5 | Allow-list contains only non-goals |
@@ -169,7 +142,9 @@ These stay allow-listed as `neo4j-extension` until this phase.
 
 ## Sequencing rules
 
-1. Phase 0 before any language work: no feature ships without TCK coverage.
+1. No feature ships without TCK coverage: a feature is done when its
+   applicable scenarios pass and its allow-list entries are pruned in the
+   same commit.
 2. Each phase lands as conventional commits with tests; the TCK report must
    not regress between phases.
 3. Storage-format changes (Phase 3) follow `docs/format.md` and bump the

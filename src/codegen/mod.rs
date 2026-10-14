@@ -288,6 +288,66 @@ impl<'a> Codegen<'a> {
                 cg.patch(jump, end)?;
                 Ok(())
             }),
+            Plan::OptionalMatch { input, inner, vars } => {
+                self.compile(input, ctx, &mut |cg, outer_ctx| {
+                    let cursor = cg.alloc_cursor();
+                    cg.emit(Op::CollectOpen { cursor });
+                    let mut produced: Option<Ctx> = None;
+                    cg.compile(inner, outer_ctx, &mut |cg, ctx| {
+                        produced = Some(ctx.clone());
+                        cg.emit(Op::CollectRow {
+                            cursor,
+                            start: ctx.window_start,
+                            count: ctx.window_len,
+                        });
+                        Ok(())
+                    })?;
+                    let Some(inner_ctx) = produced else {
+                        // The inner plan can never produce rows: only the
+                        // null-extended path exists.
+                        let mut null_ctx = outer_ctx.clone();
+                        for var in vars {
+                            let reg = cg.null_reg();
+                            null_ctx.vars.insert(var.clone(), reg);
+                        }
+                        null_ctx.window_len = cg.next_reg - null_ctx.window_start;
+                        return out(cg, &mut null_ctx);
+                    };
+                    // When the pattern missed, append one row with the new
+                    // variables nulled so the replay below sees a row.
+                    let empty_jump = cg.emit(Op::CtxRewind { cursor, target: 0 });
+                    let skip_null = cg.emit(Op::Goto { target: 0 });
+                    let null_start = cg.ops.len() as u32;
+                    for var in vars {
+                        let Some(reg) = inner_ctx.vars.get(var).copied() else {
+                            return Err(Error::internal("optional variable is not bound"));
+                        };
+                        cg.emit(Op::Null { dest: reg });
+                    }
+                    cg.emit(Op::CollectRow {
+                        cursor,
+                        start: inner_ctx.window_start,
+                        count: inner_ctx.window_len,
+                    });
+                    let replay_start = cg.ops.len() as u32;
+                    cg.patch(empty_jump, null_start)?;
+                    cg.patch(skip_null, replay_start)?;
+                    // Replay the collected (or null-extended) rows once.
+                    let loop_start = cg.ops.len() as u32;
+                    cg.emit(Op::CtxData {
+                        cursor,
+                        start: inner_ctx.window_start,
+                        count: inner_ctx.window_len,
+                    });
+                    let mut replay_ctx = inner_ctx.clone();
+                    out(cg, &mut replay_ctx)?;
+                    let next = cg.emit(Op::CtxNext { cursor, target: 0 });
+                    cg.emit(Op::Goto { target: loop_start });
+                    let end = cg.ops.len() as u32;
+                    cg.patch(next, end)?;
+                    Ok(())
+                })
+            }
             Plan::Project { input, items } => {
                 self.compile(input, ctx, &mut |cg, in_ctx| {
                     // Evaluate into scratch registers first so the output

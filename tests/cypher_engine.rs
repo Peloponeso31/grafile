@@ -391,3 +391,139 @@ fn second_connection_sees_committed_changes() {
     let rows = query(&mut reader, "MATCH (n:Person) RETURN count(*) AS n");
     assert_eq!(rows, vec![vec!["2"]]);
 }
+
+// ---- OPTIONAL MATCH ----
+
+#[test]
+fn optional_match_returns_null_row_on_empty_graph() {
+    let mut conn = connection();
+    let rows = query(&mut conn, "OPTIONAL MATCH (n) RETURN n");
+    assert_eq!(rows, vec![vec!["null"]]);
+}
+
+#[test]
+fn optional_match_extends_with_nulls_when_missing() {
+    let mut conn = connection();
+    conn.execute("CREATE ()").expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH (n) OPTIONAL MATCH (n)-[:NOT_EXIST]->(x) RETURN n, x",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1], "null");
+}
+
+#[test]
+fn optional_match_keeps_matches() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A)-[:T]->(:B)").expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH (a:A) OPTIONAL MATCH (a)-[:T]->(b) RETURN b",
+    );
+    assert_eq!(rows, vec![vec!["(node 2)"]]);
+}
+
+#[test]
+fn optional_match_with_where_filters_before_null_extension() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A)-[:T]->(:B {name: 'b'})")
+        .expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH (a:A) OPTIONAL MATCH (a)-[:T]->(b) WHERE b.name = 'nope' RETURN b",
+    );
+    assert_eq!(rows, vec![vec!["null"]]);
+}
+
+#[test]
+fn match_after_optional_match_from_null_returns_nothing() {
+    let mut conn = connection();
+    conn.execute("CREATE ()-[:T]->()").expect("create");
+    let rows = query(
+        &mut conn,
+        "OPTIONAL MATCH (a:Missing) WITH a MATCH (a)-->(b) RETURN b",
+    );
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn optional_match_after_optional_match() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A)-[:T]->(:B)").expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH (a:A) OPTIONAL MATCH (a)-[:T]->(b) OPTIONAL MATCH (b)-[:T]->(c) RETURN b, c",
+    );
+    assert_eq!(rows, vec![vec!["(node 2)", "null"]]);
+}
+
+#[test]
+fn with_where_can_reference_incoming_scope() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A)-[:T]->(:B)").expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH (a:A) OPTIONAL MATCH (a)-[:T]->(b) WITH a WHERE b IS NULL RETURN a",
+    );
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn null_bound_variables_are_safe_in_reads_and_writes() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "OPTIONAL MATCH (n:Missing) SET n.x = 1 REMOVE n.x DELETE n RETURN n.x IS NULL",
+    );
+    assert_eq!(rows, vec![vec!["true"]]);
+}
+
+// ---- pre-bound pattern elements ----
+
+#[test]
+fn pattern_verifies_a_bound_relationship() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A)-[:T]->(:B), (:C)-[:T]->(:D)")
+        .expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH ()-[r]->() WITH r LIMIT 1 MATCH (a)-[r]->(b) RETURN a, b",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], "(node 1)");
+    assert_eq!(rows[0][1], "(node 2)");
+}
+
+#[test]
+fn pattern_verifies_labels_on_bound_nodes() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A)-[:T]->(:B)").expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH (a:A)-[:T]->(b) WHERE b:B MATCH (a)-[:T]->(c:Missing) RETURN c",
+    );
+    assert!(rows.is_empty());
+}
+
+#[test]
+fn pattern_checks_every_label_on_scanned_nodes() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A), (:A:B)").expect("create");
+    let rows = query(&mut conn, "MATCH (n:A:B) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["1"]]);
+}
+
+// ---- column naming ----
+
+#[test]
+fn default_column_names_render_the_expression() {
+    let mut conn = connection();
+    seed(&mut conn);
+    let mut rows = conn
+        .query("MATCH (n:Person) RETURN n.name, count(*)", &Params::new())
+        .expect("query");
+    let columns: Vec<&str> = rows.columns().iter().map(String::as_str).collect();
+    assert_eq!(columns, vec!["n.name", "count(*)"]);
+    assert_eq!(rows_to_strings(&mut rows).len(), 3);
+}

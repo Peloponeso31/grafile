@@ -376,9 +376,17 @@ impl<'a> Runner<'a> {
         };
         if !delta.is_zero() {
             self.failures.push(format!(
-                "expected no side effects, got +{} nodes, +{} relationships, \
-                 +{} properties, +{} labels",
-                delta.nodes, delta.relationships, delta.properties, delta.labels
+                "expected no side effects, got +{} nodes, -{} nodes, \
+                 +{} relationships, -{} relationships, +{} properties, \
+                 -{} properties, +{} labels, -{} labels",
+                delta.added_nodes,
+                delta.removed_nodes,
+                delta.added_relationships,
+                delta.removed_relationships,
+                delta.added_properties,
+                delta.removed_properties,
+                delta.added_labels,
+                delta.removed_labels
             ));
         }
         Ok(())
@@ -391,29 +399,31 @@ impl<'a> Runner<'a> {
         let Some(delta) = self.side_effects else {
             return Err("side effects were not measured".to_owned());
         };
-        let mut expected: HashMap<&str, i64> = HashMap::new();
+        let mut expected: HashMap<(char, &str), i64> = HashMap::new();
         for (raw_name, raw_value) in pairs {
             let (sign, name) = if let Some(name) = raw_name.strip_prefix('+') {
-                (1, name)
+                ('+', name)
             } else if let Some(name) = raw_name.strip_prefix('-') {
-                (-1, name)
+                ('-', name)
             } else {
                 return Err(format!("malformed side-effect metric `{raw_name}`"));
             };
-            if delta.get(name).is_none() {
-                return Err(format!("unknown side-effect metric `{name}`"));
+            if delta.count(sign, name).is_none() {
+                return Err(format!("unknown side-effect metric `{raw_name}`"));
             }
             let count: i64 = raw_value
                 .parse()
                 .map_err(|_| format!("malformed side-effect count `{raw_value}`"))?;
-            expected.insert(name, sign * count);
+            expected.insert((sign, name), count);
         }
         for name in ["nodes", "relationships", "properties", "labels"] {
-            let want = expected.get(name).copied().unwrap_or(0);
-            let got = delta.get(name).unwrap_or(0);
-            if want != got {
-                self.failures
-                    .push(format!("expected {want:+} {name}, got {got:+}"));
+            for sign in ['+', '-'] {
+                let want = expected.get(&(sign, name)).copied().unwrap_or(0);
+                let got = delta.count(sign, name).unwrap_or(0);
+                if want != got {
+                    self.failures
+                        .push(format!("expected {sign}{name} {want}, got {got}"));
+                }
             }
         }
         Ok(())

@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use hashlink::LinkedHashMap as FastMap;
 
 use crate::cypher::{
-    Clause, Expr, MatchClause, NodePattern, PatternPath, Query, RelDirection, ReturnItem, SetItem,
-    SortItem,
+    BinaryOp, Clause, Expr, MatchClause, NodePattern, PatternPath, Query, RelDirection, ReturnItem,
+    SetItem, SortItem, UnaryOp,
 };
 use crate::engine::Database;
 use crate::error::{Error, ErrorCode, Result};
@@ -167,17 +167,18 @@ impl<'a> Planner<'a> {
                     limit,
                     where_clause,
                 } => {
-                    let (new_plan, new_scope, _) =
-                        self.plan_projection(plan, items, *distinct, order, skip, limit, &scope)?;
+                    let (new_plan, new_scope, _) = self.plan_projection(
+                        plan,
+                        items,
+                        *distinct,
+                        order,
+                        skip,
+                        limit,
+                        where_clause.as_ref(),
+                        &scope,
+                    )?;
                     plan = new_plan;
                     scope = new_scope;
-                    if let Some(predicate) = where_clause {
-                        validate_expr(predicate, &scope)?;
-                        plan = Plan::Filter {
-                            input: Box::new(plan),
-                            predicate: predicate.clone(),
-                        };
-                    }
                     columns.clear();
                 }
                 Clause::Return {
@@ -187,8 +188,9 @@ impl<'a> Planner<'a> {
                     skip,
                     limit,
                 } => {
-                    let (new_plan, _, new_columns) =
-                        self.plan_projection(plan, items, *distinct, order, skip, limit, &scope)?;
+                    let (new_plan, _, new_columns) = self.plan_projection(
+                        plan, items, *distinct, order, skip, limit, None, &scope,
+                    )?;
                     plan = new_plan;
                     columns = new_columns;
                     scope.clear();
@@ -210,6 +212,9 @@ impl<'a> Planner<'a> {
         plan: &mut Plan,
         scope: &mut FastMap<String, VarKind>,
     ) -> Result<()> {
+        if clause.optional {
+            return self.plan_optional_match(clause, plan, scope);
+        }
         for path in &clause.patterns {
             self.plan_path(path, plan, scope)?;
         }
@@ -220,6 +225,41 @@ impl<'a> Planner<'a> {
                 predicate: predicate.clone(),
             };
         }
+        Ok(())
+    }
+
+    /// Plan `OPTIONAL MATCH`: the patterns become an inner plan rooted at
+    /// `Empty` that references the outer variables; the code generator keeps
+    /// one null-extended row when the inner plan yields none.
+    fn plan_optional_match(
+        &mut self,
+        clause: &MatchClause,
+        plan: &mut Plan,
+        scope: &mut FastMap<String, VarKind>,
+    ) -> Result<()> {
+        let mut inner = Plan::Empty;
+        let mut inner_scope = scope.clone();
+        for path in &clause.patterns {
+            self.plan_path(path, &mut inner, &mut inner_scope)?;
+        }
+        if let Some(predicate) = &clause.where_clause {
+            validate_expr(predicate, &inner_scope)?;
+            inner = Plan::Filter {
+                input: Box::new(inner),
+                predicate: predicate.clone(),
+            };
+        }
+        let vars: Vec<String> = inner_scope
+            .keys()
+            .filter(|var| !scope.contains_key(*var))
+            .cloned()
+            .collect();
+        *scope = inner_scope;
+        *plan = Plan::OptionalMatch {
+            input: Box::new(plan.clone()),
+            inner: Box::new(inner),
+            vars,
+        };
         Ok(())
     }
 
@@ -253,7 +293,11 @@ impl<'a> Planner<'a> {
                 None => self.anon_name("rel"),
             };
             let types = self.resolve_types(&rel.types);
-            let props = self.pattern_props(rel.properties.as_ref(), "relationship")?;
+            let props = self
+                .pattern_props(rel.properties.as_ref(), "relationship")?
+                .into_iter()
+                .map(|(_, key_id, value)| (key_id, value))
+                .collect();
             rels.push(RelInfo {
                 index: nodes.len() - 2,
                 var,
@@ -267,14 +311,18 @@ impl<'a> Planner<'a> {
             .iter()
             .map(|node| scope.contains_key(&node.var))
             .collect();
-        // Bind edges for anonymous relationships when expanded.
+        let mut scanned = vec![false; nodes.len()];
+        let mut handled = vec![false; rels.len()];
         loop {
-            if bound.iter().all(|b| *b) {
+            if bound.iter().all(|b| *b) && handled.iter().all(|h| *h) {
                 break;
             }
-            // Try to expand from a bound node.
-            let mut expanded = false;
-            for rel in &rels {
+            // Expand from a bound endpoint into an unbound one.
+            let mut progressed = false;
+            for (idx, rel) in rels.iter().enumerate() {
+                if handled[idx] {
+                    continue;
+                }
                 let (from, to) = (rel.index, rel.index + 1);
                 let direction = if bound[from] && !bound[to] {
                     Some((from, to, rel.direction))
@@ -286,26 +334,73 @@ impl<'a> Planner<'a> {
                 let Some((from_idx, to_idx, direction)) = direction else {
                     continue;
                 };
-                let from_var = nodes[from_idx].var.clone();
-                let to_var = nodes[to_idx].var.clone();
-                if !scope.contains_key(&rel.var) {
+                let edge_bound = scope.contains_key(&rel.var);
+                let edge_var = if edge_bound {
+                    self.anon_name("rel")
+                } else {
                     scope.insert(rel.var.clone(), VarKind::Edge);
-                }
+                    rel.var.clone()
+                };
                 *plan = Plan::Expand {
                     input: Box::new(plan.clone()),
-                    src: from_var,
-                    edge: Some(rel.var.clone()),
-                    dst: to_var.clone(),
+                    src: nodes[from_idx].var.clone(),
+                    edge: Some(edge_var.clone()),
+                    dst: nodes[to_idx].var.clone(),
                     direction,
                     types: rel.types.clone(),
                     props: rel.props.clone(),
                 };
-                scope.insert(to_var, VarKind::Node);
+                constrain_edge(plan, &edge_var, &rel.var, edge_bound);
+                scope.insert(nodes[to_idx].var.clone(), VarKind::Node);
                 bound[to_idx] = true;
-                expanded = true;
+                handled[idx] = true;
+                progressed = true;
                 break;
             }
-            if expanded {
+            if progressed {
+                continue;
+            }
+            // Both endpoints are bound: verify the relationship exists by
+            // expanding one endpoint and matching the other.
+            for (idx, rel) in rels.iter().enumerate() {
+                if handled[idx] {
+                    continue;
+                }
+                let (from, to) = (rel.index, rel.index + 1);
+                if !(bound[from] && bound[to]) {
+                    continue;
+                }
+                let fresh_node = self.anon_name("node");
+                let edge_bound = scope.contains_key(&rel.var);
+                let edge_var = if edge_bound {
+                    self.anon_name("rel")
+                } else {
+                    scope.insert(rel.var.clone(), VarKind::Edge);
+                    rel.var.clone()
+                };
+                *plan = Plan::Expand {
+                    input: Box::new(plan.clone()),
+                    src: nodes[from].var.clone(),
+                    edge: Some(edge_var.clone()),
+                    dst: fresh_node.clone(),
+                    direction: rel.direction,
+                    types: rel.types.clone(),
+                    props: rel.props.clone(),
+                };
+                scope.insert(fresh_node.clone(), VarKind::Node);
+                *plan = Plan::Filter {
+                    input: Box::new(plan.clone()),
+                    predicate: eq_expr(
+                        Expr::Variable(fresh_node),
+                        Expr::Variable(nodes[to].var.clone()),
+                    ),
+                };
+                constrain_edge(plan, &edge_var, &rel.var, edge_bound);
+                handled[idx] = true;
+                progressed = true;
+                break;
+            }
+            if progressed {
                 continue;
             }
             // New anchor: choose the most selective unbound node.
@@ -323,6 +418,18 @@ impl<'a> Planner<'a> {
                 props,
             };
             bound[idx] = true;
+            scanned[idx] = true;
+        }
+        // Constraints a scan did not enforce: every label beyond the first on
+        // scanned nodes, and all labels and literal properties on nodes that
+        // were bound by the scope or an expansion.
+        for (idx, node) in nodes.iter().enumerate() {
+            if let Some(predicate) = node_constraints(node, scanned[idx]) {
+                *plan = Plan::Filter {
+                    input: Box::new(plan.clone()),
+                    predicate,
+                };
+            }
         }
         Ok(())
     }
@@ -412,11 +519,23 @@ impl<'a> Planner<'a> {
         Ok(PlannedNode {
             var,
             label_ids,
-            props,
+            label_names: pattern.labels.clone(),
+            props: props
+                .iter()
+                .map(|(_, key_id, value)| (*key_id, value.clone()))
+                .collect(),
+            prop_literals: props
+                .into_iter()
+                .map(|(name, _, value)| (name, value))
+                .collect(),
         })
     }
 
-    fn pattern_props(&self, properties: Option<&Expr>, what: &str) -> Result<Vec<(u32, Value)>> {
+    fn pattern_props(
+        &self,
+        properties: Option<&Expr>,
+        what: &str,
+    ) -> Result<Vec<(String, u32, Value)>> {
         let Some(properties) = properties else {
             return Ok(Vec::new());
         };
@@ -436,7 +555,7 @@ impl<'a> Planner<'a> {
                 continue;
             }
             let key_id = self.db.property_key_id(key).unwrap_or(NO_KEY);
-            props.push((key_id, value.clone()));
+            props.push((key.clone(), key_id, value.clone()));
         }
         Ok(props)
     }
@@ -692,6 +811,7 @@ impl<'a> Planner<'a> {
     // ---- projection ----
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn plan_projection(
         &mut self,
         input: Plan,
@@ -700,6 +820,7 @@ impl<'a> Planner<'a> {
         order: &[SortItem],
         skip: &Option<Expr>,
         limit: &Option<Expr>,
+        where_clause: Option<&Expr>,
         scope: &FastMap<String, VarKind>,
     ) -> Result<(Plan, FastMap<String, VarKind>, Vec<String>)> {
         // Expand `*` items.
@@ -725,6 +846,27 @@ impl<'a> Planner<'a> {
         }
         for (expr, _) in &expanded {
             validate_expr(expr, scope)?;
+        }
+
+        // A `WITH ... WHERE` may reference variables of the incoming scope
+        // (not only the projected aliases); those predicates filter before
+        // the projection. Aliases take precedence when they resolve.
+        let mut input = input;
+        let mut filter_after = None;
+        if let Some(predicate) = where_clause {
+            let projected: FastMap<String, VarKind> = expanded
+                .iter()
+                .map(|(expr, name)| (name.clone(), expr_kind(expr, scope)))
+                .collect();
+            if validate_expr(predicate, &projected).is_ok() {
+                filter_after = Some(predicate.clone());
+            } else {
+                validate_expr(predicate, scope)?;
+                input = Plan::Filter {
+                    input: Box::new(input),
+                    predicate: predicate.clone(),
+                };
+            }
         }
 
         let mut groups = Vec::new();
@@ -806,6 +948,24 @@ impl<'a> Planner<'a> {
             for (_, _, name) in &aggs {
                 new_scope.insert(name.clone(), VarKind::Value);
             }
+            // The aggregate window holds groups before aggregations; reorder
+            // it to the written item order so values line up with columns.
+            let window_names: Vec<&str> = groups
+                .iter()
+                .map(|(_, name)| name.as_str())
+                .chain(aggs.iter().map(|(_, _, name)| name.as_str()))
+                .collect();
+            let item_names: Vec<&str> = expanded.iter().map(|(_, name)| name.as_str()).collect();
+            if window_names != item_names {
+                let visible: Vec<(Expr, String)> = expanded
+                    .iter()
+                    .map(|(_, name)| (Expr::Variable(name.clone()), name.clone()))
+                    .collect();
+                plan = Plan::Project {
+                    input: Box::new(plan),
+                    items: visible,
+                };
+            }
         }
 
         if distinct {
@@ -844,6 +1004,12 @@ impl<'a> Planner<'a> {
                 items: visible,
             };
         }
+        if let Some(predicate) = filter_after {
+            plan = Plan::Filter {
+                input: Box::new(plan),
+                predicate,
+            };
+        }
 
         let columns: Vec<String> = expanded.iter().map(|(_, name)| name.clone()).collect();
         // Output scope maps names to output registers; nodes keep their kind.
@@ -860,7 +1026,68 @@ impl<'a> Planner<'a> {
 struct PlannedNode {
     var: String,
     label_ids: Vec<u32>,
+    label_names: Vec<String>,
     props: Vec<(u32, Value)>,
+    prop_literals: Vec<(String, Value)>,
+}
+
+/// `expr = expr`, used to constrain expansions to pre-bound elements.
+fn eq_expr(left: Expr, right: Expr) -> Expr {
+    Expr::Binary {
+        op: BinaryOp::Eq,
+        left: Box::new(left),
+        right: Box::new(right),
+    }
+}
+
+/// When the pattern's relationship variable was already bound, the expansion
+/// binds a fresh variable; constrain it to the bound one.
+fn constrain_edge(plan: &mut Plan, edge_var: &str, rel_var: &str, edge_bound: bool) {
+    if !edge_bound {
+        return;
+    }
+    *plan = Plan::Filter {
+        input: Box::new(plan.clone()),
+        predicate: eq_expr(
+            Expr::Variable(edge_var.to_owned()),
+            Expr::Variable(rel_var.to_owned()),
+        ),
+    };
+}
+
+/// Predicates for node constraints a scan did not apply. Scans enforce the
+/// first label and all literal properties, so only the remaining labels are
+/// left; nodes bound by the scope or an expansion need everything.
+fn node_constraints(node: &PlannedNode, scanned: bool) -> Option<Expr> {
+    let mut predicates: Vec<Expr> = Vec::new();
+    let labels: &[String] = if scanned {
+        node.label_names.get(1..).unwrap_or(&[])
+    } else {
+        &node.label_names
+    };
+    if !labels.is_empty() {
+        predicates.push(Expr::LabelCheck {
+            expr: Box::new(Expr::Variable(node.var.clone())),
+            labels: labels.to_vec(),
+        });
+    }
+    if !scanned {
+        for (key, value) in &node.prop_literals {
+            predicates.push(Expr::Binary {
+                op: BinaryOp::Eq,
+                left: Box::new(Expr::Property {
+                    base: Box::new(Expr::Variable(node.var.clone())),
+                    key: key.clone(),
+                }),
+                right: Box::new(Expr::Literal(value.clone())),
+            });
+        }
+    }
+    predicates.into_iter().reduce(|left, right| Expr::Binary {
+        op: BinaryOp::And,
+        left: Box::new(left),
+        right: Box::new(right),
+    })
 }
 
 fn flip(direction: RelDirection) -> RelDirection {
@@ -949,10 +1176,105 @@ fn expr_kind(expr: &Expr, scope: &FastMap<String, VarKind>) -> VarKind {
 fn default_name(expr: &Expr) -> String {
     match expr {
         Expr::Variable(name) => name.clone(),
-        Expr::Property { key, .. } => key.clone(),
-        Expr::Function { name, .. } => name.clone(),
-        Expr::Literal(Value::Text(text)) => text.to_string(),
+        Expr::Parameter(name) => format!("${name}"),
+        Expr::Literal(value) => literal_text(value),
+        Expr::Property { base, key } => format!("{}.{}", atomic_name(base), key),
+        Expr::Subscript { base, index } => {
+            format!("{}[{}]", atomic_name(base), default_name(index))
+        }
+        Expr::Function {
+            name,
+            distinct,
+            star,
+            args,
+        } => {
+            if *star {
+                format!("{name}(*)")
+            } else {
+                let prefix = if *distinct { "DISTINCT " } else { "" };
+                let args: Vec<String> = args.iter().map(default_name).collect();
+                format!("{name}({prefix}{})", args.join(", "))
+            }
+        }
+        Expr::Unary { op, expr } => match op {
+            UnaryOp::Neg => format!("-{}", default_name(expr)),
+            UnaryOp::Not => format!("NOT {}", default_name(expr)),
+        },
+        Expr::Binary { op, left, right } => format!(
+            "{} {} {}",
+            default_name(left),
+            binary_text(*op),
+            default_name(right)
+        ),
+        Expr::IsNull { expr, negated } => format!(
+            "{} IS {}NULL",
+            default_name(expr),
+            if *negated { "NOT " } else { "" }
+        ),
+        Expr::LabelCheck { expr, labels } => {
+            format!("{}:{}", default_name(expr), labels.join(":"))
+        }
+        Expr::List(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(default_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Map(entries) => format!(
+            "{{{}}}",
+            entries
+                .iter()
+                .map(|(key, value)| format!("{key}: {}", default_name(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::Case { .. } => "CASE".to_owned(),
+    }
+}
+
+/// Render a base expression, parenthesising anything that is not atomic.
+fn atomic_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Variable(_) | Expr::Property { .. } | Expr::Subscript { .. } => default_name(expr),
+        other => format!("({})", default_name(other)),
+    }
+}
+
+fn literal_text(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Bool(inner) => inner.to_string(),
+        Value::Int(inner) => inner.to_string(),
+        Value::Float(inner) => format!("{inner}"),
+        Value::Text(inner) => format!("'{inner}'"),
         other => format!("{other:?}"),
+    }
+}
+
+fn binary_text(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::Mod => "%",
+        BinaryOp::Pow => "^",
+        BinaryOp::Eq => "=",
+        BinaryOp::Ne => "<>",
+        BinaryOp::Lt => "<",
+        BinaryOp::Le => "<=",
+        BinaryOp::Gt => ">",
+        BinaryOp::Ge => ">=",
+        BinaryOp::And => "AND",
+        BinaryOp::Or => "OR",
+        BinaryOp::Xor => "XOR",
+        BinaryOp::In => "IN",
+        BinaryOp::StartsWith => "STARTS WITH",
+        BinaryOp::EndsWith => "ENDS WITH",
+        BinaryOp::Contains => "CONTAINS",
+        BinaryOp::Regex => "=~",
     }
 }
 

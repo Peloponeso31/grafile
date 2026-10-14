@@ -187,27 +187,23 @@
       }
     },
     "clauses/delete/Delete1.feature": {
-      "[4] Delete on null node": {
-        "reason": "not-implemented",
-        "note": "expected no rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      },
-      "[5] Ignore null when deleting node": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      },
-      "[6] Detach delete on null node": {
-        "reason": "not-implemented",
-        "note": "expected no rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      },
       "[8] Failing when deleting a label": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got TypeError at runtime"
       }
     },
     "clauses/delete/Delete2.feature": {
-      "*": {
+      "[1] Delete relationships": {
         "reason": "not-implemented",
         "note": "setup failed: Unsupported: function `range` is not supported yet"
+      },
+      "[3] Delete relationship with bidirectional matching": {
+        "reason": "not-implemented",
+        "note": "expected no rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident); expected -relationships 1, got 0; expected -properties 1, got 0"
+      },
+      "[5] Failing when deleting a relationship type": {
+        "reason": "not-implemented",
+        "note": "expected SyntaxError at compile time, got TypeError at runtime"
       }
     },
     "clauses/delete/Delete3.feature": {
@@ -265,10 +261,6 @@
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
       },
-      "[1] Filter node with node label predicate on multi variables with multiple bindings": {
-        "reason": "not-implemented",
-        "note": "expected column `a.id`, got `id`"
-      },
       "[8] Filter relationship with property predicate on multi variables with multiple bindings": {
         "reason": "not-implemented",
         "note": "rows differ: expected (:A), got ()"
@@ -284,12 +276,6 @@
       "[2] Join with disjunctive multi-part predicates including patterns": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 4 column 12 (found Colon)"
-      }
-    },
-    "clauses/match-where/MatchWhere6.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 4 column 16 (found LParen)"
       }
     },
     "clauses/match/Match1.feature": {
@@ -324,10 +310,6 @@
       "[11] Fail when matching a node variable bound to a value (example 8)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 1 rows"
-      },
-      "[3] Matching nodes using multiple labels": {
-        "reason": "not-implemented",
-        "note": "expected 2 rows, got 4"
       },
       "[7] Fail when a relationship has the same variable in a preceding MATCH (example 1)": {
         "reason": "not-implemented",
@@ -579,10 +561,6 @@
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 32 rows"
       },
-      "[2] Matching a relationship pattern using a label predicate on both sides": {
-        "reason": "not-implemented",
-        "note": "expected 1 rows, got 2"
-      },
       "[5] Match relationship with inline property value": {
         "reason": "not-implemented",
         "note": "rows differ: expected (:A), got ()"
@@ -693,10 +671,6 @@
       }
     },
     "clauses/match/Match3.feature": {
-      "[10] Matching using self-referencing pattern returns no result": {
-        "reason": "not-implemented",
-        "note": "expected 0 rows, got 2"
-      },
       "[15] Mixing directed and undirected pattern parts with self-relationship, simple": {
         "reason": "not-implemented",
         "note": "expected 2 rows, got 3"
@@ -709,29 +683,9 @@
         "reason": "not-implemented",
         "note": "expected column `a.name`, got `name`"
       },
-      "[18] Handling cyclic patterns when separated into two parts": {
-        "reason": "not-implemented",
-        "note": "expected column `a.name`, got `name`"
-      },
       "[19] Two bound nodes pointing to the same node": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: invalid relationship direction at line 3 column 20 (found LParen)"
-      },
-      "[21] Three bound nodes pointing to the same node with extra connections": {
-        "reason": "not-implemented",
-        "note": "expected 2 rows, got 5"
-      },
-      "[25] Matching twice with an additional node label": {
-        "reason": "not-implemented",
-        "note": "expected 0 rows, got 1"
-      },
-      "[27] Matching from null nodes should return no results owing to finding no matches": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      },
-      "[28] Matching from null nodes should return no results owing to matches being filtered out": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
       },
       "[29] Fail when re-using a relationship in the same pattern": {
         "reason": "not-implemented",
@@ -869,9 +823,41 @@
       }
     },
     "clauses/match/Match7.feature": {
-      "*": {
+      "[12] Variable length optional relationships": {
         "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
+        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet"
+      },
+      "[13] Variable length optional relationships with bound nodes": {
+        "reason": "not-implemented",
+        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet"
+      },
+      "[14] Variable length optional relationships with length predicates": {
+        "reason": "not-implemented",
+        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet"
+      },
+      "[15] Variable length patterns and nulls": {
+        "reason": "not-implemented",
+        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet"
+      },
+      "[16] Optionally matching named paths - null result": {
+        "reason": "not-implemented",
+        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 3 column 16 (found Ident)"
+      },
+      "[17] Optionally matching named paths - existing result": {
+        "reason": "not-implemented",
+        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 4 column 16 (found Ident)"
+      },
+      "[18] Named paths inside optional matches with node predicates": {
+        "reason": "not-implemented",
+        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 3 column 16 (found Ident)"
+      },
+      "[19] Optionally matching named paths with single and variable length patterns": {
+        "reason": "not-implemented",
+        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 3 column 16 (found Ident)"
+      },
+      "[20] Variable length optional relationships with bound nodes, no matches": {
+        "reason": "not-implemented",
+        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 3 column 16 (found Ident)"
       }
     },
     "clauses/match/Match8.feature": {
@@ -906,64 +892,18 @@
       "[17] Fail on merging node with null property": {
         "reason": "not-implemented",
         "note": "expected SemanticError at runtime, but the query returned 0 rows"
-      },
-      "[2] Merge node with label": {
-        "reason": "not-implemented",
-        "note": "expected column `labels(a)`, got `labels`"
-      },
-      "[3] Merge node with label when it exists": {
-        "reason": "not-implemented",
-        "note": "expected column `a.id`, got `id`"
-      },
-      "[4] Merge node should create when it doesn't match, properties": {
-        "reason": "not-implemented",
-        "note": "expected column `a.num`, got `num`"
-      },
-      "[5] Merge node should create when it doesn't match, properties and label": {
-        "reason": "not-implemented",
-        "note": "expected column `a.num`, got `num`"
-      },
-      "[6] Merge node with prop and label": {
-        "reason": "not-implemented",
-        "note": "expected column `a.num`, got `num`"
       }
     },
     "clauses/merge/Merge2.feature": {
-      "[1] Merge node with label add label on create": {
-        "reason": "not-implemented",
-        "note": "expected column `labels(a)`, got `labels`"
-      },
       "[3] Merge node with label add property on create": {
         "reason": "not-implemented",
         "note": "expected column `a.num`, got `num`"
-      },
-      "[4] Merge node with label add property on update when it exists": {
-        "reason": "not-implemented",
-        "note": "expected column `a.num`, got `num`"
-      },
-      "[5] Merge should be able to use properties of bound node in ON CREATE": {
-        "reason": "not-implemented",
-        "note": "expected column `person.bornIn`, got `bornIn`"
       }
     },
     "clauses/merge/Merge3.feature": {
-      "[2] Merge node with label add label on match when it exists": {
-        "reason": "not-implemented",
-        "note": "expected column `labels(a)`, got `labels`"
-      },
       "[3] Merge node and set property on match": {
         "reason": "not-implemented",
         "note": "expected column `a.num`, got `num`"
-      },
-      "[4] Merge should be able to use properties of bound node in ON MATCH": {
-        "reason": "not-implemented",
-        "note": "expected column `person.bornIn`, got `bornIn`"
-      }
-    },
-    "clauses/merge/Merge4.feature": {
-      "[2] Merge should be able to use properties of bound node in ON MATCH and ON CREATE": {
-        "reason": "not-implemented",
-        "note": "expected column `person.bornIn`, got `bornIn`"
       }
     },
     "clauses/merge/Merge5.feature": {
@@ -987,22 +927,6 @@
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: function `split` is not supported yet; expected +2 nodes, got +0; expected +1 relationships, got +0; expected +1 properties, got +0;..."
       },
-      "[15] Matching using list property": {
-        "reason": "not-implemented",
-        "note": "expected column `count(*)`, got `count`"
-      },
-      "[1] Creating a relationship": {
-        "reason": "not-implemented",
-        "note": "expected column `count(*)`, got `count`"
-      },
-      "[20] Do not match on deleted entities": {
-        "reason": "not-implemented",
-        "note": "expected -4 nodes, got -2; expected -4 relationships, got -2; expected -2 properties, got -1"
-      },
-      "[21] Do not match on deleted relationships": {
-        "reason": "not-implemented",
-        "note": "expected column `t2.name`, got `name`; expected -2 relationships, got -1; expected -2 properties, got -1"
-      },
       "[22] Fail when imposing new predicates on a variable that is already bound": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 0 rows"
@@ -1015,40 +939,12 @@
         "reason": "not-implemented",
         "note": "expected SemanticError at runtime, but the query returned 0 rows"
       },
-      "[2] Matching a relationship": {
-        "reason": "not-implemented",
-        "note": "expected column `count(r)`, got `count`"
-      },
       "[3] Matching two relationships": {
-        "reason": "not-implemented",
-        "note": "expected column `count(r)`, got `count`"
-      },
-      "[4] Using bound variables from other updating clause": {
-        "reason": "not-implemented",
-        "note": "expected column `count(a)`, got `count`"
-      },
-      "[5] Filtering relationships": {
-        "reason": "not-implemented",
-        "note": "expected column `count(r)`, got `count`"
-      },
-      "[6] Creating relationship when all matches filtered out": {
-        "reason": "not-implemented",
-        "note": "expected column `count(r)`, got `count`"
-      },
-      "[7] Matching incoming relationship": {
-        "reason": "not-implemented",
-        "note": "expected column `count(r)`, got `count`"
-      },
-      "[8] Creating relationship with property": {
         "reason": "not-implemented",
         "note": "expected column `count(r)`, got `count`"
       }
     },
     "clauses/merge/Merge6.feature": {
-      "[2] Using ON CREATE on a relationship": {
-        "reason": "not-implemented",
-        "note": "expected column `count(r)`, got `count`"
-      },
       "[3] Updating one property with ON CREATE": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 3 column 24 (found Pipe)"
@@ -1067,10 +963,6 @@
       }
     },
     "clauses/merge/Merge7.feature": {
-      "[3] Using ON MATCH on a relationship": {
-        "reason": "not-implemented",
-        "note": "expected column `count(r)`, got `count`"
-      },
       "[4] Copying properties from node with ON MATCH": {
         "reason": "not-implemented",
         "note": "expected no rows, got a runtime error: runtime: Type: expected a node, got relationship; expected -1 properties, got +0; expected rows, got a compile time error: compile time: Syntax: expected ']' to ..."
@@ -1078,92 +970,6 @@
       "[5] Copying properties from literal map with ON MATCH": {
         "reason": "not-implemented",
         "note": "expected no rows, got a compile time error: compile time: Syntax: expected '.', ':' or '=' in SET item at line 4 column 18 (found Plus); expected -1 properties, got +0; expected rows, got a compile ti..."
-      }
-    },
-    "clauses/merge/Merge8.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected column `count(r)`, got `count`"
-      }
-    },
-    "clauses/merge/Merge9.feature": {
-      "[1] UNWIND with one MERGE": {
-        "reason": "not-implemented",
-        "note": "expected column `count(*)`, got `count`"
-      },
-      "[3] Mixing MERGE with CREATE": {
-        "reason": "not-implemented",
-        "note": "expected column `count(*)`, got `count`"
-      }
-    },
-    "clauses/remove/Remove1.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found Return); expected -1 properties, got +0"
-      }
-    },
-    "clauses/remove/Remove2.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected column `n.num`, got `num`"
-      }
-    },
-    "clauses/remove/Remove3.feature": {
-      "[15] Limiting to zero results after removing a property from relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found Return); expected -1 properties, got +0"
-      },
-      "[16] Skipping all results after removing a property from relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found Return); expected -1 properties, got +0"
-      },
-      "[17] Skipping and limiting to a few results after removing a property from relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found Return); expected -5 properties, got +0"
-      },
-      "[18] Skipping zero result and limiting to all results after removing a property from relationships does not affect the result set nor the side effects": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found Return); expected -5 properties, got +0"
-      },
-      "[19] Filtering after removing a property from relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found With); expected -5 properties, got +0"
-      },
-      "[1] Limiting to zero results after removing a property from nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found Return); expected -1 properties, got +0"
-      },
-      "[20] Aggregating in `RETURN` after removing a property from relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found Return); expected -5 properties, got +0"
-      },
-      "[21] Aggregating in `WITH` after removing a property from relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found With); expected -5 properties, got +0"
-      },
-      "[2] Skipping all results after removing a property from nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found Return); expected -1 properties, got +0"
-      },
-      "[3] Skipping and limiting to a few results after removing a property from nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found Return); expected -5 properties, got +0"
-      },
-      "[4] Skipping zero results and limiting to all results after removing a property from nodes does not affect the result set nor the side effects": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found Return); expected -5 properties, got +0"
-      },
-      "[5] Filtering after removing a property from nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found With); expected -5 properties, got +0"
-      },
-      "[6] Aggregating in `RETURN` after removing a property from nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found Return); expected -5 properties, got +0"
-      },
-      "[7] Aggregating in `WITH` after removing a property from nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected = in SET item at line 4 column 1 (found With); expected -5 properties, got +0"
       }
     },
     "clauses/return-orderby/ReturnOrderBy1.feature": {
@@ -1200,24 +1006,6 @@
       "[14] Fail on aggregation in ORDER BY after RETURN": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[3] Sort on aggregated function": {
-        "reason": "not-implemented",
-        "note": "expected column `n.division`, got `division`"
-      },
-      "[6] Count star should count everything in scope": {
-        "reason": "not-implemented",
-        "note": "expected column `count(*)`, got `count`"
-      },
-      "[7] Ordering with aggregation": {
-        "reason": "not-implemented",
-        "note": "expected column `n.name`, got `name`"
-      }
-    },
-    "clauses/return-orderby/ReturnOrderBy3.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected column `n.division`, got `division`"
       }
     },
     "clauses/return-orderby/ReturnOrderBy6.feature": {
@@ -1288,10 +1076,6 @@
       "[6] LIMIT with an expression that does not depend on variables": {
         "reason": "not-implemented",
         "note": "setup failed: Unsupported: function `range` is not supported yet"
-      },
-      "[8] Limit to more rows than actual results 2": {
-        "reason": "not-implemented",
-        "note": "expected column `n.num`, got `num`"
       }
     },
     "clauses/return-skip-limit/ReturnSkipLimit3.feature": {
@@ -1304,10 +1088,6 @@
       "[10] Return count aggregation over an empty graph": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      },
-      "[11] RETURN does not lose precision on large integers": {
-        "reason": "not-implemented",
-        "note": "expected column `p.id`, got `id`"
       },
       "[14] Do not fail when returning type of deleted relationships": {
         "reason": "not-implemented",
@@ -1329,35 +1109,9 @@
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
       },
-      "[2] Returning a node property value": {
-        "reason": "not-implemented",
-        "note": "expected column `a.num`, got `num`"
-      },
-      "[3] Missing node property should become null": {
-        "reason": "not-implemented",
-        "note": "expected column `a.name`, got `name`"
-      },
-      "[4] Returning a relationship property value": {
-        "reason": "not-implemented",
-        "note": "expected column `r.num`, got `num`"
-      },
-      "[5] Missing relationship property should become null": {
-        "reason": "not-implemented",
-        "note": "expected column `r.name2`, got `name2`"
-      },
       "[8] Returning label predicate expression": {
         "reason": "not-implemented",
         "note": "expected column `(n:Foo)`, got `LabelCheck { expr: Variable(\"n\"), labels: [\"Foo\"] }`"
-      },
-      "[9] Returning a projected map": {
-        "reason": "not-implemented",
-        "note": "expected column `{a: 1, b: 'foo'}`, got `Map([(\"a\", Literal(Int(1))), (\"b\", Literal(Text(\"foo\")))])`"
-      }
-    },
-    "clauses/return/Return3.feature": {
-      "[2] Returning multiple node property values": {
-        "reason": "not-implemented",
-        "note": "expected column `a.name`, got `name`"
       }
     },
     "clauses/return/Return4.feature": {
@@ -1368,10 +1122,6 @@
       "[11] Reusing variable names in RETURN": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      },
-      "[3] Aliasing expressions": {
-        "reason": "not-implemented",
-        "note": "expected column `a.id`, got `id`"
       },
       "[4] Keeping used expression 1": {
         "reason": "not-implemented",
@@ -1399,23 +1149,23 @@
       }
     },
     "clauses/return/Return5.feature": {
-      "*": {
+      "[1] DISTINCT inside aggregation should work with lists in maps": {
+        "reason": "not-implemented",
+        "note": "expected rows, got a compile time error: compile time: Unsupported: DISTINCT inside aggregations is not supported yet"
+      },
+      "[3] DISTINCT inside aggregation should work with nested lists in maps": {
+        "reason": "not-implemented",
+        "note": "expected rows, got a compile time error: compile time: Unsupported: DISTINCT inside aggregations is not supported yet"
+      },
+      "[4] DISTINCT inside aggregation should work with nested lists of maps in maps": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: DISTINCT inside aggregations is not supported yet"
       }
     },
     "clauses/return/Return6.feature": {
-      "[10] Multiple aggregates on same variable": {
-        "reason": "not-implemented",
-        "note": "expected column `count(n)`, got `count`"
-      },
       "[11] Counting matches": {
         "reason": "not-implemented",
         "note": "setup failed: Unsupported: function `range` is not supported yet"
-      },
-      "[12] Counting matches per group": {
-        "reason": "not-implemented",
-        "note": "expected column `count(*)`, got `count`"
       },
       "[13] Returning the minimum length of paths": {
         "reason": "not-implemented",
@@ -1469,10 +1219,6 @@
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
       },
-      "[7] Aggregate on property": {
-        "reason": "not-implemented",
-        "note": "expected column `n.num`, got `num`"
-      },
       "[8] Handle aggregation on functions": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
@@ -1488,24 +1234,10 @@
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       }
     },
-    "clauses/return/Return8.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected column `count(*)`, got `count`"
-      }
-    },
     "clauses/set/Set1.feature": {
       "[10] Failing when setting a list of maps as a property": {
         "reason": "not-implemented",
         "note": "expected TypeError at runtime, but the query returned 0 rows"
-      },
-      "[1] Set a property": {
-        "reason": "not-implemented",
-        "note": "expected -1 properties, got +0"
-      },
-      "[2] Set a property to an expression": {
-        "reason": "not-implemented",
-        "note": "expected -1 properties, got +0"
       },
       "[3] Set a property by selecting the node using a simple expression": {
         "reason": "not-implemented",
@@ -1526,106 +1258,12 @@
       "[7] Concatenate elements in reverse onto a list property": {
         "reason": "not-implemented",
         "note": "expected column `a.numbers`, got `numbers`; expected +1 properties, got +0"
-      },
-      "[8] Ignore null when setting property": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      }
-    },
-    "clauses/set/Set3.feature": {
-      "[5] Ignore whitespace before colon 1": {
-        "reason": "not-implemented",
-        "note": "expected column `labels(n)`, got `labels`"
-      },
-      "[6] Ignore whitespace before colon 2": {
-        "reason": "not-implemented",
-        "note": "expected column `labels(n)`, got `labels`"
-      },
-      "[7] Ignore whitespace before colon 3": {
-        "reason": "not-implemented",
-        "note": "expected column `labels(n)`, got `labels`"
-      },
-      "[8] Ignore null when setting label": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      }
-    },
-    "clauses/set/Set4.feature": {
-      "[2] Non-existent values in a property map are removed with SET": {
-        "reason": "not-implemented",
-        "note": "expected -2 properties, got +0"
-      },
-      "[3] Null values in a property map are removed with SET": {
-        "reason": "not-implemented",
-        "note": "expected -2 properties, got +0"
-      },
-      "[5] Ignore null when setting properties using an overriding map": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
       }
     },
     "clauses/set/Set5.feature": {
       "*": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      }
-    },
-    "clauses/set/Set6.feature": {
-      "[15] Limiting to zero results after setting a property on relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected -1 properties, got +0"
-      },
-      "[16] Skipping all results after setting a property on relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected -1 properties, got +0"
-      },
-      "[17] Skipping and limiting to a few results after setting a property on relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected -5 properties, got +0"
-      },
-      "[18] Skipping zero result and limiting to all results after setting a property on relationships does not affect the result set nor the side effects": {
-        "reason": "not-implemented",
-        "note": "expected -5 properties, got +0"
-      },
-      "[19] Filtering after setting a property on relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected -5 properties, got +0"
-      },
-      "[1] Limiting to zero results after setting a property on nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected -1 properties, got +0"
-      },
-      "[20] Aggregating in `RETURN` after setting a property on relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected -5 properties, got +0"
-      },
-      "[21] Aggregating in `WITH` after setting a property on relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected -5 properties, got +0"
-      },
-      "[2] Skipping all results after setting a property on nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected -1 properties, got +0"
-      },
-      "[3] Skipping and limiting to a few results after setting a property on nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected -5 properties, got +0"
-      },
-      "[4] Skipping zero results and limiting to all results after setting a property on nodes does not affect the result set nor the side effects": {
-        "reason": "not-implemented",
-        "note": "expected -5 properties, got +0"
-      },
-      "[5] Filtering after setting a property on nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected -5 properties, got +0"
-      },
-      "[6] Aggregating in `RETURN` after setting a property on nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected -5 properties, got +0"
-      },
-      "[7] Aggregating in `WITH` after setting a property on nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected -5 properties, got +0"
       }
     },
     "clauses/union/Union1.feature": {
@@ -1680,10 +1318,6 @@
       "[4] Unwinding a collected unwound expression": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: function `range` is not supported yet"
-      },
-      "[5] Unwinding a collected expression": {
-        "reason": "not-implemented",
-        "note": "expected column `node.id`, got `id`"
       },
       "[6] Creating nodes from an unwound parameter list": {
         "reason": "not-implemented",
@@ -2144,20 +1778,6 @@
         "note": "setup failed: Unsupported: function `range` is not supported yet"
       }
     },
-    "clauses/with-where/WithWhere1.feature": {
-      "[2] Filter node with property predicate on a single variable with multiple distinct bindings": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: NotFound: variable `a` is not defined"
-      },
-      "[3] Filter for an unbound relationship variable": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 3 column 16 (found LParen)"
-      },
-      "[4] Filter for an unbound node variable": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 3 column 16 (found LParen)"
-      }
-    },
     "clauses/with-where/WithWhere2.feature": {
       "*": {
         "reason": "not-implemented",
@@ -2171,10 +1791,6 @@
       }
     },
     "clauses/with-where/WithWhere7.feature": {
-      "[1] WHERE sees a variable bound before but not after WITH": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: NotFound: variable `a` is not defined"
-      },
       "[3] WHERE sees both, variable bound before but not after WITH and variable bound after but not before WITH": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: NotFound: variable `a` is not defined"
@@ -2185,19 +1801,7 @@
         "reason": "not-implemented",
         "note": "expected column `a`, got `b`"
       },
-      "[3] Forwarding a relationship variable": {
-        "reason": "not-implemented",
-        "note": "expected column `a`, got `b`"
-      },
       "[4] Forwarding a path variable": {
-        "reason": "not-implemented",
-        "note": "expected column `a`, got `b`"
-      },
-      "[5] Forwarding null": {
-        "reason": "not-implemented",
-        "note": "expected column `a`, got `b`"
-      },
-      "[6] Forwarding a node variable possibly null": {
         "reason": "not-implemented",
         "note": "expected column `a`, got `b`"
       }
@@ -2230,17 +1834,7 @@
         "note": "expected column `m.second`, got `second`"
       }
     },
-    "clauses/with/With5.feature": {
-      "[2] Handling DISTINCT with lists in maps": {
-        "reason": "not-implemented",
-        "note": "expected column `count(*)`, got `count`"
-      }
-    },
     "clauses/with/With6.feature": {
-      "[2] Implicit grouping with single relationship variable as grouping key and single aggregation": {
-        "reason": "not-implemented",
-        "note": "expected 2 rows, got 6"
-      },
       "[4] Implicit grouping with single path variable as grouping key and single aggregation": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
@@ -2266,34 +1860,26 @@
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
       }
     },
-    "clauses/with/With7.feature": {
-      "[2] Multiple WITHs using a predicate and aggregation": {
-        "reason": "not-implemented",
-        "note": "expected column `count(*)`, got `count`"
-      }
-    },
-    "expressions/aggregation/Aggregation1.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected column `n.name`, got `name`"
-      }
-    },
     "expressions/aggregation/Aggregation2.feature": {
-      "*": {
+      "[11] `max()` over mixed values": {
         "reason": "not-implemented",
-        "note": "expected column `max(x)`, got `max`"
+        "note": "rows differ: expected 1, got [1, 2]"
+      },
+      "[12] `min()` over mixed values": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected [1, 2], got 0.2"
       }
     },
     "expressions/aggregation/Aggregation3.feature": {
-      "*": {
+      "[2] No overflow during summation": {
         "reason": "not-implemented",
-        "note": "expected column `n.name`, got `name`"
+        "note": "expected rows, got a compile time error: compile time: Unsupported: function `range` is not supported yet"
       }
     },
     "expressions/aggregation/Aggregation5.feature": {
-      "*": {
+      "[2] OPTIONAL MATCH and `collect()` on node property": {
         "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 3 column 16 (found LParen)"
+        "note": "expected rows, got a compile time error: compile time: Unsupported: DISTINCT inside aggregations is not supported yet"
       }
     },
     "expressions/aggregation/Aggregation6.feature": {
@@ -2779,33 +2365,9 @@
       }
     },
     "expressions/comparison/Comparison1.feature": {
-      "[10] Handling inlined equality of large integer": {
-        "reason": "not-implemented",
-        "note": "expected column `p.id`, got `id`"
-      },
-      "[11] Handling explicit equality of large integer": {
-        "reason": "not-implemented",
-        "note": "expected column `p.id`, got `id`"
-      },
-      "[12] Handling inlined equality of large integer, non-equal values": {
-        "reason": "not-implemented",
-        "note": "expected column `p.id`, got `id`"
-      },
-      "[13] Handling explicit equality of large integer, non-equal values": {
-        "reason": "not-implemented",
-        "note": "expected column `p.id`, got `id`"
-      },
       "[14] Direction of traversed relationship is not significant for path equality, simple": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[4] Comparing nodes to nodes": {
-        "reason": "not-implemented",
-        "note": "expected column `count(b)`, got `count`"
-      },
-      "[5] Comparing relationships to relationships": {
-        "reason": "not-implemented",
-        "note": "expected column `count(b)`, got `count`"
       },
       "[6] Comparing lists to lists (example 3)": {
         "reason": "not-implemented",
@@ -2869,14 +2431,6 @@
       }
     },
     "expressions/comparison/Comparison2.feature": {
-      "[1] Comparing strings and integers using > in an AND'd predicate": {
-        "reason": "not-implemented",
-        "note": "expected column `i.var`, got `var`"
-      },
-      "[2] Comparing strings and integers using > in a OR'd predicate": {
-        "reason": "not-implemented",
-        "note": "expected column `i.var`, got `var`"
-      },
       "[3] Comparing across types yields null, except numbers (example 1)": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
@@ -2919,21 +2473,43 @@
       }
     },
     "expressions/comparison/Comparison3.feature": {
-      "*": {
+      "[1] Handling numerical ranges 1": {
         "reason": "not-implemented",
-        "note": "expected column `n.num`, got `num`"
+        "note": "expected 1 rows, got 0"
+      },
+      "[2] Handling numerical ranges 2": {
+        "reason": "not-implemented",
+        "note": "expected 2 rows, got 0"
+      },
+      "[3] Handling numerical ranges 3": {
+        "reason": "not-implemented",
+        "note": "expected 2 rows, got 0"
+      },
+      "[4] Handling numerical ranges 4": {
+        "reason": "not-implemented",
+        "note": "expected 3 rows, got 0"
+      },
+      "[5] Handling string ranges 1": {
+        "reason": "not-implemented",
+        "note": "expected 1 rows, got 0"
+      },
+      "[6] Handling string ranges 2": {
+        "reason": "not-implemented",
+        "note": "expected 2 rows, got 0"
+      },
+      "[7] Handling string ranges 3": {
+        "reason": "not-implemented",
+        "note": "expected 2 rows, got 0"
+      },
+      "[8] Handling string ranges 4": {
+        "reason": "not-implemented",
+        "note": "expected 3 rows, got 0"
       }
     },
     "expressions/comparison/Comparison4.feature": {
       "*": {
         "reason": "not-implemented",
         "note": "expected column `labels(m)`, got `labels`"
-      }
-    },
-    "expressions/conditional/Conditional1.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected column `coalesce(a.title, a.name)`, got `coalesce`"
       }
     },
     "expressions/existentialSubqueries/ExistentialSubquery1.feature": {
@@ -2959,39 +2535,35 @@
       }
     },
     "expressions/graph/Graph3.feature": {
-      "[1] Creating node without label": {
-        "reason": "not-implemented",
-        "note": "expected column `labels(node)`, got `labels`"
-      },
-      "[2] Creating node with two labels": {
-        "reason": "not-implemented",
-        "note": "expected column `labels(node)`, got `labels`"
-      },
-      "[3] Ignore space when creating node with labels": {
-        "reason": "not-implemented",
-        "note": "expected column `labels(node)`, got `labels`"
-      },
-      "[4] Create node with label in pattern": {
-        "reason": "not-implemented",
-        "note": "expected column `labels(n)`, got `labels`"
-      },
-      "[5] Using `labels()` in return clauses": {
-        "reason": "not-implemented",
-        "note": "expected column `labels(n)`, got `labels`"
-      },
-      "[7] `labels()` on null node": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      },
       "[9] `labels()` failing on invalid arguments": {
         "reason": "not-implemented",
         "note": "expected TypeError at runtime, but the query returned 2 rows"
       }
     },
     "expressions/graph/Graph4.feature": {
-      "*": {
+      "[6] `type()` failing on invalid arguments (example 1)": {
         "reason": "not-implemented",
-        "note": "expected column `type(r)`, got `type`"
+        "note": "expected TypeError at runtime, got SyntaxError at compile time"
+      },
+      "[6] `type()` failing on invalid arguments (example 2)": {
+        "reason": "not-implemented",
+        "note": "expected TypeError at runtime, got SyntaxError at compile time"
+      },
+      "[6] `type()` failing on invalid arguments (example 3)": {
+        "reason": "not-implemented",
+        "note": "expected TypeError at runtime, got SyntaxError at compile time"
+      },
+      "[6] `type()` failing on invalid arguments (example 4)": {
+        "reason": "not-implemented",
+        "note": "expected TypeError at runtime, got SyntaxError at compile time"
+      },
+      "[6] `type()` failing on invalid arguments (example 5)": {
+        "reason": "not-implemented",
+        "note": "expected TypeError at runtime, got SyntaxError at compile time"
+      },
+      "[7] Failing when using `type()` on a node": {
+        "reason": "not-implemented",
+        "note": "expected SyntaxError at compile time, but the query returned 13 rows"
       }
     },
     "expressions/graph/Graph5.feature": {
@@ -3005,9 +2577,37 @@
       }
     },
     "expressions/graph/Graph6.feature": {
-      "*": {
+      "[4] Statically access a property of a node resulting from an expression": {
         "reason": "not-implemented",
-        "note": "expected column `n.missing`, got `missing`"
+        "note": "expected column `(list[1]).missing`, got `list[1].missing`"
+      },
+      "[8] Statically access a property of a relationship resulting from an expression": {
+        "reason": "not-implemented",
+        "note": "expected column `(list[1]).missing`, got `list[1].missing`"
+      },
+      "[9] Fail when performing property access on a non-graph element (example 1)": {
+        "reason": "not-implemented",
+        "note": "expected TypeError at compile time, but the query returned 1 rows"
+      },
+      "[9] Fail when performing property access on a non-graph element (example 2)": {
+        "reason": "not-implemented",
+        "note": "expected TypeError at compile time, but the query returned 1 rows"
+      },
+      "[9] Fail when performing property access on a non-graph element (example 3)": {
+        "reason": "not-implemented",
+        "note": "expected TypeError at compile time, but the query returned 1 rows"
+      },
+      "[9] Fail when performing property access on a non-graph element (example 4)": {
+        "reason": "not-implemented",
+        "note": "expected TypeError at compile time, but the query returned 1 rows"
+      },
+      "[9] Fail when performing property access on a non-graph element (example 5)": {
+        "reason": "not-implemented",
+        "note": "expected TypeError at compile time, but the query returned 1 rows"
+      },
+      "[9] Fail when performing property access on a non-graph element (example 6)": {
+        "reason": "not-implemented",
+        "note": "expected TypeError at compile time, but the query returned 1 rows"
       }
     },
     "expressions/graph/Graph7.feature": {
@@ -3016,21 +2616,7 @@
         "note": "rows differ: expected 'Apa', got null"
       }
     },
-    "expressions/graph/Graph8.feature": {
-      "[4] Using `keys()` on an optionally matched node": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      },
-      "[7] Using `keys()` on an optionally matched relationship": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      }
-    },
     "expressions/graph/Graph9.feature": {
-      "[3] `properties()` on null": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      },
       "[4] `properties()` on a map": {
         "reason": "not-implemented",
         "note": "rows differ: expected {name: 'Popeye', level: 9001}, got null"
@@ -3275,10 +2861,6 @@
         "reason": "not-implemented",
         "note": "expected column `size(n.numbers)`, got `size`"
       },
-      "[4] `size()` on null list": {
-        "reason": "not-implemented",
-        "note": "expected column `size(l)`, got `size`"
-      },
       "[7] Using size of pattern comprehension to test existence": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 3 column 23 (found RParen)"
@@ -3437,10 +3019,6 @@
         "reason": "not-implemented",
         "note": "expected column `m.missing`, got `missing`"
       },
-      "[2] Statically access a field of a null map": {
-        "reason": "not-implemented",
-        "note": "expected column `m.missing`, got `missing`"
-      },
       "[3] Statically access a field of a map resulting from an expression": {
         "reason": "not-implemented",
         "note": "expected column `(list[1]).missing`, got `missing`"
@@ -3541,9 +3119,45 @@
       }
     },
     "expressions/map/Map3.feature": {
-      "*": {
+      "[1] Using `keys()` on a literal map": {
         "reason": "not-implemented",
         "note": "rows differ: expected ['name', 'age', 'address'], got null"
+      },
+      "[2] Using `keys()` on a parameter map": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected ['address', 'name', 'age'], got null"
+      },
+      "[4] Using `keys()` on map with null values (example 1)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected [], got null"
+      },
+      "[4] Using `keys()` on map with null values (example 2)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected ['k'], got null"
+      },
+      "[4] Using `keys()` on map with null values (example 3)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected ['k'], got null"
+      },
+      "[4] Using `keys()` on map with null values (example 4)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected ['k', 'l'], got null"
+      },
+      "[4] Using `keys()` on map with null values (example 5)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected ['k', 'l'], got null"
+      },
+      "[4] Using `keys()` on map with null values (example 6)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected ['k', 'l'], got null"
+      },
+      "[4] Using `keys()` on map with null values (example 7)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected ['k', 'l', 'm'], got null"
+      },
+      "[5] Using `keys()` and `IN` to check field existence": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected true | true | false, got null | null | null"
       }
     },
     "expressions/mathematical/Mathematical11.feature": {
@@ -3558,31 +3172,13 @@
         "note": "expected rows, got a compile time error: compile time: Unsupported: function `sqrt` is not supported yet"
       }
     },
-    "expressions/mathematical/Mathematical2.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected column `a.version + 5`, got `Binary { op: Add, left: Property { base: Variable(\"a\"), key: \"version\" }, right: Literal(Int(5)) }`"
-      }
-    },
     "expressions/mathematical/Mathematical8.feature": {
-      "*": {
+      "[2] Arithmetic precedence with parenthesis test": {
         "reason": "not-implemented",
-        "note": "expected column `12 / 4 * 3 - 2 * 4`, got `Binary { op: Sub, left: Binary { op: Mul, left: Binary { op: Div, left: Literal(Int(12)), right: Literal(Int(4)) }, right: Literal(Int(3)) }, right: Binary {..."
+        "note": "expected column `12 / 4 * (3 - 2 * 4)`, got `12 / 4 * 3 - 2 * 4`"
       }
     },
     "expressions/null/Null1.feature": {
-      "[1] Property null check on non-null node": {
-        "reason": "not-implemented",
-        "note": "expected column `n.missing IS NULL`, got `IsNull { expr: Property { base: Variable(\"n\"), key: \"missing\" }, negated: false }`"
-      },
-      "[2] Property null check on optional non-null node": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      },
-      "[3] Property null check on null node": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      },
       "[5] IS NULL on a map (example 1)": {
         "reason": "not-implemented",
         "note": "expected rows, got a runtime error: runtime: Type: property access on map"
@@ -3594,10 +3190,6 @@
       "[5] IS NULL on a map (example 11)": {
         "reason": "not-implemented",
         "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NULL on a map (example 12)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on null"
       },
       "[5] IS NULL on a map (example 2)": {
         "reason": "not-implemented",
@@ -3625,18 +3217,6 @@
       }
     },
     "expressions/null/Null2.feature": {
-      "[1] Property not null check on non-null node": {
-        "reason": "not-implemented",
-        "note": "expected column `n.missing IS NOT NULL`, got `IsNull { expr: Property { base: Variable(\"n\"), key: \"missing\" }, negated: true }`"
-      },
-      "[2] Property not null check on optional non-null node": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      },
-      "[3] Property not null check on null node": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
-      },
       "[5] IS NOT NULL on a map (example 1)": {
         "reason": "not-implemented",
         "note": "expected rows, got a runtime error: runtime: Type: property access on map"
@@ -3648,10 +3228,6 @@
       "[5] IS NOT NULL on a map (example 11)": {
         "reason": "not-implemented",
         "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NOT NULL on a map (example 12)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on null"
       },
       "[5] IS NOT NULL on a map (example 2)": {
         "reason": "not-implemented",
@@ -5810,12 +5386,6 @@
         "note": "expected rows, got a compile time error: compile time: Unsupported: function `substring` is not supported yet"
       }
     },
-    "expressions/string/String10.feature": {
-      "[8] Handling non-string operands for CONTAINS": {
-        "reason": "not-implemented",
-        "note": "expected column `count(*)`, got `count`"
-      }
-    },
     "expressions/string/String3.feature": {
       "*": {
         "reason": "not-implemented",
@@ -5826,18 +5396,6 @@
       "*": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: function `split` is not supported yet"
-      }
-    },
-    "expressions/string/String8.feature": {
-      "[8] Handling non-string operands for STARTS WITH": {
-        "reason": "not-implemented",
-        "note": "expected column `count(*)`, got `count`"
-      }
-    },
-    "expressions/string/String9.feature": {
-      "[8] Handling non-string operands for ENDS WITH": {
-        "reason": "not-implemented",
-        "note": "expected column `count(*)`, got `count`"
       }
     },
     "expressions/temporal/Temporal1.feature": {
@@ -5907,10 +5465,6 @@
       }
     },
     "expressions/typeConversion/TypeConversion2.feature": {
-      "[1] `toInteger()` on float": {
-        "reason": "not-implemented",
-        "note": "expected column `toInteger(weight)`, got `toInteger`"
-      },
       "[3] `toInteger()` handling mixed number types": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 3 column 22 (found Pipe)"
@@ -6003,10 +5557,6 @@
         "reason": "not-implemented",
         "note": "expected TypeError at runtime, got SyntaxError at compile time"
       },
-      "[4] `toString()` handling boolean properties": {
-        "reason": "not-implemented",
-        "note": "expected column `toString(m.watched)`, got `toString`"
-      },
       "[5] `toString()` should work on Any type": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 2 column 36 (found Pipe)"
@@ -6014,22 +5564,24 @@
       "[6] `toString()` on a list of integers": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 3 column 22 (found Pipe)"
-      },
-      "[7] `toString()` on node property": {
-        "reason": "not-implemented",
-        "note": "expected column `toString(n.rating)`, got `toString`"
       }
     },
     "useCases/countingSubgraphMatches/CountingSubgraphMatches1.feature": {
-      "*": {
+      "[10] Mixing directed and undirected pattern parts with self-relationship, count": {
         "reason": "not-implemented",
-        "note": "expected column `count(*)`, got `count`"
-      }
-    },
-    "useCases/triadicSelection/TriadicSelection1.feature": {
-      "*": {
+        "note": "rows differ: expected 2, got 3"
+      },
+      "[11] Mixing directed and undirected pattern parts with self-relationship, undirected count": {
         "reason": "not-implemented",
-        "note": "expected column `c.name`, got `name`"
+        "note": "rows differ: expected 6, got 11"
+      },
+      "[7] Counting distinct undirected self-relationships in self-relationship graph": {
+        "reason": "not-implemented",
+        "note": "expected rows, got a compile time error: compile time: Unsupported: DISTINCT inside aggregations is not supported yet"
+      },
+      "[9] Counting directed self-relationships": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected 1, got 2"
       }
     }
   }

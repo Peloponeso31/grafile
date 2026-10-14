@@ -133,11 +133,11 @@ impl<'a> Parser<'a> {
             }
             Some(Token::Set) => {
                 self.advance();
-                Ok(Clause::Set(self.parse_set_items()?))
+                Ok(Clause::Set(self.parse_set_items(false)?))
             }
             Some(Token::Remove) => {
                 self.advance();
-                Ok(Clause::Remove(self.parse_set_items()?))
+                Ok(Clause::Remove(self.parse_set_items(true)?))
             }
             Some(Token::Delete) => {
                 self.advance();
@@ -159,9 +159,6 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_match_clause(&mut self, optional: bool) -> Result<MatchClause> {
-        if optional {
-            return self.fail("OPTIONAL MATCH is not supported yet");
-        }
         let patterns = self.parse_patterns()?;
         let where_clause = if self.eat(Token::Where) {
             Some(self.parse_expr()?)
@@ -284,10 +281,10 @@ impl<'a> Parser<'a> {
         while self.eat(Token::On) {
             if self.eat(Token::Create) {
                 self.expect(Token::Set, "SET after ON CREATE")?;
-                on_create.extend(self.parse_set_items()?);
+                on_create.extend(self.parse_set_items(false)?);
             } else if self.eat(Token::Match) {
                 self.expect(Token::Set, "SET after ON MATCH")?;
-                on_match.extend(self.parse_set_items()?);
+                on_match.extend(self.parse_set_items(false)?);
             } else {
                 return self.fail("expected CREATE or MATCH after ON");
             }
@@ -299,14 +296,20 @@ impl<'a> Parser<'a> {
         })
     }
 
-    fn parse_set_items(&mut self) -> Result<Vec<SetItem>> {
+    /// Parse `SET` (`remove = false`) or `REMOVE` (`remove = true`) items.
+    /// `REMOVE` takes no `=` for property and label items.
+    fn parse_set_items(&mut self, remove: bool) -> Result<Vec<SetItem>> {
         let mut items = Vec::new();
         loop {
             let variable = self.parse_name()?;
             if self.eat(Token::Dot) {
                 let key = self.parse_name()?;
-                self.expect(Token::Equals, "= in SET item")?;
-                let value = self.parse_expr()?;
+                let value = if remove {
+                    Expr::Literal(Value::Null)
+                } else {
+                    self.expect(Token::Equals, "= in SET item")?;
+                    self.parse_expr()?
+                };
                 items.push(SetItem::Property {
                     variable,
                     key,
@@ -318,11 +321,15 @@ impl<'a> Parser<'a> {
                     labels.push(self.parse_name()?);
                 }
                 items.push(SetItem::Label { variable, labels });
-            } else if self.eat(Token::Equals) {
+            } else if !remove && self.eat(Token::Equals) {
                 let value = self.parse_expr()?;
                 items.push(SetItem::Replace { variable, value });
             } else {
-                return self.fail("expected '.', ':' or '=' in SET item");
+                return self.fail(if remove {
+                    "expected '.' or ':' in REMOVE item"
+                } else {
+                    "expected '.', ':' or '=' in SET item"
+                });
             }
             if !self.eat(Token::Comma) {
                 break;
@@ -850,6 +857,31 @@ mod tests {
             Clause::Return { items, .. } => items[0].expr.clone(),
             other => panic!("unexpected clause {other:?}"),
         }
+    }
+
+    #[test]
+    fn parses_optional_match() {
+        let query = parse("OPTIONAL MATCH (n)-[:T]->(m) WHERE m.x = 1 RETURN n").expect("parse");
+        let Clause::Match(matched) = &query.clauses[0] else {
+            panic!("expected MATCH");
+        };
+        assert!(matched.optional);
+        assert!(matched.where_clause.is_some());
+    }
+
+    #[test]
+    fn parses_remove_without_equals() {
+        let query = parse("MATCH (n) REMOVE n.name, n:Label RETURN n").expect("parse");
+        let Clause::Remove(items) = &query.clauses[1] else {
+            panic!("expected REMOVE");
+        };
+        assert_eq!(items.len(), 2);
+        let SetItem::Property { key, value, .. } = &items[0] else {
+            panic!("expected property removal");
+        };
+        assert_eq!(key, "name");
+        assert!(matches!(value, Expr::Literal(Value::Null)));
+        assert!(matches!(&items[1], SetItem::Label { .. }));
     }
 
     #[test]
