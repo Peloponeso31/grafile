@@ -50,33 +50,59 @@ Known semantic deviations to close:
   the relationship, instead of matching the whole path atomically.
 - `ORDER BY` after aggregation may only reference projected values.
 - Aggregations with multiple arguments are rejected.
+- Property access resolves the property key at compile time, so reading a
+  property whose key is first created in the same statement returns null
+  (`CREATE (n {num: 12}) RETURN n.num`).
 
 ## Phases
 
+Where the allow-list stood after `OPTIONAL MATCH` (2024.3, 2710 scenarios):
+temporal types 1004 (Phase 3), error-kind and validation mismatches ~340
+(Phase 4), ordering/comparison/precedence semantics ~350 (Phase 4), quantifier
+and list/map/pattern expressions ~860 (Phase 1C), paths ~250 (Phase 1B),
+statement and expression surface ~140 (Phase 1A), CALL procedure registration
+52 (unreachable: the TCK registers test procedures), and the rest spread over
+functions (Phase 2) and clause corner cases.
+
 ### Phase 1 — Core language completion (large)
 
-Highest TCK scenario share; ordered roughly by dependency:
+Four sub-phases, each verified by the TCK gate; scenario counts are the
+allow-list sizes measured after `OPTIONAL MATCH`.
 
-1. `UNION` / `UNION ALL`: statement-level concatenation plus deduplication
-   for `UNION`.
-2. Variable-length paths: bounded and unbounded expansion with a per-path
-   visited/trail set, driven by the incidence matrix.
-3. Named paths and path values: `p = (a)-[…]→(b)` plus `nodes(p)`,
-   `relationships(p)`, `length(p)`; new value representation across record,
-   JSON and display layers.
-4. Pattern predicates in `WHERE`, `exists()`, and `shortestPath()` /
-   `allShortestPaths()` (bidirectional BFS over the incidence planes).
-5. List comprehensions, pattern comprehensions, quantifiers
-   (`all`, `any`, `none`, `single`), `reduce()`.
-6. Map property access (`m.k`), subscript (`m['k']`), list slicing
-   (`list[1..3]`), and map projections (`n{.name}`).
-7. `FOREACH`, `SET n += {…}`, and `CALL … YIELD` for built-in procedures
-   (`db.labels()`, `db.propertyKeys()`, …).
-8. MERGE conformance: whole-path match-or-create and multiple
-   relationships; removes the documented deviation.
-9. Aggregation completeness: `DISTINCT` inside aggregations,
-   multi-argument aggregations, and grouping-key semantics for
-   expressions that mix aggregation and non-aggregated values.
+#### 1A — Statement and expression surface
+
+- `UNION` / `UNION ALL`: statement-level concatenation plus deduplication for
+  `UNION` (10 scenarios).
+- `SET n += {…}` (5).
+- Aggregation completeness: `DISTINCT` inside aggregations, multi-argument
+  aggregations, and post-aggregation expressions (21).
+- Runtime property-key resolution, fixing own-write reads such as
+  `CREATE (n {num: 12}) RETURN n.num` (~15).
+- Map property access (`m.k`), subscript (`m['k']`), list slicing
+  (`list[1..3]`), and map projections (`n{.name}`) (~91).
+
+#### 1B — Paths
+
+- Variable-length paths: bounded and unbounded expansion with a per-path
+  trail set, driven by the incidence matrix; the relationship variable binds
+  a list (~85).
+- Named paths and path values: `p = (a)-[…]→(b)` plus `nodes(p)`,
+  `relationships(p)`, `length(p)`; new value representation across the
+  value, JSON and display layers (~111).
+- Pattern predicates in `WHERE`, `exists()`, and `shortestPath()` /
+  `allShortestPaths()` (early-exit BFS over the incidence planes) (~50).
+
+#### 1C — Comprehensions, quantifiers, reduce
+
+- List comprehensions, pattern comprehensions, quantifiers
+  (`all`, `any`, `none`, `single`), `reduce()` (~688).
+
+#### 1D — Write-side completeness
+
+- MERGE conformance: whole-path match-or-create and multiple relationships;
+  removes the documented deviation (~21).
+- `FOREACH` and `CALL … YIELD` for built-in procedures (`db.labels()`,
+  `db.propertyKeys()`, …); no TCK coverage, verified by unit tests only.
 
 ### Phase 2 — Function library (medium)
 
