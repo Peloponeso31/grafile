@@ -288,7 +288,9 @@ disjunction, inline property filters), `WHERE`, `RETURN` and `WITH` (with
 `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE` /
 `DETACH DELETE`, `UNION` / `UNION ALL`, `SET n += {…}`, parameters
 (`$name`), list and map literals, map field access and subscript
-(`m.k`, `m['k']`), list indexing and slicing (`list[1..3]`), `CASE`,
+(`m.k`, `m['k']`), list indexing and slicing (`list[1..3]`), list
+comprehensions, quantifiers (`all`, `any`, `none`, `single`), `reduce()`,
+`CASE`,
 `IS [NOT] NULL`, string predicates (`STARTS WITH`, `ENDS WITH`, `CONTAINS`,
 `=~`), label predicates, three-valued logic, and the aggregations `count`,
 `sum`, `avg`, `min`, `max`, `collect` (with `DISTINCT` and expressions over
@@ -297,9 +299,9 @@ aggregations). Scalar functions: `id`, `labels`,
 `toFloat`, `size`, `properties`, `keys`.
 
 Explicit gaps fail with clear `Unsupported` errors instead of wrong results:
-variable-length paths, named paths and path values,
-pattern predicates, list and pattern comprehensions, map projections,
-`FOREACH`, `CALL`, most of the function library, and temporal/spatial types.
+variable-length paths, named paths and path values, pattern predicates and
+pattern comprehensions, map projections, `FOREACH`, `CALL`, most of the
+function library, and temporal/spatial types.
 The plan to close them, ordered by TCK scenario share, is in
 [docs/roadmap.md](docs/roadmap.md). Storage-side work tracked alongside it:
 WAL mode for concurrent readers, delete rebalancing and `VACUUM`-style
@@ -319,7 +321,7 @@ $ cargo run -p tck-runner --release      # exits 0 when the gate passes
 The gate fails on unexpected failures, harness errors (steps or cells the
 runner cannot evaluate) and **stale allow-list entries**, so a fix must prune
 its allow-list entries in the same commit. Current baseline: 3897 scenarios,
-1333 passing (34.2% of the suite, 100% of applicable scenarios), 2564
+1889 passing (48.5% of the suite, 100% of applicable scenarios), 2008
 allow-listed, zero harness errors. Run instructions, error mapping and
 comparison semantics are documented in [docs/tck.md](docs/tck.md).
 
