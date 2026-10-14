@@ -1266,42 +1266,6 @@
         "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
       }
     },
-    "clauses/union/Union1.feature": {
-      "[1] Two elements, both unique, distinct": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: UNION is not supported yet at line 3 column 1 (found Union)"
-      },
-      "[2] Three elements, two unique, distinct": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: UNION is not supported yet at line 3 column 1 (found Union)"
-      },
-      "[3] Two single-column inputs, one with duplicates, distinct": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: UNION is not supported yet at line 4 column 1 (found Union)"
-      },
-      "[4] Should be able to create text output from union queries": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: UNION is not supported yet at line 4 column 1 (found Union)"
-      }
-    },
-    "clauses/union/Union2.feature": {
-      "[1] Two elements, both unique, not distinct": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: UNION is not supported yet at line 3 column 1 (found Union)"
-      },
-      "[2] Three elements, two unique, not distinct": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: UNION is not supported yet at line 3 column 1 (found Union)"
-      },
-      "[3] Two single-column inputs, one with duplicates, not distinct": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: UNION is not supported yet at line 4 column 1 (found Union)"
-      },
-      "[4] Should be able to create text output from union all queries": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: UNION is not supported yet at line 4 column 1 (found Union)"
-      }
-    },
     "clauses/unwind/Unwind1.feature": {
       "[13] Multiple unwinds after each other": {
         "reason": "not-implemented",
