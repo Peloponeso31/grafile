@@ -9,7 +9,7 @@
 
 use hashbrown::HashMap;
 
-use crate::cypher::{Expr, SetItem};
+use crate::cypher::{Expr, QuantifierKind, SetItem};
 use crate::engine::Database;
 use crate::error::{Error, Result};
 use crate::planner::Prepared;
@@ -972,6 +972,253 @@ impl<'a> Codegen<'a> {
         ctx.vars.get(name).copied().ok_or_else(|| undefined(name))
     }
 
+    /// Compile `all|any|none|single(var IN list WHERE predicate)` with
+    /// three-valued logic: a predicate that is null never decides the result
+    /// on its own, but makes it null when the outcome is otherwise undecided.
+    fn compile_quantifier(
+        &mut self,
+        kind: QuantifierKind,
+        var: &str,
+        list: &Expr,
+        predicate: &Expr,
+        ctx: &Ctx,
+        dest: u32,
+    ) -> Result<()> {
+        use QuantifierKind::*;
+        let list_reg = self.compile_expr(list, ctx)?;
+        let cursor = self.alloc_cursor();
+        self.emit(Op::UnwindInit {
+            cursor,
+            list: list_reg,
+        });
+        let result = self.alloc_reg();
+        let saw_null = self.alloc_reg();
+        let false_reg = self.const_reg(Value::Bool(false));
+        let true_reg = self.const_reg(Value::Bool(true));
+        let null_reg = self.null_reg();
+        // `all` and `none` start true, `any` false; `single` counts matches.
+        let start = match kind {
+            All | None => true_reg,
+            Any => false_reg,
+            Single => self.const_reg(Value::Int(0)),
+        };
+        self.emit(Op::Copy {
+            dest: result,
+            src: start,
+        });
+        self.emit(Op::Copy {
+            dest: saw_null,
+            src: false_reg,
+        });
+        let element = self.alloc_reg();
+        let loop_start = self.ops.len() as u32;
+        let jump_end = self.emit(Op::UnwindNext {
+            cursor,
+            dest: element,
+            target: 0,
+        });
+        let mut inner = ctx.clone();
+        inner.vars.insert(var.to_owned(), element);
+        let condition = self.compile_expr(predicate, &inner)?;
+        let is_null = self.alloc_reg();
+        self.emit(Op::IsNull {
+            src: condition,
+            dest: is_null,
+        });
+        let not_null = self.emit(Op::IfNot {
+            reg: is_null,
+            target: 0,
+        });
+        // Null predicate: remember it and move on.
+        self.emit(Op::Copy {
+            dest: saw_null,
+            src: true_reg,
+        });
+        self.emit(Op::Goto { target: loop_start });
+        let decided = self.ops.len() as u32;
+        self.patch(not_null, decided)?;
+        let not_true = self.emit(Op::IfNot {
+            reg: condition,
+            target: 0,
+        });
+        // Predicate is true.
+        let mut break_jump: Option<u32> = Option::None;
+        match kind {
+            All => {
+                // One satisfied element does not decide `all`.
+                self.emit(Op::Goto { target: loop_start });
+            }
+            None => {
+                self.emit(Op::Copy {
+                    dest: result,
+                    src: false_reg,
+                });
+                break_jump = Some(self.emit(Op::Goto { target: 0 }));
+            }
+            Any => {
+                self.emit(Op::Copy {
+                    dest: result,
+                    src: true_reg,
+                });
+                break_jump = Some(self.emit(Op::Goto { target: 0 }));
+            }
+            Single => {
+                let one = self.const_reg(Value::Int(1));
+                let next = self.alloc_reg();
+                self.emit(Op::Binary {
+                    op: binary_code::ADD,
+                    left: result,
+                    right: one,
+                    dest: next,
+                });
+                self.emit(Op::Copy {
+                    dest: result,
+                    src: next,
+                });
+                self.emit(Op::Goto { target: loop_start });
+            }
+        }
+        // Predicate is false.
+        let false_branch = self.ops.len() as u32;
+        self.patch(not_true, false_branch)?;
+        match kind {
+            All => {
+                // One unsatisfied element decides `all`.
+                self.emit(Op::Copy {
+                    dest: result,
+                    src: false_reg,
+                });
+                break_jump = Some(self.emit(Op::Goto { target: 0 }));
+            }
+            None | Any | Single => {
+                self.emit(Op::Goto { target: loop_start });
+            }
+        }
+        let end = self.ops.len() as u32;
+        self.patch(jump_end, end)?;
+        if let Some(break_jump) = break_jump {
+            self.patch(break_jump, end)?;
+        }
+        match kind {
+            All | None => {
+                // A false result stands; otherwise a seen null makes it null.
+                let no_null = self.emit(Op::IfNot {
+                    reg: saw_null,
+                    target: 0,
+                });
+                let settled = self.emit(Op::IfNot {
+                    reg: result,
+                    target: 0,
+                });
+                self.emit(Op::Copy {
+                    dest: result,
+                    src: null_reg,
+                });
+                let done = self.ops.len() as u32;
+                self.patch(no_null, done)?;
+                self.patch(settled, done)?;
+            }
+            Any => {
+                // A true result stands; otherwise a seen null makes it null.
+                let no_null = self.emit(Op::IfNot {
+                    reg: saw_null,
+                    target: 0,
+                });
+                let inverted = self.alloc_reg();
+                self.emit(Op::Unary {
+                    op: unary_code::NOT,
+                    src: result,
+                    dest: inverted,
+                });
+                let settled = self.emit(Op::IfNot {
+                    reg: inverted,
+                    target: 0,
+                });
+                self.emit(Op::Copy {
+                    dest: result,
+                    src: null_reg,
+                });
+                let done = self.ops.len() as u32;
+                self.patch(no_null, done)?;
+                self.patch(settled, done)?;
+            }
+            Single => {
+                // `result` counts matches: >1 false, 1 true, 0 false, with
+                // any seen null turning the undecided outcomes null.
+                let one = self.const_reg(Value::Int(1));
+                let more = self.alloc_reg();
+                self.emit(Op::Binary {
+                    op: binary_code::GT,
+                    left: result,
+                    right: one,
+                    dest: more,
+                });
+                let at_most_one = self.emit(Op::IfNot {
+                    reg: more,
+                    target: 0,
+                });
+                self.emit(Op::Copy {
+                    dest: result,
+                    src: false_reg,
+                });
+                let done = self.emit(Op::Goto { target: 0 });
+                let check_one = self.ops.len() as u32;
+                self.patch(at_most_one, check_one)?;
+                let exactly_one = self.alloc_reg();
+                self.emit(Op::Binary {
+                    op: binary_code::EQ,
+                    left: result,
+                    right: one,
+                    dest: exactly_one,
+                });
+                let none_matched = self.emit(Op::IfNot {
+                    reg: exactly_one,
+                    target: 0,
+                });
+                let no_null = self.emit(Op::IfNot {
+                    reg: saw_null,
+                    target: 0,
+                });
+                self.emit(Op::Copy {
+                    dest: result,
+                    src: null_reg,
+                });
+                let matched_done = self.emit(Op::Goto { target: 0 });
+                let matched = self.ops.len() as u32;
+                self.patch(no_null, matched)?;
+                self.emit(Op::Copy {
+                    dest: result,
+                    src: true_reg,
+                });
+                let matched_true_done = self.emit(Op::Goto { target: 0 });
+                let zero = self.ops.len() as u32;
+                self.patch(none_matched, zero)?;
+                let no_null_zero = self.emit(Op::IfNot {
+                    reg: saw_null,
+                    target: 0,
+                });
+                self.emit(Op::Copy {
+                    dest: result,
+                    src: null_reg,
+                });
+                let zero_done = self.emit(Op::Goto { target: 0 });
+                let zero_false = self.ops.len() as u32;
+                self.patch(no_null_zero, zero_false)?;
+                self.emit(Op::Copy {
+                    dest: result,
+                    src: false_reg,
+                });
+                let single_done = self.ops.len() as u32;
+                self.patch(done, single_done)?;
+                self.patch(matched_done, single_done)?;
+                self.patch(matched_true_done, single_done)?;
+                self.patch(zero_done, single_done)?;
+            }
+        }
+        self.emit(Op::Copy { dest, src: result });
+        Ok(())
+    }
+
     fn compile_expr(&mut self, expr: &Expr, ctx: &Ctx) -> Result<u32> {
         let reg = self.alloc_reg();
         self.compile_expr_into(expr, ctx, reg)?;
@@ -1013,6 +1260,94 @@ impl<'a> Codegen<'a> {
                     index: index_reg,
                     dest,
                 });
+            }
+            Expr::ListComprehension {
+                var,
+                list,
+                predicate,
+                projection,
+            } => {
+                let list_reg = self.compile_expr(list, ctx)?;
+                let cursor = self.alloc_cursor();
+                self.emit(Op::UnwindInit {
+                    cursor,
+                    list: list_reg,
+                });
+                self.emit(Op::BuildList {
+                    dest,
+                    items: Vec::new(),
+                });
+                let element = self.alloc_reg();
+                let loop_start = self.ops.len() as u32;
+                let jump = self.emit(Op::UnwindNext {
+                    cursor,
+                    dest: element,
+                    target: 0,
+                });
+                let mut inner = ctx.clone();
+                inner.vars.insert(var.clone(), element);
+                let mut skip = None;
+                if let Some(predicate) = predicate {
+                    let condition = self.compile_expr(predicate, &inner)?;
+                    skip = Some(self.emit(Op::IfNot {
+                        reg: condition,
+                        target: 0,
+                    }));
+                }
+                let value = match projection {
+                    Some(projection) => self.compile_expr(projection, &inner)?,
+                    None => element,
+                };
+                self.emit(Op::ListPush { list: dest, value });
+                if let Some(skip) = skip {
+                    let target = self.ops.len() as u32;
+                    self.patch(skip, target)?;
+                }
+                self.emit(Op::Goto { target: loop_start });
+                let end = self.ops.len() as u32;
+                self.patch(jump, end)?;
+            }
+            Expr::Quantifier {
+                kind,
+                var,
+                list,
+                predicate,
+            } => {
+                self.compile_quantifier(*kind, var, list, predicate, ctx, dest)?;
+            }
+            Expr::Reduce {
+                accumulator,
+                init,
+                var,
+                list,
+                expression,
+            } => {
+                let acc = self.compile_expr(init, ctx)?;
+                let list_reg = self.compile_expr(list, ctx)?;
+                let cursor = self.alloc_cursor();
+                self.emit(Op::UnwindInit {
+                    cursor,
+                    list: list_reg,
+                });
+                let element = self.alloc_reg();
+                let loop_start = self.ops.len() as u32;
+                let jump = self.emit(Op::UnwindNext {
+                    cursor,
+                    dest: element,
+                    target: 0,
+                });
+                let mut inner = ctx.clone();
+                inner.vars.insert(var.clone(), element);
+                inner.vars.insert(accumulator.clone(), acc);
+                let value = self.compile_expr(expression, &inner)?;
+                self.emit(Op::Copy {
+                    dest: acc,
+                    src: value,
+                });
+                self.emit(Op::Goto { target: loop_start });
+                let end = self.ops.len() as u32;
+                self.patch(jump, end)?;
+                self.emit(Op::Copy { dest, src: acc });
             }
             Expr::Slice { base, lower, upper } => {
                 let base_reg = self.compile_expr(base, ctx)?;

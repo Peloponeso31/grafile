@@ -743,3 +743,54 @@ fn list_concatenation_with_scalars() {
     let rows = query(&mut conn, "RETURN [1, 2] + 3 AS a, 0 + [1, 2] AS b");
     assert_eq!(rows, vec![vec!["[1, 2, 3]", "[0, 1, 2]"]]);
 }
+
+// ---- comprehensions, quantifiers and reduce ----
+
+#[test]
+fn list_comprehensions() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH [1, 2, 3, 4] AS list RETURN [x IN list WHERE x > 2] AS a, [x IN list | x * 10] AS b, [x IN list WHERE x < 3 | x + 1] AS c",
+    );
+    assert_eq!(rows, vec![vec!["[3, 4]", "[10, 20, 30, 40]", "[2, 3]"]]);
+}
+
+#[test]
+fn quantifiers() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH [1, 2, 3] AS list RETURN all(x IN list WHERE x > 0) AS a, any(x IN list WHERE x > 2) AS b, none(x IN list WHERE x > 5) AS c, single(x IN list WHERE x = 2) AS d",
+    );
+    assert_eq!(rows, vec![vec!["true", "true", "true", "true"]]);
+}
+
+#[test]
+fn quantifiers_with_nulls() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH [1, null] AS list RETURN all(x IN list WHERE x > 0) AS a, any(x IN list WHERE x > 0) AS b, none(x IN list WHERE x > 5) AS c",
+    );
+    assert_eq!(rows, vec![vec!["null", "true", "null"]]);
+}
+
+#[test]
+fn reduce_folds_a_list() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN reduce(total = 0, x IN [1, 2, 3] | total + x) AS total",
+    );
+    assert_eq!(rows, vec![vec!["6"]]);
+}
+
+#[test]
+fn aggregations_inside_comprehensions_are_rejected() {
+    let mut conn = connection();
+    let err = conn
+        .query("RETURN [x IN [1] | count(*)]", &Params::new())
+        .expect_err("aggregation in comprehension");
+    assert_eq!(err.code(), grafile::ErrorCode::Syntax);
+}

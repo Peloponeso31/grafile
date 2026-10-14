@@ -356,6 +356,13 @@ pub enum Op {
         /// Destination register.
         dest: u32,
     },
+    /// Append a value to a list register (rebuilding the list).
+    ListPush {
+        /// List register, updated in place.
+        list: u32,
+        /// Value register.
+        value: u32,
+    },
     /// Start unwinding a list.
     UnwindInit {
         /// Cursor slot.
@@ -1103,6 +1110,21 @@ impl<'a> Executor<'a> {
                         .clone();
                     self.regs[(*start as usize) + idx] = value;
                 }
+            }
+            Op::ListPush { list, value } => {
+                let value = self.reg_value(*value)?;
+                let items = match self.reg_value(*list)? {
+                    Value::List(items) => items,
+                    other => {
+                        return Err(Error::internal(format!(
+                            "ListPush on {}",
+                            other.type_name()
+                        )));
+                    }
+                };
+                let mut new_items = items.to_vec();
+                new_items.push(value);
+                self.regs[*list as usize] = Reg::Value(Value::List(new_items.into()));
             }
             Op::UnwindInit { cursor, list } => {
                 let value = self.reg_value(*list)?;

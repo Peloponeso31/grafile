@@ -79,6 +79,41 @@ pub enum Expr {
         /// Index expression.
         index: Box<Expr>,
     },
+    /// `[var IN list WHERE predicate | projection]` list comprehension.
+    ListComprehension {
+        /// Loop variable.
+        var: String,
+        /// Source list.
+        list: Box<Expr>,
+        /// Optional filter.
+        predicate: Option<Box<Expr>>,
+        /// Optional projection; defaults to the loop variable.
+        projection: Option<Box<Expr>>,
+    },
+    /// `all|any|none|single(var IN list WHERE predicate)`.
+    Quantifier {
+        /// Which quantifier.
+        kind: QuantifierKind,
+        /// Loop variable.
+        var: String,
+        /// Source list.
+        list: Box<Expr>,
+        /// Predicate each element is tested against.
+        predicate: Box<Expr>,
+    },
+    /// `reduce(accumulator = init, var IN list | expression)`.
+    Reduce {
+        /// Accumulator variable.
+        accumulator: String,
+        /// Initial accumulator value.
+        init: Box<Expr>,
+        /// Loop variable.
+        var: String,
+        /// Source list.
+        list: Box<Expr>,
+        /// Fold expression over the accumulator and the element.
+        expression: Box<Expr>,
+    },
     /// `expr[lower..upper]` list slice; omitted bounds are open.
     Slice {
         /// Base expression.
@@ -142,6 +177,31 @@ pub enum Expr {
         /// Label names.
         labels: Vec<String>,
     },
+}
+
+/// The four list quantifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantifierKind {
+    /// `all`
+    All,
+    /// `any`
+    Any,
+    /// `none`
+    None,
+    /// `single`
+    Single,
+}
+
+impl QuantifierKind {
+    /// The name as written.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Any => "any",
+            Self::None => "none",
+            Self::Single => "single",
+        }
+    }
 }
 
 /// Direction of a relationship pattern as written.

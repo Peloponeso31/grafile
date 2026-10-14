@@ -754,6 +754,59 @@ impl<'a> Parser<'a> {
             Token::Ident | Token::EscapedIdent => {
                 let name = self.parse_name()?;
                 if self.peek() == Some(Token::LParen) {
+                    let lower = name.to_ascii_lowercase();
+                    let quantifier = match lower.as_str() {
+                        "all" => Some(QuantifierKind::All),
+                        "any" => Some(QuantifierKind::Any),
+                        "none" => Some(QuantifierKind::None),
+                        "single" => Some(QuantifierKind::Single),
+                        _ => None,
+                    };
+                    let followed_by_var_in = |parser: &Self, offset: usize| {
+                        matches!(
+                            parser
+                                .tokens
+                                .get(parser.pos + offset)
+                                .map(|entry| entry.token),
+                            Some(Token::Ident) | Some(Token::EscapedIdent)
+                        ) && parser
+                            .tokens
+                            .get(parser.pos + offset + 1)
+                            .map(|entry| entry.token)
+                            == Some(Token::In)
+                    };
+                    if let Some(kind) = quantifier
+                        && followed_by_var_in(self, 1)
+                    {
+                        return self.parse_quantifier(kind);
+                    }
+                    if lower == "reduce"
+                        && matches!(
+                            self.tokens.get(self.pos + 1).map(|entry| entry.token),
+                            Some(Token::Ident) | Some(Token::EscapedIdent)
+                        )
+                        && self.tokens.get(self.pos + 2).map(|entry| entry.token)
+                            == Some(Token::Equals)
+                    {
+                        self.advance();
+                        let accumulator = self.parse_name()?;
+                        self.expect(Token::Equals, "= after the reduce accumulator")?;
+                        let init = self.parse_expr()?;
+                        self.expect(Token::Comma, "',' after the reduce initial value")?;
+                        let var = self.parse_name()?;
+                        self.expect(Token::In, "IN in reduce")?;
+                        let list = self.parse_expr()?;
+                        self.expect(Token::Pipe, "'|' in reduce")?;
+                        let expression = self.parse_expr()?;
+                        self.expect(Token::RParen, "')' to close reduce")?;
+                        return Ok(Expr::Reduce {
+                            accumulator,
+                            init: Box::new(init),
+                            var,
+                            list: Box::new(list),
+                            expression: Box::new(expression),
+                        });
+                    }
                     self.advance();
                     let distinct = self.eat(Token::Distinct);
                     let mut star = false;
@@ -784,8 +837,48 @@ impl<'a> Parser<'a> {
                 self.expect(Token::RParen, "')' to close a parenthesized expression")?;
                 Ok(expr)
             }
+            Token::All => {
+                // `all(x IN list WHERE predicate)`; `ALL` is otherwise only
+                // valid in `UNION ALL`.
+                self.advance();
+                if self.peek() == Some(Token::LParen)
+                    && matches!(
+                        self.tokens.get(self.pos + 1).map(|entry| entry.token),
+                        Some(Token::Ident) | Some(Token::EscapedIdent)
+                    )
+                    && self.tokens.get(self.pos + 2).map(|entry| entry.token) == Some(Token::In)
+                {
+                    return self.parse_quantifier(QuantifierKind::All);
+                }
+                self.fail("unexpected ALL")
+            }
             Token::LBracket => {
                 self.advance();
+                // `[x IN list WHERE predicate | projection]`.
+                if matches!(self.peek(), Some(Token::Ident) | Some(Token::EscapedIdent))
+                    && self.tokens.get(self.pos + 1).map(|entry| entry.token) == Some(Token::In)
+                {
+                    let var = self.parse_name()?;
+                    self.expect(Token::In, "IN after the comprehension variable")?;
+                    let list = self.parse_expr()?;
+                    let predicate = if self.eat(Token::Where) {
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
+                    };
+                    let projection = if self.eat(Token::Pipe) {
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
+                    };
+                    self.expect(Token::RBracket, "']' to close a list comprehension")?;
+                    return Ok(Expr::ListComprehension {
+                        var,
+                        list: Box::new(list),
+                        predicate,
+                        projection,
+                    });
+                }
                 let mut items = Vec::new();
                 if self.peek() != Some(Token::RBracket) {
                     items.push(self.parse_expr()?);
@@ -800,6 +893,23 @@ impl<'a> Parser<'a> {
             Token::Case => self.parse_case(),
             _ => self.fail("expected an expression"),
         }
+    }
+
+    /// Parse the body of a quantifier; the current token is `(`.
+    fn parse_quantifier(&mut self, kind: QuantifierKind) -> Result<Expr> {
+        self.expect(Token::LParen, "'(' to open the quantifier")?;
+        let var = self.parse_name()?;
+        self.expect(Token::In, "IN after the quantifier variable")?;
+        let list = self.parse_expr()?;
+        self.expect(Token::Where, "WHERE in a quantifier")?;
+        let predicate = self.parse_expr()?;
+        self.expect(Token::RParen, "')' to close the quantifier")?;
+        Ok(Expr::Quantifier {
+            kind,
+            var,
+            list: Box::new(list),
+            predicate: Box::new(predicate),
+        })
     }
 
     fn parse_map_literal(&mut self) -> Result<Expr> {

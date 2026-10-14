@@ -919,6 +919,11 @@ impl<'a> Planner<'a> {
         let mut aggs: Vec<AggItem> = Vec::new();
         let mut post: Vec<(Expr, String)> = Vec::new();
         for (expr, name) in &expanded {
+            if has_aggregation_inside_comprehension(expr) {
+                return Err(Error::syntax(
+                    "aggregations are not allowed inside list comprehensions",
+                ));
+            }
             if let Some((func, argument, star, distinct)) = aggregate_call(expr)? {
                 aggs.push(AggItem {
                     func,
@@ -1232,6 +1237,48 @@ fn validate_expr(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
             }
             Ok(())
         }
+        Expr::ListComprehension {
+            var,
+            list,
+            predicate,
+            projection,
+        } => {
+            validate_expr(list, scope)?;
+            let mut inner = scope.clone();
+            inner.insert(var.clone(), VarKind::Value);
+            if let Some(predicate) = predicate {
+                validate_expr(predicate, &inner)?;
+            }
+            if let Some(projection) = projection {
+                validate_expr(projection, &inner)?;
+            }
+            Ok(())
+        }
+        Expr::Quantifier {
+            var,
+            list,
+            predicate,
+            ..
+        } => {
+            validate_expr(list, scope)?;
+            let mut inner = scope.clone();
+            inner.insert(var.clone(), VarKind::Value);
+            validate_expr(predicate, &inner)
+        }
+        Expr::Reduce {
+            accumulator,
+            init,
+            var,
+            list,
+            expression,
+        } => {
+            validate_expr(init, scope)?;
+            validate_expr(list, scope)?;
+            let mut inner = scope.clone();
+            inner.insert(var.clone(), VarKind::Value);
+            inner.insert(accumulator.clone(), VarKind::Value);
+            validate_expr(expression, &inner)
+        }
         Expr::Unary { expr, .. } => validate_expr(expr, scope),
         Expr::Binary { left, right, .. } => {
             validate_expr(left, scope)?;
@@ -1298,6 +1345,45 @@ fn default_name(expr: &Expr) -> String {
             let upper = upper.as_ref().map(|e| default_name(e)).unwrap_or_default();
             format!("{}[{lower}..{upper}]", subscript_base_name(base))
         }
+        Expr::ListComprehension {
+            var,
+            list,
+            predicate,
+            projection,
+        } => {
+            let mut text = format!("[{var} IN {}]", default_name(list));
+            if let Some(predicate) = predicate {
+                text.push_str(&format!(" WHERE {}", default_name(predicate)));
+            }
+            if let Some(projection) = projection {
+                text.push_str(&format!(" | {}", default_name(projection)));
+            }
+            text.insert(text.len() - 1, ' ');
+            text
+        }
+        Expr::Quantifier {
+            kind,
+            var,
+            list,
+            predicate,
+        } => format!(
+            "{}({var} IN {} WHERE {})",
+            kind.name(),
+            default_name(list),
+            default_name(predicate)
+        ),
+        Expr::Reduce {
+            accumulator,
+            init,
+            var,
+            list,
+            expression,
+        } => format!(
+            "reduce({accumulator} = {}, {var} IN {} | {})",
+            default_name(init),
+            default_name(list),
+            default_name(expression)
+        ),
         Expr::Function {
             name,
             distinct,
@@ -1495,6 +1581,47 @@ fn rewrite_expr(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>) -
                 .map(|upper| rewrite_expr(upper, f).map(Box::new))
                 .transpose()?,
         },
+        Expr::ListComprehension {
+            var,
+            list,
+            predicate,
+            projection,
+        } => Expr::ListComprehension {
+            var: var.clone(),
+            list: Box::new(rewrite_expr(list, f)?),
+            predicate: predicate
+                .as_ref()
+                .map(|predicate| rewrite_expr(predicate, f).map(Box::new))
+                .transpose()?,
+            projection: projection
+                .as_ref()
+                .map(|projection| rewrite_expr(projection, f).map(Box::new))
+                .transpose()?,
+        },
+        Expr::Quantifier {
+            kind,
+            var,
+            list,
+            predicate,
+        } => Expr::Quantifier {
+            kind: *kind,
+            var: var.clone(),
+            list: Box::new(rewrite_expr(list, f)?),
+            predicate: Box::new(rewrite_expr(predicate, f)?),
+        },
+        Expr::Reduce {
+            accumulator,
+            init,
+            var,
+            list,
+            expression,
+        } => Expr::Reduce {
+            accumulator: accumulator.clone(),
+            init: Box::new(rewrite_expr(init, f)?),
+            var: var.clone(),
+            list: Box::new(rewrite_expr(list, f)?),
+            expression: Box::new(rewrite_expr(expression, f)?),
+        },
         Expr::Unary { op, expr: inner } => Expr::Unary {
             op: *op,
             expr: Box::new(rewrite_expr(inner, f)?),
@@ -1579,6 +1706,33 @@ fn expr_references(expr: &Expr, pred: &mut dyn FnMut(&str) -> bool) -> bool {
                 || lower.as_deref().is_some_and(|e| expr_references(e, pred))
                 || upper.as_deref().is_some_and(|e| expr_references(e, pred))
         }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            projection,
+            ..
+        } => {
+            expr_references(list, pred)
+                || predicate
+                    .as_deref()
+                    .is_some_and(|e| expr_references(e, pred))
+                || projection
+                    .as_deref()
+                    .is_some_and(|e| expr_references(e, pred))
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => expr_references(list, pred) || expr_references(predicate, pred),
+        Expr::Reduce {
+            init,
+            list,
+            expression,
+            ..
+        } => {
+            expr_references(init, pred)
+                || expr_references(list, pred)
+                || expr_references(expression, pred)
+        }
         Expr::Unary { expr, .. } => expr_references(expr, pred),
         Expr::Binary { left, right, .. } => {
             expr_references(left, pred) || expr_references(right, pred)
@@ -1620,6 +1774,81 @@ fn references_aggregation(expr: &Expr, aggs: &[AggItem]) -> bool {
     expr_references(expr, &mut |name| aggs.iter().any(|item| item.name == name))
 }
 
+/// Whether an aggregation appears inside a comprehension body, quantifier
+/// predicate or `reduce` expression, where openCypher forbids it.
+fn has_aggregation_inside_comprehension(expr: &Expr) -> bool {
+    match expr {
+        Expr::ListComprehension {
+            list,
+            predicate,
+            projection,
+            ..
+        } => {
+            predicate.as_deref().is_some_and(contains_aggregation)
+                || projection.as_deref().is_some_and(contains_aggregation)
+                || has_aggregation_inside_comprehension(list)
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => contains_aggregation(predicate) || has_aggregation_inside_comprehension(list),
+        Expr::Reduce {
+            init,
+            list,
+            expression,
+            ..
+        } => {
+            contains_aggregation(expression)
+                || has_aggregation_inside_comprehension(init)
+                || has_aggregation_inside_comprehension(list)
+        }
+        Expr::Property { base, .. } | Expr::Unary { expr: base, .. } => {
+            has_aggregation_inside_comprehension(base)
+        }
+        Expr::Subscript { base, index } => {
+            has_aggregation_inside_comprehension(base)
+                || has_aggregation_inside_comprehension(index)
+        }
+        Expr::Slice { base, lower, upper } => {
+            has_aggregation_inside_comprehension(base)
+                || lower
+                    .as_deref()
+                    .is_some_and(has_aggregation_inside_comprehension)
+                || upper
+                    .as_deref()
+                    .is_some_and(has_aggregation_inside_comprehension)
+        }
+        Expr::Binary { left, right, .. } => {
+            has_aggregation_inside_comprehension(left)
+                || has_aggregation_inside_comprehension(right)
+        }
+        Expr::Function { args, .. } => args.iter().any(has_aggregation_inside_comprehension),
+        Expr::List(items) => items.iter().any(has_aggregation_inside_comprehension),
+        Expr::Map(entries) => entries
+            .iter()
+            .any(|(_, value)| has_aggregation_inside_comprehension(value)),
+        Expr::Case {
+            subject,
+            alternatives,
+            default,
+        } => {
+            subject
+                .as_deref()
+                .is_some_and(has_aggregation_inside_comprehension)
+                || alternatives.iter().any(|(when, then)| {
+                    has_aggregation_inside_comprehension(when)
+                        || has_aggregation_inside_comprehension(then)
+                })
+                || default
+                    .as_deref()
+                    .is_some_and(has_aggregation_inside_comprehension)
+        }
+        Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => {
+            has_aggregation_inside_comprehension(expr)
+        }
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => false,
+    }
+}
+
 fn contains_aggregation(expr: &Expr) -> bool {
     match expr {
         Expr::Function { name, args, .. } => {
@@ -1637,6 +1866,29 @@ fn contains_aggregation(expr: &Expr) -> bool {
             contains_aggregation(base)
                 || lower.as_deref().is_some_and(contains_aggregation)
                 || upper.as_deref().is_some_and(contains_aggregation)
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            projection,
+            ..
+        } => {
+            contains_aggregation(list)
+                || predicate.as_deref().is_some_and(contains_aggregation)
+                || projection.as_deref().is_some_and(contains_aggregation)
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => contains_aggregation(list) || contains_aggregation(predicate),
+        Expr::Reduce {
+            init,
+            list,
+            expression,
+            ..
+        } => {
+            contains_aggregation(init)
+                || contains_aggregation(list)
+                || contains_aggregation(expression)
         }
         Expr::Binary { left, right, .. } => {
             contains_aggregation(left) || contains_aggregation(right)
@@ -1811,6 +2063,37 @@ fn substitute_expr(expr: &mut Expr, params: &HashMap<String, Value>) -> Result<(
                 substitute_expr(upper, params)?;
             }
             Ok(())
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            projection,
+            ..
+        } => {
+            substitute_expr(list, params)?;
+            if let Some(predicate) = predicate {
+                substitute_expr(predicate, params)?;
+            }
+            if let Some(projection) = projection {
+                substitute_expr(projection, params)?;
+            }
+            Ok(())
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => {
+            substitute_expr(list, params)?;
+            substitute_expr(predicate, params)
+        }
+        Expr::Reduce {
+            init,
+            list,
+            expression,
+            ..
+        } => {
+            substitute_expr(init, params)?;
+            substitute_expr(list, params)?;
+            substitute_expr(expression, params)
         }
         Expr::Unary { expr, .. } => substitute_expr(expr, params),
         Expr::Binary { left, right, .. } => {
