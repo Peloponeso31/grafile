@@ -48,11 +48,12 @@ Known semantic deviations to close:
 - `MERGE` on a path with unbound endpoints merges the node(s) first and then
   the relationship, instead of matching the whole path atomically.
 - `ORDER BY` after aggregation may only reference projected values.
-- Aggregations with multiple arguments are rejected.
+- Aggregations with multiple arguments are rejected (needed for
+  `percentileCont`/`percentileDisc`, Phase 2).
 
 ## Phases
 
-Where the allow-list stood after `UNION` (2024.3, 2647 scenarios):
+Where the allow-list stood after `UNION` (2024.3, 2626 scenarios):
 temporal types 1004 (Phase 3), error-kind and validation mismatches ~340
 (Phase 4), ordering/comparison/precedence semantics ~350 (Phase 4), quantifier
 and list/map/pattern expressions ~860 (Phase 1C), paths ~250 (Phase 1B),
@@ -67,8 +68,6 @@ allow-list sizes measured after `OPTIONAL MATCH`.
 
 #### 1A — Statement and expression surface
 
-- Aggregation completeness: `DISTINCT` inside aggregations, multi-argument
-  aggregations, and post-aggregation expressions (21).
 - Map property access (`m.k`), subscript (`m['k']`), list slicing
   (`list[1..3]`), and map projections (`n{.name}`) (~91).
 
