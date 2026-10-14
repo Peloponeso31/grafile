@@ -37,18 +37,6 @@
       }
     },
     "clauses/create/Create1.feature": {
-      "[10] Create a single node with two properties and return them": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 12 | 'foo', got null | 'foo'"
-      },
-      "[11] Create a single node with null properties should not return those properties": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 12 | null, got null | null"
-      },
-      "[12] CREATE does not lose precision on large integers": {
-        "reason": "not-implemented",
-        "note": "expected column `p.id`, got `id`"
-      },
       "[13] Fail when creating a node that is already bound": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 0 rows"
@@ -86,18 +74,6 @@
       "[12] Create a single relationship and a starting node on an existing end node": {
         "reason": "not-implemented",
         "note": "setup failed: Syntax: expected an identifier at line 2 column 10 (found End)"
-      },
-      "[14] Create a single relationship with a property and return it": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 42, got null"
-      },
-      "[16] Create a single relationship with two properties and return them": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 12 | 'foo', got null | 'foo'"
-      },
-      "[17] Create a single relationship with null properties should not return those properties": {
-        "reason": "not-implemented",
-        "note": "expected column `r.id`, got `id`"
       },
       "[19] Fail when creating a relationship without a direction": {
         "reason": "not-implemented",
@@ -142,48 +118,6 @@
       "[5] Create a pattern with multiple hops and varying directions": {
         "reason": "not-implemented",
         "note": "expected column `a`, got `r2`"
-      }
-    },
-    "clauses/create/Create6.feature": {
-      "[10] Skipping and limiting to a few results after creating relationships does not affect the result set nor the side effects": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 42, got null"
-      },
-      "[11] Skipping zero result and limiting to all results after creating relationships does not affect the result set nor the side effects": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 42, got null"
-      },
-      "[12] Filtering after creating relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected 2 rows, got 0"
-      },
-      "[13] Aggregating in `RETURN` after creating relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 15, got 0"
-      },
-      "[14] Aggregating in `WITH` after creating relationships affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 15, got 0"
-      },
-      "[3] Skipping and limiting to a few results after creating nodes does not affect the result set nor the side effects": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 42, got null"
-      },
-      "[4] Skipping zero result and limiting to all results after creating nodes does not affect the result set nor the side effects": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 42, got null"
-      },
-      "[5] Filtering after creating nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "expected 2 rows, got 0"
-      },
-      "[6] Aggregating in `RETURN` after creating nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 15, got 0"
-      },
-      "[7] Aggregating in `WITH` after creating nodes affects the result set but not the side effects": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 15, got 0"
       }
     },
     "clauses/delete/Delete1.feature": {
@@ -877,10 +811,6 @@
       }
     },
     "clauses/merge/Merge1.feature": {
-      "[12] Merge should be able to merge using property of freshly created node": {
-        "reason": "not-implemented",
-        "note": "expected +2 nodes, got +1; expected +2 properties, got +1"
-      },
       "[13] Merge should bind a path": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident); expected +1 nodes, got +0; expected +1 properties, got +0"
@@ -894,26 +824,10 @@
         "note": "expected SemanticError at runtime, but the query returned 0 rows"
       }
     },
-    "clauses/merge/Merge2.feature": {
-      "[3] Merge node with label add property on create": {
-        "reason": "not-implemented",
-        "note": "expected column `a.num`, got `num`"
-      }
-    },
-    "clauses/merge/Merge3.feature": {
-      "[3] Merge node and set property on match": {
-        "reason": "not-implemented",
-        "note": "expected column `a.num`, got `num`"
-      }
-    },
     "clauses/merge/Merge5.feature": {
       "[10] Merge should bind a path": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 4 column 7 (found Ident); expected +2 nodes, got +0; expected +1 relationships, got +0; expe..."
-      },
-      "[11] Use outgoing direction when unspecified": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 2 | 1, got null | null"
       },
       "[12] Match outgoing relationship when direction unspecified": {
         "reason": "not-implemented",
@@ -1250,30 +1164,12 @@
       "[5] Adding a list property": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 4 column 24 (found Pipe); expected +1 properties, got +0"
-      },
-      "[6] Concatenate elements onto a list property": {
-        "reason": "not-implemented",
-        "note": "expected column `a.numbers`, got `numbers`; expected +1 properties, got +0"
-      },
-      "[7] Concatenate elements in reverse onto a list property": {
-        "reason": "not-implemented",
-        "note": "expected column `a.numbers`, got `numbers`; expected +1 properties, got +0"
-      }
-    },
-    "clauses/set/Set5.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 2 column 16 (found LParen)"
       }
     },
     "clauses/unwind/Unwind1.feature": {
       "[13] Multiple unwinds after each other": {
         "reason": "not-implemented",
         "note": "expected column `x`, got `y`"
-      },
-      "[14] Unwind with merge": {
-        "reason": "not-implemented",
-        "note": "expected column `p.name`, got `name`; expected +2 nodes, got +1; expected +4 properties, got +0"
       },
       "[2] Unwinding a range": {
         "reason": "not-implemented",
@@ -1771,7 +1667,7 @@
       }
     },
     "clauses/with/With2.feature": {
-      "*": {
+      "[1] Forwarding a property to express a join": {
         "reason": "not-implemented",
         "note": "setup failed: Syntax: expected an identifier at line 2 column 11 (found End)"
       }
@@ -1792,10 +1688,6 @@
       "[6] Reusing variable names in WITH": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      },
-      "[7] Multiple aliasing and backreferencing": {
-        "reason": "not-implemented",
-        "note": "expected column `m.second`, got `second`"
       }
     },
     "clauses/with/With6.feature": {
@@ -2821,10 +2713,6 @@
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 3 column 19 (found Colon)"
       },
-      "[2] Setting and returning the size of a list property": {
-        "reason": "not-implemented",
-        "note": "expected column `size(n.numbers)`, got `size`"
-      },
       "[7] Using size of pattern comprehension to test existence": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 3 column 23 (found RParen)"
@@ -2979,33 +2867,9 @@
       }
     },
     "expressions/map/Map1.feature": {
-      "[1] Statically access a field of a non-null map": {
-        "reason": "not-implemented",
-        "note": "expected column `m.missing`, got `missing`"
-      },
       "[3] Statically access a field of a map resulting from an expression": {
         "reason": "not-implemented",
         "note": "expected column `(list[1]).missing`, got `missing`"
-      },
-      "[4] Statically access a field is case-sensitive (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[4] Statically access a field is case-sensitive (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[4] Statically access a field is case-sensitive (example 3)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 'Pontus', got null"
-      },
-      "[5] Statically access a field with a delimited identifier (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] Statically access a field with a delimited identifier (example 2)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 'Pontus', got null"
       },
       "[5] Statically access a field with a delimited identifier (example 5)": {
         "reason": "not-implemented",
@@ -3140,82 +3004,6 @@
       "[2] Arithmetic precedence with parenthesis test": {
         "reason": "not-implemented",
         "note": "expected column `12 / 4 * (3 - 2 * 4)`, got `12 / 4 * 3 - 2 * 4`"
-      }
-    },
-    "expressions/null/Null1.feature": {
-      "[5] IS NULL on a map (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NULL on a map (example 10)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NULL on a map (example 11)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NULL on a map (example 2)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got true"
-      },
-      "[5] IS NULL on a map (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NULL on a map (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NULL on a map (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NULL on a map (example 8)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NULL on a map (example 9)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      }
-    },
-    "expressions/null/Null2.feature": {
-      "[5] IS NOT NULL on a map (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NOT NULL on a map (example 10)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NOT NULL on a map (example 11)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NOT NULL on a map (example 2)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true, got false"
-      },
-      "[5] IS NOT NULL on a map (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NOT NULL on a map (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NOT NULL on a map (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NOT NULL on a map (example 8)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
-      },
-      "[5] IS NOT NULL on a map (example 9)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: property access on map"
       }
     },
     "expressions/path/Path1.feature": {
