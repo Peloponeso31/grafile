@@ -118,5 +118,5 @@ Cypher escape rules when reading expected string values.
 `tck/report.json` (uploaded as a CI artifact) contains the totals, the pass
 rate, per-file counts and the full lists of unexpected failures, harness
 errors, stale entries and detail notes. Current baseline: 3897 scenarios,
-1187 passing, 2710 allow-listed (30.5% of the whole suite, 100% of
+1195 passing, 2702 allow-listed (30.7% of the whole suite, 100% of
 applicable scenarios).

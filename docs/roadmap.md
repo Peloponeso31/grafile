@@ -13,7 +13,7 @@ Implemented:
 - Clauses: `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN`, `WITH` (with
   `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`, trailing `WHERE`), `UNWIND`,
   `CREATE`, `MERGE` (with `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`,
-  `DELETE`, `DETACH DELETE`.
+  `DELETE`, `DETACH DELETE`, `UNION` / `UNION ALL`.
 - Patterns: node and relationship patterns, directions, type disjunction
   (`:A|B`), inline literal property filters, multiple labels, pre-bound
   elements (nodes and relationships verified instead of re-bound).
@@ -29,7 +29,6 @@ Explicit gaps (currently clear `Unsupported` errors):
 
 | Gap | Where rejected |
 |-----|----------------|
-| `UNION` / `UNION ALL` | parser |
 | Variable-length paths (`*min..max`) | planner |
 | `MERGE` with multiple relationships | planner |
 | Expressions mixing aggregation and grouping keys | planner |
@@ -56,11 +55,11 @@ Known semantic deviations to close:
 
 ## Phases
 
-Where the allow-list stood after `OPTIONAL MATCH` (2024.3, 2710 scenarios):
+Where the allow-list stood after `UNION` (2024.3, 2702 scenarios):
 temporal types 1004 (Phase 3), error-kind and validation mismatches ~340
 (Phase 4), ordering/comparison/precedence semantics ~350 (Phase 4), quantifier
 and list/map/pattern expressions ~860 (Phase 1C), paths ~250 (Phase 1B),
-statement and expression surface ~140 (Phase 1A), CALL procedure registration
+statement and expression surface ~130 (Phase 1A), CALL procedure registration
 52 (unreachable: the TCK registers test procedures), and the rest spread over
 functions (Phase 2) and clause corner cases.
 
@@ -71,8 +70,6 @@ allow-list sizes measured after `OPTIONAL MATCH`.
 
 #### 1A — Statement and expression surface
 
-- `UNION` / `UNION ALL`: statement-level concatenation plus deduplication for
-  `UNION` (10 scenarios).
 - `SET n += {…}` (5).
 - Aggregation completeness: `DISTINCT` inside aggregations, multi-argument
   aggregations, and post-aggregation expressions (21).
