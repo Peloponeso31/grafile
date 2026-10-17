@@ -87,7 +87,7 @@ fn date_part(fields: &[(String, Field)], base: Date) -> Result<Date, String> {
         // explicit year, the base date's ISO week year applies:
         // `{date: date('1816-12-31'), week: 2}` is a week-2 Tuesday.
         let default_weekday = match find(fields, "date") {
-            Some(Field::Date(_)) => base.iso_weekday(),
+            Some(field) if date_value(field).is_some() => base.iso_weekday(),
             _ => 1,
         };
         let weekday = component(fields, "dayOfWeek")?.unwrap_or(default_weekday as i64) as u32;
@@ -103,7 +103,15 @@ fn date_part(fields: &[(String, Field)], base: Date) -> Result<Date, String> {
             .ok_or_else(|| "invalid ordinal day".to_owned());
     }
     if let Some(quarter) = component(fields, "quarter")? {
-        let day = component(fields, "dayOfQuarter")?.unwrap_or(1) as u32;
+        // Without `dayOfQuarter`, a whole `date` key keeps its position in
+        // the quarter with the new quarter number.
+        let day = match component(fields, "dayOfQuarter")? {
+            Some(day) => day as u32,
+            None => match find(fields, "date") {
+                Some(field) if date_value(field).is_some() => base.day_of_quarter(),
+                _ => 1,
+            },
+        };
         return Date::from_quarter(year(fields, base)?, quarter as u32, day)
             .ok_or_else(|| "invalid quarter date".to_owned());
     }
@@ -196,90 +204,214 @@ fn parse_offset_text(text: &str) -> Result<i32, String> {
     Ok(offset)
 }
 
+/// The date part of a whole-value field: dates, datetimes and local
+/// datetimes all contribute their civil date.
+fn date_value(field: &Field) -> Option<Date> {
+    match field {
+        Field::Date(date) => Some(*date),
+        Field::LocalDateTime(datetime) => Some(datetime.date()),
+        Field::DateTime(datetime) => Some(datetime.local().date()),
+        _ => None,
+    }
+}
+
+/// The time part of a whole-value field and its offset, when it has one.
+fn time_value(field: &Field) -> Option<(LocalTime, Option<i32>)> {
+    match field {
+        Field::LocalTime(time) => Some((*time, None)),
+        Field::Time(time) => Some((time.local(), Some(time.offset()))),
+        Field::LocalDateTime(datetime) => Some((datetime.time(), None)),
+        Field::DateTime(datetime) => Some((datetime.local().time(), Some(datetime.offset()))),
+        _ => None,
+    }
+}
+
+/// The whole-value components a constructor map starts from: the base civil
+/// datetime plus (for datetime/time constructors) a base offset and zone,
+/// and whether the base really carried an offset.
+struct WholeValue {
+    local: LocalDateTime,
+    offset: i32,
+    zone: Option<Arc<str>>,
+    has_offset: bool,
+}
+
+fn whole_value(fields: &[(String, Field)]) -> Result<WholeValue, String> {
+    let mut base = WholeValue {
+        local: LocalDateTime::new(year_zero(), midnight()),
+        offset: 0,
+        zone: None,
+        has_offset: false,
+    };
+    if let Some(field) = find(fields, "datetime") {
+        match field {
+            Field::DateTime(datetime) => {
+                base.local = datetime.local();
+                base.offset = datetime.offset();
+                base.zone = datetime.zone().map(Arc::from);
+                base.has_offset = true;
+            }
+            Field::LocalDateTime(datetime) => base.local = *datetime,
+            _ => return Err("`datetime` must be a datetime value".to_owned()),
+        }
+    }
+    if let Some(field) = find(fields, "date") {
+        let date = date_value(field).ok_or_else(|| "`date` must be a date value".to_owned())?;
+        base.local = LocalDateTime::new(date, base.local.time());
+    }
+    if let Some(field) = find(fields, "time") {
+        let (time, offset) =
+            time_value(field).ok_or_else(|| "`time` must be a time value".to_owned())?;
+        base.local = LocalDateTime::new(base.local.date(), time);
+        if let (Some(offset), false) = (offset, base.has_offset) {
+            base.offset = offset;
+            base.has_offset = true;
+            if let Field::DateTime(datetime) = field {
+                base.zone = datetime.zone().map(Arc::from);
+            }
+        }
+    }
+    Ok(base)
+}
+
 /// Build a date from field map keys.
 pub fn date_from_fields(fields: &[(String, Field)]) -> Result<Date, String> {
-    let base = match find(fields, "date") {
-        Some(Field::Date(date)) => *date,
-        Some(_) => return Err("`date` must be a date value".to_owned()),
-        None => Date::new(0, 1, 1).expect("year zero is valid"),
-    };
+    let base = whole_value(fields)?.local.date();
     date_part(fields, base)
 }
 
 /// Build a local time from field map keys.
 pub fn localtime_from_fields(fields: &[(String, Field)]) -> Result<LocalTime, String> {
-    let base = match find(fields, "time") {
-        Some(Field::LocalTime(time)) => *time,
-        Some(Field::Time(time)) => time.local(),
-        Some(_) => return Err("`time` must be a time value".to_owned()),
-        None => LocalTime::new(0, 0, 0, 0).expect("midnight"),
-    };
+    let base = whole_value(fields)?.local.time();
     time_part(fields, base)
 }
 
-/// Build a time (with offset) from field map keys.
+/// Build a time (with offset) from field map keys. A `timezone` override
+/// keeps the instant when the base carried an offset: the local time shifts
+/// by the offset difference (Neo4j's "select time with a timezone").
 pub fn time_from_fields(fields: &[(String, Field)]) -> Result<Time, String> {
-    let (base, base_offset) = match find(fields, "time") {
-        Some(Field::Time(time)) => (time.local(), time.offset()),
-        Some(Field::LocalTime(time)) => (*time, 0),
-        Some(_) => return Err("`time` must be a time value".to_owned()),
-        None => (LocalTime::new(0, 0, 0, 0).expect("midnight"), 0),
-    };
-    let local = time_part(fields, base)?;
-    let offset = match timezone_part(fields)? {
-        Some(Timezone::Offset(offset)) => offset,
-        Some(Timezone::Named(name)) => {
-            return Err(format!("`{name}` cannot be used as a time zone for a time"));
+    let base = whole_value(fields)?;
+    let local = time_part(fields, base.local.time())?;
+    let timezone = timezone_part(fields)?;
+    let (local, offset) = match timezone {
+        None => (local, base.offset),
+        Some(Timezone::Offset(offset)) => {
+            if base.has_offset {
+                shift_time(local, base.offset, offset)
+            } else {
+                (local, offset)
+            }
         }
-        None => base_offset,
+        Some(Timezone::Named(name)) => {
+            if base.has_offset {
+                let instant = LocalDateTime::new(year_zero(), local).epoch_nanos()
+                    - base.offset as i128 * 1_000_000_000;
+                let seconds = instant.div_euclid(1_000_000_000) as i64;
+                let nanos = instant.rem_euclid(1_000_000_000) as i32;
+                let offset = zone::offset_at_instant(&name, seconds, nanos)?;
+                let shifted = LocalDateTime::from_epoch(
+                    seconds,
+                    nanos as i64 + offset as i64 * 1_000_000_000,
+                )
+                .ok_or_else(|| "shifted time out of range".to_owned())?;
+                (shifted.time(), offset)
+            } else {
+                let civil = zone::Civil::from_date_and_nanos(year_zero(), local.nanos());
+                (local, zone::offset_for_civil(&name, civil)?)
+            }
+        }
     };
     Time::new(local, offset).ok_or_else(|| "offset out of range".to_owned())
 }
 
+/// Shift a wall-clock time by `new_offset - old_offset` seconds, keeping the
+/// instant, and wrapping around midnight.
+fn shift_time(local: LocalTime, old_offset: i32, new_offset: i32) -> (LocalTime, i32) {
+    let nanos = local.nanos() + (new_offset - old_offset) as i64 * 1_000_000_000;
+    (LocalTime::from_nanos_wrapped(nanos), new_offset)
+}
+
 /// Build a local datetime from field map keys.
 pub fn localdatetime_from_fields(fields: &[(String, Field)]) -> Result<LocalDateTime, String> {
-    let base = datetime_base(fields)?;
-    let date = date_part(fields, base.local().date())?;
-    let time = time_part(fields, base.local().time())?;
+    let base = whole_value(fields)?;
+    let date = date_part(fields, base.local.date())?;
+    let time = time_part(fields, base.local.time())?;
     Ok(LocalDateTime::new(date, time))
 }
 
-/// Build a datetime from field map keys.
+/// Build a datetime from field map keys. A `timezone` override keeps the
+/// instant when the base carried an offset: the local datetime shifts by the
+/// offset difference.
 pub fn datetime_from_fields(fields: &[(String, Field)]) -> Result<DateTime, String> {
-    let base = datetime_base(fields)?;
-    let date = date_part(fields, base.local().date())?;
-    let time = time_part(fields, base.local().time())?;
+    let base = whole_value(fields)?;
+    let date = date_part(fields, base.local.date())?;
+    let time = time_part(fields, base.local.time())?;
     let local = LocalDateTime::new(date, time);
     let timezone = timezone_part(fields)?;
-    let (offset, zone) = match timezone {
-        Some(Timezone::Offset(offset)) => (offset, None),
-        Some(Timezone::Named(name)) => {
-            let civil = zone::Civil::from_date_and_nanos(date, time.nanos());
-            let offset = zone::offset_for_civil(&name, civil)?;
-            (offset, Some(Arc::from(name.as_str())))
+    // A named base zone re-resolves its offset for the final civil datetime.
+    let base_offset = match &base.zone {
+        Some(zone_name) => zone::offset_for_civil(
+            zone_name,
+            zone::Civil::from_date_and_nanos(local.date(), local.time().nanos()),
+        )?,
+        None => base.offset,
+    };
+    let (local, offset, zone) = match timezone {
+        None => (
+            local,
+            if base.has_offset {
+                base_offset
+            } else {
+                base.offset
+            },
+            base.zone.clone(),
+        ),
+        Some(Timezone::Offset(offset)) => {
+            if base.has_offset {
+                (
+                    shift_localdatetime(local, base_offset, offset)?,
+                    offset,
+                    None,
+                )
+            } else {
+                (local, offset, None)
+            }
         }
-        None => (base.offset(), base.zone().map(Arc::from)),
+        Some(Timezone::Named(name)) => {
+            if base.has_offset {
+                let instant = local.epoch_nanos() - base_offset as i128 * 1_000_000_000;
+                let seconds = instant.div_euclid(1_000_000_000) as i64;
+                let nanos = instant.rem_euclid(1_000_000_000) as i32;
+                let offset = zone::offset_at_instant(&name, seconds, nanos)?;
+                let shifted = LocalDateTime::from_epoch(
+                    seconds,
+                    nanos as i64 + offset as i64 * 1_000_000_000,
+                )
+                .ok_or_else(|| "shifted datetime out of range".to_owned())?;
+                (shifted, offset, Some(Arc::from(name.as_str())))
+            } else {
+                let civil = zone::Civil::from_date_and_nanos(date, time.nanos());
+                let offset = zone::offset_for_civil(&name, civil)?;
+                (local, offset, Some(Arc::from(name.as_str())))
+            }
+        }
     };
     DateTime::new(local, offset, zone).ok_or_else(|| "offset out of range".to_owned())
 }
 
-/// The whole-value keys a datetime map may start from.
-fn datetime_base(fields: &[(String, Field)]) -> Result<DateTime, String> {
-    if let Some(Field::DateTime(datetime)) = find(fields, "datetime") {
-        return Ok(datetime.clone());
-    }
-    if let Some(field) = find(fields, "datetime") {
-        if let Field::LocalDateTime(local) = field {
-            return Ok(DateTime::new(*local, 0, None).expect("zero offset"));
-        }
-        return Err("`datetime` must be a datetime value".to_owned());
-    }
-    if let Some(Field::Date(date)) = find(fields, "date") {
-        return Ok(
-            DateTime::new(LocalDateTime::new(*date, midnight()), 0, None).expect("zero offset"),
-        );
-    }
-    Ok(DateTime::new(LocalDateTime::new(year_zero(), midnight()), 0, None).expect("zero offset"))
+/// Shift a civil datetime by `new_offset - old_offset` seconds, keeping the
+/// instant.
+fn shift_localdatetime(
+    local: LocalDateTime,
+    old_offset: i32,
+    new_offset: i32,
+) -> Result<LocalDateTime, String> {
+    let instant = local.epoch_nanos() + (new_offset - old_offset) as i128 * 1_000_000_000;
+    LocalDateTime::from_epoch(
+        instant.div_euclid(1_000_000_000) as i64,
+        instant.rem_euclid(1_000_000_000) as i64,
+    )
+    .ok_or_else(|| "shifted datetime out of range".to_owned())
 }
 
 fn midnight() -> LocalTime {
