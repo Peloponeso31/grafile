@@ -590,7 +590,7 @@ fn default_column_names_keep_necessary_parentheses() {
         ]
     );
     let values = rows_to_strings(&mut rows);
-    assert_eq!(values, vec![vec!["-15", "6", "512", "-12"]]);
+    assert_eq!(values, vec![vec!["-15", "6", "64", "-12"]]);
 }
 
 #[test]

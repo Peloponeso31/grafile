@@ -2260,15 +2260,15 @@ fn operand_name(expr: &Expr, precedence: u8, right: bool, parent: Option<BinaryO
         false
     } else if !right {
         // A same-precedence left operand only needs parentheses under a
-        // right-associative operator: `(a ^ b) ^ c`.
-        parent == Some(BinaryOp::Pow)
+        // right-associative operator, which the grammar has none of.
+        false
     } else {
         match parent {
             // `a - (b - c)` and `a / (b * c)` would re-associate; associative
-            // operators, and `^` chains to the right, need none.
+            // operators only need parentheses when the operator differs.
             Some(parent_op) => {
                 let same = matches!(expr, Expr::Binary { op, .. } if *op == parent_op);
-                !(same && (op_associative(parent_op) || parent_op == BinaryOp::Pow))
+                !(same && op_associative(parent_op))
             }
             None => true,
         }

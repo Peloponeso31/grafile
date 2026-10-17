@@ -326,7 +326,14 @@ impl<'a> Parser<'a> {
     fn parse_set_items(&mut self, remove: bool) -> Result<Vec<SetItem>> {
         let mut items = Vec::new();
         loop {
-            let variable = self.parse_name()?;
+            // The target may be parenthesized: `SET (n).name = 'x'`.
+            let variable = if self.eat(Token::LParen) {
+                let name = self.parse_name()?;
+                self.expect(Token::RParen, "')' after the SET target")?;
+                name
+            } else {
+                self.parse_name()?
+            };
             if self.eat(Token::Dot) {
                 let key = self.parse_name()?;
                 let value = if remove {
@@ -697,44 +704,62 @@ impl<'a> Parser<'a> {
         self.parse_comparison()
     }
 
+    /// Comparison operators bind looser than membership and string-list
+    /// predicates, and a chain such as `a < b < c` is the conjunction
+    /// `a < b AND b < c` (openCypher's chained comparison).
     fn parse_comparison(&mut self) -> Result<Expr> {
+        let mut left = self.parse_membership()?;
+        let mut conjuncts: Vec<Expr> = Vec::new();
+        loop {
+            let op = match self.peek() {
+                Some(Token::Equals) => BinaryOp::Eq,
+                Some(Token::NotEquals) => BinaryOp::Ne,
+                Some(Token::Less) => BinaryOp::Lt,
+                Some(Token::LessEquals) => BinaryOp::Le,
+                Some(Token::Greater) => BinaryOp::Gt,
+                Some(Token::GreaterEquals) => BinaryOp::Ge,
+                Some(Token::RegexMatch) => BinaryOp::Regex,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_membership()?;
+            conjuncts.push(binary(op, left.clone(), right.clone()));
+            left = right;
+        }
+        Ok(match conjuncts.len() {
+            0 => left,
+            1 => conjuncts.pop().expect("one conjunct"),
+            _ => {
+                let mut chains = conjuncts.into_iter();
+                let mut combined = chains.next().expect("first conjunct");
+                for conjunct in chains {
+                    combined = binary(BinaryOp::And, combined, conjunct);
+                }
+                combined
+            }
+        })
+    }
+
+    /// `IN`, `STARTS WITH`, `ENDS WITH` and `CONTAINS` bind tighter than the
+    /// comparison operators: `a = b IN c` is `a = (b IN c)`.
+    fn parse_membership(&mut self) -> Result<Expr> {
         let mut left = self.parse_additive()?;
         loop {
             let op = match self.peek() {
-                Some(Token::Equals) => Some(BinaryOp::Eq),
-                Some(Token::NotEquals) => Some(BinaryOp::Ne),
-                Some(Token::Less) => Some(BinaryOp::Lt),
-                Some(Token::LessEquals) => Some(BinaryOp::Le),
-                Some(Token::Greater) => Some(BinaryOp::Gt),
-                Some(Token::GreaterEquals) => Some(BinaryOp::Ge),
-                Some(Token::RegexMatch) => Some(BinaryOp::Regex),
-                Some(Token::In) => Some(BinaryOp::In),
-                Some(Token::Starts) => Some(BinaryOp::StartsWith),
-                Some(Token::Ends) => Some(BinaryOp::EndsWith),
-                Some(Token::Contains) => Some(BinaryOp::Contains),
-                _ => None,
+                Some(Token::In) => BinaryOp::In,
+                Some(Token::Starts) => BinaryOp::StartsWith,
+                Some(Token::Ends) => BinaryOp::EndsWith,
+                Some(Token::Contains) => BinaryOp::Contains,
+                _ => break,
             };
-            if let Some(op) = op {
-                self.advance();
-                if op == BinaryOp::StartsWith {
-                    self.expect(Token::With, "WITH after STARTS")?;
-                } else if op == BinaryOp::EndsWith {
-                    self.expect(Token::With, "WITH after ENDS")?;
-                }
-                let right = self.parse_additive()?;
-                left = binary(op, left, right);
-                continue;
+            self.advance();
+            if op == BinaryOp::StartsWith {
+                self.expect(Token::With, "WITH after STARTS")?;
+            } else if op == BinaryOp::EndsWith {
+                self.expect(Token::With, "WITH after ENDS")?;
             }
-            if self.eat(Token::Is) {
-                let negated = self.eat(Token::Not);
-                self.expect(Token::Null, "NULL after IS")?;
-                left = Expr::IsNull {
-                    expr: Box::new(left),
-                    negated,
-                };
-                continue;
-            }
-            break;
+            let right = self.parse_additive()?;
+            left = binary(op, left, right);
         }
         Ok(left)
     }
@@ -770,12 +795,12 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// Exponentiation is left-associative: `4 ^ 6 ^ 3` is `(4 ^ 6) ^ 3`.
     fn parse_power(&mut self) -> Result<Expr> {
-        let left = self.parse_unary()?;
-        if self.eat(Token::Caret) {
-            // Right-associative.
-            let right = self.parse_power()?;
-            return Ok(binary(BinaryOp::Pow, left, right));
+        let mut left = self.parse_unary()?;
+        while self.eat(Token::Caret) {
+            let right = self.parse_unary()?;
+            left = binary(BinaryOp::Pow, left, right);
         }
         Ok(left)
     }
@@ -812,6 +837,17 @@ impl<'a> Parser<'a> {
         let mut expr = self.parse_primary()?;
         loop {
             match self.peek() {
+                // `IS [NOT] NULL` binds tighter than comparisons:
+                // `false = true IS NULL` is `false = (true IS NULL)`.
+                Some(Token::Is) => {
+                    self.advance();
+                    let negated = self.eat(Token::Not);
+                    self.expect(Token::Null, "NULL after IS")?;
+                    expr = Expr::IsNull {
+                        expr: Box::new(expr),
+                        negated,
+                    };
+                }
                 Some(Token::Dot) => {
                     self.advance();
                     let key = self.parse_name()?;
@@ -1337,13 +1373,13 @@ mod tests {
     }
 
     #[test]
-    fn power_is_right_associative() {
+    fn power_is_left_associative() {
         let expr = expr_of("RETURN 2 ^ 3 ^ 2");
-        let Expr::Binary { op, right, .. } = expr else {
+        let Expr::Binary { op, left, .. } = expr else {
             panic!("expected binary");
         };
         assert_eq!(op, BinaryOp::Pow);
-        let Expr::Binary { op, .. } = *right else {
+        let Expr::Binary { op, .. } = *left else {
             panic!("expected nested power");
         };
         assert_eq!(op, BinaryOp::Pow);

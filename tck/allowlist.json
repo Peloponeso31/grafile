@@ -536,14 +536,6 @@
       "[10] Failing when setting a list of maps as a property": {
         "reason": "not-implemented",
         "note": "expected TypeError at runtime, but the query returned 0 rows"
-      },
-      "[3] Set a property by selecting the node using a simple expression": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an identifier at line 3 column 5 (found LParen); expected +1 properties, got +0"
-      },
-      "[4] Set a property by selecting the relationship using a simple expression": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an identifier at line 3 column 5 (found LParen); expected +1 properties, got +0"
       }
     },
     "clauses/unwind/Unwind1.feature": {
@@ -787,14 +779,6 @@
       }
     },
     "expressions/boolean/Boolean1.feature": {
-      "[5] Conjunction is commutative on null": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true | null | true, got true | null | true"
-      },
-      "[7] Conjunction is associative on null": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true | true | null | true, got true | true | null | true"
-      },
       "[8] Fail on conjunction of at least one non-booleans (example 1)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 1 rows"
@@ -889,14 +873,6 @@
       }
     },
     "expressions/boolean/Boolean2.feature": {
-      "[5] Disjunction is commutative on null": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected null | false | true, got null | false | true"
-      },
-      "[7] Disjunction is associative on null": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true | null | false | true, got true | null | false | false"
-      },
       "[8] Fail on disjunction of at least one non-booleans (example 1)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 1 rows"
@@ -1250,20 +1226,6 @@
         "note": "expected SyntaxError at compile time, got TypeError at runtime"
       }
     },
-    "expressions/boolean/Boolean5.feature": {
-      "[2] Disjunction is distributive over conjunction on null": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true | true | null | true, got true | true | null | false"
-      },
-      "[4] Conjunction is distributive over disjunction on null": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true | true | null | true, got true | true | null | false"
-      },
-      "[6] Conjunction is not distributive over exclusive disjunction on null": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true | true | null | true, got true | true | null | true"
-      }
-    },
     "expressions/comparison/Comparison1.feature": {
       "[6] Comparing lists to lists (example 3)": {
         "reason": "not-implemented",
@@ -1350,46 +1312,6 @@
       "[5] Comparing NaN (example 3)": {
         "reason": "not-implemented",
         "note": "rows differ: expected false | false | false | false, got false | true | false | true"
-      }
-    },
-    "expressions/comparison/Comparison3.feature": {
-      "[1] Handling numerical ranges 1": {
-        "reason": "not-implemented",
-        "note": "expected 1 rows, got 0"
-      },
-      "[2] Handling numerical ranges 2": {
-        "reason": "not-implemented",
-        "note": "expected 2 rows, got 0"
-      },
-      "[3] Handling numerical ranges 3": {
-        "reason": "not-implemented",
-        "note": "expected 2 rows, got 0"
-      },
-      "[4] Handling numerical ranges 4": {
-        "reason": "not-implemented",
-        "note": "expected 3 rows, got 0"
-      },
-      "[5] Handling string ranges 1": {
-        "reason": "not-implemented",
-        "note": "expected 1 rows, got 0"
-      },
-      "[6] Handling string ranges 2": {
-        "reason": "not-implemented",
-        "note": "expected 2 rows, got 0"
-      },
-      "[7] Handling string ranges 3": {
-        "reason": "not-implemented",
-        "note": "expected 2 rows, got 0"
-      },
-      "[8] Handling string ranges 4": {
-        "reason": "not-implemented",
-        "note": "expected 3 rows, got 0"
-      }
-    },
-    "expressions/comparison/Comparison4.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected column `labels(m)`, got `labels`"
       }
     },
     "expressions/existentialSubqueries/ExistentialSubquery1.feature": {
@@ -1786,110 +1708,6 @@
         "note": "expected rows, got a compile time error: compile time: Unsupported: pattern expressions inside list comprehensions are not supported"
       }
     },
-    "expressions/precedence/Precedence1.feature": {
-      "[11] List predicate takes precedence over comparison operator": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false | false | true, got true | false | true"
-      },
-      "[23] Null predicates take precedence over comparison operators in every combination of truth values (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 6 column 8 (found All)"
-      },
-      "[23] Null predicates take precedence over comparison operators in every combination of truth values (example 10)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 6 column 8 (found All)"
-      },
-      "[23] Null predicates take precedence over comparison operators in every combination of truth values (example 11)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 6 column 8 (found All)"
-      },
-      "[23] Null predicates take precedence over comparison operators in every combination of truth values (example 12)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 6 column 8 (found All)"
-      },
-      "[23] Null predicates take precedence over comparison operators in every combination of truth values (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 6 column 8 (found All)"
-      },
-      "[23] Null predicates take precedence over comparison operators in every combination of truth values (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 6 column 8 (found All)"
-      },
-      "[23] Null predicates take precedence over comparison operators in every combination of truth values (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 6 column 8 (found All)"
-      },
-      "[23] Null predicates take precedence over comparison operators in every combination of truth values (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 6 column 8 (found All)"
-      },
-      "[23] Null predicates take precedence over comparison operators in every combination of truth values (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 6 column 8 (found All)"
-      },
-      "[23] Null predicates take precedence over comparison operators in every combination of truth values (example 7)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 6 column 8 (found All)"
-      },
-      "[23] Null predicates take precedence over comparison operators in every combination of truth values (example 8)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 6 column 8 (found All)"
-      },
-      "[23] Null predicates take precedence over comparison operators in every combination of truth values (example 9)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 6 column 8 (found All)"
-      },
-      "[26] List predicate takes precedence over comparison operators in every combination of truth values (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 7 column 8 (found All)"
-      },
-      "[26] List predicate takes precedence over comparison operators in every combination of truth values (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 7 column 8 (found All)"
-      },
-      "[26] List predicate takes precedence over comparison operators in every combination of truth values (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 7 column 8 (found All)"
-      },
-      "[26] List predicate takes precedence over comparison operators in every combination of truth values (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 7 column 8 (found All)"
-      },
-      "[26] List predicate takes precedence over comparison operators in every combination of truth values (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 7 column 8 (found All)"
-      },
-      "[26] List predicate takes precedence over comparison operators in every combination of truth values (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 7 column 8 (found All)"
-      },
-      "[8] Null predicate takes precedence over comparison operator": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true | true | false, got false | true | false"
-      }
-    },
-    "expressions/precedence/Precedence2.feature": {
-      "[2] Exponentiation takes precedence over numeric multiplicative operations (example 1)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 512.0 | 512.0 | 68719476736.0, got 512.0 | 512.0 | 1.109067877648326e130"
-      },
-      "[2] Exponentiation takes precedence over numeric multiplicative operations (example 2)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 8.0 | 8.0 | 64.0, got 8.0 | 8.0 | 4.0"
-      },
-      "[2] Exponentiation takes precedence over numeric multiplicative operations (example 3)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 0.0 | 0.0 | 64.0, got 0.0 | 0.0 | 4.0"
-      },
-      "[3] Exponentiation takes precedence over numeric additive operations (example 1)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 72.0 | 72.0 | 1073741824.0, got 72.0 | 72.0 | 1.8092513943330656e75"
-      },
-      "[3] Exponentiation takes precedence over numeric additive operations (example 2)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 56.0 | 56.0 | 64.0, got 56.0 | 56.0 | 4.0"
-      }
-    },
     "expressions/precedence/Precedence3.feature": {
       "[4] List appending takes precedence over list element containment": {
         "reason": "not-implemented",
@@ -1922,20 +1740,6 @@
       "[6] List element containment takes precedence over comparison operator (example 6)": {
         "reason": "not-implemented",
         "note": "rows differ: expected null | null | true, got null | null | null"
-      }
-    },
-    "expressions/precedence/Precedence4.feature": {
-      "[1] Null predicate takes precedence over comparison operator (example 1)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false | false | true, got true | false | true"
-      },
-      "[1] Null predicate takes precedence over comparison operator (example 2)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false | false | true, got true | false | true"
-      },
-      "[1] Null predicate takes precedence over comparison operator (example 3)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true | true | false, got false | true | false"
       }
     },
     "expressions/quantifier/Quantifier1.feature": {
