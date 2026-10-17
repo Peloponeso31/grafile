@@ -303,6 +303,19 @@ pub enum Plan {
         /// Alias bound to each element.
         alias: String,
     },
+    /// Read a CSV file and expand its rows (one value per row).
+    LoadCsv {
+        /// Input plan.
+        input: Box<Plan>,
+        /// Source path expression (evaluated per input row).
+        source: Expr,
+        /// Alias bound to each row.
+        alias: String,
+        /// Whether the first row holds column names.
+        with_headers: bool,
+        /// Field separator; defaults to a comma.
+        field_terminator: Option<char>,
+    },
     /// Create nodes and edges.
     Create {
         /// Input plan.
@@ -589,6 +602,23 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
         }
         Plan::Unwind { input, alias, .. } => {
             out.push_str(&format!("{pad}Unwind AS {alias}\n"));
+            explain(input, indent + 1, out);
+        }
+        Plan::LoadCsv {
+            input,
+            alias,
+            with_headers,
+            field_terminator,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{pad}LoadCsv AS {alias}{}{}\n",
+                if *with_headers { " with_headers" } else { "" },
+                match field_terminator {
+                    Some(ch) => format!(" fieldterminator={ch:?}"),
+                    None => String::new(),
+                }
+            ));
             explain(input, indent + 1, out);
         }
         Plan::Create { input, items } => {

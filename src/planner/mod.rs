@@ -217,6 +217,22 @@ impl<'a> Planner<'a> {
                     };
                     scope.insert(alias.clone(), VarKind::Value);
                 }
+                Clause::LoadCsv {
+                    with_headers,
+                    source,
+                    alias,
+                    field_terminator,
+                } => {
+                    validate_expr(source, &scope)?;
+                    plan = Plan::LoadCsv {
+                        input: Box::new(plan),
+                        source: source.clone(),
+                        alias: alias.clone(),
+                        with_headers: *with_headers,
+                        field_terminator: *field_terminator,
+                    };
+                    scope.insert(alias.clone(), VarKind::Value);
+                }
                 Clause::With {
                     distinct,
                     items,
@@ -511,7 +527,8 @@ impl<'a> Planner<'a> {
                     Clause::Match(_)
                     | Clause::With { .. }
                     | Clause::Return { .. }
-                    | Clause::Unwind { .. } => {}
+                    | Clause::Unwind { .. }
+                    | Clause::LoadCsv { .. } => {}
                     _ => {
                         return Err(Error::syntax(
                             "InvalidClauseComposition: EXISTS only allows reading clauses",
@@ -4354,6 +4371,7 @@ fn substitute_clause(clause: &mut Clause, params: &HashMap<String, Value>) -> Re
             ..
         } => substitute_items(items, order, skip, limit, params),
         Clause::Unwind { expr, .. } => substitute_expr(expr, params),
+        Clause::LoadCsv { source, .. } => substitute_expr(source, params),
     }
 }
 

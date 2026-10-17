@@ -451,8 +451,50 @@ impl<'a> Parser<'a> {
             }
             Some(Token::Foreach) => self.parse_foreach_clause(),
             Some(Token::Call) => self.parse_call_clause(),
+            Some(Token::Ident)
+                if self
+                    .peek_ident_text()
+                    .is_some_and(|text| text.eq_ignore_ascii_case("load")) =>
+            {
+                self.parse_load_csv_clause()
+            }
             _ => self.fail("expected a clause"),
         }
+    }
+
+    fn parse_load_csv_clause(&mut self) -> Result<Clause> {
+        self.advance(); // LOAD
+        self.expect_ident_text("csv")?;
+        let with_headers = if self.eat(Token::With) {
+            self.expect_ident_text("headers")?;
+            true
+        } else {
+            false
+        };
+        self.expect_ident_text("from")?;
+        let source = self.parse_expr()?;
+        self.expect(Token::As, "AS after the CSV source")?;
+        let alias = self.parse_name()?;
+        let field_terminator = if self.eat_ident_text("fieldterminator") {
+            match self.parse_expr()? {
+                Expr::Literal(Value::Text(text)) if text.chars().count() == 1 => {
+                    let ch = text.chars().next().expect("one character");
+                    if !ch.is_ascii() {
+                        return self.fail("FIELDTERMINATOR must be a single-byte character");
+                    }
+                    Some(ch)
+                }
+                _ => return self.fail("FIELDTERMINATOR expects a single-character string"),
+            }
+        } else {
+            None
+        };
+        Ok(Clause::LoadCsv {
+            with_headers,
+            source,
+            alias,
+            field_terminator,
+        })
     }
 
     fn parse_match_clause(&mut self, optional: bool) -> Result<MatchClause> {

@@ -432,6 +432,17 @@ pub enum Op {
         /// Constant index of the procedure name.
         name: u32,
     },
+    /// Read a CSV file, filling a row cursor with one value per row.
+    LoadCsvOpen {
+        /// Cursor slot.
+        cursor: u32,
+        /// Source path register.
+        source: u32,
+        /// Whether the first row holds column names.
+        with_headers: bool,
+        /// Field separator byte.
+        terminator: u8,
+    },
     /// Open a shortest-path search from a node to a target node.
     ShortestOpen {
         /// Cursor slot.
@@ -1531,6 +1542,22 @@ impl<'a> Executor<'a> {
                     _ => return Err(Error::internal("procedure name is not text")),
                 };
                 let rows = self.procedure_rows(&name)?;
+                self.cursors[*cursor as usize] = Cursor::Rows { rows, pos: 0 };
+            }
+            Op::LoadCsvOpen {
+                cursor,
+                source,
+                with_headers,
+                terminator,
+            } => {
+                let value = self.reg_value(*source)?;
+                let Value::Text(path) = value else {
+                    return Err(Error::type_error(format!(
+                        "LOAD CSV FROM expects a path string, got {}",
+                        value.type_name()
+                    )));
+                };
+                let rows = load_csv_rows(&path, *with_headers, *terminator)?;
                 self.cursors[*cursor as usize] = Cursor::Rows { rows, pos: 0 };
             }
             Op::ShortestOpen {
@@ -4190,4 +4217,76 @@ pub fn format_value(value: &Value) -> String {
         Value::Duration(value) => value.to_string(),
         Value::Point(value) => value.to_string(),
     }
+}
+
+/// Read a local CSV file into single-column rows: maps when the file has a
+/// header row, lists otherwise. Fields missing from a short row become null.
+fn load_csv_rows(path: &str, with_headers: bool, terminator: u8) -> Result<Vec<Vec<Reg>>> {
+    let path = path.strip_prefix("file://").unwrap_or(path);
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return Err(Error::unsupported(
+            "remote LOAD CSV over HTTP is not supported; use a local path",
+        ));
+    }
+    let file = std::fs::File::open(path).map_err(|error| {
+        Error::new(
+            ErrorCode::Io,
+            format!("cannot load CSV from `{path}`: {error}"),
+        )
+    })?;
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(with_headers)
+        .flexible(true)
+        .delimiter(terminator)
+        .from_reader(file);
+    let io_error = |error: csv::Error| {
+        Error::new(
+            ErrorCode::Io,
+            format!("cannot read CSV from `{path}`: {error}"),
+        )
+    };
+    let mut rows = Vec::new();
+    if with_headers {
+        let headers: Vec<std::sync::Arc<str>> = reader
+            .headers()
+            .map_err(io_error)?
+            .iter()
+            .map(std::sync::Arc::from)
+            .collect();
+        for record in reader.records() {
+            let record = record.map_err(io_error)?;
+            if record.len() > headers.len() {
+                return Err(Error::new(
+                    ErrorCode::Io,
+                    format!(
+                        "CSV row {} has {} fields but the header has {}",
+                        record.position().map_or(0, |pos| pos.line()),
+                        record.len(),
+                        headers.len()
+                    ),
+                ));
+            }
+            let entries: Vec<(std::sync::Arc<str>, Value)> = headers
+                .iter()
+                .enumerate()
+                .map(|(index, header)| {
+                    let value = record
+                        .get(index)
+                        .map_or(Value::Null, |field| Value::Text(field.into()));
+                    (header.clone(), value)
+                })
+                .collect();
+            rows.push(vec![Reg::Value(Value::Map(entries.into()))]);
+        }
+    } else {
+        for record in reader.records() {
+            let record = record.map_err(io_error)?;
+            let fields: Vec<Value> = record
+                .iter()
+                .map(|field| Value::Text(field.into()))
+                .collect();
+            rows.push(vec![Reg::Value(Value::List(fields.into()))]);
+        }
+    }
+    Ok(rows)
 }

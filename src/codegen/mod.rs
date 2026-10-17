@@ -870,6 +870,42 @@ impl Codegen {
                 cg.patch(jump, end)?;
                 Ok(())
             }),
+            Plan::LoadCsv {
+                input,
+                source,
+                alias,
+                with_headers,
+                field_terminator,
+            } => self.compile(input, ctx, &mut |cg, ctx| {
+                let source_reg = cg.compile_expr(source, ctx)?;
+                let cursor = cg.alloc_cursor();
+                cg.emit(Op::LoadCsvOpen {
+                    cursor,
+                    source: source_reg,
+                    with_headers: *with_headers,
+                    terminator: field_terminator.unwrap_or(',') as u8,
+                });
+                let base = cg.next_reg;
+                cg.alloc_reg();
+                let mut inner_ctx = ctx.clone();
+                inner_ctx.vars.insert(alias.clone(), base);
+                inner_ctx.window_start = base;
+                inner_ctx.window_len = 1;
+                let empty = cg.emit(Op::CtxRewind { cursor, target: 0 });
+                let loop_start = cg.ops.len() as u32;
+                cg.emit(Op::CtxData {
+                    cursor,
+                    start: base,
+                    count: 1,
+                });
+                out(cg, &mut inner_ctx)?;
+                let next = cg.emit(Op::CtxNext { cursor, target: 0 });
+                cg.emit(Op::Goto { target: loop_start });
+                let end = cg.ops.len() as u32;
+                cg.patch(empty, end)?;
+                cg.patch(next, end)?;
+                Ok(())
+            }),
             Plan::Create { input, items } => {
                 let mut apply = |cg: &mut Codegen, ctx: &mut Ctx| -> Result<()> {
                     for item in items {

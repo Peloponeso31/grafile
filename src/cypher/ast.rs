@@ -484,6 +484,17 @@ pub enum Clause {
         /// Alias for each element.
         alias: String,
     },
+    /// `LOAD CSV [WITH HEADERS] FROM source AS alias [FIELDTERMINATOR char]`.
+    LoadCsv {
+        /// Whether the first row holds column names.
+        with_headers: bool,
+        /// Source path expression (evaluated per input row).
+        source: Expr,
+        /// Variable bound to each row (a map with headers, a list without).
+        alias: String,
+        /// Field separator; defaults to a comma.
+        field_terminator: Option<char>,
+    },
     /// `FOREACH (var IN list | updating clauses)`.
     Foreach {
         /// Loop variable.
