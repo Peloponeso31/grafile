@@ -354,12 +354,22 @@ math library (`abs`, `sign`, `ceil`, `floor`, `round`, `sqrt`, `exp`, `log`,
 `log10`, `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`, `atan2`,
 `haversin`, `degrees`, `radians`, `pi`, `e`, `rand`).
 
+Temporal and spatial values are first class: `date`, `localtime`, `time`,
+`localdatetime`, `datetime` (fixed offsets and IANA zones like
+`Europe/Stockholm`), `duration` and `point`, built from strings, component
+maps or other temporal values, comparable and storable, with ISO 8601
+serialization, component accessors (`d.year`, `t.offset`, `du.months`,
+`p.longitude`), calendar and clock arithmetic (`date + duration`, `duration
+* 2`), `duration.between`/`inMonths`/`inDays`/`inSeconds`,
+`date.truncate`/`datetime.truncate` and friends (millennium through
+microsecond), plus `distance()` for cartesian and WGS-84 points.
+
 Explicit gaps fail with clear `Unsupported` errors instead of wrong results:
-`REMOVE n = {…}`, map projections (`n{.name}`) and temporal/spatial types.
-The plan to close them, ordered by TCK scenario share, is in
-[docs/roadmap.md](docs/roadmap.md). Storage-side work tracked alongside it:
-WAL mode for concurrent readers, delete rebalancing and `VACUUM`-style
-compaction, bulk loading, and streaming scans.
+`REMOVE n = {…}` and map projections (`n{.name}`). The plan to close them,
+ordered by TCK scenario share, is in [docs/roadmap.md](docs/roadmap.md).
+Storage-side work tracked alongside it: WAL mode for concurrent readers,
+delete rebalancing and `VACUUM`-style compaction, bulk loading, and
+streaming scans.
 
 ## Conformance: the openCypher TCK
 
@@ -375,7 +385,7 @@ $ cargo run -p tck-runner --release      # exits 0 when the gate passes
 The gate fails on unexpected failures, harness errors (steps or cells the
 runner cannot evaluate) and **stale allow-list entries**, so a fix must prune
 its allow-list entries in the same commit. Current baseline: 3897 scenarios,
-2301 passing (59.0% of the suite, 100% of applicable scenarios), 1596
+3370 passing (86.5% of the suite, 100% of applicable scenarios), 527
 allow-listed, zero harness errors. Run instructions, error mapping and
 comparison semantics are documented in [docs/tck.md](docs/tck.md).
 

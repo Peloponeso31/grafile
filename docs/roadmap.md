@@ -37,6 +37,15 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
   `replace`); math functions (`abs`, `sign`, `ceil`, `floor`, `round`,
   `sqrt`, `exp`, `log`, `log10`, trigonometry, `degrees`/`radians`,
   `haversin`, `pi`, `e`, `rand`).
+- Temporal and spatial values: `date`, `localtime`, `time`, `localdatetime`,
+  `datetime` (fixed offsets and IANA zones), `duration` and `point`, built
+  from strings, component maps or other temporal values; ISO 8601
+  serialization and parsing (week, ordinal and compact dates, named zones,
+  the alternative duration form); component accessors; calendar and clock
+  arithmetic; `duration.between`/`inMonths`/`inDays`/`inSeconds`;
+  `*.truncate` from millennium to microsecond; `distance()` for cartesian
+  and WGS-84 points; statement clock functions
+  (`date.transaction`/`realtime`/`statement` and friends).
 
 Explicit gaps (currently clear `Unsupported` errors):
 
@@ -46,7 +55,7 @@ Explicit gaps (currently clear `Unsupported` errors):
 | Map projections (`n{.name}`) | parser |
 | Unknown functions | codegen (by design) |
 
-Silently absent areas: temporal/spatial value types.
+Silently absent areas: none of the openCypher value types.
 
 Known semantic deviations to close:
 
@@ -54,6 +63,9 @@ Known semantic deviations to close:
   buffering: `MATCH (a:A) DELETE a MERGE (a2:A)` can still match a node
   deleted by an earlier row (Phase 4).
 - `ORDER BY` after aggregation may only reference projected values.
+- Comparing values of different temporal types (a date with a datetime, for
+  example) yields null instead of Neo4j's error; the Phase 4 comparison
+  sweep pins the exact rules.
 - Errors that Neo4j detects statically (for example `NOT {true: true}`) are
   raised at runtime instead, so their phase differs from the TCK.
 - `+` does not coerce the non-string operand to text, so `'p-' + 1` errors.
@@ -64,12 +76,13 @@ Status markers: `[done]` implemented and gated, `[partial]` some items
 finished, `[pending]` not started. Items the TCK does not exercise are
 verified by unit and integration tests and must not regress the report.
 
-Current baseline: 2301 of 3897 scenarios passing (59.0%), 1596 allow-listed.
-The remaining list is dominated by temporal types (1004, Phase 3), the
-error-kind/phase and ordering/comparison sweeps (~380 across precedence,
-comparison, boolean, literal and ordering files, Phase 4), eager evaluation
-after writes (Phase 4) and CALL procedure registration (52, unreachable: the
-TCK registers test procedures).
+Current baseline: 3370 of 3897 scenarios passing (86.5%), 527 allow-listed.
+The remaining list is dominated by the error-kind/phase and
+ordering/comparison sweeps (~340 across boolean, precedence, comparison,
+literal and ordering files, Phase 4), eager evaluation after writes
+(Phase 4, the create/delete/match family), CALL procedure registration
+(52, unreachable: the TCK registers test procedures) and `EXISTS` subqueries
+(9, Phase 5).
 
 ### Phase 1 — Core language completion (large) [done]
 
@@ -134,20 +147,22 @@ TCK registers test procedures).
   `percentileCont`/`percentileDisc`, which required multi-argument
   aggregation plumbing (value plus percentile in the aggregate window).
 
-### Phase 3 — Temporal and spatial types (large, cross-cutting) [pending]
+### Phase 3 — Temporal and spatial types (large, cross-cutting) [done]
 
-The biggest value-system change:
-
-- New `Value` variants: `Date`, `Time`, `LocalTime`, `DateTime`,
-  `LocalDateTime`, `Duration`, `Point`.
-- Record encode/decode tags, order-preserving index-key encodings,
-  comparison and arithmetic rules.
-- Function surface: `date()`, `datetime()`, `duration()`, `point()`,
-  `distance()`, component accessors.
-- CLI/JSON rendering.
-
-Storage stays backward compatible (new tags only); the format minor version
-is bumped.
+- [done] New `Value` variants `Date`, `LocalTime`, `Time`, `LocalDateTime`,
+  `DateTime` (offset plus optional IANA zone name), `Duration` (Neo4j's
+  months/days/seconds/nanoseconds that never fold into each other, with the
+  nanosecond field in `[0, 1e9)`) and `Point`; total ordering and equality.
+- [done] Record encode/decode tags, order-preserving index-key encodings,
+  JSON rendering, FFI column kinds, CLI output; storage stays backward
+  compatible (new tags only) with the format minor bumped to 2.
+- [done] Function surface: `date`, `localtime`, `time`, `localdatetime`,
+  `datetime`, `duration` and `point` constructors (strings, field maps with
+  calendar/week/ordinal/quarter keys, whole-value composition and timezone
+  resolution through the bundled IANA database), `distance`, component
+  accessors, `toString`, statement clocks, `*.truncate` (millennium through
+  microsecond), calendar/clock arithmetic and the
+  `duration.between`/`inMonths`/`inDays`/`inSeconds` family.
 
 ### Phase 4 — Semantic conformance sweep (medium, iterative) [pending]
 
@@ -204,9 +219,9 @@ scenarios are excluded), so milestones are stated against the whole suite.
 | Milestone | Target |
 |-----------|--------|
 | After Phases 1–2 | 2301 of 3897 scenarios pass (59.0%) |
-| After Phase 3 | ≥ 80% of the whole suite (temporal closes ~1000 scenarios) |
-| After Phase 4 | ≥ 95% of the whole suite; deviations closed |
-| After Phase 5 | Allow-list contains only non-goals |
+| After Phase 3 | 3370 of 3897 scenarios pass (86.5%) |
+| After Phase 4 | ≥ 93% of the whole suite; deviations closed |
+| After Phase 5 | Allow-list contains only non-goals (e.g. registered procedures) |
 
 ## Non-goals
 

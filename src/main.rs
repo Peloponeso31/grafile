@@ -1196,7 +1196,9 @@ cypher (v1): MATCH, OPTIONAL MATCH, WHERE, RETURN, WITH, UNWIND,
              CREATE, MERGE, SET, REMOVE, DELETE/DETACH DELETE, FOREACH,
              CALL, UNION, ORDER BY, SKIP, LIMIT, DISTINCT,
              aggregations (count/sum/avg/min/max/collect/percentile/
-             stDev) and a built-in function library, parameters ($name)
+             stDev), a built-in function library, temporal values
+             (date/time/datetime/duration with IANA zones) and spatial
+             points, parameters ($name)
 ddl (extension): CREATE INDEX ON :Label(prop) / :TYPE(prop) via API"
     );
 }
