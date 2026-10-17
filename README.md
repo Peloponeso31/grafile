@@ -103,7 +103,7 @@ src/            library + CLI (main.rs)
   api.rs        Connection, Params, Rows
 benches/        criterion: storage, queries, insert (SQLite baselines)
 examples/       profile_insert.rs: insert-path profiling workload
-tests/          end-to-end Cypher integration tests
+tests/          end-to-end Cypher suites by feature area, CLI tests, helpers
 ffi/            C ABI crate, header and language examples
 tck-runner/     openCypher TCK harness (see docs/tck.md)
 third_party/    vendored openCypher TCK (submodule)
@@ -411,18 +411,22 @@ $ cargo test --workspace   # unit + property + crash recovery + integration + FF
 $ cargo bench              # criterion: storage, queries, insert
 ```
 
-- Unit tests live beside the code; B+tree and fragment codecs are also checked
-  against reference models with `proptest` (`proptest-regressions/` keeps seed
-  corpora for past failures).
+- Unit tests live beside the code; B+tree, fragment codecs and crash recovery
+  are also checked against reference models with `proptest`
+  (`proptest-regressions/` keeps seed corpora for past failures).
 - Crash recovery is exercised with the fault-injecting `MemVfs`, which fails
   or tears writes at every operation boundary; reopened databases are verified
-  for integrity.
-- `tests/cypher_engine.rs` drives end-to-end Cypher through the public API.
+  for integrity, including a randomized multi-fault commit proptest.
+- `tests/` holds end-to-end suites by feature area (`matching`, `functions`,
+  `temporal`, `paths`, `writes`, `schema`, `transactions`, ...) sharing
+  helpers from `tests/support/`, plus `tests/cli.rs` for the binary's flags,
+  scripts, piped input and exit codes.
 - The TCK harness has fixture-based tests for the gate itself plus a parse and
   classification test over every vendored feature file.
-- CI builds and tests the FFI crate on macOS, Linux and Windows (with C and
-  Python smoke tests on macOS and Linux) and runs the TCK gate on every pull
-  request.
+- CI runs formatting, clippy, documentation, the full test suite on macOS and
+  Linux and a benchmark smoke run on every pull request; the FFI crate is
+  built and tested on macOS, Linux and Windows (with C and Python smoke tests
+  on macOS and Linux) and the TCK gate runs on every pull request.
 
 ## Performance
 
