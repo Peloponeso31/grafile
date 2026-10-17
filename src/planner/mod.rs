@@ -2305,7 +2305,10 @@ fn literal_text(value: &Value) -> String {
         Value::Null => "null".to_owned(),
         Value::Bool(inner) => inner.to_string(),
         Value::Int(inner) => inner.to_string(),
-        Value::Float(inner) => format!("{inner}"),
+        Value::Float(inner) => {
+            let mut buffer = ryu::Buffer::new();
+            buffer.format(*inner).to_owned()
+        }
         Value::Text(inner) => format!("'{inner}'"),
         other => format!("{other:?}"),
     }

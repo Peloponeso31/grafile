@@ -1818,6 +1818,7 @@ fn scalar_function(name: &str) -> Result<u8> {
         "tostring" => Ok(func::TO_STRING),
         "tointeger" => Ok(func::TO_INTEGER),
         "tofloat" => Ok(func::TO_FLOAT),
+        "toboolean" => Ok(func::TO_BOOLEAN),
         "size" => Ok(func::SIZE),
         "properties" => Ok(func::PROPERTIES),
         "keys" => Ok(func::KEYS),

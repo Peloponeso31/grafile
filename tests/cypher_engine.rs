@@ -840,6 +840,67 @@ fn aggregations_inside_comprehensions_are_rejected() {
     assert_eq!(err.code(), grafile::ErrorCode::Syntax);
 }
 
+// ---- type conversions ----
+
+#[test]
+fn to_integer_truncates_and_parses() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH [82.9, 2, true, '2.9', 'foo', '', null] AS xs \
+         RETURN [x IN xs | toInteger(x)] AS ints",
+    );
+    assert_eq!(rows, vec![vec!["[82, 2, 1, 2, null, null, null]"]]);
+}
+
+#[test]
+fn to_float_converts_numbers_and_strings() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH [3.4, 3, '5', 'foo', null] AS xs RETURN [x IN xs | toFloat(x)] AS floats",
+    );
+    assert_eq!(rows, vec![vec!["[3.4, 3.0, 5.0, null, null]"]]);
+}
+
+#[test]
+fn to_boolean_accepts_boolean_and_string() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH [true, 'TRUE', 'False', ' tru ', 'x', null] AS xs \
+         RETURN [x IN xs | toBoolean(x)] AS bools",
+    );
+    assert_eq!(rows, vec![vec!["[true, true, false, null, null, null]"]]);
+}
+
+#[test]
+fn to_string_renders_scalars() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH [42, 2.3, true, 'apa', null] AS xs RETURN [x IN xs | toString(x)] AS texts",
+    );
+    assert_eq!(rows, vec![vec!["[42, 2.3, true, apa, null]"]]);
+}
+
+#[test]
+fn conversions_reject_incompatible_types() {
+    let mut conn = connection();
+    for source in [
+        "RETURN toInteger([1])",
+        "RETURN toFloat(true)",
+        "RETURN toBoolean(1.0)",
+        "RETURN toString([1, 2])",
+        "RETURN toString({a: 1})",
+    ] {
+        let err = conn
+            .query(source, &Params::new())
+            .expect_err("conversion must reject the type");
+        assert_eq!(err.code(), grafile::ErrorCode::Type, "{source}");
+    }
+}
+
 // ---- variable-length paths ----
 
 #[test]

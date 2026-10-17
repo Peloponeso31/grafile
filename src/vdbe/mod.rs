@@ -566,6 +566,8 @@ pub mod func {
     pub const RELATIONSHIPS: u8 = 13;
     /// `length(path)`
     pub const LENGTH: u8 = 14;
+    /// `toBoolean(x)`
+    pub const TO_BOOLEAN: u8 = 15;
 }
 
 /// A compiled VDBE program.
@@ -1860,31 +1862,52 @@ impl<'a> Executor<'a> {
                 .find(|value| !value.is_null())
                 .cloned()
                 .unwrap_or(Value::Null)),
-            func::TO_STRING => Ok(match args.first() {
-                Some(Value::Null) | None => Value::Null,
-                Some(value) => Value::Text(std::sync::Arc::from(format_value(value).as_str())),
-            }),
-            func::TO_INTEGER => Ok(match args.first() {
-                Some(Value::Int(value)) => Value::Int(*value),
-                Some(Value::Float(value)) => Value::Int(*value as i64),
-                Some(Value::Bool(value)) => Value::Int(i64::from(*value)),
-                Some(Value::Text(text)) => text
-                    .trim()
-                    .parse::<i64>()
+            func::TO_STRING => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::Int(value)) => Ok(Value::Text(std::sync::Arc::from(value.to_string()))),
+                Some(Value::Bool(value)) => {
+                    Ok(Value::Text(std::sync::Arc::from(value.to_string())))
+                }
+                Some(Value::Float(value)) => {
+                    let mut buffer = ryu::Buffer::new();
+                    Ok(Value::Text(std::sync::Arc::from(buffer.format(*value))))
+                }
+                Some(Value::Text(value)) => Ok(Value::Text(value.clone())),
+                Some(other) => Err(conversion_error("toString", other)),
+            },
+            func::TO_INTEGER => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::Int(value)) => Ok(Value::Int(*value)),
+                Some(Value::Float(value)) => Ok(truncate_to_int(*value)
                     .map(Value::Int)
-                    .unwrap_or(Value::Null),
-                _ => Value::Null,
-            }),
-            func::TO_FLOAT => Ok(match args.first() {
-                Some(Value::Int(value)) => Value::Float(*value as f64),
-                Some(Value::Float(value)) => Value::Float(*value),
-                Some(Value::Text(text)) => text
+                    .unwrap_or(Value::Null)),
+                Some(Value::Bool(value)) => Ok(Value::Int(i64::from(*value))),
+                Some(Value::Text(text)) => {
+                    Ok(text_to_integer(text).map(Value::Int).unwrap_or(Value::Null))
+                }
+                Some(other) => Err(conversion_error("toInteger", other)),
+            },
+            func::TO_FLOAT => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::Int(value)) => Ok(Value::Float(*value as f64)),
+                Some(Value::Float(value)) => Ok(Value::Float(*value)),
+                Some(Value::Text(text)) => Ok(text
                     .trim()
                     .parse::<f64>()
                     .map(Value::Float)
-                    .unwrap_or(Value::Null),
-                _ => Value::Null,
-            }),
+                    .unwrap_or(Value::Null)),
+                Some(other) => Err(conversion_error("toFloat", other)),
+            },
+            func::TO_BOOLEAN => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::Bool(value)) => Ok(Value::Bool(*value)),
+                Some(Value::Text(text)) => Ok(match text.to_ascii_lowercase().as_str() {
+                    "true" => Value::Bool(true),
+                    "false" => Value::Bool(false),
+                    _ => Value::Null,
+                }),
+                Some(other) => Err(conversion_error("toBoolean", other)),
+            },
             func::SIZE => Ok(match args.first() {
                 Some(Value::List(items)) => Value::Int(items.len() as i64),
                 Some(Value::Text(text)) => Value::Int(text.chars().count() as i64),
@@ -2431,6 +2454,40 @@ fn normalize_reg(value: Value) -> Reg {
 }
 
 /// Format a value the way Cypher's `toString` does.
+/// Truncate a float toward zero like `toInteger`; NaN and infinities have no
+/// integer value and yield `None`, as does anything outside the `i64` range.
+fn truncate_to_int(value: f64) -> Option<i64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let truncated = value.trunc();
+    // `i64::MAX as f64` rounds up to 2^63, so the upper bound is exclusive.
+    if truncated >= i64::MIN as f64 && truncated < i64::MAX as f64 {
+        Some(truncated as i64)
+    } else {
+        None
+    }
+}
+
+/// Parse text as an integer, accepting the float notation the TCK requires
+/// (`toInteger('2.9')` is 2); unparsable text yields `None`.
+fn text_to_integer(text: &str) -> Option<i64> {
+    let text = text.trim();
+    if let Ok(value) = text.parse::<i64>() {
+        return Some(value);
+    }
+    truncate_to_int(text.parse::<f64>().ok()?)
+}
+
+/// Invalid argument for a conversion function, reported as a runtime
+/// `TypeError` like openCypher's `InvalidArgumentValue`.
+fn conversion_error(name: &str, value: &Value) -> Error {
+    Error::type_error(format!(
+        "{name}() does not accept {} values",
+        value.type_name()
+    ))
+}
+
 pub fn format_value(value: &Value) -> String {
     match value {
         Value::Null => "null".to_owned(),
