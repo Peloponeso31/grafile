@@ -340,7 +340,8 @@ Implemented: `MATCH` (node and relationship patterns, directions, type
 disjunction and label expressions — `:A|B`, `:A&B`, `:!A` — inline
 property filters including non-literal values),
 `OPTIONAL MATCH`, `WHERE`, `RETURN` and `WITH` (with
-`DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`), `UNWIND`, `CREATE`, `MERGE` (with
+`DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`), `UNWIND`,
+`LOAD CSV [WITH HEADERS] FROM file AS row`, `CREATE`, `MERGE` (with
 `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE` /
 `DETACH DELETE`, `FOREACH`, `CALL` for built-in `db.*` procedures,
 `UNION` / `UNION ALL`, `SET n += {…}`, parameters

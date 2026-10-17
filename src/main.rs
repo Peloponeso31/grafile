@@ -1237,8 +1237,8 @@ modes: table (default), box, qbox, psql, markdown, column,
        list, tabs, csv, quote, line, json
 
 cypher (v1): MATCH, OPTIONAL MATCH, WHERE, RETURN, WITH, UNWIND,
-             CREATE, MERGE, SET, REMOVE, DELETE/DETACH DELETE, FOREACH,
-             CALL, UNION, ORDER BY, SKIP, LIMIT, DISTINCT,
+             LOAD CSV, CREATE, MERGE, SET, REMOVE, DELETE/DETACH DELETE,
+             FOREACH, CALL, UNION, ORDER BY, SKIP, LIMIT, DISTINCT,
              aggregations (count/sum/avg/min/max/collect/percentile/
              stDev), a built-in function library, temporal values
              (date/time/datetime/duration with IANA zones) and spatial

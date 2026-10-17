@@ -50,7 +50,8 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
 - Schema DDL: `CREATE INDEX`/`CREATE CONSTRAINT` with `IS UNIQUE`,
   `IS NOT NULL` and `IS NODE KEY`, `DROP INDEX`/`DROP CONSTRAINT` with
   `IF [NOT] EXISTS`, and the edge forms; constraints are enforced on every
-  write path (see Phase 5).
+  write path (see Phase 5). `LOAD CSV [WITH HEADERS] FROM file AS row` reads
+  local CSVs into the row pipeline.
 
 Explicit gaps (currently clear `Unsupported` errors):
 
@@ -179,7 +180,7 @@ column names.
 Not delivered: pattern comprehensions nested inside list comprehensions
 (evaluated per element without plan nodes; one scenario stays allow-listed).
 
-### Phase 5 — Neo4j extensions (medium) [partial]
+### Phase 5 — Neo4j extensions (medium) [done]
 
 - [done] Cypher DDL for indexes and constraints:
   - `CREATE [CONSTRAINT|INDEX] name [IF NOT EXISTS] FOR (n:Label) …` and the
@@ -198,7 +199,10 @@ Not delivered: pattern comprehensions nested inside list comprehensions
     encodings. Dropping an index frees its B+tree pages.
   - No TCK coverage (openCypher defines no DDL): verified by unit and
     integration tests, and the conformance gate must not regress.
-- [pending] `LOAD CSV [WITH HEADERS] FROM …` for local file paths.
+- [done] `LOAD CSV [WITH HEADERS] FROM expr AS var [FIELDTERMINATOR char]`
+  for local paths and `file://` URIs (the `csv` crate parses RFC 4180);
+  HTTP stays a non-goal. Headers bind a string map per row, plain files a
+  list of strings, and short rows fill nulls.
 - [done] Label expressions in patterns: `:A|B`, `:A&B`, `:!A` (negation and
   conjunction are rejected on variable-length and shortest-path patterns).
 
