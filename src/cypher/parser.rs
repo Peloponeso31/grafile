@@ -794,6 +794,20 @@ impl<'a> Parser<'a> {
         self.parse_postfix()
     }
 
+    /// Parse a function-call argument list; the opening parenthesis has
+    /// already been consumed.
+    fn parse_call_arguments(&mut self) -> Result<Vec<Expr>> {
+        let mut args = Vec::new();
+        if self.peek() != Some(Token::RParen) {
+            args.push(self.parse_expr()?);
+            while self.eat(Token::Comma) {
+                args.push(self.parse_expr()?);
+            }
+        }
+        self.expect(Token::RParen, "')' to close a function call")?;
+        Ok(args)
+    }
+
     fn parse_postfix(&mut self) -> Result<Expr> {
         let mut expr = self.parse_primary()?;
         loop {
@@ -897,6 +911,32 @@ impl<'a> Parser<'a> {
             }
             Token::Ident | Token::EscapedIdent => {
                 let name = self.parse_name()?;
+                // Namespaced function calls such as `date.truncate(...)` or
+                // `duration.inDays(...)`: an identifier, a dot, a second
+                // identifier and an argument list.
+                if self.peek() == Some(Token::Dot)
+                    && matches!(
+                        self.tokens.get(self.pos + 1).map(|entry| entry.token),
+                        Some(Token::Ident) | Some(Token::EscapedIdent)
+                    )
+                    && self.tokens.get(self.pos + 2).map(|entry| entry.token) == Some(Token::LParen)
+                {
+                    self.advance();
+                    let member = self.parse_name()?;
+                    self.advance();
+                    let args = self.parse_call_arguments()?;
+                    let qualified = format!(
+                        "{}.{}",
+                        name.to_ascii_lowercase(),
+                        member.to_ascii_lowercase()
+                    );
+                    return Ok(Expr::Function {
+                        name: qualified,
+                        distinct: false,
+                        star: false,
+                        args,
+                    });
+                }
                 if self.peek() == Some(Token::LParen) {
                     let lower = name.to_ascii_lowercase();
                     let quantifier = match lower.as_str() {

@@ -1875,6 +1875,11 @@ fn scalar_function(name: &str) -> Result<u8> {
         "duration" => Ok(func::DURATION),
         "point" => Ok(func::POINT),
         "distance" => Ok(func::DISTANCE),
+        "date.truncate" => Ok(func::DATE_TRUNCATE),
+        "localtime.truncate" => Ok(func::LOCALTIME_TRUNCATE),
+        "time.truncate" => Ok(func::TIME_TRUNCATE),
+        "localdatetime.truncate" => Ok(func::LOCAL_DATETIME_TRUNCATE),
+        "datetime.truncate" => Ok(func::DATETIME_TRUNCATE),
         other => Err(Error::unsupported(format!(
             "function `{other}` is not supported yet"
         ))),

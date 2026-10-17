@@ -10,6 +10,7 @@
 //! references bound by cursors.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::cypher::UnaryOp;
 use crate::engine::Database;
@@ -18,7 +19,7 @@ use crate::matrix::Direction;
 use crate::planner::plan::AggFn;
 use crate::record::{Value, value_equals};
 use crate::temporal::civil::Date;
-use crate::temporal::construct::{self, Field};
+use crate::temporal::construct::{self, Field, TruncateUnit};
 use crate::temporal::datetime::{DateTime, LocalDateTime, LocalTime, Time};
 use crate::temporal::point::Point;
 
@@ -666,6 +667,16 @@ pub mod func {
     pub const POINT: u8 = 60;
     /// `distance(a, b)`
     pub const DISTANCE: u8 = 61;
+    /// `date.truncate(unit, value [, map])`
+    pub const DATE_TRUNCATE: u8 = 62;
+    /// `localtime.truncate(unit, value [, map])`
+    pub const LOCALTIME_TRUNCATE: u8 = 63;
+    /// `time.truncate(unit, value [, map])`
+    pub const TIME_TRUNCATE: u8 = 64;
+    /// `localdatetime.truncate(unit, value [, map])`
+    pub const LOCAL_DATETIME_TRUNCATE: u8 = 65;
+    /// `datetime.truncate(unit, value [, map])`
+    pub const DATETIME_TRUNCATE: u8 = 66;
 }
 
 /// A compiled VDBE program.
@@ -2168,6 +2179,11 @@ impl<'a> Executor<'a> {
             func::DURATION => call_duration(args),
             func::POINT => call_point(args),
             func::DISTANCE => call_distance(args),
+            func::DATE_TRUNCATE => call_truncate(TruncateKind::Date, args),
+            func::LOCALTIME_TRUNCATE => call_truncate(TruncateKind::LocalTime, args),
+            func::TIME_TRUNCATE => call_truncate(TruncateKind::Time, args),
+            func::LOCAL_DATETIME_TRUNCATE => call_truncate(TruncateKind::LocalDateTime, args),
+            func::DATETIME_TRUNCATE => call_truncate(TruncateKind::DateTime, args),
             func::PROPERTIES => match args.first() {
                 Some(Value::Node(id)) => {
                     let Some(record) = self.db.get_node(*id)? else {
@@ -3245,6 +3261,98 @@ fn call_point(args: &[Value]) -> Result<Value> {
     Point::new(srid, x, y, z)
         .map(Value::Point)
         .ok_or_else(|| Error::type_error("point(): invalid srid or coordinates"))
+}
+
+/// Which value `*.truncate` returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TruncateKind {
+    Date,
+    LocalTime,
+    Time,
+    LocalDateTime,
+    DateTime,
+}
+
+/// `*.truncate(unit, value [, map])`: floor a temporal value to a unit and
+/// apply component overrides.
+fn call_truncate(kind: TruncateKind, args: &[Value]) -> Result<Value> {
+    let name = match kind {
+        TruncateKind::Date => "date.truncate",
+        TruncateKind::LocalTime => "localtime.truncate",
+        TruncateKind::Time => "time.truncate",
+        TruncateKind::LocalDateTime => "localdatetime.truncate",
+        TruncateKind::DateTime => "datetime.truncate",
+    };
+    let unit_text = match args.first() {
+        Some(Value::Text(text)) => text,
+        Some(other) => return Err(invalid_argument(name, other)),
+        None => return Err(Error::type_error(format!("{name}() requires a unit"))),
+    };
+    let unit = TruncateUnit::parse(unit_text)
+        .ok_or_else(|| Error::type_error(format!("{name}(): unknown unit `{unit_text}`")))?;
+    let Some(value) = args.get(1) else {
+        return Err(Error::type_error(format!("{name}() requires a value")));
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    let overrides = match args.get(2) {
+        Some(map) => field_map(name, map)?.ok_or_else(|| {
+            Error::type_error(format!("{name}(): the third argument must be a map"))
+        })?,
+        None => Vec::new(),
+    };
+    let midnight = LocalTime::new(0, 0, 0, 0).expect("midnight");
+    let epoch = Date::new(1970, 1, 1).expect("epoch");
+    let (date, time, offset, zone): (Date, LocalTime, i32, Option<Arc<str>>) = match value {
+        Value::Date(date) => (*date, midnight, 0, None),
+        Value::LocalTime(time) => (epoch, *time, 0, None),
+        Value::Time(time) => (epoch, time.local(), time.offset(), None),
+        Value::LocalDateTime(datetime) => (datetime.date(), datetime.time(), 0, None),
+        Value::DateTime(datetime) => (
+            datetime.local().date(),
+            datetime.local().time(),
+            datetime.offset(),
+            datetime.zone().map(Arc::<str>::from),
+        ),
+        other => return Err(invalid_argument(name, other)),
+    };
+    let date = if unit.is_time_unit() {
+        date
+    } else {
+        construct::truncate_date(unit, date, &overrides)
+            .map_err(|message| Error::type_error(format!("{name}(): {message}")))?
+    };
+    let time = construct::truncate_time(unit, time, &overrides)
+        .map_err(|message| Error::type_error(format!("{name}(): {message}")))?;
+    Ok(match kind {
+        TruncateKind::Date => Value::Date(date),
+        TruncateKind::LocalTime => Value::LocalTime(time),
+        TruncateKind::Time => Value::Time(
+            Time::new(time, offset).ok_or_else(|| Error::type_error("offset out of range"))?,
+        ),
+        TruncateKind::LocalDateTime => Value::LocalDateTime(LocalDateTime::new(date, time)),
+        TruncateKind::DateTime => {
+            let (offset, zone) = match construct::timezone_override(&overrides, date, time)
+                .map_err(|message| Error::type_error(format!("{name}(): {message}")))?
+            {
+                Some(pair) => pair,
+                None => match &zone {
+                    Some(zone) => (
+                        construct::zone_offset(zone, date, time)
+                            .map_err(|message| Error::type_error(format!("{name}(): {message}")))?,
+                        Some(zone.clone()),
+                    ),
+                    None => (offset, None),
+                },
+            };
+            let local = LocalDateTime::new(date, time);
+            Value::DateTime(
+                DateTime::new(local, offset, zone)
+                    .ok_or_else(|| Error::type_error("offset out of range"))?,
+            )
+        }
+    })
 }
 
 /// `distance(a, b)` between two points.

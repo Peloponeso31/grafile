@@ -1136,6 +1136,29 @@ fn temporal_serialization_round_trips() {
 }
 
 #[test]
+fn temporal_truncation() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN date.truncate('millennium', date({year: 2017, month: 10, day: 11}), {day: 2}) AS a, \
+         date.truncate('week', date({year: 1984, month: 10, day: 11}), {dayOfWeek: 2}) AS b, \
+         date.truncate('weekYear', date({year: 1984, month: 2, day: 1}), {}) AS c, \
+         localtime.truncate('hour', localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876123}), {nanosecond: 2}) AS d, \
+         datetime.truncate('week', date({year: 1984, month: 10, day: 11}), {timezone: 'Europe/Stockholm'}) AS e",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "2000-01-02",
+            "1984-10-09",
+            "1984-01-02",
+            "12:00:00.000000002",
+            "1984-10-08T00:00+01:00[Europe/Stockholm]"
+        ]]
+    );
+}
+
+#[test]
 fn temporal_values_store_and_compare() {
     let mut conn = connection();
     conn.execute(

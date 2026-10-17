@@ -274,6 +274,156 @@ fn year_zero() -> Date {
     Date::new(0, 1, 1).expect("year zero is valid")
 }
 
+/// Truncation units accepted by `*.truncate(unit, value, map)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TruncateUnit {
+    /// Thousands of years.
+    Millennium,
+    /// Hundreds of years.
+    Century,
+    /// Tens of years.
+    Decade,
+    /// Whole year.
+    Year,
+    /// First day of the first ISO week of the ISO week year.
+    WeekYear,
+    /// First day of the quarter.
+    Quarter,
+    /// First day of the month.
+    Month,
+    /// Monday of the ISO week.
+    Week,
+    /// Midnight (or midnight of the day for time values).
+    Day,
+    /// Whole hour.
+    Hour,
+    /// Whole minute.
+    Minute,
+    /// Whole second.
+    Second,
+    /// Whole millisecond.
+    Millisecond,
+    /// Whole microsecond.
+    Microsecond,
+}
+
+impl TruncateUnit {
+    /// Parse a unit name (case-insensitive, like Neo4j's `weekYear`).
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text.to_ascii_lowercase().as_str() {
+            "millennium" => Self::Millennium,
+            "century" => Self::Century,
+            "decade" => Self::Decade,
+            "year" => Self::Year,
+            "weekyear" => Self::WeekYear,
+            "quarter" => Self::Quarter,
+            "month" => Self::Month,
+            "week" => Self::Week,
+            "day" => Self::Day,
+            "hour" => Self::Hour,
+            "minute" => Self::Minute,
+            "second" => Self::Second,
+            "millisecond" => Self::Millisecond,
+            "microsecond" => Self::Microsecond,
+            _ => return None,
+        })
+    }
+
+    /// Whether the unit stays below one day.
+    pub const fn is_time_unit(self) -> bool {
+        matches!(
+            self,
+            Self::Hour | Self::Minute | Self::Second | Self::Millisecond | Self::Microsecond
+        )
+    }
+}
+
+/// Truncate a date to a unit, then apply map overrides (`day` for calendar
+/// units, `dayOfWeek` for weeks).
+pub fn truncate_date(
+    unit: TruncateUnit,
+    date: Date,
+    overrides: &[(String, Field)],
+) -> Result<Date, String> {
+    let truncated = match unit {
+        TruncateUnit::Millennium => Date::new(date.year().div_euclid(1000) * 1000, 1, 1),
+        TruncateUnit::Century => Date::new(date.year().div_euclid(100) * 100, 1, 1),
+        TruncateUnit::Decade => Date::new(date.year().div_euclid(10) * 10, 1, 1),
+        TruncateUnit::Year => Date::new(date.year(), 1, 1),
+        TruncateUnit::WeekYear => {
+            let (week_year, _) = date.iso_week();
+            Date::from_iso_week(week_year, 1, 1)
+        }
+        TruncateUnit::Quarter => Date::new(date.year(), (date.quarter() - 1) * 3 + 1, 1),
+        TruncateUnit::Month => Date::new(date.year(), date.month(), 1),
+        TruncateUnit::Week => Some(Date::from_days(
+            date.days() - (date.iso_weekday() as i64 - 1),
+        )),
+        // `Day` and the time units leave the date untouched.
+        _ => Some(date),
+    }
+    .ok_or_else(|| "invalid truncated date".to_owned())?;
+    if unit == TruncateUnit::Week {
+        return match component(overrides, "dayOfWeek")? {
+            Some(day_of_week) => Ok(Date::from_days(truncated.days() + day_of_week - 1)),
+            None => Ok(truncated),
+        };
+    }
+    date_part(overrides, truncated)
+}
+
+/// Truncate a time of day to a unit, then apply map overrides (`nanosecond`
+/// and friends).
+pub fn truncate_time(
+    unit: TruncateUnit,
+    base: LocalTime,
+    overrides: &[(String, Field)],
+) -> Result<LocalTime, String> {
+    let truncated = match unit {
+        TruncateUnit::Hour => LocalTime::new(base.hour(), 0, 0, 0),
+        TruncateUnit::Minute => LocalTime::new(base.hour(), base.minute(), 0, 0),
+        TruncateUnit::Second => LocalTime::new(base.hour(), base.minute(), base.second(), 0),
+        TruncateUnit::Millisecond => LocalTime::new(
+            base.hour(),
+            base.minute(),
+            base.second(),
+            base.nanosecond() / 1_000_000 * 1_000_000,
+        ),
+        TruncateUnit::Microsecond => LocalTime::new(
+            base.hour(),
+            base.minute(),
+            base.second(),
+            base.nanosecond() / 1_000 * 1_000,
+        ),
+        _ => LocalTime::new(0, 0, 0, 0),
+    }
+    .ok_or_else(|| "invalid truncated time".to_owned())?;
+    time_part(overrides, truncated)
+}
+
+/// Resolve a `timezone` override against a truncated civil datetime.
+pub fn timezone_override(
+    fields: &[(String, Field)],
+    date: Date,
+    time: LocalTime,
+) -> Result<Option<(i32, Option<Arc<str>>)>, String> {
+    match timezone_part(fields)? {
+        None => Ok(None),
+        Some(Timezone::Offset(offset)) => Ok(Some((offset, None))),
+        Some(Timezone::Named(name)) => {
+            let civil = zone::Civil::from_date_and_nanos(date, time.nanos());
+            let offset = zone::offset_for_civil(&name, civil)?;
+            Ok(Some((offset, Some(Arc::from(name.as_str())))))
+        }
+    }
+}
+
+/// The offset in effect in `name` for a civil datetime, for recomputing
+/// named-zone offsets after truncation.
+pub fn zone_offset(name: &str, date: Date, time: LocalTime) -> Result<i32, String> {
+    zone::offset_for_civil(name, zone::Civil::from_date_and_nanos(date, time.nanos()))
+}
+
 /// Build a duration from field map keys (`years`, `months`, `weeks`,
 /// `days`, `hours`, `minutes`, `seconds`, `milliseconds`, `microseconds`,
 /// `nanoseconds`).

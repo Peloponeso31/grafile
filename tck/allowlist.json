@@ -2831,9 +2831,117 @@
       }
     },
     "expressions/temporal/Temporal9.feature": {
-      "*": {
+      "[2] Should truncate datetime (example 100)": {
         "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected a clause at line 2 column 21 (found LParen)"
+        "note": "rows differ: expected '1984-10-11T12:31:14.645000002Z', got '1984-10-11T12:31:14.000000002Z'"
+      },
+      "[2] Should truncate datetime (example 102)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '1984-10-11T12:31:14.645876002+01:00', got '1984-10-11T12:31:14.000000002+01:00'"
+      },
+      "[2] Should truncate datetime (example 104)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '1984-10-11T12:31:14.645876002Z', got '1984-10-11T12:31:14.000000002Z'"
+      },
+      "[2] Should truncate datetime (example 98)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '1984-10-11T12:31:14.645000002+01:00', got '1984-10-11T12:31:14.000000002+01:00'"
+      },
+      "[3] Should truncate localdatetime (example 67)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '1984-10-11T12:31:14.645000002', got '1984-10-11T12:31:14.000000002'"
+      },
+      "[3] Should truncate localdatetime (example 69)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '1984-10-11T12:31:14.645000002', got '1984-10-11T12:31:14.000000002'"
+      },
+      "[3] Should truncate localdatetime (example 71)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '1984-10-11T12:31:14.645876002', got '1984-10-11T12:31:14.000000002'"
+      },
+      "[3] Should truncate localdatetime (example 73)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '1984-10-11T12:31:14.645876002', got '1984-10-11T12:31:14.000000002'"
+      },
+      "[4] Should truncate localtime (example 29)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645000002', got '12:31:14.000000002'"
+      },
+      "[4] Should truncate localtime (example 31)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645000002', got '12:31:14.000000002'"
+      },
+      "[4] Should truncate localtime (example 33)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645000002', got '12:31:14.000000002'"
+      },
+      "[4] Should truncate localtime (example 35)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645000002', got '12:31:14.000000002'"
+      },
+      "[4] Should truncate localtime (example 37)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645876002', got '12:31:14.000000002'"
+      },
+      "[4] Should truncate localtime (example 39)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645876002', got '12:31:14.000000002'"
+      },
+      "[4] Should truncate localtime (example 41)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645876002', got '12:31:14.000000002'"
+      },
+      "[4] Should truncate localtime (example 43)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645876002', got '12:31:14.000000002'"
+      },
+      "[5] Should truncate time (example 12)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:00+01:00', got '12:00Z'"
+      },
+      "[5] Should truncate time (example 15)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:00+01:00', got '12:00-01:00'"
+      },
+      "[5] Should truncate time (example 33)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645000002+01:00', got '12:31:14.000000002+01:00'"
+      },
+      "[5] Should truncate time (example 35)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645000002Z', got '12:31:14.000000002Z'"
+      },
+      "[5] Should truncate time (example 37)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645000002Z', got '12:31:14.000000002Z'"
+      },
+      "[5] Should truncate time (example 39)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645000002+01:00', got '12:31:14.000000002+01:00'"
+      },
+      "[5] Should truncate time (example 41)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645876002+01:00', got '12:31:14.000000002+01:00'"
+      },
+      "[5] Should truncate time (example 43)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645876002Z', got '12:31:14.000000002Z'"
+      },
+      "[5] Should truncate time (example 45)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645876002Z', got '12:31:14.000000002Z'"
+      },
+      "[5] Should truncate time (example 47)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:31:14.645876002+01:00', got '12:31:14.000000002+01:00'"
+      },
+      "[5] Should truncate time (example 6)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:00+01:00', got '12:00-01:00'"
+      },
+      "[5] Should truncate time (example 9)": {
+        "reason": "not-implemented",
+        "note": "rows differ: expected '12:00+01:00', got '12:00Z'"
       }
     },
     "useCases/countingSubgraphMatches/CountingSubgraphMatches1.feature": {
