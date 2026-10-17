@@ -132,8 +132,18 @@ impl<'a> Planner<'a> {
 
     /// Plan one query part (a pipeline of clauses) on its own scope.
     fn plan_part(&mut self, clauses: &[Clause]) -> Result<(Plan, Vec<String>, bool)> {
+        self.plan_part_with(clauses, FastMap::new())
+    }
+
+    /// Plan one query part on top of an initial scope; used by `EXISTS`
+    /// subqueries, whose clauses see the enclosing variables.
+    fn plan_part_with(
+        &mut self,
+        clauses: &[Clause],
+        scope: FastMap<String, VarKind>,
+    ) -> Result<(Plan, Vec<String>, bool)> {
         let mut plan = Plan::Empty;
-        let mut scope: FastMap<String, VarKind> = FastMap::new();
+        let mut scope = scope;
         let mut columns = Vec::new();
         let mut mutating = false;
         for clause in clauses {
@@ -487,7 +497,43 @@ impl<'a> Planner<'a> {
             };
             return Ok(());
         }
+        if let Expr::ExistsSubquery(part) = expr {
+            if context == PatternContext::Nested {
+                return Err(Error::unsupported(
+                    "EXISTS subqueries inside comprehensions are not supported",
+                ));
+            }
+            // The subquery runs as a semi-join: its clauses build an inner
+            // plan over the enclosing scope, and only whether it produced a
+            // row is visible.
+            for clause in &part.clauses {
+                match clause {
+                    Clause::Match(_)
+                    | Clause::With { .. }
+                    | Clause::Return { .. }
+                    | Clause::Unwind { .. } => {}
+                    _ => {
+                        return Err(Error::syntax(
+                            "InvalidClauseComposition: EXISTS only allows reading clauses",
+                        ));
+                    }
+                }
+            }
+            let (inner, _, _) = self.plan_part_with(&part.clauses, scope.clone())?;
+            let hidden = self.anon_name("exists");
+            scope.insert(hidden.clone(), VarKind::Value);
+            *plan = Plan::PatternPredicate {
+                input: Box::new(std::mem::replace(plan, Plan::Empty)),
+                inner: Box::new(inner),
+                var: hidden.clone(),
+            };
+            *expr = Expr::Variable(hidden);
+            return Ok(());
+        }
         match expr {
+            Expr::ExistsSubquery(_) => Err(Error::internal(
+                "EXISTS subquery survived pattern extraction",
+            )),
             Expr::Pattern(_) | Expr::PatternComprehension { .. } => {
                 if context == PatternContext::Nested {
                     return Err(Error::unsupported(
@@ -2319,6 +2365,9 @@ fn validate_expr(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
         Expr::Pattern(_) | Expr::PatternComprehension { .. } => Err(Error::syntax(
             "pattern expressions are only allowed in predicates",
         )),
+        // Rewritten into a pattern predicate before validation; a survivor
+        // is boolean by construction.
+        Expr::ExistsSubquery(_) => Ok(()),
         Expr::Unary { expr, .. } => validate_expr(expr, scope),
         Expr::Binary { left, right, .. } => {
             validate_expr(left, scope)?;
@@ -2424,6 +2473,7 @@ fn static_kind_with(
     locals: Option<&FastMap<String, Kind>>,
 ) -> Option<Kind> {
     match expr {
+        Expr::ExistsSubquery(_) => Some(Kind::Boolean),
         Expr::Literal(value) => Some(match value {
             Value::Null => Kind::Null,
             Value::Bool(_) => Kind::Boolean,
@@ -2834,6 +2884,7 @@ fn default_name(expr: &Expr) -> String {
     match expr {
         Expr::Variable(name) => name.clone(),
         Expr::Pattern(_) => "pattern".to_owned(),
+        Expr::ExistsSubquery(_) => "exists { ... }".to_owned(),
         Expr::PatternComprehension { projection, .. } => {
             format!("[pattern | {}]", default_name(projection))
         }
@@ -3296,6 +3347,7 @@ fn rewrite_expr(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>) -
     }
     Ok(match expr {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => expr.clone(),
+        Expr::ExistsSubquery(_) => expr.clone(),
         Expr::Pattern(path) => Expr::Pattern(Box::new(rewrite_pattern(path, f)?)),
         Expr::PatternComprehension {
             path,
@@ -3633,6 +3685,7 @@ fn hoist_walk(
     }
     Ok(match expr {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => expr.clone(),
+        Expr::ExistsSubquery(_) => expr.clone(),
         Expr::Pattern(path) => {
             Expr::Pattern(Box::new(hoist_pattern(path, groups, aggs, scope, bound)?))
         }
@@ -3866,6 +3919,7 @@ fn has_aggregation_inside_comprehension(expr: &Expr) -> bool {
                 || contains_aggregation(projection)
         }
         Expr::Pattern(path) => pattern_has_aggregation(path),
+        Expr::ExistsSubquery(_) => false,
         Expr::ListComprehension {
             list,
             predicate,
@@ -3940,6 +3994,7 @@ fn has_aggregation_inside_comprehension(expr: &Expr) -> bool {
 /// Call `f` on every direct child expression of `expr`.
 fn for_each_child(expr: &Expr, mut f: &mut dyn FnMut(&Expr)) {
     match expr {
+        Expr::ExistsSubquery(_) => {}
         Expr::Function { args, .. } => args.iter().for_each(&mut f),
         Expr::Property { base, .. } | Expr::Unary { expr: base, .. } => f(base),
         Expr::Subscript { base, index } => {
@@ -4249,6 +4304,12 @@ fn substitute_pattern(path: &mut PatternPath, params: &HashMap<String, Value>) -
 
 fn substitute_expr(expr: &mut Expr, params: &HashMap<String, Value>) -> Result<()> {
     match expr {
+        Expr::ExistsSubquery(part) => {
+            for clause in &mut part.clauses {
+                substitute_clause(clause, params)?;
+            }
+            Ok(())
+        }
         Expr::Parameter(name) => {
             let value = params.get(name).cloned().ok_or_else(|| {
                 Error::new(

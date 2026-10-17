@@ -125,6 +125,9 @@ pub enum Expr {
     },
     /// Pattern predicate `(a)-[:T]->(b)`; true when the pattern matches.
     Pattern(Box<PatternPath>),
+    /// `exists { ... }` subquery: its clauses are only inspected for
+    /// whether they match at least one row.
+    ExistsSubquery(Box<QueryPart>),
     /// `[p = (a)-[:T]->(b) WHERE predicate | projection]` comprehension.
     PatternComprehension {
         /// Pattern matched for every input row.

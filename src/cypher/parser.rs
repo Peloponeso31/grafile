@@ -111,6 +111,7 @@ impl<'a> Parser<'a> {
         while self.peek().is_some()
             && self.peek() != Some(Token::Semicolon)
             && self.peek() != Some(Token::Union)
+            && self.peek() != Some(Token::RBrace)
         {
             clauses.push(self.parse_clause()?);
         }
@@ -1036,6 +1037,31 @@ impl<'a> Parser<'a> {
             }
             Token::Ident | Token::EscapedIdent => {
                 let name = self.parse_name()?;
+                // `exists { ... }` is an existential subquery, not a call.
+                if name.eq_ignore_ascii_case("exists") && self.peek() == Some(Token::LBrace) {
+                    self.advance();
+                    let clauses =
+                        if matches!(self.peek(), Some(Token::LParen) | Some(Token::LBracket)) {
+                            let patterns = self.parse_patterns()?;
+                            let where_clause = if self.eat(Token::Where) {
+                                Some(self.parse_expr()?)
+                            } else {
+                                None
+                            };
+                            vec![Clause::Match(MatchClause {
+                                optional: false,
+                                patterns,
+                                where_clause,
+                            })]
+                        } else {
+                            self.parse_clauses()?
+                        };
+                    self.expect(Token::RBrace, "'}' to close the EXISTS subquery")?;
+                    return Ok(Expr::ExistsSubquery(Box::new(QueryPart {
+                        union_all: false,
+                        clauses,
+                    })));
+                }
                 // Namespaced function calls such as `date.truncate(...)` or
                 // `duration.inDays(...)`: an identifier, a dot, a second
                 // identifier and an argument list.

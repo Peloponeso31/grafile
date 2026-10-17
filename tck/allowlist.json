@@ -36,28 +36,6 @@
         "note": "procedures are not supported: `there exists a procedure test.labels() :: (label :: STRING?):`"
       }
     },
-    "expressions/existentialSubqueries/ExistentialSubquery1.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected a clause at line 2 column 24 (found LBrace)"
-      }
-    },
-    "expressions/existentialSubqueries/ExistentialSubquery2.feature": {
-      "[1] Full existential subquery": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected a clause at line 2 column 24 (found LBrace)"
-      },
-      "[2] Full existential subquery with aggregation": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected a clause at line 2 column 24 (found LBrace)"
-      }
-    },
-    "expressions/existentialSubqueries/ExistentialSubquery3.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected a clause at line 2 column 24 (found LBrace)"
-      }
-    },
     "expressions/pattern/Pattern2.feature": {
       "[7] Use a pattern comprehension inside a list comprehension": {
         "reason": "not-implemented",

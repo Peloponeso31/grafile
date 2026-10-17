@@ -1633,6 +1633,11 @@ impl Codegen {
 
     fn compile_expr_into(&mut self, expr: &Expr, ctx: &Ctx, dest: u32) -> Result<()> {
         match expr {
+            Expr::ExistsSubquery(_) => {
+                return Err(Error::unsupported(
+                    "EXISTS subqueries are only supported in predicates",
+                ));
+            }
             Expr::Literal(value) => {
                 let index = self.constants.len() as u32;
                 self.constants.push(value.clone());
