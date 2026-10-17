@@ -190,12 +190,6 @@
         "note": "expected 2 rows, got 18"
       }
     },
-    "clauses/match-where/MatchWhere4.feature": {
-      "[2] Join with disjunctive multi-part predicates including patterns": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 4 column 12 (found Colon)"
-      }
-    },
     "clauses/match/Match1.feature": {
       "[11] Fail when matching a node variable bound to a value (example 1)": {
         "reason": "not-implemented",
@@ -1122,12 +1116,6 @@
         "note": "expected 2 rows, got 18"
       }
     },
-    "clauses/with-where/WithWhere4.feature": {
-      "[2] Join with disjunctive multi-part predicates including patterns": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 5 column 12 (found Colon)"
-      }
-    },
     "clauses/with-where/WithWhere7.feature": {
       "[3] WHERE sees both, variable bound before but not after WITH and variable bound after but not before WITH": {
         "reason": "not-implemented",
@@ -2051,25 +2039,9 @@
       }
     },
     "expressions/list/List6.feature": {
-      "[10] Get node degree via size of pattern comprehension that specifies multiple relationship types": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 3 column 19 (found Colon)"
-      },
       "[5] Fail for `size()` on paths": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 116 rows"
-      },
-      "[7] Using size of pattern comprehension to test existence": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 3 column 23 (found RParen)"
-      },
-      "[8] Get node degree via size of pattern comprehension": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 3 column 18 (found ArrowRight)"
-      },
-      "[9] Get node degree via size of pattern comprehension that specifies a relationship type": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 3 column 19 (found Colon)"
       }
     },
     "expressions/list/List9.feature": {
@@ -2273,95 +2245,15 @@
       }
     },
     "expressions/pattern/Pattern1.feature": {
-      "[10] Matching on a specific type of undirected connection with length 2": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 22 (found Colon)"
-      },
       "[11] Fail on checking self pattern": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[12] Matching two nodes on a single directed connection between them": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected a clause at line 2 column 28 (found ArrowRight)"
-      },
-      "[13] Fail on matching two nodes on a single undirected connection between them": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 27 (found Colon)"
-      },
-      "[14] Matching two nodes on a specific type of single outgoing directed connection": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 27 (found Colon)"
-      },
-      "[15] Matching two nodes on a specific type of single undirected connection": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 27 (found Colon)"
-      },
-      "[16] Matching two nodes on a specific type of a variable length outgoing directed connection": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 27 (found Colon)"
-      },
-      "[17] Matching two nodes on a specific type of variable length undirected connection": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 27 (found Colon)"
-      },
-      "[18] Matching two nodes on a specific type of undirected connection with length 2": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 27 (found Colon)"
-      },
-      "[19] Using a negated existential pattern predicate": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 26 (found Colon)"
-      },
-      "[1] Matching on any single outgoing directed connection": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected a clause at line 2 column 23 (found ArrowRight)"
-      },
-      "[20] Using two existential pattern predicates in a conjunction": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 22 (found Colon)"
-      },
-      "[21] Using two existential pattern predicates in a disjunction": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 22 (found Colon)"
-      },
-      "[2] Matching on a single undirected connection": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 25 (found RParen)"
-      },
-      "[3] Matching on any single incoming directed connection": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected a clause at line 2 column 20 (found ArrowLeft)"
-      },
-      "[4] Matching on a specific type of single outgoing directed connection": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 22 (found Colon)"
-      },
-      "[5] Matching on a specific type of single undirected connection": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 22 (found Colon)"
-      },
-      "[6] Matching on a specific type of single incoming directed connection": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected a clause at line 2 column 20 (found ArrowLeft)"
-      },
-      "[7] Matching on a specific type of a variable length outgoing directed connection": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 22 (found Colon)"
-      },
-      "[8] Matching on a specific type of variable length undirected connection": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 2 column 22 (found Colon)"
-      },
-      "[9] Matching on a specific type of variable length incoming directed connection": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected a clause at line 2 column 20 (found ArrowLeft)"
       }
     },
     "expressions/pattern/Pattern2.feature": {
-      "*": {
+      "[7] Use a pattern comprehension inside a list comprehension": {
         "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected an expression at line 3 column 17 (found ArrowRight)"
+        "note": "expected rows, got a compile time error: compile time: Unsupported: pattern expressions inside list comprehensions are not supported"
       }
     },
     "expressions/precedence/Precedence1.feature": {
