@@ -315,6 +315,9 @@ pub struct ReturnItem {
     pub expr: Expr,
     /// Alias written with `AS`.
     pub alias: Option<String>,
+    /// The expression exactly as written, used as the column name when the
+    /// item has no alias.
+    pub text: Option<String>,
 }
 
 /// An `ORDER BY` key.

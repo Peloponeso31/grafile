@@ -1786,7 +1786,11 @@ impl<'a> Planner<'a> {
                 }
                 let name = match &item.alias {
                     Some(alias) => alias.clone(),
-                    None => default_name(&item.expr),
+                    // The column keeps the expression exactly as written.
+                    None => item
+                        .text
+                        .clone()
+                        .unwrap_or_else(|| default_name(&item.expr)),
                 };
                 expanded.push((item.expr.clone(), name));
             }

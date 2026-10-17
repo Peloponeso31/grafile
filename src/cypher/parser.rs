@@ -270,9 +270,21 @@ impl<'a> Parser<'a> {
                     star: true,
                     expr: Expr::Literal(Value::Null),
                     alias: None,
+                    text: None,
                 });
             } else {
+                let start = self.tokens.get(self.pos).map(|spanned| spanned.start);
                 let expr = self.parse_expr()?;
+                let end = self
+                    .tokens
+                    .get(self.pos.wrapping_sub(1))
+                    .map(|spanned| spanned.end);
+                let text = match (start, end) {
+                    (Some(start), Some(end)) if start <= end => {
+                        Some(self.source[start..end].to_owned())
+                    }
+                    _ => None,
+                };
                 let alias = if self.eat(Token::As) {
                     Some(self.parse_name()?)
                 } else {
@@ -282,6 +294,7 @@ impl<'a> Parser<'a> {
                     star: false,
                     expr,
                     alias,
+                    text,
                 });
             }
             if !self.eat(Token::Comma) {
