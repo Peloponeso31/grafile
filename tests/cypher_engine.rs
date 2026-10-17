@@ -1044,6 +1044,28 @@ fn standard_deviations() {
     );
 }
 
+#[test]
+fn static_type_errors_are_compile_time() {
+    let mut conn = connection();
+    for source in [
+        "RETURN 1 AND true",
+        "RETURN NOT 'x'",
+        "RETURN 1 IN 3",
+        "RETURN labels('x')",
+        "RETURN type(1)",
+        "RETURN type(2)",
+        "RETURN properties(1)",
+        "RETURN length(1)",
+        "RETURN size(1)",
+        "RETURN 'x'.name",
+        "RETURN [1, 2].name",
+        "RETURN all(x IN [1] WHERE x + 1)",
+    ] {
+        let err = conn.query(source, &Params::new()).expect_err(source);
+        assert_eq!(err.code(), grafile::ErrorCode::Syntax, "{source}");
+    }
+}
+
 // ---- matching semantics ----
 
 #[test]

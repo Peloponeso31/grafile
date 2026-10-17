@@ -2278,6 +2278,8 @@ impl<'a> Executor<'a> {
                     };
                     Ok(Value::Map(self.props_to_map(&record.props)))
                 }
+                // A map's properties are the map itself.
+                Some(Value::Map(_)) => Ok(args.first().cloned().expect("checked above")),
                 _ => Ok(Value::Null),
             },
             func::KEYS => match args.first() {

@@ -42,6 +42,8 @@ enum VarKind {
     Node,
     Edge,
     Value,
+    /// A variable-length relationship binding: a list of relationships.
+    EdgeList,
     /// A named path; usable neither as a node nor as a relationship.
     Path,
 }
@@ -923,7 +925,15 @@ impl<'a> Planner<'a> {
                 let edge_var = if edge_bound {
                     self.anon_name("rel")
                 } else {
-                    scope.insert(rel.var.clone(), VarKind::Edge);
+                    // A variable-length binding is a list of relationships.
+                    scope.insert(
+                        rel.var.clone(),
+                        if rel.var_length.is_some() {
+                            VarKind::EdgeList
+                        } else {
+                            VarKind::Edge
+                        },
+                    );
                     self.pattern_rels.insert(rel.var.clone());
                     rel.var.clone()
                 };
@@ -989,7 +999,15 @@ impl<'a> Planner<'a> {
                 let edge_var = if edge_bound {
                     self.anon_name("rel")
                 } else {
-                    scope.insert(rel.var.clone(), VarKind::Edge);
+                    // A variable-length binding is a list of relationships.
+                    scope.insert(
+                        rel.var.clone(),
+                        if rel.var_length.is_some() {
+                            VarKind::EdgeList
+                        } else {
+                            VarKind::Edge
+                        },
+                    );
                     self.pattern_rels.insert(rel.var.clone());
                     rel.var.clone()
                 };
@@ -1176,19 +1194,24 @@ impl<'a> Planner<'a> {
             // A value may hold a relationship, or a relationship list when
             // the pattern is variable-length.
             VarKind::Value => return Ok(true),
+            // A variable-length binding may serve another variable-length
+            // segment (as a list of relationships).
+            VarKind::EdgeList if var_length => {}
             VarKind::Edge => {}
-            VarKind::Node | VarKind::Path => {
+            VarKind::EdgeList | VarKind::Node | VarKind::Path => {
                 return Err(Error::syntax(format!(
                     "variable `{var}` is already bound to a {}",
                     if *kind == VarKind::Node {
                         "node"
-                    } else {
+                    } else if *kind == VarKind::Path {
                         "path"
+                    } else {
+                        "relationship"
                     }
                 )));
             }
         }
-        if !var_length && self.pattern_rels.contains(var) {
+        if self.pattern_rels.contains(var) {
             return Err(Error::syntax(format!(
                 "variable `{var}` is already bound in a preceding pattern"
             )));
@@ -1276,14 +1299,14 @@ impl<'a> Planner<'a> {
         let var = match &pattern.variable {
             Some(var) => {
                 if let Some(kind) = scope.get(var)
-                    && matches!(kind, VarKind::Edge | VarKind::Path)
+                    && matches!(kind, VarKind::Edge | VarKind::EdgeList | VarKind::Path)
                 {
                     return Err(Error::syntax(format!(
                         "variable `{var}` is already bound to a {}",
-                        if *kind == VarKind::Edge {
-                            "relationship"
-                        } else {
+                        if *kind == VarKind::Path {
                             "path"
+                        } else {
+                            "relationship"
                         }
                     )));
                 }
@@ -2073,6 +2096,7 @@ fn undefined_variable(name: &str) -> Error {
 
 /// Validate that all variables in an expression are in scope.
 fn validate_expr(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
+    check_expr_kinds(expr, scope)?;
     match expr {
         Expr::Variable(name) => {
             if scope.contains_key(name) {
@@ -2185,6 +2209,397 @@ fn validate_expr(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
         Expr::IsNull { expr, .. } => validate_expr(expr, scope),
         Expr::LabelCheck { expr, .. } => validate_expr(expr, scope),
     }
+}
+
+/// A statically known value kind, used for compile-time type checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// `null` (usable where any type is expected).
+    Null,
+    /// A boolean.
+    Boolean,
+    /// A number.
+    Number,
+    /// A string.
+    Text,
+    /// A list.
+    List,
+    /// A map.
+    Map,
+    /// A node.
+    Node,
+    /// A relationship.
+    Edge,
+    /// A named path.
+    Path,
+    /// A temporal value.
+    Temporal,
+    /// A spatial point.
+    Point,
+}
+
+impl Kind {
+    /// A short name for error messages.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Boolean => "boolean",
+            Self::Number => "number",
+            Self::Text => "string",
+            Self::List => "list",
+            Self::Map => "map",
+            Self::Node => "node",
+            Self::Edge => "relationship",
+            Self::Path => "path",
+            Self::Temporal => "temporal",
+            Self::Point => "point",
+        }
+    }
+}
+
+/// The kind of an expression when it can be decided without looking at the
+/// data; `None` when it depends on runtime values.
+fn static_kind(expr: &Expr, scope: &FastMap<String, VarKind>) -> Option<Kind> {
+    static_kind_with(expr, scope, None)
+}
+
+/// [`static_kind`] with an optional overlay of locally bound kinds (for
+/// example the element kind of a comprehension's source list).
+fn static_kind_with(
+    expr: &Expr,
+    scope: &FastMap<String, VarKind>,
+    locals: Option<&FastMap<String, Kind>>,
+) -> Option<Kind> {
+    match expr {
+        Expr::Literal(value) => Some(match value {
+            Value::Null => Kind::Null,
+            Value::Bool(_) => Kind::Boolean,
+            Value::Int(_) | Value::Float(_) => Kind::Number,
+            Value::Text(_) => Kind::Text,
+            Value::Bytes(_) => Kind::List,
+            Value::List(_) => Kind::List,
+            Value::Map(_) => Kind::Map,
+            Value::Node(_) => Kind::Node,
+            Value::Edge(_) => Kind::Edge,
+            Value::Date(_)
+            | Value::LocalTime(_)
+            | Value::Time(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime(_)
+            | Value::Duration(_) => Kind::Temporal,
+            Value::Point(_) => Kind::Point,
+        }),
+        Expr::Parameter(_) => None,
+        Expr::Variable(name) => match locals.and_then(|locals| locals.get(name).copied()) {
+            Some(kind) => Some(kind),
+            None => match scope.get(name) {
+                Some(VarKind::Node) => Some(Kind::Node),
+                Some(VarKind::Edge) => Some(Kind::Edge),
+                Some(VarKind::EdgeList) => Some(Kind::List),
+                Some(VarKind::Path) => Some(Kind::Path),
+                Some(VarKind::Value) | None => None,
+            },
+        },
+        Expr::Property { base, key } => {
+            match (static_kind_with(base, scope, locals), base.as_ref()) {
+                // A map literal exposes its entries' kinds.
+                (Some(Kind::Map), Expr::Map(entries)) => entries
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .and_then(|(_, value)| static_kind_with(value, scope, locals)),
+                _ => None,
+            }
+        }
+        // Indexing yields an element or property value of unknown kind.
+        Expr::Subscript { .. } => None,
+        Expr::Slice { base, .. } => {
+            static_kind(base, scope).filter(|kind| *kind == Kind::List || *kind == Kind::Text)
+        }
+        Expr::ListComprehension { .. } | Expr::PatternComprehension { .. } => Some(Kind::List),
+        Expr::Quantifier { .. } => Some(Kind::Boolean),
+        Expr::Reduce { .. } => None,
+        Expr::Unary { op, .. } => Some(match op {
+            UnaryOp::Neg => Kind::Number,
+            UnaryOp::Not => Kind::Boolean,
+        }),
+        Expr::Binary { op, left, right } => Some(match op {
+            BinaryOp::Add => {
+                let (left, right) = (
+                    static_kind_with(left, scope, locals),
+                    static_kind_with(right, scope, locals),
+                );
+                if left == Some(Kind::Text) || right == Some(Kind::Text) {
+                    Kind::Text
+                } else if left == Some(Kind::List) || right == Some(Kind::List) {
+                    Kind::List
+                } else if left == Some(Kind::Number) && right == Some(Kind::Number) {
+                    Kind::Number
+                } else {
+                    return None;
+                }
+            }
+            BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod | BinaryOp::Pow => {
+                Kind::Number
+            }
+            _ => Kind::Boolean,
+        }),
+        Expr::Function { name, args, .. } => static_function_kind(name, args, scope, locals),
+        Expr::List(_) => Some(Kind::List),
+        Expr::Map(_) => Some(Kind::Map),
+        Expr::Case {
+            alternatives,
+            default,
+            ..
+        } => {
+            let mut kinds = alternatives
+                .iter()
+                .map(|(_, then)| static_kind(then, scope))
+                .chain(
+                    default
+                        .as_deref()
+                        .map(|default| static_kind(default, scope)),
+                )
+                .collect::<Vec<_>>();
+            kinds.dedup();
+            match kinds.as_slice() {
+                [Some(kind)] => Some(*kind),
+                _ => None,
+            }
+        }
+        Expr::IsNull { .. } | Expr::LabelCheck { .. } => Some(Kind::Boolean),
+        Expr::Pattern(_) => Some(Kind::Boolean),
+    }
+}
+
+/// The result kind of a built-in function, when known.
+fn static_function_kind(
+    name: &str,
+    args: &[Expr],
+    scope: &FastMap<String, VarKind>,
+    locals: Option<&FastMap<String, Kind>>,
+) -> Option<Kind> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "id" | "size" | "length" | "count" | "sum" | "avg" | "stdev" | "stdevp"
+        | "percentilecont" | "percentiledisc" | "tointeger" | "tofloat" | "distance" | "abs"
+        | "sign" | "ceil" | "floor" | "round" | "sqrt" | "exp" | "log" | "log10" | "sin"
+        | "cos" | "tan" | "cot" | "asin" | "acos" | "atan" | "atan2" | "degrees" | "radians"
+        | "haversin" | "pi" | "e" | "rand" => Kind::Number,
+        "labels" | "keys" | "nodes" | "relationships" | "collect" | "range" | "head" | "last"
+        | "tail" | "reverse" | "split" => Kind::List,
+        "properties" => Kind::Map,
+        "type" | "tostring" | "substring" | "toupper" | "tolower" | "trim" | "ltrim" | "rtrim"
+        | "left" | "right" | "replace" => Kind::Text,
+        "toboolean" => Kind::Boolean,
+        "startnode" | "endnode" => Kind::Node,
+        "date" | "localtime" | "time" | "localdatetime" | "datetime" | "duration" => Kind::Temporal,
+        "point" => Kind::Point,
+        "coalesce" => {
+            let mut kinds = args
+                .iter()
+                .map(|arg| static_kind_with(arg, scope, locals))
+                .collect::<Vec<_>>();
+            kinds.dedup();
+            match kinds.as_slice() {
+                [Some(kind)] => *kind,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Statically check an expression's operators and built-in arguments.
+fn check_expr_kinds(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
+    check_expr_kinds_with(expr, scope, None)
+}
+
+/// The element kind of a list expression, when it can be decided (a list
+/// literal with elements of one kind).
+fn list_element_kind(
+    list: &Expr,
+    scope: &FastMap<String, VarKind>,
+    locals: Option<&FastMap<String, Kind>>,
+) -> Option<Kind> {
+    let Expr::List(items) = list else {
+        return None;
+    };
+    let mut kinds = items
+        .iter()
+        .map(|item| static_kind_with(item, scope, locals))
+        .collect::<Vec<_>>();
+    kinds.dedup();
+    match kinds.as_slice() {
+        [Some(kind)] => Some(*kind),
+        _ => None,
+    }
+}
+
+fn check_expr_kinds_with(
+    expr: &Expr,
+    scope: &FastMap<String, VarKind>,
+    locals: Option<&FastMap<String, Kind>>,
+) -> Result<()> {
+    let require = |kind: Option<Kind>, wanted: &[Kind], what: &str| -> Result<()> {
+        if let Some(kind) = kind
+            && !wanted.contains(&kind)
+        {
+            return Err(Error::syntax(format!(
+                "{what} expects {}, got {}",
+                wanted
+                    .iter()
+                    .map(|kind| kind.name())
+                    .collect::<Vec<_>>()
+                    .join(" or "),
+                kind.name()
+            )));
+        }
+        Ok(())
+    };
+    let kind = |e: &Expr| static_kind_with(e, scope, locals);
+    match expr {
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr: operand,
+        } => {
+            require(
+                static_kind(operand, scope),
+                &[Kind::Boolean, Kind::Null],
+                "NOT",
+            )?;
+        }
+        Expr::Binary { op, left, right } => match op {
+            BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
+                require(kind(left), &[Kind::Boolean, Kind::Null], "boolean operator")?;
+                require(
+                    kind(right),
+                    &[Kind::Boolean, Kind::Null],
+                    "boolean operator",
+                )?;
+            }
+            BinaryOp::In => {
+                require(kind(right), &[Kind::List, Kind::Null], "IN")?;
+            }
+            _ => {}
+        },
+        Expr::Property { base, .. } => {
+            // Property access works on maps, entities, temporal values and
+            // points; scalars and lists are invalid.
+            require(
+                kind(base),
+                &[
+                    Kind::Map,
+                    Kind::Node,
+                    Kind::Edge,
+                    Kind::Temporal,
+                    Kind::Point,
+                    Kind::Null,
+                ],
+                "property access",
+            )?;
+        }
+        Expr::Function { name, args, .. } => {
+            let first = args.first();
+            let argument = first.and_then(|arg| kind(arg));
+            match name.to_ascii_lowercase().as_str() {
+                "labels" | "properties" | "keys" => require(
+                    argument,
+                    &[Kind::Node, Kind::Edge, Kind::Map, Kind::Null],
+                    name,
+                )?,
+                "type" | "startnode" | "endnode" => {
+                    require(argument, &[Kind::Edge, Kind::Null], name)?
+                }
+                "length" => require(argument, &[Kind::List, Kind::Path, Kind::Null], name)?,
+                "size" => require(argument, &[Kind::List, Kind::Text, Kind::Null], name)?,
+                _ => {}
+            }
+        }
+        Expr::Quantifier {
+            var,
+            list,
+            predicate,
+            ..
+        } => {
+            if let Some(element) = list_element_kind(list, scope, locals) {
+                let mut inner = locals.cloned().unwrap_or_default();
+                inner.insert(var.clone(), element);
+                check_expr_kinds_with(predicate, scope, Some(&inner))?;
+                require(
+                    static_kind_with(predicate, scope, Some(&inner)),
+                    &[Kind::Boolean, Kind::Null],
+                    "quantifier predicate",
+                )?;
+            }
+        }
+        Expr::ListComprehension {
+            var,
+            list,
+            predicate,
+            projection,
+        } => {
+            if let Some(element) = list_element_kind(list, scope, locals) {
+                let mut inner = locals.cloned().unwrap_or_default();
+                inner.insert(var.clone(), element);
+                if let Some(predicate) = predicate {
+                    check_expr_kinds_with(predicate, scope, Some(&inner))?;
+                    require(
+                        static_kind_with(predicate, scope, Some(&inner)),
+                        &[Kind::Boolean, Kind::Null],
+                        "comprehension predicate",
+                    )?;
+                }
+                if let Some(projection) = projection {
+                    check_expr_kinds_with(projection, scope, Some(&inner))?;
+                }
+            }
+        }
+        _ => {}
+    }
+    // Arithmetic requires numbers, with the documented exceptions: `+`
+    // concatenates and appends, and durations scale by numbers.
+    if let Expr::Binary { op, left, right } = expr {
+        let (left_kind, right_kind) = (kind(left), kind(right));
+        let arithmetic = |wanted: &[Kind], what: &str| -> Result<()> {
+            require(left_kind, wanted, what)?;
+            require(right_kind, wanted, what)
+        };
+        match op {
+            BinaryOp::Sub | BinaryOp::Mod | BinaryOp::Pow => {
+                arithmetic(&[Kind::Number, Kind::Temporal, Kind::Null], "arithmetic")?
+            }
+            BinaryOp::Mul | BinaryOp::Div => {
+                arithmetic(&[Kind::Number, Kind::Temporal, Kind::Null], "arithmetic")?;
+                // A duration scales by a number; two durations do not.
+                if left_kind == Some(Kind::Temporal) && right_kind == Some(Kind::Temporal) {
+                    return Err(Error::syntax(
+                        "a duration scales by a number, not another duration",
+                    ));
+                }
+            }
+            BinaryOp::Add => {
+                // `+` concatenates strings, appends to lists (whatever the
+                // element is) and adds numbers or durations.
+                let allowed = left_kind == Some(Kind::Text)
+                    || right_kind == Some(Kind::Text)
+                    || left_kind == Some(Kind::List)
+                    || right_kind == Some(Kind::List)
+                    || matches!(
+                        left_kind,
+                        None | Some(Kind::Number) | Some(Kind::Temporal) | Some(Kind::Null)
+                    ) && matches!(
+                        right_kind,
+                        None | Some(Kind::Number) | Some(Kind::Temporal) | Some(Kind::Null)
+                    );
+                if !allowed {
+                    return Err(Error::syntax(
+                        "arithmetic expects numbers, strings or lists",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn expr_kind(expr: &Expr, scope: &FastMap<String, VarKind>) -> VarKind {
