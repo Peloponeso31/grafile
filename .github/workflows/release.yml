@@ -1,0 +1,207 @@
+name: release
+
+# Releasing: bump the version in Cargo.toml, run `cargo check` so Cargo.lock
+# records the new version (CI builds with --locked), commit both, then push
+# (or merge) to the `release` branch. The workflow refuses to run if the
+# matching `vX.Y.Z` tag already exists.
+
+on:
+  push:
+    branches: [release]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Lint installer script
+        run: shellcheck install.sh
+      - name: Resolve version
+        id: version
+        run: |
+          version=$(cargo metadata --format-version 1 --no-deps --locked |
+            jq -r '.packages[] | select(.name == "grafile") | .version')
+          tag="v$version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Create or reuse draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            if [ "$(gh release view "$TAG" --json isDraft --jq '.isDraft' 2>/dev/null || echo false)" = "true" ]; then
+              echo "reusing draft release $TAG from a previous run"
+            else
+              echo "error: tag $TAG already exists; bump the version in Cargo.toml" >&2
+              exit 1
+            fi
+          else
+            gh release create "$TAG" --draft --generate-notes --title "$TAG" --target "$GITHUB_SHA"
+          fi
+
+  linux:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+            asset: x86_64-linux-musl
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+            asset: aarch64-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+      - name: Build (gnu)
+        run: cargo build -p grafile --release --locked
+      - name: Package .deb
+        run: cargo deb -p grafile --no-build
+      - name: Package .rpm
+        run: |
+          strip -s target/release/grafile
+          cargo generate-rpm
+      - name: Build (musl, static)
+        run: cargo build -p grafile --release --locked --target ${{ matrix.target }}
+      - name: Stage artifacts
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p stage dist
+          strip -s target/${{ matrix.target }}/release/grafile
+          cp target/${{ matrix.target }}/release/grafile LICENSE stage/
+          tar -czf "dist/grafile-${VERSION}-${{ matrix.asset }}.tar.gz" -C stage grafile LICENSE
+          cp target/debian/*.deb target/generate-rpm/*.rpm dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    needs: prepare
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build universal binary
+        run: |
+          cargo build -p grafile --release --locked --target aarch64-apple-darwin
+          cargo build -p grafile --release --locked --target x86_64-apple-darwin
+          strip -x target/aarch64-apple-darwin/release/grafile
+          strip -x target/x86_64-apple-darwin/release/grafile
+          lipo -create -output grafile \
+            target/aarch64-apple-darwin/release/grafile \
+            target/x86_64-apple-darwin/release/grafile
+          lipo -archs grafile
+      - name: Stage artifacts
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          mkdir -p stage dist
+          cp grafile LICENSE stage/
+          tar -czf "dist/grafile-${VERSION}-macos-universal.tar.gz" -C stage grafile LICENSE
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    needs: prepare
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build -p grafile --release --locked
+      - name: Stage artifacts
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          New-Item -ItemType Directory -Force -Path stage, dist | Out-Null
+          Copy-Item target/release/grafile.exe stage/
+          Copy-Item LICENSE stage/
+          Compress-Archive -Path stage/* -DestinationPath "dist/grafile-${env:VERSION}-x86_64-windows.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: [prepare, linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Render winget manifests
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          zip="dist/grafile-${VERSION}-x86_64-windows.zip"
+          [ -f "$zip" ] || { echo "error: missing $zip" >&2; exit 1; }
+          sha=$(sha256sum "$zip" | awk '{ print $1 }' | tr 'a-f' 'A-F')
+          for tpl in packaging/winget/*.tmpl; do
+            out="dist/$(basename "${tpl%.tmpl}")"
+            sed -e "s/\${VERSION}/${VERSION}/g" -e "s/\${SHA256}/${sha}/g" "$tpl" > "$out"
+          done
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum -- *.tar.gz *.deb *.rpm *.zip > SHA256SUMS.txt
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          cp install.sh dist/
+          gh release upload "$TAG" dist/* --clobber
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false --latest
+
+  verify-install:
+    needs: publish
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Install with the published one-liner
+        env:
+          GRAFILE_INSTALL_DIR: ${{ runner.temp }}/grafile-bin
+        run: |
+          curl -LsSf https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sh
+          "$GRAFILE_INSTALL_DIR/grafile" --version

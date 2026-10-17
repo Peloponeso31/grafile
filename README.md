@@ -110,12 +110,45 @@ third_party/    vendored openCypher TCK (submodule)
 docs/           format.md, ffi.md, tck.md, roadmap.md
 ```
 
-## Using the shell
+## Installation
 
-No release binaries yet; build from source (stable Rust, edition 2024):
+macOS and Linux, any distro. The script picks the right static binary,
+verifies its SHA-256, and installs to `~/.local/bin` without sudo:
+
+```console
+$ curl -LsSf https://github.com/Peloponeso31/grafile/releases/latest/download/install.sh | sh
+```
+
+Set `GRAFILE_INSTALL_DIR` to install elsewhere, or `GRAFILE_VERSION` to pin a
+release.
+
+Debian/Ubuntu users can install the `.deb`; Fedora/RHEL users the `.rpm`
+(x86_64 and aarch64 packages are released):
+
+```console
+$ sudo dpkg -i grafile_0.1.0-1_amd64.deb
+$ sudo rpm -i grafile-0.1.0-1.x86_64.rpm
+```
+
+Windows, once the first manifest is merged into the winget community
+repository:
+
+```console
+$ winget install Peloponeso31.Grafile
+```
+
+From source (stable Rust, edition 2024):
 
 ```console
 $ cargo install --path .        # installs the `grafile` binary
+```
+
+Every release also ships tarballs, packages and `SHA256SUMS.txt` on the
+[releases page](https://github.com/Peloponeso31/grafile/releases).
+
+## Using the shell
+
+```console
 $ grafile social.grafile        # start the shell on a new or existing file
 ```
 
