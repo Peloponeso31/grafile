@@ -26,25 +26,27 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
   `reduce()`, `CASE`, `IS [NOT] NULL`, `STARTS WITH` / `ENDS WITH` /
   `CONTAINS` / `=~`, `IN`, label predicates, three-valued logic, numeric
   cross-type comparison.
-- Aggregations: `count`, `sum`, `avg`, `min`, `max`, `collect`, with
-  `DISTINCT` and expressions over aggregations.
+- Aggregations: `count`, `sum`, `avg`, `min`, `max`, `collect`,
+  `percentileCont`, `percentileDisc`, `stDev`, `stDevP`, with `DISTINCT`,
+  multiple arguments and expressions over aggregations.
 - Scalar functions: `id`, `labels`, `type`, `startNode`, `endNode`,
-  `coalesce`, `toString`, `toInteger`, `toFloat`, `size`, `properties`,
-  `keys`, `nodes`, `relationships`, `length`.
+  `coalesce`, `toString`, `toInteger`, `toFloat`, `toBoolean`, `size`,
+  `properties`, `keys`, `nodes`, `relationships`, `length`; list functions
+  (`range`, `head`, `last`, `tail`, `reverse`, `split`, `substring`); string
+  functions (`toUpper`, `toLower`, `trim`/`ltrim`/`rtrim`, `left`, `right`,
+  `replace`); math functions (`abs`, `sign`, `ceil`, `floor`, `round`,
+  `sqrt`, `exp`, `log`, `log10`, trigonometry, `degrees`/`radians`,
+  `haversin`, `pi`, `e`, `rand`).
 
 Explicit gaps (currently clear `Unsupported` errors):
 
 | Gap | Where rejected |
 |-----|----------------|
-| Non-literal property values in `MATCH` patterns (`{key: expr}`) | planner |
-| Pattern predicates and pattern comprehensions | parser |
-| `MERGE` with multiple relationships | planner |
 | `REMOVE n = {…}` | codegen |
 | Map projections (`n{.name}`) | parser |
-| Unknown functions | codegen |
+| Unknown functions | codegen (by design) |
 
-Silently absent areas: most of the built-in function library and
-temporal/spatial value types.
+Silently absent areas: temporal/spatial value types.
 
 Known semantic deviations to close:
 
@@ -52,8 +54,6 @@ Known semantic deviations to close:
   buffering: `MATCH (a:A) DELETE a MERGE (a2:A)` can still match a node
   deleted by an earlier row (Phase 4).
 - `ORDER BY` after aggregation may only reference projected values.
-- Aggregations with multiple arguments are rejected (needed for
-  `percentileCont`/`percentileDisc`, Phase 2).
 - Errors that Neo4j detects statically (for example `NOT {true: true}`) are
   raised at runtime instead, so their phase differs from the TCK.
 - `+` does not coerce the non-string operand to text, so `'p-' + 1` errors.
@@ -64,11 +64,12 @@ Status markers: `[done]` implemented and gated, `[partial]` some items
 finished, `[pending]` not started. Items the TCK does not exercise are
 verified by unit and integration tests and must not regress the report.
 
-Current baseline: 2084 of 3897 scenarios passing (53.5%), 1813 allow-listed.
-The remaining list is dominated by temporal types (~1000, Phase 3), the
-error-kind/phase and ordering/comparison sweeps (~690, Phase 4), the function
-library (Phase 2), eager evaluation after writes (Phase 4) and CALL procedure
-registration (52, unreachable: the TCK registers test procedures).
+Current baseline: 2301 of 3897 scenarios passing (59.0%), 1596 allow-listed.
+The remaining list is dominated by temporal types (1004, Phase 3), the
+error-kind/phase and ordering/comparison sweeps (~380 across precedence,
+comparison, boolean, literal and ordering files, Phase 4), eager evaluation
+after writes (Phase 4) and CALL procedure registration (52, unreachable: the
+TCK registers test procedures).
 
 ### Phase 1 — Core language completion (large) [done]
 
@@ -117,16 +118,21 @@ registration (52, unreachable: the TCK registers test procedures).
   `db.propertyKeys()` and `db.relationshipTypes()`. TCK-blind: unit and
   integration tests only.
 
-### Phase 2 — Function library (medium) [pending]
+### Phase 2 — Function library (medium) [done]
 
-- String: `substring`, `replace`, `split`, `trim`/`ltrim`/`rtrim`,
+- [done] String: `substring`, `replace`, `split`, `trim`/`ltrim`/`rtrim`,
   `left`/`right`, `toUpper`/`toLower`, `reverse`.
-- Math: `abs`, `ceil`, `floor`, `round`, `sign`, `sqrt`, `exp`, `log`,
-  `log10`, trigonometry, `degrees`/`radians`, `pi`, `e`, `rand`.
-- List: `head`, `last`, `tail`, `range`, `size`, `reverse`, `nodes`,
-  `relationships`.
-- Conversions: `toBoolean`, `toString` for every type.
-- Aggregation: `stDev`, `stDevP`, `percentileCont`, `percentileDisc`.
+- [done] Math: `abs`, `ceil`, `floor`, `round`, `sign`, `sqrt`, `exp`, `log`,
+  `log10`, trigonometry (`sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`,
+  `atan2`, `haversin`), `degrees`/`radians`, `pi`, `e`, `rand` (fastrand).
+- [done] List: `head`, `last`, `tail`, `range` (capped at ten million
+  elements), `reverse` for strings and lists.
+- [done] Conversions: `toBoolean`, and `toInteger`/`toFloat`/`toString`
+  follow the TCK matrix (float strings truncate, invalid types raise a
+  runtime `TypeError`).
+- [done] Aggregation: `stDev`, `stDevP` (Welford, TCK-blind) and
+  `percentileCont`/`percentileDisc`, which required multi-argument
+  aggregation plumbing (value plus percentile in the aggregate window).
 
 ### Phase 3 — Temporal and spatial types (large, cross-cutting) [pending]
 
@@ -192,10 +198,14 @@ These stay allow-listed as `neo4j-extension` until this phase.
 
 ## Milestones
 
+The gate keeps the applicable pass rate at 100% by construction (allow-listed
+scenarios are excluded), so milestones are stated against the whole suite.
+
 | Milestone | Target |
 |-----------|--------|
-| After Phases 1–2 | ≥ 80% of applicable TCK scenarios pass |
-| After Phase 4 | ≥ 95% of applicable TCK scenarios pass; deviations closed |
+| After Phases 1–2 | 2301 of 3897 scenarios pass (59.0%) |
+| After Phase 3 | ≥ 80% of the whole suite (temporal closes ~1000 scenarios) |
+| After Phase 4 | ≥ 95% of the whole suite; deviations closed |
 | After Phase 5 | Allow-list contains only non-goals |
 
 ## Non-goals
@@ -213,6 +223,6 @@ These stay allow-listed as `neo4j-extension` until this phase.
    not regress between phases.
 3. Storage-format changes follow `docs/format.md` and bump the format minor
    version; readers remain backward compatible.
-4. Features the TCK does not exercise (DDL, non-literal pattern properties,
-   operator coercions, `FOREACH`) are planned here explicitly and verified by
-   unit and integration tests; they must not regress the TCK report either.
+4. Features the TCK does not exercise (DDL, operator coercions, `stDev`) are
+   planned here explicitly and verified by unit and integration tests; they
+   must not regress the TCK report either.
