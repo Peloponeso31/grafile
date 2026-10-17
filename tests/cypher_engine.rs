@@ -293,6 +293,108 @@ fn edge_unique_constraint_survives_map_replacement() {
 }
 
 #[test]
+fn ddl_creates_and_drops_indexes() {
+    let mut conn = connection();
+    conn.execute("CREATE (:Person {name: 'alice'})")
+        .expect("seed");
+    conn.execute("CREATE INDEX person_name IF NOT EXISTS FOR (n:Person) ON (n.name)")
+        .expect("create");
+    let plan = conn
+        .explain("MATCH (n:Person {name: 'alice'}) RETURN n")
+        .expect("explain");
+    assert!(!plan.contains("seek=-"), "{plan}");
+    let schema = conn.schema();
+    assert_eq!(schema.node_indexes.len(), 1);
+    assert_eq!(schema.node_indexes[0].name.as_deref(), Some("person_name"));
+    // IF NOT EXISTS tolerates the existing name; a plain CREATE does not.
+    conn.execute("CREATE INDEX person_name IF NOT EXISTS FOR (n:Person) ON (n.name)")
+        .expect("again");
+    let err = conn
+        .execute("CREATE INDEX person_name FOR (n:Person) ON (n.name)")
+        .expect_err("duplicate");
+    assert_eq!(err.code(), grafile::ErrorCode::Exists);
+    conn.execute("DROP INDEX person_name").expect("drop");
+    assert!(conn.schema().node_indexes.is_empty());
+    let err = conn.execute("DROP INDEX person_name").expect_err("missing");
+    assert_eq!(err.code(), grafile::ErrorCode::NotFound);
+    conn.execute("DROP INDEX person_name IF EXISTS")
+        .expect("tolerated");
+}
+
+#[test]
+fn ddl_unique_constraint_is_enforced_and_backfill_is_atomic() {
+    let mut conn = connection();
+    conn.execute("CREATE (:Person {email: 'a@x'}), (:Person {email: 'a@x'})")
+        .expect("seed");
+    // Backfilling a unique constraint over duplicates fails and leaves no
+    // schema change behind.
+    let err = conn
+        .execute("CREATE CONSTRAINT person_email FOR (n:Person) REQUIRE n.email IS UNIQUE")
+        .expect_err("duplicate");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    assert!(conn.schema().node_indexes.is_empty());
+    conn.execute("MATCH (n:Person) DETACH DELETE n")
+        .expect("clean");
+    conn.execute("CREATE CONSTRAINT person_email FOR (n:Person) REQUIRE n.email IS UNIQUE")
+        .expect("constraint");
+    conn.execute("CREATE (:Person {email: 'b@x'})").expect("ok");
+    let err = conn
+        .execute("CREATE (:Person {email: 'b@x'})")
+        .expect_err("duplicate");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    // Constraint-backed names are dropped through DROP CONSTRAINT.
+    let err = conn
+        .execute("DROP INDEX person_email")
+        .expect_err("is constraint");
+    assert_eq!(err.code(), grafile::ErrorCode::Misuse);
+    conn.execute("DROP CONSTRAINT person_email").expect("drop");
+    assert!(conn.schema().node_indexes.is_empty());
+}
+
+#[test]
+fn ddl_composite_and_edge_forms() {
+    let mut conn = connection();
+    conn.execute("CREATE (:Person {first: 'a', last: 'b'})")
+        .expect("seed");
+    conn.execute("CREATE INDEX person_name FOR (n:Person) ON (n.first, n.last)")
+        .expect("composite");
+    // Composite indexes are not seekable yet.
+    let plan = conn
+        .explain("MATCH (n:Person {first: 'a'}) RETURN n")
+        .expect("explain");
+    assert!(plan.contains("seek=-"), "{plan}");
+    conn.execute("CREATE INDEX knows_weight FOR ()-[r:KNOWS]-() ON (r.weight)")
+        .expect("edge index");
+    let schema = conn.schema();
+    assert_eq!(schema.edge_indexes.len(), 1);
+    assert_eq!(schema.edge_indexes[0].name.as_deref(), Some("knows_weight"));
+    conn.execute("DROP INDEX knows_weight").expect("drop edge");
+    assert!(conn.schema().edge_indexes.is_empty());
+    let err = conn
+        .execute("DROP CONSTRAINT person_name")
+        .expect_err("is index");
+    assert_eq!(err.code(), grafile::ErrorCode::Misuse);
+    conn.execute("DROP INDEX person_name")
+        .expect("drop composite");
+    assert!(conn.schema().node_indexes.is_empty());
+}
+
+#[test]
+fn ddl_is_rejected_where_unsupported() {
+    let mut conn = connection();
+    let err = conn.execute("SHOW INDEXES").expect_err("show");
+    assert_eq!(err.code(), grafile::ErrorCode::Unsupported);
+    let err = conn
+        .execute("CREATE INDEX ON :Person(name)")
+        .expect_err("old form");
+    assert_eq!(err.code(), grafile::ErrorCode::Syntax);
+    let err = conn
+        .execute("CREATE CONSTRAINT ON (n:Person) ASSERT n.name IS UNIQUE")
+        .expect_err("old form");
+    assert_eq!(err.code(), grafile::ErrorCode::Syntax);
+}
+
+#[test]
 fn undefined_variable_is_rejected() {
     let mut conn = connection();
     let err = conn

@@ -9,7 +9,7 @@ pub mod lexer;
 pub mod parser;
 
 pub use ast::*;
-pub use parser::parse;
+pub use parser::{parse, parse_statement};
 
 /// Split a script into statements at top-level semicolons.
 ///
