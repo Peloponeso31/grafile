@@ -79,7 +79,7 @@ registration (52, unreachable: the TCK registers test procedures).
   post-aggregation expressions (21), map access, subscript, list slicing and
   list concatenation (64).
 
-#### 1B — Patterns and paths [partial]
+#### 1B — Patterns and paths [done]
 
 - [done] Variable-length paths: trails with `*`, `*2`, `*1..3`, `*0..`; the
   relationship variable binds a list (41 scenarios).
@@ -91,7 +91,10 @@ registration (52, unreachable: the TCK registers test procedures).
   anywhere an expression is allowed (36 scenarios). Nested pattern
   expressions inside list comprehensions are rejected: their bodies are
   evaluated per element without plan nodes (one scenario, Phase 4).
-- [ ] `shortestPath()` / `allShortestPaths()`; TCK-blind: unit tests only.
+- [done] `shortestPath()` / `allShortestPaths()`: a breadth-first search over
+  simple paths, both as a `MATCH` pattern and as an expression (null when no
+  path exists), honouring direction, type filters, bounds and unbound
+  endpoints. TCK-blind: unit and integration tests only.
 - [done] Non-literal property values in `MATCH` patterns (`{key: expr}`)
   compile to runtime filters while literals keep index seeks; `MERGE` already
   supports expressions. TCK-blind: unit and integration tests only.
