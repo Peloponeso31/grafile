@@ -6,6 +6,7 @@
 //! and seconds (which never fold into each other). Named time zones are
 //! resolved through the bundled IANA database exposed by [`zone`].
 
+pub mod between;
 pub mod civil;
 pub mod construct;
 pub mod datetime;

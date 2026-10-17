@@ -1880,6 +1880,21 @@ fn scalar_function(name: &str) -> Result<u8> {
         "time.truncate" => Ok(func::TIME_TRUNCATE),
         "localdatetime.truncate" => Ok(func::LOCAL_DATETIME_TRUNCATE),
         "datetime.truncate" => Ok(func::DATETIME_TRUNCATE),
+        "datetime.fromepoch" => Ok(func::DATETIME_FROM_EPOCH),
+        "duration.between" => Ok(func::DURATION_BETWEEN),
+        "duration.inmonths" => Ok(func::DURATION_IN_MONTHS),
+        "duration.indays" => Ok(func::DURATION_IN_DAYS),
+        "duration.inseconds" => Ok(func::DURATION_IN_SECONDS),
+        "datetime.fromepochmillis" => Ok(func::DATETIME_FROM_EPOCH_MILLIS),
+        "date.transaction" | "date.statement" | "date.realtime" => Ok(func::DATE),
+        "localtime.transaction" | "localtime.statement" | "localtime.realtime" => {
+            Ok(func::LOCALTIME)
+        }
+        "time.transaction" | "time.statement" | "time.realtime" => Ok(func::TIME),
+        "localdatetime.transaction" | "localdatetime.statement" | "localdatetime.realtime" => {
+            Ok(func::LOCAL_DATETIME)
+        }
+        "datetime.transaction" | "datetime.statement" | "datetime.realtime" => Ok(func::DATETIME),
         other => Err(Error::unsupported(format!(
             "function `{other}` is not supported yet"
         ))),

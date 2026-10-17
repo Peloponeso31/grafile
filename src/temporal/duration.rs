@@ -156,8 +156,10 @@ fn normalize_nanos(seconds: i64, nanos: i64) -> Option<(i64, i32)> {
     let total = (seconds as i128)
         .checked_mul(1_000_000_000)?
         .checked_add(nanos as i128)?;
-    let whole = total / 1_000_000_000;
-    let frac = total % 1_000_000_000;
+    // Neo4j keeps the nanosecond field in `[0, 1e9)` and compensates in the
+    // seconds field, so `-0.1s` is -1 second plus 900000000 nanoseconds.
+    let whole = total.div_euclid(1_000_000_000);
+    let frac = total.rem_euclid(1_000_000_000);
     Some((i64::try_from(whole).ok()?, i32::try_from(frac).ok()?))
 }
 
@@ -424,35 +426,46 @@ impl Neg for Duration {
     type Output = Duration;
 
     fn neg(self) -> Self::Output {
-        Self {
-            months: -self.months,
-            days: -self.days,
-            seconds: -self.seconds,
-            nanos: -self.nanos,
-        }
+        let months = self.months.checked_neg().unwrap_or(self.months);
+        let days = self.days.checked_neg().unwrap_or(self.days);
+        let seconds = self.seconds.checked_neg().unwrap_or(self.seconds);
+        Self::new(months, days, seconds, -(self.nanos as i64)).unwrap_or(self)
     }
 }
 
-/// Print `seconds` and `nanos` as the seconds field of an ISO duration:
-/// `10.000000001`, `-0.001`, `59.999`.
-fn write_seconds(out: &mut String, seconds: i64, nanos: i32) {
-    let negative = seconds < 0 || nanos < 0;
-    if negative {
-        out.push('-');
-    }
-    let seconds = seconds.unsigned_abs();
-    if nanos == 0 {
-        out.push_str(&seconds.to_string());
+/// Write the time part of an ISO duration from the total seconds and
+/// nanoseconds, signing each component for negative lengths
+/// (`-23H-59M-59.9S`).
+fn write_time_part(out: &mut String, seconds: i64, nanos: i32) {
+    let total = seconds as i128 * 1_000_000_000 + nanos as i128;
+    if total == 0 {
         return;
     }
-    let nanos = nanos.unsigned_abs();
-    let mut fraction = format!("{nanos:09}");
-    while fraction.ends_with('0') {
-        fraction.pop();
+    let negative = total < 0;
+    let absolute = total.unsigned_abs();
+    let sign = if negative { "-" } else { "" };
+    let hours = absolute / 3_600_000_000_000;
+    let minutes = absolute / 60_000_000_000 % 60;
+    let seconds = absolute / 1_000_000_000 % 60;
+    let nanos = (absolute % 1_000_000_000) as i64;
+    if hours != 0 {
+        out.push_str(&format!("{sign}{hours}H"));
     }
-    out.push_str(&seconds.to_string());
-    out.push('.');
-    out.push_str(&fraction);
+    if minutes != 0 {
+        out.push_str(&format!("{sign}{minutes}M"));
+    }
+    if seconds != 0 || nanos != 0 {
+        out.push_str(&format!("{sign}{seconds}"));
+        if nanos != 0 {
+            let mut fraction = format!("{nanos:09}");
+            while fraction.ends_with('0') {
+                fraction.pop();
+            }
+            out.push('.');
+            out.push_str(&fraction);
+        }
+        out.push('S');
+    }
 }
 
 impl fmt::Display for Duration {
@@ -470,19 +483,7 @@ impl fmt::Display for Duration {
             out.push_str(&format!("{}D", self.days));
         }
         let mut time = String::new();
-        let hours = self.seconds / 3_600;
-        let minutes = (self.seconds % 3_600) / 60;
-        let seconds = self.seconds % 60;
-        if hours != 0 {
-            time.push_str(&format!("{hours}H"));
-        }
-        if minutes != 0 {
-            time.push_str(&format!("{minutes}M"));
-        }
-        if seconds != 0 || self.nanos != 0 {
-            write_seconds(&mut time, seconds, self.nanos);
-            time.push('S');
-        }
+        write_time_part(&mut time, self.seconds, self.nanos);
         if time.is_empty() {
             if out.len() == 1 {
                 // A zero duration prints as `PT0S`.
@@ -506,6 +507,14 @@ impl std::str::FromStr for Duration {
         let rest = text.strip_prefix('P').ok_or_else(invalid)?;
         if rest.is_empty() {
             return Err(invalid());
+        }
+        // The ISO 8601 alternative form `P2012-02-02T14:37:21.545` places
+        // the components in date and time positions instead of suffixes.
+        if rest.len() >= 10
+            && rest.as_bytes().get(4) == Some(&b'-')
+            && rest.as_bytes().get(7) == Some(&b'-')
+        {
+            return parse_iso_alternative(rest).ok_or_else(invalid);
         }
         let mut components = Components::default();
         let mut current = String::new();
@@ -542,6 +551,49 @@ impl std::str::FromStr for Duration {
         }
         Duration::from_components(components).ok_or_else(invalid)
     }
+}
+
+/// Parse the alternative ISO form `YYYY-MM-DD[THH:MM:SS[.fff]]`.
+fn parse_iso_alternative(rest: &str) -> Option<Duration> {
+    let (date, time) = match rest.split_once('T') {
+        Some((date, time)) => (date, Some(time)),
+        None => (rest, None),
+    };
+    let mut parts = date.split('-');
+    let years: i64 = parts.next()?.parse().ok()?;
+    let months: i64 = parts.next()?.parse().ok()?;
+    let days: i64 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let (hours, minutes, seconds) = match time {
+        None => (0, 0, Component::ZERO),
+        Some(time) => {
+            let mut parts = time.split(':');
+            let hours: i64 = parts.next()?.parse().ok()?;
+            let minutes: i64 = match parts.next() {
+                Some(minutes) => minutes.parse().ok()?,
+                None => 0,
+            };
+            let seconds = match parts.next() {
+                Some(seconds) => Component::from_decimal(seconds)?,
+                None => Component::ZERO,
+            };
+            if parts.next().is_some() {
+                return None;
+            }
+            (hours, minutes, seconds)
+        }
+    };
+    Duration::from_components(Components {
+        years: Component::from_int(years),
+        months: Component::from_int(months),
+        days: Component::from_int(days),
+        hours: Component::from_int(hours),
+        minutes: Component::from_int(minutes),
+        seconds,
+        ..Components::default()
+    })
 }
 
 #[cfg(test)]
@@ -774,9 +826,12 @@ mod tests {
 
     #[test]
     fn decimal_components_are_exact() {
+        // The canonical form floors the seconds and keeps the nanoseconds
+        // in `[0, 1e9)`: -2.001s is -3 seconds plus 999000000 nanoseconds.
         let parsed: Duration = "PT-2.001S".parse().expect("parse");
-        assert_eq!(parsed.seconds(), -2);
-        assert_eq!(parsed.nanos(), -1_000_000);
+        assert_eq!(parsed.seconds(), -3);
+        assert_eq!(parsed.nanos(), 999_000_000);
+        assert_eq!(parsed.to_string(), "PT-2.001S");
         let component = Component::from_decimal("-2.001").expect("component");
         assert_eq!(component.as_f64(), -2.001);
     }

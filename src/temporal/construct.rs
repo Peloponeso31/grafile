@@ -82,9 +82,15 @@ fn date_part(fields: &[(String, Field)], base: Date) -> Result<Date, String> {
         let week = field
             .as_int()
             .ok_or_else(|| "`week` must be an integer".to_owned())? as u32;
-        let weekday = component(fields, "dayOfWeek")?.unwrap_or(1) as u32;
-        // Without an explicit year, the base date's ISO week year applies:
-        // `{date: date('1816-12-30'), week: 2}` is week 2 of 1817.
+        // An explicit weekday wins; otherwise a `date` key contributes its
+        // weekday and a bare `week` key defaults to Monday. Without an
+        // explicit year, the base date's ISO week year applies:
+        // `{date: date('1816-12-31'), week: 2}` is a week-2 Tuesday.
+        let default_weekday = match find(fields, "date") {
+            Some(Field::Date(_)) => base.iso_weekday(),
+            _ => 1,
+        };
+        let weekday = component(fields, "dayOfWeek")?.unwrap_or(default_weekday as i64) as u32;
         let week_year = match find(fields, "year") {
             Some(_) => year(fields, base)?,
             None => base.iso_week().0,
@@ -160,20 +166,30 @@ fn parse_offset_text(text: &str) -> Result<i32, String> {
         _ => return Err(invalid()),
     };
     let rest = &text[1..];
-    let (hours, minutes) = match rest.split_once(':') {
-        Some((hours, minutes)) => (hours, minutes),
-        None => match rest.len() {
-            2 => (rest, "0"),
-            4 => (&rest[..2], &rest[2..]),
+    let (hours, minutes, seconds) = if rest.contains(':') {
+        let mut parts = rest.split(':');
+        let hours = parts.next().unwrap_or_default();
+        let minutes = parts.next().unwrap_or("0");
+        let seconds = parts.next().unwrap_or("0");
+        if parts.next().is_some() {
+            return Err(invalid());
+        }
+        (hours, minutes, seconds)
+    } else {
+        match rest.len() {
+            2 => (rest, "0", "0"),
+            4 => (&rest[..2], &rest[2..], "0"),
+            6 => (&rest[..2], &rest[2..4], &rest[4..]),
             _ => return Err(invalid()),
-        },
+        }
     };
     let hours: i32 = hours.parse().map_err(|_| invalid())?;
     let minutes: i32 = minutes.parse().map_err(|_| invalid())?;
-    if hours > 18 || minutes > 59 {
+    let seconds: i32 = seconds.parse().map_err(|_| invalid())?;
+    if hours > 18 || minutes > 59 || seconds > 59 {
         return Err(invalid());
     }
-    let offset = sign * (hours * 3_600 + minutes * 60);
+    let offset = sign * (hours * 3_600 + minutes * 60 + seconds);
     if offset.abs() > crate::temporal::datetime::MAX_OFFSET_SECONDS {
         return Err(invalid());
     }
@@ -372,8 +388,10 @@ pub fn truncate_date(
     date_part(overrides, truncated)
 }
 
-/// Truncate a time of day to a unit, then apply map overrides (`nanosecond`
-/// and friends).
+/// Truncate a time of day to a unit, then apply map overrides. The
+/// overrides replace the millisecond, microsecond and nanosecond slots of
+/// the truncated value individually (`truncate('millisecond', ...)` with
+/// `{nanosecond: 2}` keeps the milliseconds).
 pub fn truncate_time(
     unit: TruncateUnit,
     base: LocalTime,
@@ -398,15 +416,28 @@ pub fn truncate_time(
         _ => LocalTime::new(0, 0, 0, 0),
     }
     .ok_or_else(|| "invalid truncated time".to_owned())?;
-    time_part(overrides, truncated)
+    let hour = component(overrides, "hour")?.unwrap_or(truncated.hour());
+    let minute = component(overrides, "minute")?.unwrap_or(truncated.minute());
+    let second = component(overrides, "second")?.unwrap_or(truncated.second());
+    let millisecond =
+        component(overrides, "millisecond")?.unwrap_or(truncated.nanosecond() / 1_000_000);
+    let microsecond =
+        component(overrides, "microsecond")?.unwrap_or(truncated.nanosecond() / 1_000 % 1_000);
+    let nanosecond = component(overrides, "nanosecond")?.unwrap_or(truncated.nanosecond() % 1_000);
+    let nanos = millisecond * 1_000_000 + microsecond * 1_000 + nanosecond;
+    LocalTime::new(hour, minute, second, nanos)
+        .ok_or_else(|| "time component out of range".to_owned())
 }
+
+/// A resolved timezone: the offset in seconds and an optional zone name.
+pub type ResolvedZone = (i32, Option<Arc<str>>);
 
 /// Resolve a `timezone` override against a truncated civil datetime.
 pub fn timezone_override(
     fields: &[(String, Field)],
     date: Date,
     time: LocalTime,
-) -> Result<Option<(i32, Option<Arc<str>>)>, String> {
+) -> Result<Option<ResolvedZone>, String> {
     match timezone_part(fields)? {
         None => Ok(None),
         Some(Timezone::Offset(offset)) => Ok(Some((offset, None))),

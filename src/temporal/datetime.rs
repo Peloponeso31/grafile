@@ -119,6 +119,14 @@ fn write_fraction(out: &mut String, nanos: i64) {
     out.push_str(&fraction);
 }
 
+/// Render an offset: `Z` for UTC, else `+01:00`; seconds appear when the
+/// offset is not a whole number of minutes (historical LMT zones).
+pub fn format_offset(offset: i32) -> String {
+    let mut out = String::new();
+    write_offset(&mut out, offset);
+    out
+}
+
 /// Write an offset: `Z` for UTC, else `+01:00`.
 fn write_offset(out: &mut String, offset: i32) {
     if offset == 0 {
@@ -133,6 +141,10 @@ fn write_offset(out: &mut String, offset: i32) {
         offset / 3_600,
         (offset % 3_600) / 60
     ));
+    let seconds = offset % 60;
+    if seconds != 0 {
+        out.push_str(&format!(":{seconds:02}"));
+    }
 }
 
 impl fmt::Display for LocalTime {
@@ -219,9 +231,11 @@ impl std::str::FromStr for Time {
     type Err = String;
 
     fn from_str(text: &str) -> Result<Self, Self::Err> {
+        // A missing offset means UTC, like Neo4j's `time('14:30')`.
         let (local, offset) = split_time_offset(text)?;
         let local = parse_local_time(local)?;
-        Time::new(local, offset).ok_or_else(|| format!("offset out of range in `{text}`"))
+        Time::new(local, offset.unwrap_or(0))
+            .ok_or_else(|| format!("offset out of range in `{text}`"))
     }
 }
 
@@ -471,22 +485,22 @@ fn parse_component(text: &str) -> Option<i64> {
     (0..60).contains(&value).then_some(value)
 }
 
-/// Split a time string into its local part and an offset in seconds. Handles
-/// `Z`, `+01`, `-0100` and `+01:30`.
-fn split_time_offset(text: &str) -> Result<(&str, i32), String> {
-    let invalid = || format!("invalid offset in `{text}`");
+/// Split a time string into its local part and an offset in seconds (or
+/// `None` when no offset is written). Handles `Z`, `+01`, `-0100`,
+/// `+01:30` and `+02:05:59`.
+fn split_time_offset(text: &str) -> Result<(&str, Option<i32>), String> {
     if let Some(local) = text.strip_suffix('Z') {
-        return Ok((local, 0));
+        return Ok((local, Some(0)));
     }
     let split = text
         .char_indices()
         .find(|(_, ch)| *ch == '+' || *ch == '-')
         .map(|(index, _)| index);
     let Some(index) = split else {
-        return Err(invalid());
+        return Ok((text, None));
     };
     let local = &text[..index];
-    parse_offset(&text[index..]).map(|offset| (local, offset))
+    parse_offset(&text[index..]).map(|offset| (local, Some(offset)))
 }
 
 /// Parse an offset: `Z`, `+01`, `-0100`, `+01:30`.
@@ -502,36 +516,51 @@ fn parse_offset(text: &str) -> Result<i32, String> {
             None => return Err(invalid()),
         },
     };
-    let (hours, minutes) = if let Some((hours, minutes)) = rest.split_once(':') {
-        (hours, minutes)
+    let (hours, minutes, seconds) = if rest.contains(':') {
+        let mut parts = rest.split(':');
+        let hours = parts.next().unwrap_or_default();
+        let minutes = parts.next().unwrap_or("0");
+        let seconds = parts.next().unwrap_or("0");
+        if parts.next().is_some() {
+            return Err(invalid());
+        }
+        (hours, minutes, seconds)
     } else {
         match rest.len() {
-            2 => (rest, "0"),
-            4 => (&rest[..2], &rest[2..]),
+            2 => (rest, "0", "0"),
+            4 => (&rest[..2], &rest[2..], "0"),
+            6 => (&rest[..2], &rest[2..4], &rest[4..]),
             _ => return Err(invalid()),
         }
     };
-    if hours.len() != 2 || minutes.len() > 2 {
+    if hours.len() != 2 || minutes.len() > 2 || seconds.len() > 2 {
         return Err(invalid());
     }
     let hours: i32 = hours.parse().map_err(|_| invalid())?;
     let minutes: i32 = minutes.parse().map_err(|_| invalid())?;
-    if hours > 18 || minutes > 59 {
+    let seconds: i32 = seconds.parse().map_err(|_| invalid())?;
+    if hours > 18 || minutes > 59 || seconds > 59 {
         return Err(invalid());
     }
-    let offset = sign * (hours * 3_600 + minutes * 60);
+    let offset = sign * (hours * 3_600 + minutes * 60 + seconds);
     if offset.abs() > MAX_OFFSET_SECONDS {
         return Err(invalid());
     }
     Ok(offset)
 }
 
-/// Parse `YYYY-MM-DDT<time>` forms, including compact dates and times.
+/// Parse `YYYY-MM-DDT<time>` forms, including compact dates and times. A
+/// date-only string is midnight, like Neo4j's `localdatetime('2015-07-21')`.
 fn parse_local_datetime(text: &str) -> Result<LocalDateTime, String> {
-    let invalid = || format!("invalid datetime `{text}`");
-    let (date, time) = text.split_once(['T', 't']).ok_or_else(invalid)?;
+    let (date, time) = match text.split_once(['T', 't']) {
+        Some((date, time)) => (date, Some(time)),
+        None => (text, None),
+    };
     let date: Date = date.parse()?;
-    let time = parse_local_time(time)?;
+    let time = match time {
+        Some(time) => parse_local_time(time)?,
+        None => LocalTime::new(0, 0, 0, 0).expect("midnight"),
+    };
     Ok(LocalDateTime::new(date, time))
 }
 
@@ -556,6 +585,17 @@ fn parse_datetime(text: &str) -> Result<DateTime, String> {
             Some(Arc::from(canonical.as_str()))
         }
         None => None,
+    };
+    // A named zone without an explicit offset takes its offset from the
+    // zone rules for that civil datetime (historical LMT offsets included).
+    let offset = match (offset, &zone) {
+        (Some(offset), _) => offset,
+        (None, Some(name)) => crate::temporal::zone::offset_for_civil(
+            name,
+            crate::temporal::zone::Civil::from_date_and_nanos(local.date(), local.time().nanos()),
+        )
+        .map_err(|_| invalid())?,
+        (None, None) => return Err(invalid()),
     };
     DateTime::new(local, offset, zone).ok_or_else(invalid)
 }

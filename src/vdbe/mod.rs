@@ -18,9 +18,11 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::matrix::Direction;
 use crate::planner::plan::AggFn;
 use crate::record::{Value, value_equals};
+use crate::temporal::between;
 use crate::temporal::civil::Date;
 use crate::temporal::construct::{self, Field, TruncateUnit};
 use crate::temporal::datetime::{DateTime, LocalDateTime, LocalTime, Time};
+use crate::temporal::duration::Duration;
 use crate::temporal::point::Point;
 
 /// A register value: a plain value or an entity reference.
@@ -677,6 +679,18 @@ pub mod func {
     pub const LOCAL_DATETIME_TRUNCATE: u8 = 65;
     /// `datetime.truncate(unit, value [, map])`
     pub const DATETIME_TRUNCATE: u8 = 66;
+    /// `datetime.fromepoch(seconds, nanos)`
+    pub const DATETIME_FROM_EPOCH: u8 = 67;
+    /// `datetime.fromepochmillis(millis)`
+    pub const DATETIME_FROM_EPOCH_MILLIS: u8 = 68;
+    /// `duration.between(from, to)`
+    pub const DURATION_BETWEEN: u8 = 69;
+    /// `duration.inMonths(from, to)`
+    pub const DURATION_IN_MONTHS: u8 = 70;
+    /// `duration.inDays(from, to)`
+    pub const DURATION_IN_DAYS: u8 = 71;
+    /// `duration.inSeconds(from, to)`
+    pub const DURATION_IN_SECONDS: u8 = 72;
 }
 
 /// A compiled VDBE program.
@@ -706,6 +720,7 @@ pub fn execute(db: &mut Database, program: &Program) -> Result<Vec<Vec<Value>>> 
         results: Vec::new(),
         key_ids: vec![None; program.constants.len()],
         label_ids: vec![None; program.constants.len()],
+        statement_time: system_local_datetime(),
         pc: 0,
         steps: 0,
     };
@@ -749,6 +764,9 @@ struct Executor<'a> {
     results: Vec<Vec<Value>>,
     key_ids: Vec<Option<u32>>,
     label_ids: Vec<Option<u32>>,
+    /// The statement's start time, shared by the clock functions so two
+    /// `datetime()` calls in one query observe the same instant.
+    statement_time: LocalDateTime,
     pc: usize,
     steps: u64,
 }
@@ -940,6 +958,7 @@ impl<'a> Executor<'a> {
                     0 => match value {
                         Value::Int(value) => Value::Int(value.wrapping_neg()),
                         Value::Float(value) => Value::Float(-value),
+                        Value::Duration(value) => Value::Duration(-value),
                         Value::Null => Value::Null,
                         other => {
                             return Err(Error::type_error(format!(
@@ -2171,11 +2190,11 @@ impl<'a> Executor<'a> {
             func::HAVERSIN => float_map(args, "haversin", |value| (1.0 - value.cos()) / 2.0),
             func::PI => Ok(Value::Float(std::f64::consts::PI)),
             func::E => Ok(Value::Float(std::f64::consts::E)),
-            func::DATE => call_date(args),
-            func::LOCALTIME => call_localtime(args),
-            func::TIME => call_time(args),
-            func::LOCAL_DATETIME => call_localdatetime(args),
-            func::DATETIME => call_datetime(args),
+            func::DATE => call_date(args, self.statement_time),
+            func::LOCALTIME => call_localtime(args, self.statement_time),
+            func::TIME => call_time(args, self.statement_time),
+            func::LOCAL_DATETIME => call_localdatetime(args, self.statement_time),
+            func::DATETIME => call_datetime(args, self.statement_time),
             func::DURATION => call_duration(args),
             func::POINT => call_point(args),
             func::DISTANCE => call_distance(args),
@@ -2184,6 +2203,12 @@ impl<'a> Executor<'a> {
             func::TIME_TRUNCATE => call_truncate(TruncateKind::Time, args),
             func::LOCAL_DATETIME_TRUNCATE => call_truncate(TruncateKind::LocalDateTime, args),
             func::DATETIME_TRUNCATE => call_truncate(TruncateKind::DateTime, args),
+            func::DATETIME_FROM_EPOCH => call_datetime_from_epoch(args),
+            func::DATETIME_FROM_EPOCH_MILLIS => call_datetime_from_epoch_millis(args),
+            func::DURATION_BETWEEN => call_duration_between(DurationDiff::Between, args),
+            func::DURATION_IN_MONTHS => call_duration_between(DurationDiff::InMonths, args),
+            func::DURATION_IN_DAYS => call_duration_between(DurationDiff::InDays, args),
+            func::DURATION_IN_SECONDS => call_duration_between(DurationDiff::InSeconds, args),
             func::PROPERTIES => match args.first() {
                 Some(Value::Node(id)) => {
                     let Some(record) = self.db.get_node(*id)? else {
@@ -2519,6 +2544,143 @@ fn percentile_argument(input: Option<&Reg>) -> Result<f64> {
     Ok(number)
 }
 
+/// Add a duration to a date: whole months first (clamped), then the days
+/// field plus the whole days contained in the seconds field, matching
+/// Neo4j's calendar arithmetic.
+fn date_plus_duration(date: Date, duration: Duration) -> Result<Date> {
+    let out_of_range = || Error::type_error("date arithmetic out of range");
+    let date = date
+        .add_months(duration.months())
+        .ok_or_else(out_of_range)?;
+    let extra_days = duration.days() + duration.seconds() / 86_400;
+    date.add_days(extra_days).ok_or_else(out_of_range)
+}
+
+/// Add a duration to a wall-clock time; months and days do not contribute.
+fn localtime_plus_duration(time: LocalTime, duration: Duration) -> LocalTime {
+    let rest = duration.seconds() % 86_400;
+    let nanos = time.nanos() + rest * 1_000_000_000 + duration.nanos() as i64;
+    LocalTime::from_nanos_wrapped(nanos)
+}
+
+/// Add a duration to a zone-less datetime: calendar months and days first,
+/// then the remaining time of day.
+fn localdatetime_plus_duration(
+    datetime: LocalDateTime,
+    duration: Duration,
+) -> Result<LocalDateTime> {
+    let out_of_range = || Error::type_error("datetime arithmetic out of range");
+    let date = date_plus_duration(datetime.date(), duration)?;
+    let nanos_of_day = datetime.time().nanos()
+        + (duration.seconds() % 86_400) * 1_000_000_000
+        + duration.nanos() as i64;
+    let carry = nanos_of_day.div_euclid(86_400_000_000_000);
+    let rest = nanos_of_day.rem_euclid(86_400_000_000_000);
+    let date = date.add_days(carry).ok_or_else(out_of_range)?;
+    Ok(LocalDateTime::new(
+        date,
+        LocalTime::from_nanos(rest).expect("wrapped time of day"),
+    ))
+}
+
+/// Add a duration to an offset/zoned datetime; named zones resolve their
+/// offset again for the resulting local time.
+fn datetime_plus_duration(datetime: &DateTime, duration: Duration) -> Result<DateTime> {
+    let local = localdatetime_plus_duration(datetime.local(), duration)?;
+    let offset = match datetime.zone() {
+        Some(zone) => crate::temporal::construct::zone_offset(zone, local.date(), local.time())
+            .map_err(Error::type_error)?,
+        None => datetime.offset(),
+    };
+    DateTime::new(local, offset, datetime.zone().map(Arc::<str>::from))
+        .ok_or_else(|| Error::type_error("datetime arithmetic out of range"))
+}
+
+/// Temporal `+`; `None` falls back to the numeric/concatenation path.
+fn temporal_add(a: &Value, b: &Value) -> Result<Option<Value>> {
+    let (temporal, duration) = match (a, b) {
+        (Value::Duration(duration), other) | (other, Value::Duration(duration)) => {
+            (other, Some(*duration))
+        }
+        (other, _) => (other, None),
+    };
+    let Some(duration) = duration else {
+        return Ok(None);
+    };
+    match temporal {
+        Value::Null => Ok(Some(Value::Null)),
+        Value::Duration(other) => Ok(Some(Value::Duration(
+            (*other + duration).ok_or_else(|| Error::type_error("duration overflow"))?,
+        ))),
+        Value::Date(date) => Ok(Some(Value::Date(date_plus_duration(*date, duration)?))),
+        Value::LocalTime(time) => Ok(Some(Value::LocalTime(localtime_plus_duration(
+            *time, duration,
+        )))),
+        Value::Time(time) => Ok(Some(Value::Time(
+            Time::new(
+                localtime_plus_duration(time.local(), duration),
+                time.offset(),
+            )
+            .expect("valid offset"),
+        ))),
+        Value::LocalDateTime(datetime) => Ok(Some(Value::LocalDateTime(
+            localdatetime_plus_duration(*datetime, duration)?,
+        ))),
+        Value::DateTime(datetime) => Ok(Some(Value::DateTime(datetime_plus_duration(
+            datetime, duration,
+        )?))),
+        other => Err(Error::type_error(format!(
+            "cannot add a duration to {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Temporal `-`; `None` falls back to the numeric path.
+fn temporal_sub(a: &Value, b: &Value) -> Result<Option<Value>> {
+    match (a, b) {
+        (Value::Duration(left), Value::Duration(right)) => Ok(Some(Value::Duration(
+            (*left - *right).ok_or_else(|| Error::type_error("duration overflow"))?,
+        ))),
+        (Value::Null, Value::Duration(_)) | (Value::Duration(_), Value::Null) => {
+            Ok(Some(Value::Null))
+        }
+        (_, Value::Duration(right)) => temporal_add(a, &Value::Duration(-*right)),
+        _ => Ok(None),
+    }
+}
+
+/// Duration multiplication (and division when `divide` is set); `None`
+/// falls back to the numeric path.
+fn temporal_scale(a: &Value, b: &Value, divide: bool) -> Result<Option<Value>> {
+    match (a, b) {
+        (Value::Null, Value::Duration(_)) | (Value::Duration(_), Value::Null) => {
+            Ok(Some(Value::Null))
+        }
+        (Value::Duration(duration), Value::Int(factor)) => {
+            scale_duration(*duration, *factor as f64, divide).map(Some)
+        }
+        (Value::Duration(duration), Value::Float(factor)) => {
+            scale_duration(*duration, *factor, divide).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn scale_duration(duration: Duration, factor: f64, divide: bool) -> Result<Value> {
+    if divide && factor == 0.0 {
+        return Ok(Value::Null);
+    }
+    let scaled = if divide {
+        duration.divided(factor)
+    } else {
+        duration.multiplied(factor)
+    };
+    scaled
+        .map(Value::Duration)
+        .ok_or_else(|| Error::type_error("duration arithmetic out of range"))
+}
+
 /// Operator codes for [`Op::Unary`].
 pub mod unary_code {
     /// Negation.
@@ -2610,16 +2772,31 @@ pub const fn unary_code(op: UnaryOp) -> u8 {
 fn binary_op(op: u8, a: &Value, b: &Value) -> Result<Value> {
     use binary_code as code;
     match op {
-        code::ADD => numeric_or_concat(a, b, |x, y| x + y, |x, y| x.wrapping_add(y)),
-        code::SUB => numeric(a, b, |x, y| x - y, |x, y| x.wrapping_sub(y)),
-        code::MUL => numeric(a, b, |x, y| x * y, |x, y| x.wrapping_mul(y)),
-        code::DIV => match (a, b) {
-            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-            (Value::Int(_), Value::Int(0)) => Ok(Value::Null),
-            (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_div(*y))),
-            _ => match (a.as_number(), b.as_number()) {
-                (Some(x), Some(y)) => Ok(Value::Float(x / y)),
-                _ => Err(type_error("division", a, b)),
+        code::ADD => match temporal_add(a, b)? {
+            Some(value) => Ok(value),
+            None => numeric_or_concat(a, b, |x, y| x + y, |x, y| x.wrapping_add(y)),
+        },
+        code::SUB => match temporal_sub(a, b)? {
+            Some(value) => Ok(value),
+            None => numeric(a, b, |x, y| x - y, |x, y| x.wrapping_sub(y)),
+        },
+        code::MUL => match temporal_scale(a, b, false)? {
+            Some(value) => Ok(value),
+            None => match temporal_scale(b, a, false)? {
+                Some(value) => Ok(value),
+                None => numeric(a, b, |x, y| x * y, |x, y| x.wrapping_mul(y)),
+            },
+        },
+        code::DIV => match temporal_scale(a, b, true)? {
+            Some(value) => Ok(value),
+            None => match (a, b) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Int(_), Value::Int(0)) => Ok(Value::Null),
+                (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_div(*y))),
+                _ => match (a.as_number(), b.as_number()) {
+                    (Some(x), Some(y)) => Ok(Value::Float(x / y)),
+                    _ => Err(type_error("division", a, b)),
+                },
             },
         },
         code::MOD => match (a, b) {
@@ -2954,19 +3131,7 @@ fn temporal_accessor(value: &Value, key: &str) -> Result<Value> {
 }
 
 fn offset_text(offset: i32) -> Value {
-    let mut text = String::new();
-    if offset == 0 {
-        text.push('Z');
-    } else {
-        let sign = if offset < 0 { '-' } else { '+' };
-        let offset = offset.unsigned_abs();
-        text.push_str(&format!(
-            "{sign}{:02}:{:02}",
-            offset / 3600,
-            (offset % 3600) / 60
-        ));
-    }
-    Value::Text(text.into())
+    Value::Text(crate::temporal::datetime::format_offset(offset).into())
 }
 
 fn unknown_field(key: &str, value: &Value) -> Error {
@@ -3006,9 +3171,8 @@ fn field_map(name: &str, value: &Value) -> Result<Option<Vec<(String, Field)>>> 
 }
 
 /// Construct a date: from a map, a string, a date or another temporal value.
-fn call_date(args: &[Value]) -> Result<Value> {
+fn call_date(args: &[Value], now: LocalDateTime) -> Result<Value> {
     let Some(value) = args.first() else {
-        let now = system_local_datetime();
         return Ok(Value::Date(now.date()));
     };
     if value.is_null() {
@@ -3032,9 +3196,9 @@ fn call_date(args: &[Value]) -> Result<Value> {
 }
 
 /// Construct a local time.
-fn call_localtime(args: &[Value]) -> Result<Value> {
+fn call_localtime(args: &[Value], now: LocalDateTime) -> Result<Value> {
     let Some(value) = args.first() else {
-        return Ok(Value::LocalTime(system_local_datetime().time()));
+        return Ok(Value::LocalTime(now.time()));
     };
     if value.is_null() {
         return Ok(Value::Null);
@@ -3058,9 +3222,8 @@ fn call_localtime(args: &[Value]) -> Result<Value> {
 }
 
 /// Construct a time with offset.
-fn call_time(args: &[Value]) -> Result<Value> {
+fn call_time(args: &[Value], now: LocalDateTime) -> Result<Value> {
     let Some(value) = args.first() else {
-        let now = system_local_datetime();
         return Ok(Value::Time(Time::new(now.time(), 0).expect("zero offset")));
     };
     if value.is_null() {
@@ -3089,9 +3252,9 @@ fn call_time(args: &[Value]) -> Result<Value> {
 }
 
 /// Construct a zone-less datetime.
-fn call_localdatetime(args: &[Value]) -> Result<Value> {
+fn call_localdatetime(args: &[Value], now: LocalDateTime) -> Result<Value> {
     let Some(value) = args.first() else {
-        return Ok(Value::LocalDateTime(system_local_datetime()));
+        return Ok(Value::LocalDateTime(now));
     };
     if value.is_null() {
         return Ok(Value::Null);
@@ -3125,10 +3288,10 @@ fn call_localdatetime(args: &[Value]) -> Result<Value> {
 }
 
 /// Construct a datetime with an offset and optional zone.
-fn call_datetime(args: &[Value]) -> Result<Value> {
+fn call_datetime(args: &[Value], now: LocalDateTime) -> Result<Value> {
     let Some(value) = args.first() else {
         return Ok(Value::DateTime(
-            DateTime::new(system_local_datetime(), 0, None).expect("zero offset"),
+            DateTime::new(now, 0, None).expect("zero offset"),
         ));
     };
     if value.is_null() {
@@ -3328,9 +3491,19 @@ fn call_truncate(kind: TruncateKind, args: &[Value]) -> Result<Value> {
     Ok(match kind {
         TruncateKind::Date => Value::Date(date),
         TruncateKind::LocalTime => Value::LocalTime(time),
-        TruncateKind::Time => Value::Time(
-            Time::new(time, offset).ok_or_else(|| Error::type_error("offset out of range"))?,
-        ),
+        TruncateKind::Time => {
+            // A timezone override resolves against the epoch date, since a
+            // `TIME` value has no calendar date of its own.
+            let offset = match construct::timezone_override(&overrides, epoch, time)
+                .map_err(|message| Error::type_error(format!("{name}(): {message}")))?
+            {
+                Some((offset, _)) => offset,
+                None => offset,
+            };
+            Value::Time(
+                Time::new(time, offset).ok_or_else(|| Error::type_error("offset out of range"))?,
+            )
+        }
         TruncateKind::LocalDateTime => Value::LocalDateTime(LocalDateTime::new(date, time)),
         TruncateKind::DateTime => {
             let (offset, zone) = match construct::timezone_override(&overrides, date, time)
@@ -3353,6 +3526,82 @@ fn call_truncate(kind: TruncateKind, args: &[Value]) -> Result<Value> {
             )
         }
     })
+}
+
+/// Which difference function runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurationDiff {
+    Between,
+    InMonths,
+    InDays,
+    InSeconds,
+}
+
+/// `duration.between`/`inMonths`/`inDays`/`inSeconds`.
+fn call_duration_between(kind: DurationDiff, args: &[Value]) -> Result<Value> {
+    let name = match kind {
+        DurationDiff::Between => "duration.between",
+        DurationDiff::InMonths => "duration.inMonths",
+        DurationDiff::InDays => "duration.inDays",
+        DurationDiff::InSeconds => "duration.inSeconds",
+    };
+    let (Some(from), Some(to)) = (args.first(), args.get(1)) else {
+        return Err(Error::type_error(format!(
+            "{name}() requires two arguments"
+        )));
+    };
+    if from.is_null() || to.is_null() {
+        return Ok(Value::Null);
+    }
+    let (Some(from), Some(to)) = (between::instant_of(from), between::instant_of(to)) else {
+        let other = if between::instant_of(from).is_none() {
+            from
+        } else {
+            to
+        };
+        return Err(invalid_argument(name, other));
+    };
+    let duration = match kind {
+        DurationDiff::Between => between::between(&from, &to),
+        DurationDiff::InMonths => between::in_months(&from, &to),
+        DurationDiff::InDays => between::in_days(&from, &to),
+        DurationDiff::InSeconds => between::in_seconds(&from, &to),
+    };
+    duration
+        .map(Value::Duration)
+        .ok_or_else(|| Error::type_error(format!("{name}(): out of range")))
+}
+
+/// `datetime.fromepoch(seconds, nanos)`: an epoch timestamp in UTC.
+fn call_datetime_from_epoch(args: &[Value]) -> Result<Value> {
+    match (args.first(), args.get(1)) {
+        (Some(Value::Int(seconds)), Some(Value::Int(nanos))) => {
+            let local = LocalDateTime::from_epoch(*seconds, *nanos)
+                .ok_or_else(|| Error::type_error("datetime.fromepoch(): out of range"))?;
+            Ok(Value::DateTime(
+                DateTime::new(local, 0, None).expect("zero offset"),
+            ))
+        }
+        (Some(Value::Null), _) | (None, _) | (_, Some(Value::Null)) => Ok(Value::Null),
+        (Some(other), _) => Err(invalid_argument("datetime.fromepoch", other)),
+    }
+}
+
+/// `datetime.fromepochmillis(millis)`: an epoch timestamp in UTC.
+fn call_datetime_from_epoch_millis(args: &[Value]) -> Result<Value> {
+    match args.first() {
+        Some(Value::Int(millis)) => {
+            let seconds = millis.div_euclid(1_000);
+            let nanos = millis.rem_euclid(1_000) * 1_000_000;
+            let local = LocalDateTime::from_epoch(seconds, nanos)
+                .ok_or_else(|| Error::type_error("datetime.fromepochmillis(): out of range"))?;
+            Ok(Value::DateTime(
+                DateTime::new(local, 0, None).expect("zero offset"),
+            ))
+        }
+        Some(Value::Null) | None => Ok(Value::Null),
+        Some(other) => Err(invalid_argument("datetime.fromepochmillis", other)),
+    }
 }
 
 /// `distance(a, b)` between two points.
