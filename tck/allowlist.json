@@ -36,26 +36,10 @@
         "note": "procedures are not supported: `there exists a procedure test.labels() :: (label :: STRING?):`"
       }
     },
-    "clauses/create/Create2.feature": {
-      "[22] Fail when creating a variable-length relationship": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      }
-    },
     "clauses/create/Create3.feature": {
-      "[2] WITH-CREATE": {
-        "reason": "not-implemented",
-        "note": "expected no rows, got a compile time error: compile time: Syntax: RETURN/WITH requires at least one item; expected +4 nodes, got +0"
-      },
       "[3] MATCH-CREATE-WITH-CREATE": {
         "reason": "not-implemented",
         "note": "expected no rows, got a compile time error: compile time: Syntax: RETURN/WITH requires at least one item; expected +10 nodes, got +0"
-      }
-    },
-    "clauses/create/Create5.feature": {
-      "[5] Create a pattern with multiple hops and varying directions": {
-        "reason": "not-implemented",
-        "note": "expected column `a`, got `r2`"
       }
     },
     "clauses/delete/Delete3.feature": {
@@ -78,12 +62,6 @@
       "[7] Delete paths from nested map/list": {
         "reason": "not-implemented",
         "note": "expected no rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident); expected -2 nodes, got +0; expected -2 relationships, got +0; e..."
-      }
-    },
-    "clauses/match/Match5.feature": {
-      "[27] Handling mixed relationship patterns and directions 2": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: invalid relationship direction at line 3 column 37 (found LParen)"
       }
     },
     "clauses/merge/Merge1.feature": {
@@ -165,14 +143,6 @@
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
       },
-      "[20] Fail if not returned variables are used inside an expression which contains an aggregation expression": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[21] Fail if more complex expressions, even if returned, are used inside expression which contains an aggregation expression": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
       "[6] Handle aggregates inside non-aggregate expressions": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
@@ -182,40 +152,6 @@
       "[10] Failing when setting a list of maps as a property": {
         "reason": "not-implemented",
         "note": "expected TypeError at runtime, but the query returned 0 rows"
-      }
-    },
-    "clauses/unwind/Unwind1.feature": {
-      "[13] Multiple unwinds after each other": {
-        "reason": "not-implemented",
-        "note": "expected column `x`, got `y`"
-      }
-    },
-    "clauses/with-skip-limit/WithSkipLimit2.feature": {
-      "[3] Connected components succeeding WITH with LIMIT": {
-        "reason": "not-implemented",
-        "note": "expected column `m`, got `n`"
-      }
-    },
-    "clauses/with-where/WithWhere7.feature": {
-      "[3] WHERE sees both, variable bound before but not after WITH and variable bound after but not before WITH": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: NotFound: variable `a` is not defined"
-      }
-    },
-    "clauses/with/With1.feature": {
-      "[2] Forwarind a node variable 2": {
-        "reason": "not-implemented",
-        "note": "expected column `a`, got `b`"
-      }
-    },
-    "clauses/with/With6.feature": {
-      "[8] Fail if not projected variables are used inside an expression which contains an aggregation expression": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[9] Fail if more complex expression, even if projected, are used inside expression which contains an aggregation expression": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got SemanticError at compile time"
       }
     },
     "expressions/existentialSubqueries/ExistentialSubquery1.feature": {
@@ -268,68 +204,6 @@
         "note": "expected TypeError at runtime, got SyntaxError at compile time"
       }
     },
-    "expressions/graph/Graph5.feature": {
-      "[2] Single-labels expression on relationships": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected [:T2] | true, got [:T2] | false"
-      },
-      "[5] Label expression on null": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 3 column 16 (found LParen)"
-      }
-    },
-    "expressions/graph/Graph6.feature": {
-      "[9] Fail when performing property access on a non-graph element (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at compile time, but the query returned 1 rows"
-      },
-      "[9] Fail when performing property access on a non-graph element (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at compile time, but the query returned 1 rows"
-      },
-      "[9] Fail when performing property access on a non-graph element (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at compile time, but the query returned 1 rows"
-      },
-      "[9] Fail when performing property access on a non-graph element (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at compile time, but the query returned 1 rows"
-      },
-      "[9] Fail when performing property access on a non-graph element (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at compile time, but the query returned 1 rows"
-      },
-      "[9] Fail when performing property access on a non-graph element (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at compile time, but the query returned 1 rows"
-      }
-    },
-    "expressions/map/Map1.feature": {
-      "[6] Fail when performing property access on a non-map (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at compile time, but the query returned 1 rows"
-      },
-      "[6] Fail when performing property access on a non-map (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at compile time, but the query returned 1 rows"
-      },
-      "[6] Fail when performing property access on a non-map (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at compile time, but the query returned 1 rows"
-      },
-      "[6] Fail when performing property access on a non-map (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at compile time, but the query returned 1 rows"
-      },
-      "[6] Fail when performing property access on a non-map (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at compile time, but the query returned 1 rows"
-      },
-      "[6] Fail when performing property access on a non-map (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at compile time, but the query returned 1 rows"
-      }
-    },
     "expressions/pattern/Pattern1.feature": {
       "[11] Fail on checking self pattern": {
         "reason": "not-implemented",
@@ -340,62 +214,6 @@
       "[7] Use a pattern comprehension inside a list comprehension": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: pattern expressions inside list comprehensions are not supported"
-      }
-    },
-    "expressions/quantifier/Quantifier1.feature": {
-      "[15] Fail none quantifier on type mismatch between list elements and predicate (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[15] Fail none quantifier on type mismatch between list elements and predicate (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[15] Fail none quantifier on type mismatch between list elements and predicate (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      }
-    },
-    "expressions/quantifier/Quantifier2.feature": {
-      "[16] Fail single quantifier on type mismatch between list elements and predicate (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[16] Fail single quantifier on type mismatch between list elements and predicate (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[16] Fail single quantifier on type mismatch between list elements and predicate (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      }
-    },
-    "expressions/quantifier/Quantifier3.feature": {
-      "[15] Fail any quantifier on type mismatch between list elements and predicate (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[15] Fail any quantifier on type mismatch between list elements and predicate (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[15] Fail any quantifier on type mismatch between list elements and predicate (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      }
-    },
-    "expressions/quantifier/Quantifier4.feature": {
-      "[15] Fail all quantifier on type mismatch between list elements and predicate (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[15] Fail all quantifier on type mismatch between list elements and predicate (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[15] Fail all quantifier on type mismatch between list elements and predicate (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
       }
     }
   }

@@ -560,9 +560,7 @@ impl<'a> Parser<'a> {
             var_length: None,
             properties: None,
         };
-        let mut bracketed = false;
         if self.eat(Token::LBracket) {
-            bracketed = true;
             if matches!(self.peek(), Some(Token::Ident) | Some(Token::EscapedIdent)) {
                 pattern.variable = Some(self.parse_name()?);
             }
@@ -597,10 +595,10 @@ impl<'a> Parser<'a> {
             (Token::Minus, Token::Minus) => RelDirection::Undirected,
             (Token::Minus, Token::ArrowRight) => RelDirection::Outgoing,
             (Token::ArrowLeft, Token::Minus) => RelDirection::Incoming,
-            // `(a)<-->(b)` is Neo4j's bidirectional spelling of an
-            // undirected relationship; `<-[:T]->` with both arrows and
-            // brackets is rejected.
-            (Token::ArrowLeft, Token::ArrowRight) if !bracketed => RelDirection::Undirected,
+            // Arrowheads on both sides (`<--` with `-->`, with or without
+            // brackets) spell an undirected relationship; the writer's
+            // CREATE planner rejects it there.
+            (Token::ArrowLeft, Token::ArrowRight) => RelDirection::Undirected,
             _ => return self.fail("invalid relationship direction"),
         };
         Ok(pattern)

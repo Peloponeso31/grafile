@@ -1047,22 +1047,25 @@ fn standard_deviations() {
 #[test]
 fn static_type_errors_are_compile_time() {
     let mut conn = connection();
-    for source in [
-        "RETURN 1 AND true",
-        "RETURN NOT 'x'",
-        "RETURN 1 IN 3",
-        "RETURN labels('x')",
-        "RETURN type(1)",
-        "RETURN type(2)",
-        "RETURN properties(1)",
-        "RETURN length(1)",
-        "RETURN size(1)",
-        "RETURN 'x'.name",
-        "RETURN [1, 2].name",
-        "RETURN all(x IN [1] WHERE x + 1)",
+    for (source, code) in [
+        ("RETURN 1 AND true", grafile::ErrorCode::Syntax),
+        ("RETURN NOT 'x'", grafile::ErrorCode::Syntax),
+        ("RETURN 1 IN 3", grafile::ErrorCode::Syntax),
+        ("RETURN labels('x')", grafile::ErrorCode::Syntax),
+        ("RETURN type(1)", grafile::ErrorCode::Syntax),
+        ("RETURN type(2)", grafile::ErrorCode::Syntax),
+        ("RETURN properties(1)", grafile::ErrorCode::Syntax),
+        ("RETURN length(1)", grafile::ErrorCode::Syntax),
+        ("RETURN size(1)", grafile::ErrorCode::Syntax),
+        ("RETURN 'x'.name", grafile::ErrorCode::Type),
+        ("RETURN [1, 2].name", grafile::ErrorCode::Type),
+        (
+            "RETURN all(x IN [1] WHERE x + 1)",
+            grafile::ErrorCode::Syntax,
+        ),
     ] {
         let err = conn.query(source, &Params::new()).expect_err(source);
-        assert_eq!(err.code(), grafile::ErrorCode::Syntax, "{source}");
+        assert_eq!(err.code(), code, "{source}");
     }
 }
 

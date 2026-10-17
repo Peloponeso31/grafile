@@ -1202,14 +1202,39 @@ impl<'a> Executor<'a> {
                 self.regs[*dest as usize] = Reg::Value(Value::Bool(value.is_null()));
             }
             Op::HasLabel { node, label, dest } => {
-                let label_id = self.resolve_label(*label)?;
-                let result = match (self.regs[*node as usize].clone(), label_id) {
-                    (Reg::Node(id) | Reg::Value(Value::Node(id)), Some(label)) => self
-                        .db
-                        .get_node(id)?
-                        .map(|record| record.labels.contains(&label))
-                        .unwrap_or(false),
-                    _ => false,
+                let value = self.reg_value(*node)?;
+                let result = match value {
+                    Value::Node(id) => {
+                        let label_id = self.resolve_label(*label)?;
+                        self.db
+                            .get_node(id)?
+                            .map(|record| {
+                                label_id.is_some_and(|label| record.labels.contains(&label))
+                            })
+                            .unwrap_or(false)
+                    }
+                    // A label predicate on a relationship tests its type.
+                    Value::Edge(id) => {
+                        let Value::Text(name) = &self.program.constants[*label as usize] else {
+                            return Err(Error::internal("label name is not a string"));
+                        };
+                        let type_id = self.db.edge_type_id(name);
+                        self.db
+                            .get_edge(id)?
+                            .map(|record| type_id.is_some_and(|id| record.edge_type == id))
+                            .unwrap_or(false)
+                    }
+                    // The label of a null value is null.
+                    Value::Null => {
+                        self.regs[*dest as usize] = normalize_reg(Value::Null);
+                        return Ok(());
+                    }
+                    other => {
+                        return Err(Error::type_error(format!(
+                            "expected a node or relationship, got {}",
+                            other.type_name()
+                        )));
+                    }
                 };
                 self.regs[*dest as usize] = Reg::Value(Value::Bool(result));
             }

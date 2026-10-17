@@ -1441,8 +1441,8 @@ impl<'a> Planner<'a> {
                     ));
                 }
                 if rel.var_length.is_some() {
-                    return Err(Error::unsupported(
-                        "variable-length relationships cannot be created",
+                    return Err(Error::syntax(
+                        "CreatingVarLength: variable-length relationships cannot be created",
                     ));
                 }
                 let var = match &rel.variable {
@@ -1743,14 +1743,15 @@ impl<'a> Planner<'a> {
         scope: &FastMap<String, VarKind>,
         require_aliases: bool,
     ) -> Result<(Plan, FastMap<String, VarKind>, Vec<String>)> {
-        // Expand `*` items.
+        // Expand `*` items; the TCK pins the column order to the sorted
+        // variable names.
         let mut expanded: Vec<(Expr, String)> = Vec::new();
         for item in items {
             if item.star {
-                for (var, _) in scope.iter() {
-                    if var.starts_with("  ") {
-                        continue;
-                    }
+                let mut stars: Vec<&String> =
+                    scope.keys().filter(|var| !var.starts_with("  ")).collect();
+                stars.sort();
+                for var in stars {
                     expanded.push((Expr::Variable(var.clone()), var.clone()));
                 }
             } else {
@@ -1770,6 +1771,13 @@ impl<'a> Planner<'a> {
             }
         }
         if expanded.is_empty() {
+            // `WITH *` over an empty scope is a legal no-op; `RETURN *`
+            // without variables is an error.
+            let all_stars = items.iter().all(|item| item.star);
+            if all_stars && require_aliases && order.is_empty() && skip.is_none() && limit.is_none()
+            {
+                return Ok((input, FastMap::new(), Vec::new()));
+            }
             return Err(Error::syntax("RETURN/WITH requires at least one item"));
         }
         let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -1800,6 +1808,30 @@ impl<'a> Planner<'a> {
                 .collect();
             if validate_expr(predicate, &projected).is_ok() {
                 filter_after = Some(predicate.clone());
+            } else if let Ok(rewritten) = rewrite_expr(predicate, &mut |sub| {
+                // Replace projected aliases by their defining expressions so
+                // the predicate can filter before the projection; this is how
+                // a WHERE sees variables bound before and after the WITH.
+                let Expr::Variable(name) = sub else {
+                    return Ok(None);
+                };
+                match expanded.iter().find(|(_, item)| item == name) {
+                    Some((expr, _)) if !contains_aggregation(expr) => Ok(Some(expr.clone())),
+                    _ => Ok(None),
+                }
+            }) && !contains_aggregation(&rewritten)
+                && validate_expr(&rewritten, &scope).is_ok()
+            {
+                self.extract_patterns(
+                    &mut rewritten.clone(),
+                    &mut input,
+                    &mut scope,
+                    PatternContext::Predicate,
+                )?;
+                input = Plan::Filter {
+                    input: Box::new(input),
+                    predicate: rewritten,
+                };
             } else {
                 let mut predicate = predicate.clone();
                 self.extract_patterns(
@@ -1823,6 +1855,13 @@ impl<'a> Planner<'a> {
         let mut groups: Vec<(Expr, String)> = Vec::new();
         let mut aggs: Vec<AggItem> = Vec::new();
         let mut post: Vec<(Expr, String)> = Vec::new();
+        // Plain items are grouping keys even when an aggregate expression
+        // that references them appears first.
+        for (expr, name) in &expanded {
+            if !contains_aggregation(expr) {
+                groups.push((expr.clone(), name.clone()));
+            }
+        }
         for (expr, name) in &expanded {
             if has_aggregation_inside_comprehension(expr) {
                 return Err(Error::syntax(
@@ -1853,9 +1892,15 @@ impl<'a> Planner<'a> {
                     Ok(Some(Expr::Variable(hidden)))
                 })?;
                 residual = hoist_groups(&residual, &mut groups, &aggs, &scope)?;
+                // Everything left must be a grouping key, an aggregation or
+                // a constant; anything else has no value to take.
+                if has_free_variable(&residual, &groups, &aggs) {
+                    return Err(Error::syntax(
+                        "AmbiguousAggregationExpression: an expression with an aggregation may \
+                         only reference projected values",
+                    ));
+                }
                 post.push((residual, name.clone()));
-            } else {
-                groups.push((expr.clone(), name.clone()));
             }
         }
         // Post-aggregation expressions may only reference grouping keys,
@@ -2536,6 +2581,22 @@ fn check_expr_kinds_with(
         }
         Ok(())
     };
+    let require_type = |kind: Option<Kind>, wanted: &[Kind], what: &str| -> Result<()> {
+        if let Some(kind) = kind
+            && !wanted.contains(&kind)
+        {
+            return Err(Error::type_error(format!(
+                "{what} expects {}, got {}",
+                wanted
+                    .iter()
+                    .map(|kind| kind.name())
+                    .collect::<Vec<_>>()
+                    .join(" or "),
+                kind.name()
+            )));
+        }
+        Ok(())
+    };
     let kind = |e: &Expr| static_kind_with(e, scope, locals);
     match expr {
         Expr::Unary {
@@ -2564,9 +2625,14 @@ fn check_expr_kinds_with(
         },
         Expr::Property { base, .. } => {
             // Property access works on maps, entities, temporal values and
-            // points; scalars and lists are invalid.
-            require(
-                kind(base),
+            // points; lists and scalars are type errors, a path is not even
+            // statically resolvable.
+            let base_kind = kind(base);
+            if base_kind == Some(Kind::Path) {
+                return Err(Error::syntax("a path has no properties"));
+            }
+            require_type(
+                base_kind,
                 &[
                     Kind::Map,
                     Kind::Node,
@@ -2601,16 +2667,15 @@ fn check_expr_kinds_with(
             predicate,
             ..
         } => {
-            if let Some(element) = list_element_kind(list, scope, locals) {
-                let mut inner = locals.cloned().unwrap_or_default();
-                inner.insert(var.clone(), element);
-                check_expr_kinds_with(predicate, scope, Some(&inner))?;
-                require(
-                    static_kind_with(predicate, scope, Some(&inner)),
-                    &[Kind::Boolean, Kind::Null],
-                    "quantifier predicate",
-                )?;
-            }
+            check_expr_kinds_with(list, scope, locals)?;
+            let inner = binder_locals(var, list, scope, locals);
+            check_expr_kinds_with(predicate, scope, inner.as_ref())?;
+            require(
+                static_kind_with(predicate, scope, inner.as_ref()),
+                &[Kind::Boolean, Kind::Null],
+                "quantifier predicate",
+            )?;
+            return Ok(());
         }
         Expr::ListComprehension {
             var,
@@ -2618,21 +2683,20 @@ fn check_expr_kinds_with(
             predicate,
             projection,
         } => {
-            if let Some(element) = list_element_kind(list, scope, locals) {
-                let mut inner = locals.cloned().unwrap_or_default();
-                inner.insert(var.clone(), element);
-                if let Some(predicate) = predicate {
-                    check_expr_kinds_with(predicate, scope, Some(&inner))?;
-                    require(
-                        static_kind_with(predicate, scope, Some(&inner)),
-                        &[Kind::Boolean, Kind::Null],
-                        "comprehension predicate",
-                    )?;
-                }
-                if let Some(projection) = projection {
-                    check_expr_kinds_with(projection, scope, Some(&inner))?;
-                }
+            check_expr_kinds_with(list, scope, locals)?;
+            let inner = binder_locals(var, list, scope, locals);
+            if let Some(predicate) = predicate {
+                check_expr_kinds_with(predicate, scope, inner.as_ref())?;
+                require(
+                    static_kind_with(predicate, scope, inner.as_ref()),
+                    &[Kind::Boolean, Kind::Null],
+                    "comprehension predicate",
+                )?;
             }
+            if let Some(projection) = projection {
+                check_expr_kinds_with(projection, scope, inner.as_ref())?;
+            }
+            return Ok(());
         }
         _ => {}
     }
@@ -2680,7 +2744,32 @@ fn check_expr_kinds_with(
             _ => {}
         }
     }
-    Ok(())
+    // Recurse into subexpressions: the checks above only see the node they
+    // match, and operators nest arbitrarily.
+    let mut error = None;
+    for_each_child(expr, &mut |child| {
+        if error.is_none() {
+            error = check_expr_kinds_with(child, scope, locals).err();
+        }
+    });
+    match error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// The element-kind overlay for a comprehension or quantifier binder, when
+/// the list's element kind is known.
+fn binder_locals(
+    var: &str,
+    list: &Expr,
+    scope: &FastMap<String, VarKind>,
+    locals: Option<&FastMap<String, Kind>>,
+) -> Option<FastMap<String, Kind>> {
+    let element = list_element_kind(list, scope, locals)?;
+    let mut inner = locals.cloned().unwrap_or_default();
+    inner.insert(var.to_owned(), element);
+    Some(inner)
 }
 
 fn expr_kind(expr: &Expr, scope: &FastMap<String, VarKind>) -> VarKind {
@@ -3094,7 +3183,7 @@ fn rewrite_sort_key(expr: &Expr, groups: &[(Expr, String)], aggs: &[AggItem]) ->
             ));
         }
         if let Some((_, group)) = groups.iter().find(|(group, _)| group == sub) {
-            if is_property_chain(sub) {
+            if is_atom_expr(sub) {
                 return Ok(Some(Expr::Variable(group.clone())));
             }
             return Err(Error::syntax(
@@ -3148,11 +3237,13 @@ fn check_path_conflicts(path: &PatternPath) -> Result<()> {
     Ok(())
 }
 
-/// Whether an expression is a variable or a chain of property accesses on one.
-fn is_property_chain(expr: &Expr) -> bool {
+/// Whether an expression is a constant, a variable or a chain of property
+/// accesses, i.e. something that can appear next to an aggregation without
+/// changing the grouping.
+fn is_atom_expr(expr: &Expr) -> bool {
     match expr {
-        Expr::Variable(_) => true,
-        Expr::Property { base, .. } => is_property_chain(base),
+        Expr::Variable(_) | Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::Property { base, .. } => is_atom_expr(base),
         _ => false,
     }
 }
@@ -3160,7 +3251,7 @@ fn is_property_chain(expr: &Expr) -> bool {
 /// `SKIP` and `LIMIT` must be constants; literal values are range checked at
 /// compile time so parameter values can be checked at execution time.
 fn validate_projection_limit(expr: &Expr, what: &str) -> Result<()> {
-    if free_refs(expr, &[], &[], &[]).unresolved {
+    if has_free_variable(expr, &[], &[]) {
         return Err(Error::syntax(format!(
             "NonConstantExpression: {what} must not depend on variables"
         )));
@@ -3344,22 +3435,6 @@ fn rewrite_pattern(
     Ok(path)
 }
 
-/// Whether the inline property expressions of a pattern path reference a
-/// variable satisfying `pred`.
-fn pattern_references(path: &PatternPath, pred: &mut dyn FnMut(&str) -> bool) -> bool {
-    path.start
-        .properties
-        .as_ref()
-        .is_some_and(|expr| expr_references(expr, pred))
-        || path.segments.iter().any(|segment| {
-            segment
-                .relationship
-                .properties
-                .as_ref()
-                .is_some_and(|expr| expr_references(expr, pred))
-        })
-}
-
 /// Whether the inline property expressions of a pattern path contain an
 /// aggregation.
 fn pattern_has_aggregation(path: &PatternPath) -> bool {
@@ -3376,171 +3451,42 @@ fn pattern_has_aggregation(path: &PatternPath) -> bool {
         })
 }
 
-/// Whether any variable reference in `expr` satisfies `pred`.
-fn expr_references(expr: &Expr, pred: &mut dyn FnMut(&str) -> bool) -> bool {
-    match expr {
-        Expr::Variable(name) => pred(name),
-        Expr::Literal(_) | Expr::Parameter(_) => false,
-        Expr::Pattern(path) => pattern_references(path, pred),
-        Expr::PatternComprehension {
-            path,
-            predicate,
-            projection,
-        } => {
-            pattern_references(path, pred)
-                || predicate
-                    .as_deref()
-                    .is_some_and(|e| expr_references(e, pred))
-                || expr_references(projection, pred)
-        }
-        Expr::Property { base, .. } => expr_references(base, pred),
-        Expr::Subscript { base, index } => {
-            expr_references(base, pred) || expr_references(index, pred)
-        }
-        Expr::Slice { base, lower, upper } => {
-            expr_references(base, pred)
-                || lower.as_deref().is_some_and(|e| expr_references(e, pred))
-                || upper.as_deref().is_some_and(|e| expr_references(e, pred))
-        }
-        Expr::ListComprehension {
-            list,
-            predicate,
-            projection,
-            ..
-        } => {
-            expr_references(list, pred)
-                || predicate
-                    .as_deref()
-                    .is_some_and(|e| expr_references(e, pred))
-                || projection
-                    .as_deref()
-                    .is_some_and(|e| expr_references(e, pred))
-        }
-        Expr::Quantifier {
-            list, predicate, ..
-        } => expr_references(list, pred) || expr_references(predicate, pred),
-        Expr::Reduce {
-            init,
-            list,
-            expression,
-            ..
-        } => {
-            expr_references(init, pred)
-                || expr_references(list, pred)
-                || expr_references(expression, pred)
-        }
-        Expr::Unary { expr, .. } => expr_references(expr, pred),
-        Expr::Binary { left, right, .. } => {
-            expr_references(left, pred) || expr_references(right, pred)
-        }
-        Expr::Function { args, .. } => args.iter().any(|arg| expr_references(arg, pred)),
-        Expr::List(items) => items.iter().any(|item| expr_references(item, pred)),
-        Expr::Map(entries) => entries
-            .iter()
-            .any(|(_, value)| expr_references(value, pred)),
-        Expr::Case {
-            subject,
-            alternatives,
-            default,
-        } => {
-            subject
-                .as_deref()
-                .is_some_and(|subject| expr_references(subject, pred))
-                || alternatives
-                    .iter()
-                    .any(|(when, then)| expr_references(when, pred) || expr_references(then, pred))
-                || default
-                    .as_deref()
-                    .is_some_and(|default| expr_references(default, pred))
-        }
-        Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => expr_references(expr, pred),
-    }
-}
-
-/// Whether `expr` references an aggregation output.
-fn references_aggregation(expr: &Expr, aggs: &[AggItem]) -> bool {
-    expr_references(expr, &mut |name| aggs.iter().any(|item| item.name == name))
-}
-
-/// Where the free variables of an expression live, relative to the grouping
-/// keys and aggregations of a post-aggregation projection.
-#[derive(Default)]
-struct FreeRefs {
-    /// A free variable that is neither a grouping key nor an aggregation.
-    unresolved: bool,
-    /// A free variable bound by an enclosing comprehension, quantifier or
-    /// `reduce`; hoisting such an expression would move the reference out of
-    /// its binder.
-    ancestor_bound: bool,
-}
-
-/// Classify the free-variable references of `expr`. Variables bound inside
-/// `expr` itself (comprehension, quantifier, `reduce` and pattern binders)
-/// are not free.
-fn free_refs(
-    expr: &Expr,
-    initially_bound: &[String],
-    groups: &[(Expr, String)],
-    aggs: &[AggItem],
-) -> FreeRefs {
+/// Whether `expr` references a variable that is neither bound inside the
+/// expression itself (comprehension, quantifier, `reduce` and pattern
+/// binders) nor the name of a grouping key or aggregation output.
+fn has_free_variable(expr: &Expr, groups: &[(Expr, String)], aggs: &[AggItem]) -> bool {
     fn walk(
         expr: &Expr,
         bound: &mut Vec<String>,
-        base: usize,
         groups: &[(Expr, String)],
         aggs: &[AggItem],
-        out: &mut FreeRefs,
-    ) {
+    ) -> bool {
         match expr {
-            Expr::Variable(name) => match bound.iter().position(|entry| entry == name) {
-                Some(position) if position < base => out.ancestor_bound = true,
-                Some(_) => {}
-                None => {
-                    let resolved = groups.iter().any(|(_, group)| group == name)
-                        || aggs.iter().any(|item| &item.name == name);
-                    if !resolved {
-                        out.unresolved = true;
-                    }
+            Expr::Variable(name) => {
+                if bound.iter().any(|entry| entry == name) {
+                    return false;
                 }
-            },
-            Expr::Literal(_) | Expr::Parameter(_) => {}
-            Expr::Pattern(path) => walk_pattern(path, bound, base, groups, aggs, out),
+                !(groups.iter().any(|(_, group)| group == name)
+                    || aggs.iter().any(|item| &item.name == name))
+            }
+            Expr::Literal(_) | Expr::Parameter(_) => false,
+            Expr::Pattern(path) => walk_pattern(path, bound, groups, aggs),
             Expr::PatternComprehension {
                 path,
                 predicate,
                 projection,
             } => {
-                walk_pattern(path, bound, base, groups, aggs, out);
+                if walk_pattern(path, bound, groups, aggs) {
+                    return true;
+                }
                 let mark = bound.len();
                 pattern_variables(path, bound);
-                if let Some(predicate) = predicate {
-                    walk(predicate, bound, base, groups, aggs, out);
-                }
-                walk(projection, bound, base, groups, aggs, out);
+                let found = predicate
+                    .as_deref()
+                    .is_some_and(|predicate| walk(predicate, bound, groups, aggs))
+                    || walk(projection, bound, groups, aggs);
                 bound.truncate(mark);
-            }
-            Expr::Property { base: inner, .. } | Expr::Unary { expr: inner, .. } => {
-                walk(inner, bound, base, groups, aggs, out);
-            }
-            Expr::Subscript {
-                base: target,
-                index,
-            } => {
-                walk(target, bound, base, groups, aggs, out);
-                walk(index, bound, base, groups, aggs, out);
-            }
-            Expr::Slice {
-                base: target,
-                lower,
-                upper,
-            } => {
-                walk(target, bound, base, groups, aggs, out);
-                if let Some(lower) = lower {
-                    walk(lower, bound, base, groups, aggs, out);
-                }
-                if let Some(upper) = upper {
-                    walk(upper, bound, base, groups, aggs, out);
-                }
+                found
             }
             Expr::ListComprehension {
                 var,
@@ -3548,15 +3494,18 @@ fn free_refs(
                 predicate,
                 projection,
             } => {
-                walk(list, bound, base, groups, aggs, out);
+                if walk(list, bound, groups, aggs) {
+                    return true;
+                }
                 bound.push(var.clone());
-                if let Some(predicate) = predicate {
-                    walk(predicate, bound, base, groups, aggs, out);
-                }
-                if let Some(projection) = projection {
-                    walk(projection, bound, base, groups, aggs, out);
-                }
+                let found = predicate
+                    .as_deref()
+                    .is_some_and(|predicate| walk(predicate, bound, groups, aggs))
+                    || projection
+                        .as_deref()
+                        .is_some_and(|projection| walk(projection, bound, groups, aggs));
                 bound.pop();
+                found
             }
             Expr::Quantifier {
                 var,
@@ -3564,10 +3513,13 @@ fn free_refs(
                 predicate,
                 ..
             } => {
-                walk(list, bound, base, groups, aggs, out);
+                if walk(list, bound, groups, aggs) {
+                    return true;
+                }
                 bound.push(var.clone());
-                walk(predicate, bound, base, groups, aggs, out);
+                let found = walk(predicate, bound, groups, aggs);
                 bound.pop();
+                found
             }
             Expr::Reduce {
                 accumulator,
@@ -3576,51 +3528,24 @@ fn free_refs(
                 list,
                 expression,
             } => {
-                walk(init, bound, base, groups, aggs, out);
-                walk(list, bound, base, groups, aggs, out);
+                if walk(init, bound, groups, aggs) || walk(list, bound, groups, aggs) {
+                    return true;
+                }
                 bound.push(accumulator.clone());
                 bound.push(var.clone());
-                walk(expression, bound, base, groups, aggs, out);
+                let found = walk(expression, bound, groups, aggs);
                 bound.pop();
                 bound.pop();
+                found
             }
-            Expr::Binary { left, right, .. } => {
-                walk(left, bound, base, groups, aggs, out);
-                walk(right, bound, base, groups, aggs, out);
-            }
-            Expr::Function { args, .. } => {
-                for arg in args {
-                    walk(arg, bound, base, groups, aggs, out);
-                }
-            }
-            Expr::List(items) => {
-                for item in items {
-                    walk(item, bound, base, groups, aggs, out);
-                }
-            }
-            Expr::Map(entries) => {
-                for (_, value) in entries {
-                    walk(value, bound, base, groups, aggs, out);
-                }
-            }
-            Expr::Case {
-                subject,
-                alternatives,
-                default,
-            } => {
-                if let Some(subject) = subject {
-                    walk(subject, bound, base, groups, aggs, out);
-                }
-                for (when, then) in alternatives {
-                    walk(when, bound, base, groups, aggs, out);
-                    walk(then, bound, base, groups, aggs, out);
-                }
-                if let Some(default) = default {
-                    walk(default, bound, base, groups, aggs, out);
-                }
-            }
-            Expr::IsNull { expr: inner, .. } | Expr::LabelCheck { expr: inner, .. } => {
-                walk(inner, bound, base, groups, aggs, out);
+            other => {
+                let mut found = false;
+                for_each_child(other, &mut |child| {
+                    if !found {
+                        found = walk(child, bound, groups, aggs);
+                    }
+                });
+                found
             }
         }
     }
@@ -3628,26 +3553,15 @@ fn free_refs(
     fn walk_pattern(
         path: &PatternPath,
         bound: &mut Vec<String>,
-        base: usize,
         groups: &[(Expr, String)],
         aggs: &[AggItem],
-        out: &mut FreeRefs,
-    ) {
-        if let Some(properties) = &path.start.properties {
-            walk(properties, bound, base, groups, aggs, out);
-        }
-        for segment in &path.segments {
-            if let Some(properties) = &segment.relationship.properties {
-                walk(properties, bound, base, groups, aggs, out);
-            }
-        }
+    ) -> bool {
+        pattern_properties(path)
+            .iter()
+            .any(|expr| walk(expr, bound, groups, aggs))
     }
 
-    let mut bound = initially_bound.to_vec();
-    let base = bound.len();
-    let mut out = FreeRefs::default();
-    walk(expr, &mut bound, base, groups, aggs, &mut out);
-    out
+    walk(expr, &mut Vec::new(), groups, aggs)
 }
 
 /// Rewrite a post-aggregation residual, hoisting every subexpression that
@@ -3671,14 +3585,16 @@ fn hoist_walk(
     bound: &[String],
 ) -> Result<Expr> {
     if let Some((_, group)) = groups.iter().find(|(group, _)| group == expr) {
-        return Ok(Expr::Variable(group.clone()));
-    }
-    let refs = free_refs(expr, bound, groups, aggs);
-    if refs.unresolved && !refs.ancestor_bound && !references_aggregation(expr, aggs) {
-        validate_expr(expr, scope)?;
-        let hidden = format!("  grp{}", groups.len());
-        groups.push((expr.clone(), hidden.clone()));
-        return Ok(Expr::Variable(hidden));
+        // Only constants and property chains may be picked out of an
+        // aggregate-containing expression; anything more complex is
+        // ambiguous.
+        if is_atom_expr(expr) {
+            return Ok(Expr::Variable(group.clone()));
+        }
+        return Err(Error::syntax(
+            "AmbiguousAggregationExpression: an expression with an aggregation may not combine \
+             non-constant subexpressions",
+        ));
     }
     Ok(match expr {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => expr.clone(),
@@ -3986,19 +3902,20 @@ fn has_aggregation_inside_comprehension(expr: &Expr) -> bool {
     }
 }
 
-/// Whether any subexpression satisfies `pred` (including `expr` itself).
-fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
-    if pred(expr) {
-        return true;
-    }
+/// Call `f` on every direct child expression of `expr`.
+fn for_each_child(expr: &Expr, mut f: &mut dyn FnMut(&Expr)) {
     match expr {
-        Expr::Function { args, .. } => args.iter().any(|arg| any_subexpr(arg, pred)),
-        Expr::Property { base, .. } | Expr::Unary { expr: base, .. } => any_subexpr(base, pred),
-        Expr::Subscript { base, index } => any_subexpr(base, pred) || any_subexpr(index, pred),
+        Expr::Function { args, .. } => args.iter().for_each(&mut f),
+        Expr::Property { base, .. } | Expr::Unary { expr: base, .. } => f(base),
+        Expr::Subscript { base, index } => {
+            f(base);
+            f(index);
+        }
         Expr::Slice { base, lower, upper } => {
-            any_subexpr(base, pred)
-                || lower.as_deref().is_some_and(|e| any_subexpr(e, pred))
-                || upper.as_deref().is_some_and(|e| any_subexpr(e, pred))
+            f(base);
+            for bound in [lower, upper].into_iter().flatten() {
+                f(bound);
+            }
         }
         Expr::ListComprehension {
             list,
@@ -4006,50 +3923,78 @@ fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
             projection,
             ..
         } => {
-            any_subexpr(list, pred)
-                || predicate.as_deref().is_some_and(|e| any_subexpr(e, pred))
-                || projection.as_deref().is_some_and(|e| any_subexpr(e, pred))
+            f(list);
+            for part in [predicate, projection].into_iter().flatten() {
+                f(part);
+            }
         }
         Expr::Quantifier {
             list, predicate, ..
-        } => any_subexpr(list, pred) || any_subexpr(predicate, pred),
+        } => {
+            f(list);
+            f(predicate);
+        }
         Expr::Reduce {
             init,
             list,
             expression,
             ..
-        } => any_subexpr(init, pred) || any_subexpr(list, pred) || any_subexpr(expression, pred),
-        Expr::Binary { left, right, .. } => any_subexpr(left, pred) || any_subexpr(right, pred),
-        Expr::List(items) => items.iter().any(|item| any_subexpr(item, pred)),
-        Expr::Map(entries) => entries.iter().any(|(_, value)| any_subexpr(value, pred)),
+        } => {
+            f(init);
+            f(list);
+            f(expression);
+        }
+        Expr::Binary { left, right, .. } => {
+            f(left);
+            f(right);
+        }
+        Expr::List(items) => items.iter().for_each(&mut f),
+        Expr::Map(entries) => entries.iter().for_each(|(_, value)| f(value)),
         Expr::Case {
             subject,
             alternatives,
             default,
         } => {
-            subject.as_ref().is_some_and(|e| any_subexpr(e, pred))
-                || alternatives
-                    .iter()
-                    .any(|(a, b)| any_subexpr(a, pred) || any_subexpr(b, pred))
-                || default.as_ref().is_some_and(|e| any_subexpr(e, pred))
+            for part in subject.iter() {
+                f(part);
+            }
+            for (when, then) in alternatives {
+                f(when);
+                f(then);
+            }
+            for part in default.iter() {
+                f(part);
+            }
         }
-        Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => any_subexpr(expr, pred),
-        Expr::Pattern(path) => pattern_properties(path)
-            .iter()
-            .any(|expr| any_subexpr(expr, pred)),
+        Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => f(expr),
+        Expr::Pattern(path) => pattern_properties(path).iter().for_each(|expr| f(expr)),
         Expr::PatternComprehension {
             path,
             predicate,
             projection,
         } => {
-            pattern_properties(path)
-                .iter()
-                .any(|expr| any_subexpr(expr, pred))
-                || predicate.as_deref().is_some_and(|e| any_subexpr(e, pred))
-                || any_subexpr(projection, pred)
+            pattern_properties(path).iter().for_each(|expr| f(expr));
+            if let Some(predicate) = predicate {
+                f(predicate);
+            }
+            f(projection);
         }
-        Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => false,
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => {}
     }
+}
+
+/// Whether any subexpression satisfies `pred` (including `expr` itself).
+fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
+    if pred(expr) {
+        return true;
+    }
+    let mut found = false;
+    for_each_child(expr, &mut |child| {
+        if !found {
+            found = any_subexpr(child, pred);
+        }
+    });
+    found
 }
 
 /// The inline property expressions of every node and relationship of a path.
