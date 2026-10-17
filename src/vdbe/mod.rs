@@ -741,6 +741,7 @@ pub struct Program {
 
 /// Execute a program and return its result rows.
 pub fn execute(db: &mut Database, program: &Program) -> Result<Vec<Vec<Value>>> {
+    db.clear_deleted();
     let mut executor = Executor {
         db,
         program,
@@ -1155,22 +1156,38 @@ impl<'a> Executor<'a> {
                 };
                 let value = match self.regs[*target as usize].clone() {
                     Reg::Value(Value::Null) => Value::Null,
-                    Reg::Node(id) | Reg::Value(Value::Node(id)) => match key {
-                        Some(key) => self
-                            .db
-                            .get_node(id)?
-                            .and_then(|record| record.get(key).cloned())
-                            .unwrap_or(Value::Null),
-                        None => Value::Null,
-                    },
-                    Reg::Edge(id) | Reg::Value(Value::Edge(id)) => match key {
-                        Some(key) => self
-                            .db
-                            .get_edge(id)?
-                            .and_then(|record| record.get(key).cloned())
-                            .unwrap_or(Value::Null),
-                        None => Value::Null,
-                    },
+                    Reg::Node(id) | Reg::Value(Value::Node(id)) => {
+                        if self.db.node_deleted(id) {
+                            return Err(Error::new(
+                                ErrorCode::NotFound,
+                                "EntityNotFound: the node has been deleted",
+                            ));
+                        }
+                        match key {
+                            Some(key) => self
+                                .db
+                                .get_node(id)?
+                                .and_then(|record| record.get(key).cloned())
+                                .unwrap_or(Value::Null),
+                            None => Value::Null,
+                        }
+                    }
+                    Reg::Edge(id) | Reg::Value(Value::Edge(id)) => {
+                        if self.db.deleted_edge_type(id).is_some() {
+                            return Err(Error::new(
+                                ErrorCode::NotFound,
+                                "EntityNotFound: the relationship has been deleted",
+                            ));
+                        }
+                        match key {
+                            Some(key) => self
+                                .db
+                                .get_edge(id)?
+                                .and_then(|record| record.get(key).cloned())
+                                .unwrap_or(Value::Null),
+                            None => Value::Null,
+                        }
+                    }
                     Reg::Value(Value::Map(entries)) => {
                         let Value::Text(name) = &self.program.constants[*name as usize] else {
                             return Err(Error::internal("property name is not a string"));
@@ -1832,25 +1849,16 @@ impl<'a> Executor<'a> {
     }
 
     fn delete_any(&mut self, value: Value, detach: bool) -> Result<()> {
-        match value {
-            Value::Node(id) => {
-                self.db.delete_node(id, detach)?;
-            }
-            Value::Edge(id) => {
-                self.db.delete_edge(id)?;
-            }
-            Value::List(items) => {
-                for item in items.iter() {
-                    self.delete_any(item.clone(), detach)?;
-                }
-            }
-            Value::Null => {}
-            other => {
-                return Err(Error::type_error(format!(
-                    "DELETE expects a node, relationship or path, got {}",
-                    other.type_name()
-                )));
-            }
+        // Flatten paths and nested lists first, then delete relationships
+        // before nodes so non-detach deletion succeeds.
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        collect_delete_targets(&value, &mut nodes, &mut edges)?;
+        for edge in edges {
+            self.db.delete_edge(edge)?;
+        }
+        for node in nodes {
+            self.db.delete_node(node, detach)?;
         }
         Ok(())
     }
@@ -2094,6 +2102,12 @@ impl<'a> Executor<'a> {
             },
             func::LABELS => match args.first() {
                 Some(Value::Node(id)) => {
+                    if self.db.node_deleted(*id) {
+                        return Err(Error::new(
+                            ErrorCode::NotFound,
+                            "EntityNotFound: the node has been deleted",
+                        ));
+                    }
                     let Some(record) = self.db.get_node(*id)? else {
                         return Ok(Value::Null);
                     };
@@ -2112,13 +2126,14 @@ impl<'a> Executor<'a> {
             },
             func::TYPE => match args.first() {
                 Some(Value::Edge(id)) => {
-                    let Some(record) = self.db.get_edge(*id)? else {
-                        return Ok(Value::Null);
+                    // A relationship deleted by this statement still knows
+                    // its type.
+                    let type_id = match self.db.deleted_edge_type(*id) {
+                        Some(type_id) => Some(type_id),
+                        None => self.db.get_edge(*id)?.map(|record| record.edge_type),
                     };
-                    Ok(self
-                        .db
-                        .schema()
-                        .edge_type_name(record.edge_type)
+                    Ok(type_id
+                        .and_then(|type_id| self.db.schema().edge_type_name(type_id))
                         .map(|name| Value::Text(std::sync::Arc::from(name)))
                         .unwrap_or(Value::Null))
                 }
@@ -2352,12 +2367,24 @@ impl<'a> Executor<'a> {
             func::DURATION_IN_SECONDS => call_duration_between(DurationDiff::InSeconds, args),
             func::PROPERTIES => match args.first() {
                 Some(Value::Node(id)) => {
+                    if self.db.node_deleted(*id) {
+                        return Err(Error::new(
+                            ErrorCode::NotFound,
+                            "EntityNotFound: the node has been deleted",
+                        ));
+                    }
                     let Some(record) = self.db.get_node(*id)? else {
                         return Ok(Value::Null);
                     };
                     Ok(Value::Map(self.props_to_map(&record.props)))
                 }
                 Some(Value::Edge(id)) => {
+                    if self.db.deleted_edge_type(*id).is_some() {
+                        return Err(Error::new(
+                            ErrorCode::NotFound,
+                            "EntityNotFound: the relationship has been deleted",
+                        ));
+                    }
                     let Some(record) = self.db.get_edge(*id)? else {
                         return Ok(Value::Null);
                     };
@@ -3211,6 +3238,28 @@ fn regex_match(a: &Value, b: &Value) -> Value {
 }
 
 /// Convert entity values returned by functions into entity registers.
+/// Flatten the nodes and relationships reachable in a `DELETE` target:
+/// entities, paths and arbitrarily nested lists of them.
+fn collect_delete_targets(value: &Value, nodes: &mut Vec<u64>, edges: &mut Vec<u64>) -> Result<()> {
+    match value {
+        Value::Node(id) => nodes.push(*id),
+        Value::Edge(id) => edges.push(*id),
+        Value::List(items) => {
+            for item in items.iter() {
+                collect_delete_targets(item, nodes, edges)?;
+            }
+        }
+        Value::Null => {}
+        other => {
+            return Err(Error::type_error(format!(
+                "DELETE expects a node, relationship or path, got {}",
+                other.type_name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn normalize_reg(value: Value) -> Reg {
     match value {
         Value::Node(id) => Reg::Node(id),

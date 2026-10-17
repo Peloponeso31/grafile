@@ -1036,13 +1036,21 @@ impl Codegen {
                 detach,
             } => {
                 let mut apply = |cg: &mut Codegen, ctx: &mut Ctx| -> Result<()> {
+                    // All targets of one DELETE are removed together, so a
+                    // path list can share endpoints (relationships first).
+                    let mut targets = Vec::with_capacity(exprs.len());
                     for expr in exprs {
-                        let target = cg.compile_expr(expr, ctx)?;
-                        cg.emit(Op::DeleteAny {
-                            target,
-                            detach: *detach,
-                        });
+                        targets.push(cg.compile_expr(expr, ctx)?);
                     }
+                    let target = cg.alloc_reg();
+                    cg.emit(Op::BuildList {
+                        dest: target,
+                        items: targets,
+                    });
+                    cg.emit(Op::DeleteAny {
+                        target,
+                        detach: *detach,
+                    });
                     Ok(())
                 };
                 self.compile_updating(input, ctx, &mut apply, out)

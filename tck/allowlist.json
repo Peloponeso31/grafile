@@ -36,29 +36,7 @@
         "note": "procedures are not supported: `there exists a procedure test.labels() :: (label :: STRING?):`"
       }
     },
-    "clauses/delete/Delete5.feature": {
-      "[7] Delete paths from nested map/list": {
-        "reason": "not-implemented",
-        "note": "expected no rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident); expected -2 nodes, got +0; expected -2 relationships, got +0; e..."
-      }
-    },
     "clauses/return/Return2.feature": {
-      "[14] Do not fail when returning type of deleted relationships": {
-        "reason": "not-implemented",
-        "note": "expected column `type(r)`, got `type`"
-      },
-      "[15] Fail when returning properties of deleted nodes": {
-        "reason": "not-implemented",
-        "note": "expected EntityNotFound at runtime, but the query returned 1 rows"
-      },
-      "[16] Fail when returning labels of deleted nodes": {
-        "reason": "not-implemented",
-        "note": "expected EntityNotFound at runtime, but the query returned 1 rows"
-      },
-      "[17] Fail when returning properties of deleted relationships": {
-        "reason": "not-implemented",
-        "note": "expected EntityNotFound at runtime, but the query returned 1 rows"
-      },
       "[8] Returning label predicate expression": {
         "reason": "not-implemented",
         "note": "expected column `(n:Foo)`, got `LabelCheck { expr: Variable(\"n\"), labels: [\"Foo\"] }`"
@@ -118,12 +96,6 @@
       "[5] Label expression on null": {
         "reason": "not-implemented",
         "note": "expected column `m:TYPE`, got `(m:TYPE)`"
-      }
-    },
-    "expressions/pattern/Pattern1.feature": {
-      "[11] Fail on checking self pattern": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
       }
     },
     "expressions/pattern/Pattern2.feature": {

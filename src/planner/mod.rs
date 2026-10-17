@@ -362,6 +362,7 @@ impl<'a> Planner<'a> {
             let mut predicate = predicate.clone();
             self.extract_patterns(&mut predicate, plan, scope, PatternContext::Predicate)?;
             validate_expr(&predicate, scope)?;
+            check_predicate_kind(&predicate, scope)?;
             *plan = Plan::Filter {
                 input: Box::new(plan.clone()),
                 predicate,
@@ -393,6 +394,7 @@ impl<'a> Planner<'a> {
                 PatternContext::Predicate,
             )?;
             validate_expr(&predicate, &inner_scope)?;
+            check_predicate_kind(&predicate, &inner_scope)?;
             inner = Plan::Filter {
                 input: Box::new(inner),
                 predicate,
@@ -1826,6 +1828,7 @@ impl<'a> Planner<'a> {
                 .map(|(expr, name)| (name.clone(), expr_kind(expr, &scope)))
                 .collect();
             if validate_expr(predicate, &projected).is_ok() {
+                check_predicate_kind(predicate, &projected)?;
                 filter_after = Some(predicate.clone());
             } else if let Ok(rewritten) = rewrite_expr(predicate, &mut |sub| {
                 // Replace projected aliases by their defining expressions so
@@ -1841,6 +1844,7 @@ impl<'a> Planner<'a> {
             }) && !contains_aggregation(&rewritten)
                 && validate_expr(&rewritten, &scope).is_ok()
             {
+                check_predicate_kind(&rewritten, &scope)?;
                 self.extract_patterns(
                     &mut rewritten.clone(),
                     &mut input,
@@ -1860,6 +1864,7 @@ impl<'a> Planner<'a> {
                     PatternContext::Predicate,
                 )?;
                 validate_expr(&predicate, &scope)?;
+                check_predicate_kind(&predicate, &scope)?;
                 input = Plan::Filter {
                     input: Box::new(input),
                     predicate,
@@ -3461,6 +3466,20 @@ fn pattern_has_aggregation(path: &PatternPath) -> bool {
                 .as_ref()
                 .is_some_and(contains_aggregation)
         })
+}
+
+/// A predicate must be boolean (or null); statically known scalars are
+/// rejected when the clause is planned.
+fn check_predicate_kind(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
+    if let Some(kind) = static_kind(expr, scope)
+        && !matches!(kind, Kind::Boolean | Kind::Null)
+    {
+        return Err(Error::syntax(format!(
+            "InvalidArgumentType: a predicate must be a boolean, got {}",
+            kind.name()
+        )));
+    }
+    Ok(())
 }
 
 /// Whether `expr` references a variable that is neither bound inside the

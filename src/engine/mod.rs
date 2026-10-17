@@ -24,6 +24,13 @@ pub struct Database {
     nodes: Btree,
     edges: Btree,
     fragments: FragmentStore,
+    /// Nodes deleted by the statement in progress. Their records are gone,
+    /// but accessing their properties or labels is an error rather than a
+    /// miss while the statement still references them.
+    deleted_nodes: std::collections::HashSet<u64>,
+    /// Edges deleted by the statement in progress, with their type so
+    /// `type()` can still answer.
+    deleted_edges: std::collections::HashMap<u64, u32>,
 }
 
 /// One variable-length expansion: the relationships in traversal order and
@@ -66,6 +73,8 @@ impl Database {
             nodes,
             edges,
             fragments,
+            deleted_nodes: std::collections::HashSet::new(),
+            deleted_edges: std::collections::HashMap::new(),
         })
     }
 
@@ -93,6 +102,8 @@ impl Database {
             nodes,
             edges,
             fragments,
+            deleted_nodes: std::collections::HashSet::new(),
+            deleted_edges: std::collections::HashMap::new(),
         })
     }
 
@@ -368,6 +379,7 @@ impl Database {
             return Ok(false);
         };
         let record = EdgeRecord::decode(&bytes)?;
+        self.deleted_edges.insert(edge_id, record.edge_type);
         self.edges.delete(&mut self.pager, &edge_id.to_be_bytes())?;
         self.set_incidence(&record, edge_id, false)?;
         self.unindex_edge(&record, edge_id)?;
@@ -400,7 +412,24 @@ impl Database {
                 .clear_bit(&mut self.pager, &key, FragmentKey::label_bit(node_id))?;
         }
         self.unindex_node(&record, node_id)?;
+        self.deleted_nodes.insert(node_id);
         Ok(true)
+    }
+
+    /// Forget the deletions of the previous statement.
+    pub fn clear_deleted(&mut self) {
+        self.deleted_nodes.clear();
+        self.deleted_edges.clear();
+    }
+
+    /// Whether the node was deleted by the statement in progress.
+    pub fn node_deleted(&self, node_id: u64) -> bool {
+        self.deleted_nodes.contains(&node_id)
+    }
+
+    /// The type of an edge deleted by the statement in progress.
+    pub fn deleted_edge_type(&self, edge_id: u64) -> Option<u32> {
+        self.deleted_edges.get(&edge_id).copied()
     }
 
     /// Reject property values outside the value model: maps and entities,
