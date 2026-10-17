@@ -1292,11 +1292,19 @@ impl<'a> Planner<'a> {
                 let (props, prop_exprs) =
                     self.create_props(rel.properties.as_ref(), &local_scope)?;
                 local_scope.insert(var.clone(), VarKind::Edge);
+                // A left-pointing pattern (`(a)<-[:T]-(b)`) swaps the
+                // endpoints: the relationship still runs from `b` to `a`.
+                let (src, dst) = match rel.direction {
+                    RelDirection::Incoming => (next_var.clone(), prev_var),
+                    RelDirection::Outgoing | RelDirection::Undirected => {
+                        (prev_var, next_var.clone())
+                    }
+                };
                 items.push(CreateItem::Edge {
                     var,
                     edge_type: rel.types[0].clone(),
-                    src: prev_var,
-                    dst: next_var.clone(),
+                    src,
+                    dst,
                     props,
                     prop_exprs,
                 });

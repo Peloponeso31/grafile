@@ -1047,6 +1047,23 @@ fn standard_deviations() {
 // ---- temporal values ----
 
 #[test]
+fn create_respects_relationship_direction() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A)<-[:R]-(:B), (:C)-[:S]->(:D)")
+        .expect("create");
+    let rows = query(
+        &mut conn,
+        "MATCH (b:B)-[:R]->(a:A) RETURN labels(a), labels(b)",
+    );
+    assert_eq!(rows, vec![vec!["[A]", "[B]"]]);
+    let rows = query(
+        &mut conn,
+        "MATCH (c:C)-[:S]->(d:D) RETURN labels(c), labels(d)",
+    );
+    assert_eq!(rows, vec![vec!["[C]", "[D]"]]);
+}
+
+#[test]
 fn temporal_constructors_from_maps_and_strings() {
     let mut conn = connection();
     let rows = query(

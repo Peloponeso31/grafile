@@ -82,14 +82,6 @@
       "[22] Fail when creating a variable-length relationship": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[4] Create two nodes and a single relationship in the reverse direction": {
-        "reason": "not-implemented",
-        "note": "expected 1 rows, got 0"
-      },
-      "[6] Create a single relationship between two existing nodes in the reverse direction": {
-        "reason": "not-implemented",
-        "note": "expected 1 rows, got 0"
       }
     },
     "clauses/create/Create3.feature": {
@@ -103,18 +95,6 @@
       }
     },
     "clauses/create/Create5.feature": {
-      "[2] Create a pattern with multiple hops in the reverse direction": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected (:A) | (:B) | (:C), got (:C) | (:B) | (:A)"
-      },
-      "[3] Create a pattern with multiple hops in varying directions": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected (:A) | (:B) | (:C), got (:A) | (:B) | (:A)"
-      },
-      "[4] Create a pattern with multiple hops with multiple types and varying directions": {
-        "reason": "not-implemented",
-        "note": "expected 1 rows, got 0"
-      },
       "[5] Create a pattern with multiple hops and varying directions": {
         "reason": "not-implemented",
         "note": "expected column `a`, got `r2`"
@@ -166,10 +146,6 @@
       "[15] Fail on aggregation in WHERE": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[8] Filter relationship with property predicate on multi variables with multiple bindings": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected (:A), got ()"
       }
     },
     "clauses/match-where/MatchWhere2.feature": {
@@ -264,10 +240,6 @@
       "[13] Fail when matching a relationship variable bound to a value (example 8)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      },
-      "[5] Match relationship with inline property value": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected (:A), got ()"
       }
     },
     "clauses/match/Match3.feature": {
@@ -354,10 +326,6 @@
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       },
       "[20] Variable length relationship without bounds": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[5] Path query should return results in written order": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       },
