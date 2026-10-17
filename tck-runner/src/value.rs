@@ -402,6 +402,26 @@ pub fn canonical_expected(value: &Expected) -> String {
             keys.sort();
             format!("[:{}{}]", ty.clone().unwrap_or_default(), keys.join(","))
         }
+        Expected::Path(elements) => {
+            // Paths compare against lists of alternating node and
+            // relationship values, so their canonical form is the sorted
+            // list form used for lists.
+            let mut keys: Vec<String> = elements
+                .iter()
+                .map(|element| match element {
+                    PathElem::Node { labels, props } => canonical_expected(&Expected::Node {
+                        labels: labels.clone(),
+                        props: props.clone(),
+                    }),
+                    PathElem::Rel { ty, props, .. } => canonical_expected(&Expected::Rel {
+                        ty: ty.clone(),
+                        props: props.clone(),
+                    }),
+                })
+                .collect();
+            keys.sort();
+            format!("[{}]", keys.join(","))
+        }
         other => other.to_string(),
     }
 }

@@ -371,15 +371,7 @@
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       },
-      "[18] Undirected named path": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
       "[19] Variable length relationship without lower bound": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[1] Zero-length named path": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       },
@@ -387,23 +379,7 @@
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       },
-      "[2] Return a simple path": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[3] Return a three node path": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
       "[5] Path query should return results in written order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[6] Handling direction of named paths": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[7] Respecting direction when matching existing path": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       },
@@ -416,17 +392,7 @@
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       }
     },
-    "clauses/match/Match7.feature": {
-      "[17] Optionally matching named paths - existing result": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 4 column 16 (found Ident)"
-      }
-    },
     "clauses/match/Match8.feature": {
-      "[2] Counting rows after MATCH, MERGE, OPTIONAL MATCH": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 5 column 16 (found LParen)"
-      },
       "[3] Matching and disregarding output, then matching again": {
         "reason": "not-implemented",
         "note": "expected column `sum(r1.times)`, got `sum`"
@@ -444,82 +410,18 @@
       "[3] Return relationships by collecting them as a list - undirected, starting from two extremes": {
         "reason": "not-implemented",
         "note": "setup failed: Syntax: expected an identifier at line 2 column 11 (found End)"
-      },
-      "[9] Optionally matching named paths with variable length patterns": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 4 column 16 (found Ident)"
       }
     },
     "clauses/merge/Merge1.feature": {
-      "[13] Merge should bind a path": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident); expected +1 nodes, got +0; expected +1 properties, got +0"
-      },
       "[14] Merges should not be able to match on deleted nodes": {
         "reason": "not-implemented",
         "note": "expected column `a2.num`, got `num`; expected -2 nodes, got -1"
-      },
-      "[17] Fail on merging node with null property": {
-        "reason": "not-implemented",
-        "note": "expected SemanticError at runtime, but the query returned 0 rows"
       }
     },
     "clauses/merge/Merge5.feature": {
-      "[10] Merge should bind a path": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 4 column 7 (found Ident); expected +2 nodes, got +0; expected +1 relationships, got +0; expe..."
-      },
-      "[12] Match outgoing relationship when direction unspecified": {
-        "reason": "not-implemented",
-        "note": "expected no side effects, got +0 nodes, +1 relationships, +0 properties, +0 labels"
-      },
-      "[13] Match both incoming and outgoing relationships when direction unspecified": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected [:KNOWS {name: 'ab'}], got [:KNOWS {name: 'ab'}]; expected no side effects, got +0 nodes, +1 relationships, +0 properties, +0 labels"
-      },
       "[14] Using list properties via variable": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: function `split` is not supported yet; expected +2 nodes, got +0; expected +1 relationships, got +0; expected +1 properties, got +0;..."
-      },
-      "[22] Fail when imposing new predicates on a variable that is already bound": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 0 rows"
-      },
-      "[28] Fail when using variable length relationship in MERGE": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[29] Fail on merging relationship with null property": {
-        "reason": "not-implemented",
-        "note": "expected SemanticError at runtime, but the query returned 0 rows"
-      },
-      "[3] Matching two relationships": {
-        "reason": "not-implemented",
-        "note": "expected column `count(r)`, got `count`"
-      }
-    },
-    "clauses/merge/Merge6.feature": {
-      "[3] Updating one property with ON CREATE": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 3 column 24 (found Pipe)"
-      },
-      "[6] Copying properties from node with ON CREATE": {
-        "reason": "not-implemented",
-        "note": "expected no rows, got a runtime error: runtime: Type: expected a node, got relationship; expected +1 relationships, got +0; expected +1 properties, got +0; expected rows, got a compile time error: com..."
-      },
-      "[7] Copying properties from literal map with ON CREATE": {
-        "reason": "not-implemented",
-        "note": "expected no rows, got a compile time error: compile time: Syntax: expected '.', ':' or '=' in SET item at line 4 column 17 (found Plus); expected +1 relationships, got +0; expected +2 properties, got ..."
-      }
-    },
-    "clauses/merge/Merge7.feature": {
-      "[4] Copying properties from node with ON MATCH": {
-        "reason": "not-implemented",
-        "note": "expected no rows, got a runtime error: runtime: Type: expected a node, got relationship; expected -1 properties, got +0; expected rows, got a compile time error: compile time: Syntax: expected ']' to ..."
-      },
-      "[5] Copying properties from literal map with ON MATCH": {
-        "reason": "not-implemented",
-        "note": "expected no rows, got a compile time error: compile time: Syntax: expected '.', ':' or '=' in SET item at line 4 column 18 (found Plus); expected -1 properties, got +0; expected rows, got a compile ti..."
       }
     },
     "clauses/return-orderby/ReturnOrderBy1.feature": {
@@ -726,12 +628,6 @@
       "[6] Handle aggregates inside non-aggregate expressions": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      }
-    },
-    "clauses/return/Return7.feature": {
-      "[1] Return all variables": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       }
     },
     "clauses/set/Set1.feature": {
@@ -1240,10 +1136,6 @@
     },
     "clauses/with/With1.feature": {
       "[2] Forwarind a node variable 2": {
-        "reason": "not-implemented",
-        "note": "expected column `a`, got `b`"
-      },
-      "[4] Forwarding a path variable": {
         "reason": "not-implemented",
         "note": "expected column `a`, got `b`"
       }
@@ -2018,12 +1910,6 @@
       "[9] Fail when performing property access on a non-graph element (example 6)": {
         "reason": "not-implemented",
         "note": "expected TypeError at compile time, but the query returned 1 rows"
-      }
-    },
-    "expressions/graph/Graph7.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 'Apa', got null"
       }
     },
     "expressions/graph/Graph9.feature": {
