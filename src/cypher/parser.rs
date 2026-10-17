@@ -807,6 +807,12 @@ impl<'a> Parser<'a> {
 
     fn parse_unary(&mut self) -> Result<Expr> {
         if self.eat(Token::Minus) {
+            // Fold the sign into a following number literal so that the full
+            // range down to `i64::MIN` and huge negative floats parse, and
+            // `-0.0` normalizes to `0.0` like Neo4j.
+            if let Some(literal) = self.try_parse_negative_number()? {
+                return Ok(literal);
+            }
             let expr = self.parse_unary()?;
             return Ok(Expr::Unary {
                 op: UnaryOp::Neg,
@@ -817,6 +823,40 @@ impl<'a> Parser<'a> {
             return self.parse_unary();
         }
         self.parse_postfix()
+    }
+
+    /// The sign of a number literal immediately following a unary minus.
+    fn try_parse_negative_number(&mut self) -> Result<Option<Expr>> {
+        let spanned = match self.tokens.get(self.pos) {
+            Some(spanned) => *spanned,
+            None => return Ok(None),
+        };
+        let text = &self.source[spanned.start..spanned.end];
+        let value = match spanned.token {
+            Token::Float => {
+                self.advance();
+                let value = parse_float(text)?;
+                // Negative zero is normalized to positive zero.
+                Number::Float(if value == 0.0 { 0.0 } else { -value })
+            }
+            Token::Integer => {
+                self.advance();
+                parse_negative_decimal_integer(text)?
+            }
+            Token::HexInteger => {
+                self.advance();
+                parse_negative_radix_integer(text, 16, "0x")?
+            }
+            Token::OctalInteger => {
+                self.advance();
+                parse_negative_radix_integer(text, 8, "0o")?
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(match value {
+            Number::Int(value) => Expr::Literal(Value::Int(value)),
+            Number::Float(value) => Expr::Literal(Value::Float(value)),
+        }))
     }
 
     /// Parse a function-call argument list; the opening parenthesis has
@@ -912,16 +952,24 @@ impl<'a> Parser<'a> {
         match spanned.token {
             Token::Integer => {
                 self.advance();
-                let value = text().parse::<i64>().map_err(|_| {
-                    Error::syntax(format!("integer literal {} out of range", text()))
-                })?;
+                Ok(match parse_decimal_integer(text())? {
+                    Number::Int(value) => Expr::Literal(Value::Int(value)),
+                    Number::Float(value) => Expr::Literal(Value::Float(value)),
+                })
+            }
+            Token::HexInteger => {
+                self.advance();
+                let value = parse_radix_integer(text(), 16, "0x")?;
+                Ok(Expr::Literal(Value::Int(value)))
+            }
+            Token::OctalInteger => {
+                self.advance();
+                let value = parse_radix_integer(text(), 8, "0o")?;
                 Ok(Expr::Literal(Value::Int(value)))
             }
             Token::Float => {
                 self.advance();
-                let value = text()
-                    .parse::<f64>()
-                    .map_err(|_| Error::syntax(format!("invalid float literal {}", text())))?;
+                let value = parse_float(text())?;
                 Ok(Expr::Literal(Value::Float(value)))
             }
             Token::StringSingle | Token::StringDouble => {
@@ -1195,6 +1243,74 @@ fn binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
     }
 }
 
+/// A parsed number literal, before it becomes an [`Expr`].
+enum Number {
+    Int(i64),
+    Float(f64),
+}
+
+/// Parse a decimal integer literal, falling back to a float when the value
+/// exceeds the `u64` range (Neo4j parses arbitrarily long numbers as floats
+/// but rejects values that could have been a 64-bit unsigned integer).
+fn parse_decimal_integer(text: &str) -> Result<Number> {
+    if let Ok(value) = text.parse::<i64>() {
+        return Ok(Number::Int(value));
+    }
+    if text.parse::<u64>().is_ok() {
+        return Err(Error::syntax("integer literal overflows 64 bits"));
+    }
+    Ok(Number::Float(parse_float(text)?))
+}
+
+/// Parse a `0x`/`0o` integer literal.
+fn parse_radix_integer(text: &str, radix: u32, prefix: &str) -> Result<i64> {
+    let digits = text
+        .strip_prefix(prefix)
+        .or_else(|| text.strip_prefix(&prefix.to_ascii_uppercase()))
+        .unwrap_or(text);
+    let magnitude = u64::from_str_radix(digits, radix)
+        .map_err(|_| Error::syntax(format!("invalid integer literal `{text}`")))?;
+    i64::try_from(magnitude).map_err(|_| Error::syntax("integer literal overflows 64 bits"))
+}
+
+/// Parse the text following a unary minus.
+fn parse_negative_decimal_integer(text: &str) -> Result<Number> {
+    let signed = format!("-{text}");
+    if let Ok(value) = signed.parse::<i64>() {
+        return Ok(Number::Int(value));
+    }
+    match text.parse::<u64>() {
+        // Within the unsigned range: an overflow rather than a float.
+        Ok(_) => Err(Error::syntax("integer literal overflows 64 bits")),
+        Err(_) => Ok(Number::Float(parse_float(&signed)?)),
+    }
+}
+
+/// Parse the text following a unary minus for `0x`/`0o` literals.
+fn parse_negative_radix_integer(text: &str, radix: u32, prefix: &str) -> Result<Number> {
+    let digits = text
+        .strip_prefix(prefix)
+        .or_else(|| text.strip_prefix(&prefix.to_ascii_uppercase()))
+        .unwrap_or(text);
+    let magnitude = u64::from_str_radix(digits, radix)
+        .map_err(|_| Error::syntax(format!("invalid integer literal `{text}`")))?;
+    // Negating the magnitude covers `-2^63` exactly.
+    i64::try_from(0_i128 - magnitude as i128)
+        .map(Number::Int)
+        .map_err(|_| Error::syntax("integer literal overflows 64 bits"))
+}
+
+/// Parse a float literal, rejecting values that do not fit `f64`.
+fn parse_float(text: &str) -> Result<f64> {
+    let value = text
+        .parse::<f64>()
+        .map_err(|_| Error::syntax(format!("invalid float literal `{text}`")))?;
+    if !value.is_finite() {
+        return Err(Error::syntax("floating point literal overflows 64 bits"));
+    }
+    Ok(value)
+}
+
 fn unescape_string(raw: &str) -> Result<String> {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars();
@@ -1370,6 +1486,37 @@ mod tests {
             panic!("expected comparison inside NOT");
         };
         assert_eq!(op, BinaryOp::Eq);
+    }
+
+    #[test]
+    fn parses_hex_octal_and_extreme_literals() {
+        let int_of = |query: &str| match expr_of(query) {
+            Expr::Literal(Value::Int(value)) => value,
+            other => panic!("expected integer literal, got {other:?}"),
+        };
+        assert_eq!(int_of("RETURN 0x1A2b"), 0x1a2b);
+        assert_eq!(int_of("RETURN 0o17"), 0o17);
+        assert_eq!(int_of("RETURN 0x7FFFFFFFFFFFFFFF"), i64::MAX);
+        assert_eq!(int_of("RETURN -0x8000000000000000"), i64::MIN);
+        assert_eq!(int_of("RETURN -0o1000000000000000000000"), i64::MIN);
+        assert_eq!(int_of("RETURN -9223372036854775808"), i64::MIN);
+
+        for query in [
+            "RETURN 9223372036854775808",
+            "RETURN -9223372036854775809",
+            "RETURN 0o1000000000000000000000",
+            "RETURN 1.34E999",
+        ] {
+            assert!(parse(query).is_err(), "{query}");
+        }
+
+        let float_of = |query: &str| match expr_of(query) {
+            Expr::Literal(Value::Float(value)) => value,
+            other => panic!("expected float literal, got {other:?}"),
+        };
+        assert_eq!(float_of("RETURN -0.0"), 0.0);
+        assert_eq!(float_of("RETURN -.0"), 0.0);
+        assert!(float_of("RETURN -12635418652381263541826355").is_sign_negative());
     }
 
     #[test]

@@ -158,6 +158,12 @@ pub enum Token {
     /// Floating point literal.
     #[regex(r"([0-9]+\.[0-9]+|\.[0-9]+)([eE][+-]?[0-9]+)?|[0-9]+[eE][+-]?[0-9]+")]
     Float,
+    /// Hexadecimal integer literal.
+    #[regex(r"0[xX][0-9a-fA-F]+")]
+    HexInteger,
+    /// Octal integer literal.
+    #[regex(r"0[oO][0-7]+")]
+    OctalInteger,
     /// Single-quoted string.
     #[regex(r"'([^'\\]|\\.)*'")]
     StringSingle,
@@ -431,7 +437,7 @@ fn classify(token: Token, tokens: &[(usize, usize, Token)], index: usize) -> Tok
     match token {
         LineComment | BlockComment => TokenClass::Comment,
         StringSingle | StringDouble => TokenClass::String,
-        Integer | Float => TokenClass::Number,
+        Integer | Float | HexInteger | OctalInteger => TokenClass::Number,
         Param => TokenClass::Parameter,
         Ident => {
             // `name(` is a function or aggregation call.

@@ -439,6 +439,10 @@ pub fn canonical_expected(value: &Expected) -> String {
 pub fn canonical_actual(value: &Actual) -> String {
     match value {
         Actual::Float(value) => canonical_float(*value),
+        // Escape text exactly like the expected-value renderer so the
+        // order-insensitive comparison matches for values containing
+        // quotes or backslashes.
+        Actual::Text(value) => format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'")),
         Actual::List(items) => {
             let mut keys: Vec<String> = items.iter().map(canonical_actual).collect();
             keys.sort();
