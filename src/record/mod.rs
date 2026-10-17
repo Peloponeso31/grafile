@@ -176,7 +176,7 @@ impl Ord for Value {
             (Self::Float(a), Self::Int(b)) => float_cmp(*a, *b as f64),
             (Self::Text(a), Self::Text(b)) => a.as_bytes().cmp(b.as_bytes()),
             (Self::Bytes(a), Self::Bytes(b)) => a.cmp(b),
-            (Self::List(a), Self::List(b)) => a.cmp(b),
+            (Self::List(a), Self::List(b)) => compare_lists(a, b),
             (Self::Map(a), Self::Map(b)) => a.cmp(b),
             (Self::Node(a), Self::Node(b)) => a.cmp(b),
             (Self::Edge(a), Self::Edge(b)) => a.cmp(b),
@@ -200,20 +200,20 @@ fn float_cmp(a: f64, b: f64) -> std::cmp::Ordering {
     a.total_cmp(&b)
 }
 
+/// Cross-type orderability, matching Neo4j: maps first, then nodes,
+/// relationships, lists, strings, booleans, numbers, with null last
+/// (`ORDER BY` places nulls last ascending). Paths are lists internally, so
+/// they rank with lists and are separated by [`compare_lists`].
 fn rank(value: &Value) -> u8 {
     match value {
-        Value::Null => 0,
-        Value::Bool(_) => 1,
-        Value::Int(_) | Value::Float(_) => 2,
-        Value::Text(_) => 3,
-        Value::Bytes(_) => 4,
-        Value::List(_) => 5,
-        Value::Map(_) => 6,
-        Value::Node(_) => 7,
-        Value::Edge(_) => 8,
-        // The relative order of the temporal and spatial types is
-        // provisional until the Phase 4 ordering sweep; it only needs to be
-        // total and stable.
+        Value::Map(_) => 1,
+        Value::Node(_) => 2,
+        Value::Edge(_) => 3,
+        Value::List(_) => 4,
+        Value::Bytes(_) => 5,
+        Value::Text(_) => 6,
+        Value::Bool(_) => 7,
+        Value::Int(_) | Value::Float(_) => 8,
         Value::Date(_) => 9,
         Value::LocalTime(_) => 10,
         Value::Time(_) => 11,
@@ -221,7 +221,37 @@ fn rank(value: &Value) -> u8 {
         Value::DateTime(_) => 13,
         Value::Duration(_) => 14,
         Value::Point(_) => 15,
+        Value::Null => 16,
     }
+}
+
+/// Compare two lists: lexicographic element-wise, with path-shaped lists
+/// (alternating nodes and relationships) ordering after plain lists like
+/// Neo4j's `Path` type. Null elements compare last via [`rank`].
+fn compare_lists(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    match (is_path_shaped(a), is_path_shaped(b)) {
+        (false, true) => return std::cmp::Ordering::Less,
+        (true, false) => return std::cmp::Ordering::Greater,
+        _ => {}
+    }
+    a.cmp(b)
+}
+
+/// Whether a list has the shape of a path: `[node, edge, node, ..., node]`.
+pub fn is_path_shaped(items: &[Value]) -> bool {
+    items.len() >= 3
+        && items.len() % 2 == 1
+        && matches!(items[0], Value::Node(_))
+        && items
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .all(|item| matches!(item, Value::Edge(_)))
+        && items
+            .iter()
+            .skip(2)
+            .step_by(2)
+            .all(|item| matches!(item, Value::Node(_)))
 }
 
 /// Cypher equality: `None` when either side is null or the types are
@@ -280,7 +310,27 @@ pub fn value_equals(a: &Value, b: &Value) -> Option<bool> {
             }
             if unknown { None } else { Some(true) }
         }
-        _ => None,
+        (Value::Map(x), Value::Map(y)) => {
+            // Maps equal when they have the same keys and equal values;
+            // `{k: null}` is not equal to `{}`.
+            if x.len() != y.len() {
+                return Some(false);
+            }
+            let mut unknown = false;
+            for (key, value) in x.iter() {
+                let Some((_, other)) = y.iter().find(|(name, _)| name == key) else {
+                    return Some(false);
+                };
+                match value_equals(value, other) {
+                    Some(true) => {}
+                    Some(false) => return Some(false),
+                    None => unknown = true,
+                }
+            }
+            if unknown { None } else { Some(true) }
+        }
+        // Values of different types are never equal (not unknown).
+        _ => Some(false),
     }
 }
 

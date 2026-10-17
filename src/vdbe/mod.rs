@@ -2903,6 +2903,51 @@ fn type_error(operation: &str, a: &Value, b: &Value) -> Error {
     ))
 }
 
+/// Lexicographic list ordering for the comparison operators: element-wise,
+/// then by length, with a null element making the comparison unknown.
+fn list_order(a: &[Value], b: &[Value]) -> Option<std::cmp::Ordering> {
+    for (left, right) in a.iter().zip(b.iter()) {
+        if left.is_null() || right.is_null() {
+            return None;
+        }
+        match value_order(left, right) {
+            Some(std::cmp::Ordering::Equal) => {}
+            Some(ordering) => return Some(ordering),
+            None => return None,
+        }
+    }
+    Some(a.len().cmp(&b.len()))
+}
+
+/// Ordering of two values under the comparison operators; `None` when the
+/// types are incomparable (which yields null).
+fn value_order(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::Int(_), Value::Int(_))
+        | (Value::Float(_), Value::Float(_))
+        | (Value::Int(_), Value::Float(_))
+        | (Value::Float(_), Value::Int(_)) => {
+            if matches!(a, Value::Float(value) if value.is_nan())
+                || matches!(b, Value::Float(value) if value.is_nan())
+            {
+                return None;
+            }
+            Some(a.as_number()?.total_cmp(&b.as_number()?))
+        }
+        (Value::Text(x), Value::Text(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
+        (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+        (Value::List(x), Value::List(y)) => list_order(x, y),
+        (Value::Date(x), Value::Date(y)) => Some(x.cmp(y)),
+        (Value::LocalTime(x), Value::LocalTime(y)) => Some(x.cmp(y)),
+        (Value::Time(x), Value::Time(y)) => Some(x.cmp(y)),
+        (Value::LocalDateTime(x), Value::LocalDateTime(y)) => Some(x.cmp(y)),
+        (Value::DateTime(x), Value::DateTime(y)) => Some(x.cmp(y)),
+        (Value::Duration(x), Value::Duration(y)) => Some(x.cmp(y)),
+        (Value::Point(x), Value::Point(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
 fn compare_value(op: u8, a: &Value, b: &Value) -> Value {
     use binary_code as code;
     let ordering = match (a, b) {
@@ -2911,6 +2956,12 @@ fn compare_value(op: u8, a: &Value, b: &Value) -> Value {
         | (Value::Float(_), Value::Float(_))
         | (Value::Int(_), Value::Float(_))
         | (Value::Float(_), Value::Int(_)) => {
+            // NaN is incomparable: every ordering comparison is false.
+            if matches!(a, Value::Float(value) if value.is_nan())
+                || matches!(b, Value::Float(value) if value.is_nan())
+            {
+                return Value::Bool(false);
+            }
             let (Some(x), Some(y)) = (a.as_number(), b.as_number()) else {
                 return Value::Null;
             };
@@ -2918,6 +2969,17 @@ fn compare_value(op: u8, a: &Value, b: &Value) -> Value {
         }
         (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::List(x), Value::List(y)) => {
+            // Lists and paths are distinct types: comparing one with the
+            // other yields null, like any other cross-type ordering.
+            if crate::record::is_path_shaped(x) != crate::record::is_path_shaped(y) {
+                return Value::Null;
+            }
+            match list_order(x, y) {
+                Some(ordering) => ordering,
+                None => return Value::Null,
+            }
+        }
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::LocalTime(x), Value::LocalTime(y)) => x.cmp(y),
         (Value::Time(x), Value::Time(y)) => x.cmp(y),

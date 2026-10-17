@@ -360,24 +360,6 @@
         "note": "expected column `a2.num`, got `num`; expected -2 nodes, got -1"
       }
     },
-    "clauses/return-orderby/ReturnOrderBy1.feature": {
-      "[10] ORDER BY DESC should order lists in the expected order": {
-        "reason": "not-implemented",
-        "note": "row 0: list element 0: expected null, got 'a'; row 1: expected a list of 2 elements, got 1; row 2: list element 1: expected null, got 'a'; row 3: list element 1: expected 'a', got null; row 5: list el..."
-      },
-      "[11] ORDER BY should order distinct types in the expected order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[12] ORDER BY DESC should order distinct types in the expected order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[9] ORDER BY should order lists in the expected order": {
-        "reason": "not-implemented",
-        "note": "row 1: expected a list of 1 elements, got 2; row 2: list element 0: expected 'a', got null; row 4: list element 1: expected 'a', got null; row 5: list element 1: expected null, got 'a'; row 6: expecte..."
-      }
-    },
     "clauses/return-orderby/ReturnOrderBy2.feature": {
       "[12] Aggregation of named paths": {
         "reason": "not-implemented",
@@ -546,28 +528,6 @@
       "[6] Creating nodes from an unwound parameter list": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected an identifier at line 5 column 14 (found In); expected +2 nodes, got +0; expected +2 relationships, got +0; expected +2 properti..."
-      }
-    },
-    "clauses/with-orderBy/WithOrderBy1.feature": {
-      "[10] Sort lists in descending order": {
-        "reason": "not-implemented",
-        "note": "row 0: list element 0: expected null, got 'a'; row 1: expected a list of 2 elements, got 1; row 2: list element 1: expected null, got 'a'; row 3: list element 1: expected 'a', got null"
-      },
-      "[21] Sort distinct types in ascending order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[22] Sort distinct types in descending order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[45] Sort order should be consistent with comparisons where comparisons are defined #Example: <exampleName> (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 5 column 25 (found Where)"
-      },
-      "[9] Sort lists in ascending order": {
-        "reason": "not-implemented",
-        "note": "row 1: expected a list of 1 elements, got 2; row 2: list element 0: expected 'a', got null"
       }
     },
     "clauses/with-orderBy/WithOrderBy2.feature": {
@@ -766,16 +726,6 @@
       "[9] Fail if more complex expression, even if projected, are used inside expression which contains an aggregation expression": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      }
-    },
-    "expressions/aggregation/Aggregation2.feature": {
-      "[11] `max()` over mixed values": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 1, got [1, 2]"
-      },
-      "[12] `min()` over mixed values": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected [1, 2], got 0.2"
       }
     },
     "expressions/boolean/Boolean1.feature": {
@@ -1226,94 +1176,6 @@
         "note": "expected SyntaxError at compile time, got TypeError at runtime"
       }
     },
-    "expressions/comparison/Comparison1.feature": {
-      "[6] Comparing lists to lists (example 3)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[7] Comparing maps to maps (example 1)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true, got null"
-      },
-      "[7] Comparing maps to maps (example 10)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[7] Comparing maps to maps (example 11)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[7] Comparing maps to maps (example 2)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true, got null"
-      },
-      "[7] Comparing maps to maps (example 3)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true, got null"
-      },
-      "[7] Comparing maps to maps (example 4)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true, got null"
-      },
-      "[7] Comparing maps to maps (example 5)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true, got null"
-      },
-      "[7] Comparing maps to maps (example 6)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true, got null"
-      },
-      "[7] Comparing maps to maps (example 7)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[7] Comparing maps to maps (example 8)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[7] Comparing maps to maps (example 9)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[8] Equality and inequality of NaN (example 4)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false | true, got null | null"
-      },
-      "[9] Equality between strings and numbers (example 3)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[9] Equality between strings and numbers (example 4)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      }
-    },
-    "expressions/comparison/Comparison2.feature": {
-      "[4] Comparing lists (example 1)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true, got null"
-      },
-      "[4] Comparing lists (example 2)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true, got null"
-      },
-      "[4] Comparing lists (example 5)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[5] Comparing NaN (example 1)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false | false | false | false, got true | true | false | false"
-      },
-      "[5] Comparing NaN (example 2)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false | false | false | false, got true | true | false | false"
-      },
-      "[5] Comparing NaN (example 3)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false | false | false | false, got false | true | false | true"
-      }
-    },
     "expressions/existentialSubqueries/ExistentialSubquery1.feature": {
       "*": {
         "reason": "not-implemented",
@@ -1426,57 +1288,7 @@
         "note": "expected SyntaxError at compile time, but the query returned 1 rows"
       }
     },
-    "expressions/list/List3.feature": {
-      "[1] Equality between list and literal should return false": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[3] Equality between different lists with null should return false": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[6] Equality between different nested lists with null should return false": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      }
-    },
     "expressions/list/List5.feature": {
-      "[11] IN should return false when order of elements in LHS list and RHS list don't match": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[12] IN with different length lists should return false": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[13] IN should return false when matching a list with a nested list with same elements": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[18] IN should return false when LHS contains a nested list and type mismatch on RHS - singleton version": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[19] IN should return false when LHS contains a nested list and type mismatch on RHS": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[28] IN should return false if no match can be found, despite nulls": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[30] IN should return false if different length lists compared, even if the extra element is null": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[33] IN should return false if different length lists with nested elements compared, even if the extra element is null": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[38] IN should work with an empty list in the presence of other list elements: not matching": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
       "[42] Failing when using IN on a non-list literal (example 1)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 1 rows"
@@ -1496,22 +1308,6 @@
       "[42] Failing when using IN on a non-list literal (example 5)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 1 rows"
-      },
-      "[5] IN should return false when matching a number with a string": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[6] IN should return false when matching a number with a string - list version": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[7] IN should return false when types of LHS and RHS don't match - singleton list": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
-      },
-      "[8] IN should return false when types of LHS and RHS don't match - list": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false, got null"
       }
     },
     "expressions/list/List6.feature": {
@@ -1706,40 +1502,6 @@
       "[7] Use a pattern comprehension inside a list comprehension": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: pattern expressions inside list comprehensions are not supported"
-      }
-    },
-    "expressions/precedence/Precedence3.feature": {
-      "[4] List appending takes precedence over list element containment": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a runtime error: runtime: Type: cannot apply arithmetic to list and integer"
-      },
-      "[5] List concatenation takes precedence over list element containment": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false | false | [false, 4] | [1, false, 4], got null | null | null | null"
-      },
-      "[6] List element containment takes precedence over comparison operator (example 1)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected false | false | true, got true | null | true"
-      },
-      "[6] List element containment takes precedence over comparison operator (example 2)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected true | true | false, got null | null | null"
-      },
-      "[6] List element containment takes precedence over comparison operator (example 3)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected null | null | false, got null | null | null"
-      },
-      "[6] List element containment takes precedence over comparison operator (example 4)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected null | null | true, got null | null | null"
-      },
-      "[6] List element containment takes precedence over comparison operator (example 5)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected null | null | false, got null | null | null"
-      },
-      "[6] List element containment takes precedence over comparison operator (example 6)": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected null | null | true, got null | null | null"
       }
     },
     "expressions/quantifier/Quantifier1.feature": {
