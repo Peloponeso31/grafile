@@ -294,7 +294,7 @@ fn find_ge(
                     return Ok(Some(found));
                 }
             }
-            find_first(pager, interior.rightmost, kind)
+            find_ge(pager, interior.rightmost, kind, target)
         }
     }
 }
@@ -464,15 +464,8 @@ mod tests {
         pager.commit().expect("commit");
     }
 
-    /// Ignored: exposes a real bug, not a bad expectation.
-    ///
-    /// `find_ge`'s interior fallback calls `find_first(rightmost)` instead of
-    /// recursing with the target. When the target is greater than every
-    /// divider (so every child is skipped) but smaller than a later key of
-    /// the rightmost subtree, the cursor lands on the first key of that
-    /// subtree. Reproduction: keys `i * 7` for `i in 0..500` with 200-byte
-    /// values; `seek_ge(3432)` returns 3430 (expected 3437).
-    #[ignore = "bug: find_ge returns the first key of the rightmost subtree instead of the first key >= target"]
+    /// Seek sweeps must agree with a `BTreeMap` model across leaf pages,
+    /// including targets greater than every divider of an interior node.
     #[test]
     fn seeks_match_the_model_across_pages() {
         let mut pager = test_pager();
