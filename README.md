@@ -119,8 +119,17 @@ verifies its SHA-256, and installs to `~/.local/bin` without sudo:
 $ curl -LsSf https://github.com/Peloponeso31/grafile/releases/latest/download/install.sh | sh
 ```
 
-Set `GRAFILE_INSTALL_DIR` to install elsewhere, or `GRAFILE_VERSION` to pin a
-release.
+Set `GRAFILE_PREFIX` to install elsewhere, or `GRAFILE_VERSION` to pin a
+release. Alongside the binary the script installs the FFI library
+(`lib/libgrafile.*`), the C header (`include/grafile.h`) and pkg-config
+metadata (`lib/pkgconfig/grafile.pc`), so programs can link with:
+
+```console
+$ export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig:$PKG_CONFIG_PATH"
+$ cc app.c $(pkg-config --cflags --libs grafile)
+```
+
+See [docs/ffi.md](docs/ffi.md) for the C ABI.
 
 Debian/Ubuntu users can install the `.deb`; Fedora/RHEL users the `.rpm`
 (x86_64 and aarch64 packages are released):
@@ -318,29 +327,49 @@ in `ffi/examples/`.
 ## Cypher support
 
 Implemented: `MATCH` (node and relationship patterns, directions, type
-disjunction, inline property filters), `WHERE`, `RETURN` and `WITH` (with
+disjunction, inline property filters including non-literal values),
+`OPTIONAL MATCH`, `WHERE`, `RETURN` and `WITH` (with
 `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`), `UNWIND`, `CREATE`, `MERGE` (with
 `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE` /
-`DETACH DELETE`, `UNION` / `UNION ALL`, `SET n += {…}`, parameters
+`DETACH DELETE`, `FOREACH`, `CALL` for built-in `db.*` procedures,
+`UNION` / `UNION ALL`, `SET n += {…}`, parameters
 (`$name`), list and map literals, map field access and subscript
 (`m.k`, `m['k']`), list indexing and slicing (`list[1..3]`), list
-comprehensions, quantifiers (`all`, `any`, `none`, `single`), `reduce()`,
-variable-length paths (`*1..3`), named paths (`p = …`) with `nodes(p)`,
+comprehensions, pattern predicates and pattern comprehensions,
+quantifiers (`all`, `any`, `none`, `single`), `reduce()`,
+variable-length paths (`*1..3`), `shortestPath()` / `allShortestPaths()`,
+named paths (`p = …`) with `nodes(p)`,
 `relationships(p)` and `length(p)`, `CASE`,
 `IS [NOT] NULL`, string predicates (`STARTS WITH`, `ENDS WITH`, `CONTAINS`,
 `=~`), label predicates, three-valued logic, and the aggregations `count`,
-`sum`, `avg`, `min`, `max`, `collect` (with `DISTINCT` and expressions over
-aggregations). Scalar functions: `id`, `labels`,
-`type`, `startNode`, `endNode`, `coalesce`, `toString`, `toInteger`,
-`toFloat`, `size`, `properties`, `keys`.
+`sum`, `avg`, `min`, `max`, `collect`, `percentileCont`, `percentileDisc`,
+`stDev`, `stDevP` (with `DISTINCT` and expressions over aggregations).
+Scalar functions: the graph accessors (`id`, `labels`, `type`, `startNode`,
+`endNode`, `properties`, `keys`, `nodes`, `relationships`, `size`,
+`length`), conversions (`toString`, `toInteger`, `toFloat`, `toBoolean`),
+list functions (`range` with two or three arguments, `head`, `last`, `tail`,
+`reverse`, `split`, `substring`, `coalesce`), string functions (`toUpper`,
+`toLower`, `trim`, `ltrim`, `rtrim`, `left`, `right`, `replace`) and the
+math library (`abs`, `sign`, `ceil`, `floor`, `round`, `sqrt`, `exp`, `log`,
+`log10`, `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`, `atan2`,
+`haversin`, `degrees`, `radians`, `pi`, `e`, `rand`).
+
+Temporal and spatial values are first class: `date`, `localtime`, `time`,
+`localdatetime`, `datetime` (fixed offsets and IANA zones like
+`Europe/Stockholm`), `duration` and `point`, built from strings, component
+maps or other temporal values, comparable and storable, with ISO 8601
+serialization, component accessors (`d.year`, `t.offset`, `du.months`,
+`p.longitude`), calendar and clock arithmetic (`date + duration`, `duration
+* 2`), `duration.between`/`inMonths`/`inDays`/`inSeconds`,
+`date.truncate`/`datetime.truncate` and friends (millennium through
+microsecond), plus `distance()` for cartesian and WGS-84 points.
 
 Explicit gaps fail with clear `Unsupported` errors instead of wrong results:
-pattern predicates and pattern comprehensions, map projections, `FOREACH`,
-`CALL`, most of the function library, and temporal/spatial types.
-The plan to close them, ordered by TCK scenario share, is in
-[docs/roadmap.md](docs/roadmap.md). Storage-side work tracked alongside it:
-WAL mode for concurrent readers, delete rebalancing and `VACUUM`-style
-compaction, bulk loading, and streaming scans.
+`REMOVE n = {…}` and map projections (`n{.name}`). The plan to close them,
+ordered by TCK scenario share, is in [docs/roadmap.md](docs/roadmap.md).
+Storage-side work tracked alongside it: WAL mode for concurrent readers,
+delete rebalancing and `VACUUM`-style compaction, bulk loading, and
+streaming scans.
 
 ## Conformance: the openCypher TCK
 
@@ -356,7 +385,7 @@ $ cargo run -p tck-runner --release      # exits 0 when the gate passes
 The gate fails on unexpected failures, harness errors (steps or cells the
 runner cannot evaluate) and **stale allow-list entries**, so a fix must prune
 its allow-list entries in the same commit. Current baseline: 3897 scenarios,
-2084 passing (53.5% of the suite, 100% of applicable scenarios), 1813
+3370 passing (86.5% of the suite, 100% of applicable scenarios), 527
 allow-listed, zero harness errors. Run instructions, error mapping and
 comparison semantics are documented in [docs/tck.md](docs/tck.md).
 

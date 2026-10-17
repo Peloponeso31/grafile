@@ -23,6 +23,7 @@ pub mod matrix;
 pub mod pager;
 pub mod planner;
 pub mod record;
+pub mod temporal;
 pub mod vdbe;
 pub mod vfs;
 

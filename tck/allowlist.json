@@ -127,10 +127,6 @@
       }
     },
     "clauses/delete/Delete2.feature": {
-      "[1] Delete relationships": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `range` is not supported yet"
-      },
       "[5] Failing when deleting a relationship type": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got TypeError at runtime"
@@ -153,14 +149,6 @@
       }
     },
     "clauses/delete/Delete5.feature": {
-      "[3] Delete nodes from a map": {
-        "reason": "not-implemented",
-        "note": "expected -2 nodes, got +0; expected -1 labels, got +0"
-      },
-      "[4] Delete relationships from a map": {
-        "reason": "not-implemented",
-        "note": "expected -2 relationships, got +0"
-      },
       "[7] Delete paths from nested map/list": {
         "reason": "not-implemented",
         "note": "expected no rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident); expected -2 nodes, got +0; expected -2 relationships, got +0; e..."
@@ -317,10 +305,6 @@
         "reason": "not-implemented",
         "note": "setup failed: Syntax: expected an identifier at line 5 column 14 (found Contains)"
       },
-      "[4] Matching longer variable length paths": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      },
       "[7] Matching variable length patterns including a bound relationship": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 3 column 7 (found Ident)"
@@ -393,10 +377,6 @@
       }
     },
     "clauses/match/Match9.feature": {
-      "[1] Variable length relationship variables are lists of relationships": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `last` is not supported yet"
-      },
       "[2] Return relationships by collecting them as a list - directed, one way": {
         "reason": "not-implemented",
         "note": "setup failed: Syntax: expected an identifier at line 2 column 57 (found End)"
@@ -410,12 +390,6 @@
       "[14] Merges should not be able to match on deleted nodes": {
         "reason": "not-implemented",
         "note": "expected column `a2.num`, got `num`; expected -2 nodes, got -1"
-      }
-    },
-    "clauses/merge/Merge5.feature": {
-      "[14] Using list properties via variable": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `split` is not supported yet; expected +2 nodes, got +0; expected +1 relationships, got +0; expected +1 properties, got +0;..."
       }
     },
     "clauses/return-orderby/ReturnOrderBy1.feature": {
@@ -460,10 +434,6 @@
       "[11] Fail when using negative value in SKIP": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[3] SKIP with an expression that does not depend on variables": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `range` is not supported yet"
       },
       "[6] Negative parameter for SKIP should fail": {
         "reason": "not-implemented",
@@ -514,16 +484,6 @@
       "[17] Fail when using floating point in LIMIT 2": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[6] LIMIT with an expression that does not depend on variables": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `range` is not supported yet"
-      }
-    },
-    "clauses/return-skip-limit/ReturnSkipLimit3.feature": {
-      "[3] Limiting amount of rows when there are fewer left than the LIMIT argument": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `range` is not supported yet"
       }
     },
     "clauses/return/Return2.feature": {
@@ -557,10 +517,6 @@
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 1 rows"
       },
-      "[11] Reusing variable names in RETURN": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
-      },
       "[4] Keeping used expression 1": {
         "reason": "not-implemented",
         "note": "expected column `cOuNt( * )`, got `cOuNt`"
@@ -576,17 +532,9 @@
       "[7] Keeping used expression 4": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[8] Support column renaming for aggregations": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `range` is not supported yet"
       }
     },
     "clauses/return/Return6.feature": {
-      "[11] Counting matches": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `range` is not supported yet"
-      },
       "[14] Aggregates in aggregates": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
@@ -610,14 +558,6 @@
       "[21] Fail if more complex expressions, even if returned, are used inside expression which contains an aggregation expression": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      },
-      "[4] Support multiple divisions in aggregate function": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `range` is not supported yet"
-      },
-      "[5] Aggregates inside normal functions": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `range` is not supported yet"
       },
       "[6] Handle aggregates inside non-aggregate expressions": {
         "reason": "not-implemented",
@@ -643,14 +583,6 @@
         "reason": "not-implemented",
         "note": "expected column `x`, got `y`"
       },
-      "[2] Unwinding a range": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `range` is not supported yet"
-      },
-      "[4] Unwinding a collected unwound expression": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `range` is not supported yet"
-      },
       "[6] Creating nodes from an unwound parameter list": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected an identifier at line 5 column 14 (found In); expected +2 nodes, got +0; expected +2 relationships, got +0; expected +2 properti..."
@@ -661,46 +593,6 @@
         "reason": "not-implemented",
         "note": "row 0: list element 0: expected null, got 'a'; row 1: expected a list of 2 elements, got 1; row 2: list element 1: expected null, got 'a'; row 3: list element 1: expected 'a', got null"
       },
-      "[11] Sort dates in ascending order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `date` is not supported yet"
-      },
-      "[12] Sort dates in descending order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `date` is not supported yet"
-      },
-      "[13] Sort local times in ascending order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `localtime` is not supported yet"
-      },
-      "[14] Sort local times in descending order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `localtime` is not supported yet"
-      },
-      "[15] Sort times in ascending order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `time` is not supported yet"
-      },
-      "[16] Sort times in descending order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `time` is not supported yet"
-      },
-      "[17] Sort local date times in ascending order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `localdatetime` is not supported yet"
-      },
-      "[18] Sort local date times in descending order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `localdatetime` is not supported yet"
-      },
-      "[19] Sort date times in ascending order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `datetime` is not supported yet"
-      },
-      "[20] Sort date times in descending order": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `datetime` is not supported yet"
-      },
       "[21] Sort distinct types in ascending order": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
@@ -709,143 +601,7 @@
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       },
-      "[33] Sort by a date variable projected from a node property in ascending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `date` is not supported yet"
-      },
-      "[33] Sort by a date variable projected from a node property in ascending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `date` is not supported yet"
-      },
-      "[33] Sort by a date variable projected from a node property in ascending order (example 3)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `date` is not supported yet"
-      },
-      "[34] Sort by a date variable projected from a node property in descending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `date` is not supported yet"
-      },
-      "[34] Sort by a date variable projected from a node property in descending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `date` is not supported yet"
-      },
-      "[35] Sort by a local time variable projected from a node property in ascending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localtime` is not supported yet"
-      },
-      "[35] Sort by a local time variable projected from a node property in ascending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localtime` is not supported yet"
-      },
-      "[35] Sort by a local time variable projected from a node property in ascending order (example 3)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localtime` is not supported yet"
-      },
-      "[36] Sort by a local time variable projected from a node property in descending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localtime` is not supported yet"
-      },
-      "[36] Sort by a local time variable projected from a node property in descending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localtime` is not supported yet"
-      },
-      "[37] Sort by a time variable projected from a node property in ascending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `time` is not supported yet"
-      },
-      "[37] Sort by a time variable projected from a node property in ascending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `time` is not supported yet"
-      },
-      "[37] Sort by a time variable projected from a node property in ascending order (example 3)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `time` is not supported yet"
-      },
-      "[38] Sort by a time variable projected from a node property in descending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `time` is not supported yet"
-      },
-      "[38] Sort by a time variable projected from a node property in descending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `time` is not supported yet"
-      },
-      "[39] Sort by a local date time variable projected from a node property in ascending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localdatetime` is not supported yet"
-      },
-      "[39] Sort by a local date time variable projected from a node property in ascending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localdatetime` is not supported yet"
-      },
-      "[39] Sort by a local date time variable projected from a node property in ascending order (example 3)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localdatetime` is not supported yet"
-      },
-      "[40] Sort by a local date time variable projected from a node property in descending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localdatetime` is not supported yet"
-      },
-      "[40] Sort by a local date time variable projected from a node property in descending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localdatetime` is not supported yet"
-      },
-      "[41] Sort by a date time variable projected from a node property in ascending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `datetime` is not supported yet"
-      },
-      "[41] Sort by a date time variable projected from a node property in ascending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `datetime` is not supported yet"
-      },
-      "[41] Sort by a date time variable projected from a node property in ascending order (example 3)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `datetime` is not supported yet"
-      },
-      "[42] Sort by a date time variable projected from a node property in descending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `datetime` is not supported yet"
-      },
-      "[42] Sort by a date time variable projected from a node property in descending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `datetime` is not supported yet"
-      },
-      "[45] Sort order should be consistent with comparisons where comparisons are defined #Example: <exampleName> (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 5 column 25 (found Where)"
-      },
-      "[45] Sort order should be consistent with comparisons where comparisons are defined #Example: <exampleName> (example 10)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 5 column 25 (found Where)"
-      },
-      "[45] Sort order should be consistent with comparisons where comparisons are defined #Example: <exampleName> (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 5 column 25 (found Where)"
-      },
-      "[45] Sort order should be consistent with comparisons where comparisons are defined #Example: <exampleName> (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 5 column 25 (found Where)"
-      },
-      "[45] Sort order should be consistent with comparisons where comparisons are defined #Example: <exampleName> (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 5 column 25 (found Where)"
-      },
       "[45] Sort order should be consistent with comparisons where comparisons are defined #Example: <exampleName> (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 5 column 25 (found Where)"
-      },
-      "[45] Sort order should be consistent with comparisons where comparisons are defined #Example: <exampleName> (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 5 column 25 (found Where)"
-      },
-      "[45] Sort order should be consistent with comparisons where comparisons are defined #Example: <exampleName> (example 7)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 5 column 25 (found Where)"
-      },
-      "[45] Sort order should be consistent with comparisons where comparisons are defined #Example: <exampleName> (example 8)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 5 column 25 (found Where)"
-      },
-      "[45] Sort order should be consistent with comparisons where comparisons are defined #Example: <exampleName> (example 9)": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 5 column 25 (found Where)"
       },
@@ -855,106 +611,6 @@
       }
     },
     "clauses/with-orderBy/WithOrderBy2.feature": {
-      "[11] Sort by a date expression in ascending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `date` is not supported yet"
-      },
-      "[11] Sort by a date expression in ascending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `date` is not supported yet"
-      },
-      "[11] Sort by a date expression in ascending order (example 3)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `date` is not supported yet"
-      },
-      "[12] Sort by a date expression in descending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `date` is not supported yet"
-      },
-      "[12] Sort by a date expression in descending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `date` is not supported yet"
-      },
-      "[13] Sort by a local time expression in ascending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localtime` is not supported yet"
-      },
-      "[13] Sort by a local time expression in ascending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localtime` is not supported yet"
-      },
-      "[13] Sort by a local time expression in ascending order (example 3)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localtime` is not supported yet"
-      },
-      "[14] Sort by a local time expression in descending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localtime` is not supported yet"
-      },
-      "[14] Sort by a local time expression in descending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localtime` is not supported yet"
-      },
-      "[15] Sort by a time expression in ascending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `time` is not supported yet"
-      },
-      "[15] Sort by a time expression in ascending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `time` is not supported yet"
-      },
-      "[15] Sort by a time expression in ascending order (example 3)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `time` is not supported yet"
-      },
-      "[16] Sort by a time expression in descending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `time` is not supported yet"
-      },
-      "[16] Sort by a time expression in descending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `time` is not supported yet"
-      },
-      "[17] Sort by a local date time expression in ascending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localdatetime` is not supported yet"
-      },
-      "[17] Sort by a local date time expression in ascending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localdatetime` is not supported yet"
-      },
-      "[17] Sort by a local date time expression in ascending order (example 3)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localdatetime` is not supported yet"
-      },
-      "[18] Sort by a local date time expression in descending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localdatetime` is not supported yet"
-      },
-      "[18] Sort by a local date time expression in descending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `localdatetime` is not supported yet"
-      },
-      "[19] Sort by a date time expression in ascending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `datetime` is not supported yet"
-      },
-      "[19] Sort by a date time expression in ascending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `datetime` is not supported yet"
-      },
-      "[19] Sort by a date time expression in ascending order (example 3)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `datetime` is not supported yet"
-      },
-      "[20] Sort by a date time expression in descending order (example 1)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `datetime` is not supported yet"
-      },
-      "[20] Sort by a date time expression in descending order (example 2)": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `datetime` is not supported yet"
-      },
       "[23] Sort by an expression that is only partially orderable on a non-distinct binding table, but used in parts as a grouping key (example 1)": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: ORDER BY after aggregation must reference projected values"
@@ -1104,12 +760,6 @@
         "note": "expected column `m`, got `n`"
       }
     },
-    "clauses/with-skip-limit/WithSkipLimit3.feature": {
-      "[3] Limiting amount of rows when there are fewer left than the LIMIT argument": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `range` is not supported yet"
-      }
-    },
     "clauses/with-where/WithWhere2.feature": {
       "*": {
         "reason": "not-implemented",
@@ -1146,10 +796,6 @@
       "[5] Fail when not aliasing expressions in WITH": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 13 rows"
-      },
-      "[6] Reusing variable names in WITH": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
       }
     },
     "clauses/with/With6.feature": {
@@ -1170,18 +816,6 @@
       "[12] `min()` over mixed values": {
         "reason": "not-implemented",
         "note": "rows differ: expected [1, 2], got 0.2"
-      }
-    },
-    "expressions/aggregation/Aggregation3.feature": {
-      "[2] No overflow during summation": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `range` is not supported yet"
-      }
-    },
-    "expressions/aggregation/Aggregation6.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `percentiledisc` is not supported yet"
       }
     },
     "expressions/boolean/Boolean1.feature": {
@@ -1725,22 +1359,6 @@
       }
     },
     "expressions/comparison/Comparison2.feature": {
-      "[3] Comparing across types yields null, except numbers (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[3] Comparing across types yields null, except numbers (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[3] Comparing across types yields null, except numbers (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[3] Comparing across types yields null, except numbers (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
       "[4] Comparing lists (example 1)": {
         "reason": "not-implemented",
         "note": "rows differ: expected true, got null"
@@ -1918,38 +1536,6 @@
         "note": "expected SyntaxError at compile time, but the query returned 1 rows"
       }
     },
-    "expressions/list/List11.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `range` is not supported yet"
-      }
-    },
-    "expressions/list/List12.feature": {
-      "[1] Collect and extract using a list comprehension": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 4 column 25 (found Pipe); expected -1 properties, got +0"
-      },
-      "[2] Collect and filter using a list comprehension": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 4 column 25 (found Where); expected -1 properties, got +0"
-      },
-      "[3] Size of list comprehension": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 3 column 16 (found LParen)"
-      },
-      "[4] Returning a list comprehension": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[5] Using a list comprehension in a WITH": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[6] Using a list comprehension in a WHERE": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 3 column 33 (found Pipe)"
-      }
-    },
     "expressions/list/List3.feature": {
       "[1] Equality between list and literal should return false": {
         "reason": "not-implemented",
@@ -2042,12 +1628,6 @@
       "[5] Fail for `size()` on paths": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 116 rows"
-      }
-    },
-    "expressions/list/List9.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `tail` is not supported yet; expected +1 properties, got +0"
       }
     },
     "expressions/literals/Literals2.feature": {
@@ -2208,24 +1788,6 @@
       "[6] Fail when performing property access on a non-map (example 6)": {
         "reason": "not-implemented",
         "note": "expected TypeError at compile time, but the query returned 1 rows"
-      }
-    },
-    "expressions/mathematical/Mathematical11.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `abs` is not supported yet"
-      }
-    },
-    "expressions/mathematical/Mathematical13.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `sqrt` is not supported yet"
-      }
-    },
-    "expressions/mathematical/Mathematical8.feature": {
-      "[2] Arithmetic precedence with parenthesis test": {
-        "reason": "not-implemented",
-        "note": "expected column `12 / 4 * (3 - 2 * 4)`, got `12 / 4 * 3 - 2 * 4`"
       }
     },
     "expressions/path/Path2.feature": {
@@ -2424,52 +1986,6 @@
       "[8] None quantifier on list containing nodes": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[9] None quantifier on list containing relationships": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      }
-    },
-    "expressions/quantifier/Quantifier10.feature": {
-      "[1] Single quantifier is always false if the predicate is statically false and the list is not empty": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `rand` is not supported yet"
-      },
-      "[2] Single quantifier is always false if the predicate is statically true and the list has more than one element": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `rand` is not supported yet"
-      },
-      "[4] Single quantifier is always equal whether the size of the list filtered with same the predicate is one (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `rand` is not supported yet"
-      },
-      "[4] Single quantifier is always equal whether the size of the list filtered with same the predicate is one (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `rand` is not supported yet"
-      },
-      "[4] Single quantifier is always equal whether the size of the list filtered with same the predicate is one (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `rand` is not supported yet"
-      },
-      "[4] Single quantifier is always equal whether the size of the list filtered with same the predicate is one (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `rand` is not supported yet"
-      },
-      "[4] Single quantifier is always equal whether the size of the list filtered with same the predicate is one (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `rand` is not supported yet"
-      }
-    },
-    "expressions/quantifier/Quantifier11.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 4 column 37 (found Where)"
-      }
-    },
-    "expressions/quantifier/Quantifier12.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 4 column 37 (found Where)"
       }
     },
     "expressions/quantifier/Quantifier2.feature": {
@@ -2486,10 +2002,6 @@
         "note": "expected SyntaxError at compile time, got TypeError at runtime"
       },
       "[8] Single quantifier on list containing nodes": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[9] Single quantifier on list containing relationships": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       }
@@ -2510,10 +2022,6 @@
       "[8] Any quantifier on list containing nodes": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[9] Any quantifier on list containing relationships": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
       }
     },
     "expressions/quantifier/Quantifier4.feature": {
@@ -2532,190 +2040,6 @@
       "[8] All quantifier on list containing nodes": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      },
-      "[9] All quantifier on list containing relationships": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      }
-    },
-    "expressions/quantifier/Quantifier5.feature": {
-      "[2] None quantifier can nest itself and other quantifiers on the same list (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `abs` is not supported yet"
-      }
-    },
-    "expressions/quantifier/Quantifier8.feature": {
-      "[2] All quantifier can nest itself and other quantifiers on the same list (example 7)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `abs` is not supported yet"
-      }
-    },
-    "expressions/quantifier/Quantifier9.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 4 column 37 (found Where)"
-      }
-    },
-    "expressions/string/String1.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `substring` is not supported yet"
-      }
-    },
-    "expressions/string/String3.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `reverse` is not supported yet"
-      }
-    },
-    "expressions/string/String4.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `split` is not supported yet"
-      }
-    },
-    "expressions/temporal/Temporal1.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `date` is not supported yet"
-      }
-    },
-    "expressions/temporal/Temporal10.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected a clause at line 2 column 22 (found LParen)"
-      }
-    },
-    "expressions/temporal/Temporal2.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `date` is not supported yet"
-      }
-    },
-    "expressions/temporal/Temporal3.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `date` is not supported yet"
-      }
-    },
-    "expressions/temporal/Temporal4.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected no rows, got a compile time error: compile time: Unsupported: function `date` is not supported yet; expected +1 nodes, got +0; expected +1 properties, got +0; expected column `n.created`, got..."
-      }
-    },
-    "expressions/temporal/Temporal5.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `date` is not supported yet"
-      }
-    },
-    "expressions/temporal/Temporal6.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `date` is not supported yet"
-      }
-    },
-    "expressions/temporal/Temporal7.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `date` is not supported yet"
-      }
-    },
-    "expressions/temporal/Temporal8.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `duration` is not supported yet"
-      }
-    },
-    "expressions/temporal/Temporal9.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected a clause at line 2 column 21 (found LParen)"
-      }
-    },
-    "expressions/typeConversion/TypeConversion1.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `toboolean` is not supported yet"
-      }
-    },
-    "expressions/typeConversion/TypeConversion2.feature": {
-      "[4] `toInteger()` handling Any type": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 3 column 21 (found Pipe)"
-      },
-      "[5] `toInteger()` on a list of strings": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 3 column 22 (found Pipe)"
-      },
-      "[8] Fail `toInteger()` on invalid types #Example: <exampleName> (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[8] Fail `toInteger()` on invalid types #Example: <exampleName> (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[8] Fail `toInteger()` on invalid types #Example: <exampleName> (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[8] Fail `toInteger()` on invalid types #Example: <exampleName> (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[8] Fail `toInteger()` on invalid types #Example: <exampleName> (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      }
-    },
-    "expressions/typeConversion/TypeConversion3.feature": {
-      "[6] Fail `toFloat()` on invalid types #Example: <exampleName> (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[6] Fail `toFloat()` on invalid types #Example: <exampleName> (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[6] Fail `toFloat()` on invalid types #Example: <exampleName> (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[6] Fail `toFloat()` on invalid types #Example: <exampleName> (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[6] Fail `toFloat()` on invalid types #Example: <exampleName> (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[6] Fail `toFloat()` on invalid types #Example: <exampleName> (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      }
-    },
-    "expressions/typeConversion/TypeConversion4.feature": {
-      "[10] Fail `toString()` on invalid types #Example: <exampleName> (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[10] Fail `toString()` on invalid types #Example: <exampleName> (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[10] Fail `toString()` on invalid types #Example: <exampleName> (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[10] Fail `toString()` on invalid types #Example: <exampleName> (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[10] Fail `toString()` on invalid types #Example: <exampleName> (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
       }
     },
     "useCases/countingSubgraphMatches/CountingSubgraphMatches1.feature": {

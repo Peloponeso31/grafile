@@ -83,14 +83,24 @@ jobs:
           cargo generate-rpm
       - name: Build (musl, static)
         run: cargo build -p grafile --release --locked --target ${{ matrix.target }}
+      - name: Build FFI library (gnu, shared + static)
+        run: |
+          cargo rustc -p grafile-ffi --release --locked -- -C link-arg=-Wl,-soname,libgrafile.so
+          readelf -d target/release/libgrafile.so | grep -q 'SONAME.*libgrafile\.so' ||
+            { echo "error: libgrafile.so has no SONAME" >&2; exit 1; }
       - name: Stage artifacts
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          mkdir -p stage dist
+          mkdir -p stage/bin stage/include stage/lib/pkgconfig dist
           strip -s target/${{ matrix.target }}/release/grafile
-          cp target/${{ matrix.target }}/release/grafile LICENSE stage/
-          tar -czf "dist/grafile-${VERSION}-${{ matrix.asset }}.tar.gz" -C stage grafile LICENSE
+          cp target/${{ matrix.target }}/release/grafile stage/bin/
+          cp LICENSE stage/
+          cp ffi/include/grafile.h stage/include/
+          cp target/release/libgrafile.so target/release/libgrafile.a stage/lib/
+          sed -e "s/\${VERSION}/${VERSION}/g" -e "s/\${STATIC_LIBS}/-lpthread -ldl -lm/g" \
+            packaging/pkgconfig/grafile.pc.tmpl > stage/lib/pkgconfig/grafile.pc
+          tar -czf "dist/grafile-${VERSION}-${{ matrix.asset }}.tar.gz" -C stage bin include lib LICENSE
           cp target/debian/*.deb target/generate-rpm/*.rpm dist/
       - uses: actions/upload-artifact@v4
         with:
@@ -118,13 +128,32 @@ jobs:
             target/aarch64-apple-darwin/release/grafile \
             target/x86_64-apple-darwin/release/grafile
           lipo -archs grafile
+      - name: Build universal FFI library
+        run: |
+          cargo build -p grafile-ffi --release --locked --target aarch64-apple-darwin
+          cargo build -p grafile-ffi --release --locked --target x86_64-apple-darwin
+          mkdir -p target/ffi
+          lipo -create -output target/ffi/libgrafile.dylib \
+            target/aarch64-apple-darwin/release/libgrafile.dylib \
+            target/x86_64-apple-darwin/release/libgrafile.dylib
+          lipo -create -output target/ffi/libgrafile.a \
+            target/aarch64-apple-darwin/release/libgrafile.a \
+            target/x86_64-apple-darwin/release/libgrafile.a
+          install_name_tool -id @rpath/libgrafile.dylib target/ffi/libgrafile.dylib
+          [ "$(otool -D target/ffi/libgrafile.dylib | tail -n 1)" = "@rpath/libgrafile.dylib" ]
       - name: Stage artifacts
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
         run: |
-          mkdir -p stage dist
-          cp grafile LICENSE stage/
-          tar -czf "dist/grafile-${VERSION}-macos-universal.tar.gz" -C stage grafile LICENSE
+          mkdir -p stage/bin stage/include stage/lib/pkgconfig dist
+          cp grafile stage/bin/
+          cp LICENSE stage/
+          cp ffi/include/grafile.h stage/include/
+          cp target/ffi/libgrafile.dylib target/ffi/libgrafile.a stage/lib/
+          sed -e "s/\${VERSION}/${VERSION}/g" \
+            -e "s/\${STATIC_LIBS}/-liconv -framework Security -framework CoreFoundation -framework SystemConfiguration/g" \
+            packaging/pkgconfig/grafile.pc.tmpl > stage/lib/pkgconfig/grafile.pc
+          tar -czf "dist/grafile-${VERSION}-macos-universal.tar.gz" -C stage bin include lib LICENSE
       - uses: actions/upload-artifact@v4
         with:
           name: release-macos
@@ -139,6 +168,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build -p grafile --release --locked
+      - name: Build FFI library
+        run: cargo build -p grafile-ffi --release --locked
       - name: Stage artifacts
         shell: pwsh
         env:
@@ -147,6 +178,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path stage, dist | Out-Null
           Copy-Item target/release/grafile.exe stage/
           Copy-Item LICENSE stage/
+          Copy-Item ffi/include/grafile.h stage/
+          Copy-Item target/release/grafile.dll stage/
+          Get-ChildItem target/release -Filter "grafile*.lib" -File | Copy-Item -Destination stage/
+          if (-not (Test-Path stage/grafile.dll)) { throw "missing target/release/grafile.dll" }
+          if (-not (Get-ChildItem stage -Filter "*.lib" -File)) { throw "missing import/static library" }
           Compress-Archive -Path stage/* -DestinationPath "dist/grafile-${env:VERSION}-x86_64-windows.zip"
       - uses: actions/upload-artifact@v4
         with:
@@ -199,9 +235,28 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      - uses: actions/checkout@v4
       - name: Install with the published one-liner
         env:
-          GRAFILE_INSTALL_DIR: ${{ runner.temp }}/grafile-bin
+          GRAFILE_PREFIX: ${{ runner.temp }}/grafile
         run: |
           curl -LsSf https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sh
-          "$GRAFILE_INSTALL_DIR/grafile" --version
+          "$GRAFILE_PREFIX/bin/grafile" --version
+      - name: Link and run the C smoke test
+        env:
+          GRAFILE_PREFIX: ${{ runner.temp }}/grafile
+        run: |
+          if ! command -v pkg-config >/dev/null 2>&1; then
+            brew install pkg-config
+          fi
+          export PKG_CONFIG_PATH="$GRAFILE_PREFIX/lib/pkgconfig"
+          # shellcheck disable=SC2046
+          cc ffi/examples/smoke.c -o smoke $(pkg-config --cflags --libs grafile)
+          ./smoke "$RUNNER_TEMP/dynamic.grafile"
+          mkdir -p only-static
+          cp "$GRAFILE_PREFIX/lib/libgrafile.a" only-static/
+          # shellcheck disable=SC2046
+          cc ffi/examples/smoke.c -o smoke-static -I"$GRAFILE_PREFIX/include" \
+            -Lonly-static $(pkg-config --libs-only-l --static grafile) \
+            $(pkg-config --libs-only-other --static grafile)
+          ./smoke-static "$RUNNER_TEMP/static.grafile"

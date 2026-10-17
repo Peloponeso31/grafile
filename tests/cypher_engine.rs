@@ -572,6 +572,28 @@ fn union_uses_first_part_column_names() {
 }
 
 #[test]
+fn default_column_names_keep_necessary_parentheses() {
+    let mut conn = connection();
+    let mut rows = conn
+        .query(
+            "RETURN 12 / 4 * (3 - 2 * 4), 1 + 2 + 3, 2 ^ 3 ^ 2, -(3 * 4)",
+            &Params::new(),
+        )
+        .expect("query");
+    assert_eq!(
+        rows.columns(),
+        &[
+            "12 / 4 * (3 - 2 * 4)".to_owned(),
+            "1 + 2 + 3".to_owned(),
+            "2 ^ 3 ^ 2".to_owned(),
+            "-(3 * 4)".to_owned(),
+        ]
+    );
+    let values = rows_to_strings(&mut rows);
+    assert_eq!(values, vec![vec!["-15", "6", "512", "-12"]]);
+}
+
+#[test]
 fn union_rejects_different_columns() {
     let mut conn = connection();
     let err = conn
@@ -757,6 +779,29 @@ fn list_comprehensions() {
 }
 
 #[test]
+fn comprehension_over_inline_aggregation() {
+    let mut conn = connection();
+    seed(&mut conn);
+    let rows = query(
+        &mut conn,
+        "MATCH (n:Person) RETURN [x IN collect(n) WHERE x.age > 28 | x.name] AS names",
+    );
+    assert_eq!(rows, vec![vec!["[alice, carol]"]]);
+}
+
+#[test]
+fn comprehension_body_hoists_free_variables() {
+    let mut conn = connection();
+    seed(&mut conn);
+    let rows = query(
+        &mut conn,
+        "MATCH (n:Person) WITH n, 10 AS extra \
+         RETURN size([x IN collect(n) | x.age + extra]) AS s, extra",
+    );
+    assert_eq!(rows, vec![vec!["3", "10"]]);
+}
+
+#[test]
 fn quantifiers() {
     let mut conn = connection();
     let rows = query(
@@ -793,6 +838,460 @@ fn aggregations_inside_comprehensions_are_rejected() {
         .query("RETURN [x IN [1] | count(*)]", &Params::new())
         .expect_err("aggregation in comprehension");
     assert_eq!(err.code(), grafile::ErrorCode::Syntax);
+}
+
+// ---- type conversions ----
+
+#[test]
+fn to_integer_truncates_and_parses() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH [82.9, 2, true, '2.9', 'foo', '', null] AS xs \
+         RETURN [x IN xs | toInteger(x)] AS ints",
+    );
+    assert_eq!(rows, vec![vec!["[82, 2, 1, 2, null, null, null]"]]);
+}
+
+#[test]
+fn to_float_converts_numbers_and_strings() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH [3.4, 3, '5', 'foo', null] AS xs RETURN [x IN xs | toFloat(x)] AS floats",
+    );
+    assert_eq!(rows, vec![vec!["[3.4, 3.0, 5.0, null, null]"]]);
+}
+
+#[test]
+fn to_boolean_accepts_boolean_and_string() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH [true, 'TRUE', 'False', ' tru ', 'x', null] AS xs \
+         RETURN [x IN xs | toBoolean(x)] AS bools",
+    );
+    assert_eq!(rows, vec![vec!["[true, true, false, null, null, null]"]]);
+}
+
+#[test]
+fn to_string_renders_scalars() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH [42, 2.3, true, 'apa', null] AS xs RETURN [x IN xs | toString(x)] AS texts",
+    );
+    assert_eq!(rows, vec![vec!["[42, 2.3, true, apa, null]"]]);
+}
+
+// ---- list and string functions ----
+
+#[test]
+fn range_builds_inclusive_sequences() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN range(0, 5) AS a, range(5, 0, -2) AS b, range(0, -3) AS c, range(0, 0, -7) AS d",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["[0, 1, 2, 3, 4, 5]", "[5, 3, 1]", "[]", "[0]"]]
+    );
+}
+
+#[test]
+fn range_rejects_zero_step_and_fractional_bounds() {
+    let mut conn = connection();
+    let err = conn
+        .query("RETURN range(2, 8, 0)", &Params::new())
+        .expect_err("zero step");
+    assert_eq!(err.code(), grafile::ErrorCode::Range);
+    let err = conn
+        .query("RETURN range(1.1, 8, 1)", &Params::new())
+        .expect_err("float bound");
+    assert_eq!(err.code(), grafile::ErrorCode::Misuse);
+}
+
+#[test]
+fn head_last_and_tail() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN head([1, 2, 3]) AS h, last([1, 2, 3]) AS l, tail([1, 2, 3]) AS t, \
+         head([]) AS eh, tail([]) AS et, head(null) AS nh",
+    );
+    assert_eq!(rows, vec![vec!["1", "3", "[2, 3]", "null", "[]", "null"]]);
+}
+
+#[test]
+fn reverse_strings_and_lists() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN reverse('raksO') AS s, reverse([1, 2, 3]) AS l, reverse(null) AS n",
+    );
+    assert_eq!(rows, vec![vec!["Oskar", "[3, 2, 1]", "null"]]);
+}
+
+#[test]
+fn split_and_substring() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN split('one1two', '1') AS a, split('abc', '') AS b, split('', ',') AS c, \
+         substring('0123456789', 1) AS d, substring('hello', 1, 3) AS e, substring('hi', 9) AS f",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "[one, two]",
+            "[a, b, c]",
+            "[]",
+            "123456789",
+            "ell",
+            ""
+        ]]
+    );
+}
+
+#[test]
+fn split_empty_input_keeps_one_empty_part() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN size(split('', ',')) AS a, substring('hello', null) AS b",
+    );
+    assert_eq!(rows, vec![vec!["1", "null"]]);
+}
+
+#[test]
+fn string_case_and_trimming_helpers() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN toUpper('aBc') AS u, toLower('AbC') AS l, trim('  x  ') AS t, \
+         ltrim('  x  ') AS lt, rtrim('  x  ') AS rt, left('hello', 2) AS le, \
+         right('hello', 2) AS ri, left('hi', 9) AS lc, replace('hello', 'l', 'L') AS rp",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "ABC", "abc", "x", "x  ", "  x", "he", "lo", "hi", "heLLo"
+        ]]
+    );
+}
+
+// ---- percentile and deviation aggregations ----
+
+#[test]
+fn percentile_aggregations() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "UNWIND [10.0, 20.0, 30.0] AS price \
+         RETURN percentileDisc(price, 0.5) AS d, percentileCont(price, 0.5) AS c, \
+         percentileCont(price, 0.0) AS lo, percentileDisc(price, 1.0) AS hi",
+    );
+    assert_eq!(rows, vec![vec!["20", "20", "10", "30"]]);
+}
+
+#[test]
+fn percentile_disc_preserves_value_types() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "UNWIND [10, 20, 30] AS x \
+         RETURN percentileDisc(x, 0.5) AS d, percentileCont(x, 0.5) AS c",
+    );
+    assert_eq!(rows, vec![vec!["20", "20"]]);
+}
+
+#[test]
+fn percentile_ignores_null_values() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "UNWIND [null, 4.0, null, 8.0] AS x \
+         RETURN percentileDisc(x, 0.5) AS d, percentileCont(x, 1.0) AS c",
+    );
+    assert_eq!(rows, vec![vec!["4", "8"]]);
+}
+
+#[test]
+fn percentile_out_of_range_is_an_error() {
+    let mut conn = connection();
+    for source in [
+        "UNWIND [1.0] AS x RETURN percentileCont(x, 2.0)",
+        "UNWIND [1.0] AS x RETURN percentileDisc(x, -0.5)",
+    ] {
+        let err = conn
+            .query(source, &Params::new())
+            .expect_err("out of range");
+        assert_eq!(err.code(), grafile::ErrorCode::Range, "{source}");
+    }
+}
+
+#[test]
+fn standard_deviations() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "UNWIND [1, 2, 3, 4] AS x RETURN stDev(x) AS s, stDevP(x) AS p, stDev(null) AS n",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1.2909944487358056", "1.118033988749895", "null"]]
+    );
+}
+
+// ---- temporal values ----
+
+#[test]
+fn temporal_constructors_from_maps_and_strings() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN date({year: 1984, month: 10, day: 11}) AS a, \
+         date('2015-W30-2') AS b, \
+         date({year: 1817, week: 1, dayOfWeek: 2}) AS c, \
+         localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876123}) AS d, \
+         time({hour: 21, minute: 40, timezone: '+01:00'}) AS e",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "1984-10-11",
+            "2015-07-21",
+            "1816-12-31",
+            "12:31:14.645876123",
+            "21:40+01:00"
+        ]]
+    );
+}
+
+#[test]
+fn temporal_composition_and_overrides() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH date({year: 1984, month: 10, day: 11}) AS other \
+         RETURN localdatetime({date: other, hour: 10, minute: 10, second: 10}) AS a, \
+         localdatetime({date: other, day: 28, hour: 10, minute: 10, second: 10}) AS b",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1984-10-11T10:10:10", "1984-10-28T10:10:10"]]
+    );
+}
+
+#[test]
+fn temporal_accessors() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH datetime({year: 1984, month: 11, day: 11, hour: 12, minute: 31, second: 14, \
+          nanosecond: 645876123, timezone: 'Europe/Stockholm'}) AS d \
+         RETURN d.year, d.quarter, d.week, d.weekDay, d.dayOfQuarter, d.hour, d.nanosecond, \
+                d.timezone, d.offset, d.offsetSeconds, d.epochSeconds, d.epochMillis",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "1984",
+            "4",
+            "45",
+            "7",
+            "42",
+            "12",
+            "645876123",
+            "Europe/Stockholm",
+            "+01:00",
+            "3600",
+            "469020674",
+            "469020674645"
+        ]]
+    );
+}
+
+#[test]
+fn temporal_serialization_round_trips() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH date({year: 1984, month: 10, day: 11}) AS d, \
+              localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876123}) AS t, \
+              duration({years: 12, months: 5, days: 14, hours: 16, minutes: 12, seconds: 70, nanoseconds: 1}) AS du \
+         RETURN date(toString(d)) = d AS a, localtime(toString(t)) = t AS b, duration(toString(du)) = du AS c, \
+                toString(du) AS text",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "true",
+            "true",
+            "true",
+            "P12Y5M14DT16H13M10.000000001S"
+        ]]
+    );
+}
+
+#[test]
+fn temporal_truncation() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN date.truncate('millennium', date({year: 2017, month: 10, day: 11}), {day: 2}) AS a, \
+         date.truncate('week', date({year: 1984, month: 10, day: 11}), {dayOfWeek: 2}) AS b, \
+         date.truncate('weekYear', date({year: 1984, month: 2, day: 1}), {}) AS c, \
+         localtime.truncate('hour', localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876123}), {nanosecond: 2}) AS d, \
+         datetime.truncate('week', date({year: 1984, month: 10, day: 11}), {timezone: 'Europe/Stockholm'}) AS e",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "2000-01-02",
+            "1984-10-09",
+            "1984-01-02",
+            "12:00:00.000000002",
+            "1984-10-08T00:00+01:00[Europe/Stockholm]"
+        ]]
+    );
+}
+
+#[test]
+fn temporal_values_store_and_compare() {
+    let mut conn = connection();
+    conn.execute(
+        "CREATE (:Val {date: date({year: 1984, month: 10, day: 11}), \
+          dates: [date({year: 1984, month: 10, day: 12})]})",
+    )
+    .expect("store temporals");
+    let rows = query(
+        &mut conn,
+        "MATCH (v:Val) \
+         RETURN v.date, v.dates, v.date < date('2000-01-01'), v.date = date('1984-10-11')",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1984-10-11", "[1984-10-12]", "true", "true"]]
+    );
+}
+
+#[test]
+fn spatial_points_and_distance() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN point({x: 1.5, y: 2.5}) AS p, \
+         point({latitude: 12.0, longitude: 14.0}) AS g, \
+         distance(point({x: 0, y: 0}), point({x: 3, y: 4})) AS d, \
+         point({x: 1.5, y: 2.5, z: 3.0}) AS p3",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "point({x: 1.5, y: 2.5})",
+            "point({srid: 4326, x: 14.0, y: 12.0})",
+            "5",
+            "point({srid: 9157, x: 1.5, y: 2.5, z: 3.0})"
+        ]]
+    );
+    let rows = query(
+        &mut conn,
+        "WITH point({latitude: 12.0, longitude: 12.0}) AS p \
+         RETURN p.latitude, p.longitude, p.srid, p.crs, \
+                distance(p, point({latitude: 13.0, longitude: 12.0})) > 110000.0",
+    );
+    assert_eq!(rows, vec![vec!["12", "12", "4326", "wgs-84", "true"]]);
+}
+
+#[test]
+fn temporal_duration_arithmetic_forms() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH duration({months: 1, days: -14, hours: 16, minutes: -12, seconds: 70}) AS dur \
+         RETURN dur.years, dur.months, dur.days, dur.hours, dur.seconds, dur.minutes, dur.secondsOfMinute",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["0", "1", "-14", "15", "56950", "949", "10"]]
+    );
+}
+
+// ---- math functions ----
+
+#[test]
+fn math_rounding_and_signs() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN abs(-1) AS a, abs(-2.5) AS b, sign(-3) AS c, sign(0.0) AS d, \
+         ceil(0.1) AS e, floor(-0.1) AS f, round(2.5) AS g, round(-2.5) AS h",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1", "2.5", "-1", "0", "1", "-1", "3", "-3"]]
+    );
+}
+
+#[test]
+fn math_logarithms_and_roots() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN sqrt(12.96) AS a, exp(0.0) AS b, log(1.0) AS c, log10(100.0) AS d, \
+         log(null) AS e",
+    );
+    assert_eq!(rows, vec![vec!["3.6", "1", "0", "2", "null"]]);
+}
+
+#[test]
+fn math_trigonometry_and_constants() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN degrees(pi()) AS a, radians(180.0) AS b, sin(0.0) AS c, cos(0.0) AS d, \
+         atan2(1.0, 1.0) AS e, haversin(pi()) AS f, e() > 2.7 AS g",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "180",
+            "3.141592653589793",
+            "0",
+            "1",
+            "0.7853981633974483",
+            "1",
+            "true"
+        ]]
+    );
+}
+
+#[test]
+fn math_functions_reject_non_numbers() {
+    let mut conn = connection();
+    let err = conn
+        .query("RETURN abs('x')", &Params::new())
+        .expect_err("string argument");
+    assert_eq!(err.code(), grafile::ErrorCode::Type);
+}
+
+#[test]
+fn conversions_reject_incompatible_types() {
+    let mut conn = connection();
+    for source in [
+        "RETURN toInteger([1])",
+        "RETURN toFloat(true)",
+        "RETURN toBoolean(1.0)",
+        "RETURN toString([1, 2])",
+        "RETURN toString({a: 1})",
+    ] {
+        let err = conn
+            .query(source, &Params::new())
+            .expect_err("conversion must reject the type");
+        assert_eq!(err.code(), grafile::ErrorCode::Type, "{source}");
+    }
 }
 
 // ---- variable-length paths ----
@@ -1076,6 +1575,31 @@ fn set_entity_copies_properties() {
         "MATCH (n:Person {name: 'ravi'}) RETURN count(*), max(n.age)",
     );
     assert_eq!(rows, vec![vec!["2", "40"]]);
+}
+
+#[test]
+fn writes_on_entities_unwound_from_lists() {
+    let mut conn = connection();
+    conn.execute("CREATE (:Person {name: 'ravi', age: 40})")
+        .expect("seed");
+    let rows = query(
+        &mut conn,
+        "MATCH (a:Person) WITH collect(a) AS people UNWIND people AS n \
+         SET n.age = 41, n.city = 'oslo' RETURN n.age, n.city",
+    );
+    assert_eq!(rows, vec![vec!["41", "oslo"]]);
+    let rows = query(
+        &mut conn,
+        "MATCH (a:Person) WITH collect(a) AS people UNWIND people AS n \
+         REMOVE n.city RETURN n.city",
+    );
+    assert_eq!(rows, vec![vec!["null"]]);
+    let rows = query(
+        &mut conn,
+        "MATCH (a:Person) WITH collect(a) AS people UNWIND people AS n \
+         DETACH DELETE n RETURN count(*)",
+    );
+    assert_eq!(rows, vec![vec!["1"]]);
 }
 
 #[test]

@@ -652,9 +652,12 @@ impl Codegen {
                     for (expr, _) in groups {
                         group_values.push(cg.compile_expr(expr, in_ctx)?);
                     }
-                    let mut agg_values = Vec::with_capacity(aggs.len());
+                    let arg_count: usize = aggs.iter().map(|item| item.arguments.len()).sum();
+                    let mut agg_values = Vec::with_capacity(arg_count);
                     for item in aggs {
-                        agg_values.push(cg.compile_expr(&item.argument, in_ctx)?);
+                        for argument in &item.arguments {
+                            agg_values.push(cg.compile_expr(argument, in_ctx)?);
+                        }
                     }
                     let prefix = cg.next_reg - in_ctx.window_start;
                     let group_base = cg.next_reg;
@@ -676,7 +679,7 @@ impl Codegen {
                     cg.emit(Op::CollectRow {
                         cursor,
                         start: in_ctx.window_start,
-                        count: prefix + (groups.len() + aggs.len()) as u32,
+                        count: prefix + (groups.len() + arg_count) as u32,
                     });
                     Ok(())
                 })?;
@@ -686,6 +689,7 @@ impl Codegen {
                     .iter()
                     .map(|item| AggSpec {
                         func: item.func,
+                        args: item.arguments.len() as u8,
                         star: false,
                         distinct: item.distinct,
                     })
@@ -1818,12 +1822,79 @@ fn scalar_function(name: &str) -> Result<u8> {
         "tostring" => Ok(func::TO_STRING),
         "tointeger" => Ok(func::TO_INTEGER),
         "tofloat" => Ok(func::TO_FLOAT),
+        "toboolean" => Ok(func::TO_BOOLEAN),
         "size" => Ok(func::SIZE),
         "properties" => Ok(func::PROPERTIES),
         "keys" => Ok(func::KEYS),
         "nodes" => Ok(func::NODES),
         "relationships" => Ok(func::RELATIONSHIPS),
         "length" => Ok(func::LENGTH),
+        "range" => Ok(func::RANGE),
+        "head" => Ok(func::HEAD),
+        "last" => Ok(func::LAST),
+        "tail" => Ok(func::TAIL),
+        "reverse" => Ok(func::REVERSE),
+        "split" => Ok(func::SPLIT),
+        "substring" => Ok(func::SUBSTRING),
+        "rand" => Ok(func::RAND),
+        "toupper" => Ok(func::TO_UPPER),
+        "tolower" => Ok(func::TO_LOWER),
+        "trim" => Ok(func::TRIM),
+        "ltrim" => Ok(func::LTRIM),
+        "rtrim" => Ok(func::RTRIM),
+        "left" => Ok(func::LEFT),
+        "right" => Ok(func::RIGHT),
+        "replace" => Ok(func::REPLACE),
+        "abs" => Ok(func::ABS),
+        "ceil" => Ok(func::CEIL),
+        "floor" => Ok(func::FLOOR),
+        "round" => Ok(func::ROUND),
+        "sign" => Ok(func::SIGN),
+        "sqrt" => Ok(func::SQRT),
+        "exp" => Ok(func::EXP),
+        "log" => Ok(func::LOG),
+        "log10" => Ok(func::LOG10),
+        "sin" => Ok(func::SIN),
+        "cos" => Ok(func::COS),
+        "tan" => Ok(func::TAN),
+        "cot" => Ok(func::COT),
+        "asin" => Ok(func::ASIN),
+        "acos" => Ok(func::ACOS),
+        "atan" => Ok(func::ATAN),
+        "atan2" => Ok(func::ATAN2),
+        "degrees" => Ok(func::DEGREES),
+        "radians" => Ok(func::RADIANS),
+        "haversin" => Ok(func::HAVERSIN),
+        "pi" => Ok(func::PI),
+        "e" => Ok(func::E),
+        "date" => Ok(func::DATE),
+        "localtime" => Ok(func::LOCALTIME),
+        "time" => Ok(func::TIME),
+        "localdatetime" => Ok(func::LOCAL_DATETIME),
+        "datetime" => Ok(func::DATETIME),
+        "duration" => Ok(func::DURATION),
+        "point" => Ok(func::POINT),
+        "distance" => Ok(func::DISTANCE),
+        "date.truncate" => Ok(func::DATE_TRUNCATE),
+        "localtime.truncate" => Ok(func::LOCALTIME_TRUNCATE),
+        "time.truncate" => Ok(func::TIME_TRUNCATE),
+        "localdatetime.truncate" => Ok(func::LOCAL_DATETIME_TRUNCATE),
+        "datetime.truncate" => Ok(func::DATETIME_TRUNCATE),
+        "datetime.fromepoch" => Ok(func::DATETIME_FROM_EPOCH),
+        "duration.between" => Ok(func::DURATION_BETWEEN),
+        "duration.inmonths" => Ok(func::DURATION_IN_MONTHS),
+        "duration.indays" => Ok(func::DURATION_IN_DAYS),
+        "duration.inseconds" => Ok(func::DURATION_IN_SECONDS),
+        "datetime.fromepochmillis" => Ok(func::DATETIME_FROM_EPOCH_MILLIS),
+        "date.transaction" | "date.statement" | "date.realtime" => Ok(func::DATE),
+        "localtime.transaction" | "localtime.statement" | "localtime.realtime" => {
+            Ok(func::LOCALTIME)
+        }
+        "time.transaction" | "time.statement" | "time.realtime" => Ok(func::TIME),
+        "localdatetime.transaction" | "localdatetime.statement" | "localdatetime.realtime" => {
+            Ok(func::LOCAL_DATETIME)
+        }
+        "datetime.transaction" | "datetime.statement" | "datetime.realtime" => Ok(func::DATETIME),
         other => Err(Error::unsupported(format!(
             "function `{other}` is not supported yet"
         ))),

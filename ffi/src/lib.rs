@@ -92,6 +92,20 @@ pub const GRAFILE_MAP: c_int = 7;
 pub const GRAFILE_NODE: c_int = 8;
 /// Column kind: edge reference.
 pub const GRAFILE_EDGE: c_int = 9;
+/// Column kind: date, exposed as ISO 8601 text.
+pub const GRAFILE_DATE: c_int = 10;
+/// Column kind: local time.
+pub const GRAFILE_LOCALTIME: c_int = 11;
+/// Column kind: time with a fixed UTC offset.
+pub const GRAFILE_TIME: c_int = 12;
+/// Column kind: local datetime.
+pub const GRAFILE_LOCALDATETIME: c_int = 13;
+/// Column kind: datetime with an offset and optional IANA zone.
+pub const GRAFILE_DATETIME: c_int = 14;
+/// Column kind: duration.
+pub const GRAFILE_DURATION: c_int = 15;
+/// Column kind: point, exposed as a JSON object.
+pub const GRAFILE_POINT: c_int = 16;
 
 const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "\0");
 
@@ -290,6 +304,13 @@ fn kind_of(value: &Value) -> c_int {
         Value::Map(_) => GRAFILE_MAP,
         Value::Node(_) => GRAFILE_NODE,
         Value::Edge(_) => GRAFILE_EDGE,
+        Value::Date(_) => GRAFILE_DATE,
+        Value::LocalTime(_) => GRAFILE_LOCALTIME,
+        Value::Time(_) => GRAFILE_TIME,
+        Value::LocalDateTime(_) => GRAFILE_LOCALDATETIME,
+        Value::DateTime(_) => GRAFILE_DATETIME,
+        Value::Duration(_) => GRAFILE_DURATION,
+        Value::Point(_) => GRAFILE_POINT,
     }
 }
 

@@ -1308,7 +1308,14 @@ fn validate_property_value(value: &Value) -> Result<()> {
         | Value::Int(_)
         | Value::Float(_)
         | Value::Text(_)
-        | Value::Bytes(_) => Ok(()),
+        | Value::Bytes(_)
+        | Value::Date(_)
+        | Value::LocalTime(_)
+        | Value::Time(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime(_)
+        | Value::Duration(_)
+        | Value::Point(_) => Ok(()),
         Value::List(items) => {
             for item in items.iter() {
                 if matches!(

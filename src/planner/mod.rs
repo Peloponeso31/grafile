@@ -1632,41 +1632,28 @@ impl<'a> Planner<'a> {
                     "aggregations are not allowed inside list comprehensions",
                 ));
             }
-            if let Some((func, argument, star, distinct)) = aggregate_call(expr)? {
+            if let Some((func, arguments, star, distinct)) = aggregate_call(expr)? {
                 aggs.push(AggItem {
                     func,
-                    argument: aggregate_argument(func, argument, star, &scope)?,
+                    arguments: aggregate_arguments(func, &arguments, star, &scope)?,
                     distinct,
                     name: name.clone(),
                 });
             } else if contains_aggregation(expr) {
                 let mut residual = rewrite_expr(expr, &mut |sub| {
-                    let Some((func, argument, star, distinct)) = aggregate_call(sub)? else {
+                    let Some((func, arguments, star, distinct)) = aggregate_call(sub)? else {
                         return Ok(None);
                     };
                     let hidden = format!("  agg{}", aggs.len());
                     aggs.push(AggItem {
                         func,
-                        argument: aggregate_argument(func, argument, star, &scope)?,
+                        arguments: aggregate_arguments(func, &arguments, star, &scope)?,
                         distinct,
                         name: hidden.clone(),
                     });
                     Ok(Some(Expr::Variable(hidden)))
                 })?;
-                residual = rewrite_expr(&residual, &mut |sub| {
-                    if let Some((_, group)) = groups.iter().find(|(group, _)| group == sub) {
-                        return Ok(Some(Expr::Variable(group.clone())));
-                    }
-                    if references_unresolved(sub, &groups, &aggs)
-                        && !references_aggregation(sub, &aggs)
-                    {
-                        let hidden = format!("  grp{}", groups.len());
-                        validate_expr(sub, &scope)?;
-                        groups.push((sub.clone(), hidden.clone()));
-                        return Ok(Some(Expr::Variable(hidden)));
-                    }
-                    Ok(None)
-                })?;
+                residual = hoist_groups(&residual, &mut groups, &aggs, &scope)?;
                 post.push((residual, name.clone()));
             } else {
                 groups.push((expr.clone(), name.clone()));
@@ -2156,15 +2143,15 @@ fn default_name(expr: &Expr) -> String {
             }
         }
         Expr::Unary { op, expr } => match op {
-            UnaryOp::Neg => format!("-{}", default_name(expr)),
-            UnaryOp::Not => format!("NOT {}", default_name(expr)),
+            UnaryOp::Neg => format!("-{}", operand_name(expr, UNARY_PRECEDENCE, false, None)),
+            UnaryOp::Not => format!("NOT {}", operand_name(expr, NOT_PRECEDENCE, false, None)),
         },
-        Expr::Binary { op, left, right } => format!(
-            "{} {} {}",
-            default_name(left),
-            binary_text(*op),
-            default_name(right)
-        ),
+        Expr::Binary { op, left, right } => {
+            let precedence = op_precedence(*op);
+            let left = operand_name(left, precedence, false, Some(*op));
+            let right = operand_name(right, precedence, true, Some(*op));
+            format!("{left} {} {right}", binary_text(*op))
+        }
         Expr::IsNull { expr, negated } => format!(
             "{} IS {}NULL",
             default_name(expr),
@@ -2190,6 +2177,98 @@ fn default_name(expr: &Expr) -> String {
                 .join(", ")
         ),
         Expr::Case { .. } => "CASE".to_owned(),
+    }
+}
+
+/// Precedence levels mirroring the expression grammar in the parser; larger
+/// values bind tighter.
+const OR_PRECEDENCE: u8 = 1;
+const XOR_PRECEDENCE: u8 = 2;
+const AND_PRECEDENCE: u8 = 3;
+const NOT_PRECEDENCE: u8 = 4;
+const COMPARISON_PRECEDENCE: u8 = 5;
+const ADDITIVE_PRECEDENCE: u8 = 6;
+const MULTIPLICATIVE_PRECEDENCE: u8 = 7;
+const POWER_PRECEDENCE: u8 = 8;
+const UNARY_PRECEDENCE: u8 = 9;
+const ATOMIC_PRECEDENCE: u8 = 10;
+
+/// Binding strength of a binary operator.
+fn op_precedence(op: BinaryOp) -> u8 {
+    match op {
+        BinaryOp::Or => OR_PRECEDENCE,
+        BinaryOp::Xor => XOR_PRECEDENCE,
+        BinaryOp::And => AND_PRECEDENCE,
+        BinaryOp::Eq
+        | BinaryOp::Ne
+        | BinaryOp::Lt
+        | BinaryOp::Le
+        | BinaryOp::Gt
+        | BinaryOp::Ge
+        | BinaryOp::Regex
+        | BinaryOp::In
+        | BinaryOp::StartsWith
+        | BinaryOp::EndsWith
+        | BinaryOp::Contains => COMPARISON_PRECEDENCE,
+        BinaryOp::Add | BinaryOp::Sub => ADDITIVE_PRECEDENCE,
+        BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => MULTIPLICATIVE_PRECEDENCE,
+        BinaryOp::Pow => POWER_PRECEDENCE,
+    }
+}
+
+/// Whether chaining the operator needs no parentheses: `a + b + c`,
+/// `a AND b AND c`.
+fn op_associative(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Add | BinaryOp::Mul | BinaryOp::And | BinaryOp::Or | BinaryOp::Xor
+    )
+}
+
+/// Binding strength of an arbitrary expression: binary operators, unary
+/// operators and the comparison-shaped predicates.
+fn expr_precedence(expr: &Expr) -> u8 {
+    match expr {
+        Expr::Binary { op, .. } => op_precedence(*op),
+        Expr::Unary {
+            op: UnaryOp::Not, ..
+        } => NOT_PRECEDENCE,
+        Expr::Unary {
+            op: UnaryOp::Neg, ..
+        } => UNARY_PRECEDENCE,
+        Expr::IsNull { .. } | Expr::LabelCheck { .. } => COMPARISON_PRECEDENCE,
+        _ => ATOMIC_PRECEDENCE,
+    }
+}
+
+/// Render `expr` as an operand of an operator with `precedence`, adding
+/// parentheses wherever the operator tree would otherwise re-parse
+/// differently, so `12 / 4 * (3 - 2 * 4)` keeps its parentheses.
+fn operand_name(expr: &Expr, precedence: u8, right: bool, parent: Option<BinaryOp>) -> String {
+    let child = expr_precedence(expr);
+    let parenthesize = if child < precedence {
+        true
+    } else if child > precedence {
+        false
+    } else if !right {
+        // A same-precedence left operand only needs parentheses under a
+        // right-associative operator: `(a ^ b) ^ c`.
+        parent == Some(BinaryOp::Pow)
+    } else {
+        match parent {
+            // `a - (b - c)` and `a / (b * c)` would re-associate; associative
+            // operators, and `^` chains to the right, need none.
+            Some(parent_op) => {
+                let same = matches!(expr, Expr::Binary { op, .. } if *op == parent_op);
+                !(same && (op_associative(parent_op) || parent_op == BinaryOp::Pow))
+            }
+            None => true,
+        }
+    };
+    if parenthesize {
+        format!("({})", default_name(expr))
+    } else {
+        default_name(expr)
     }
 }
 
@@ -2226,7 +2305,10 @@ fn literal_text(value: &Value) -> String {
         Value::Null => "null".to_owned(),
         Value::Bool(inner) => inner.to_string(),
         Value::Int(inner) => inner.to_string(),
-        Value::Float(inner) => format!("{inner}"),
+        Value::Float(inner) => {
+            let mut buffer = ryu::Buffer::new();
+            buffer.format(*inner).to_owned()
+        }
         Value::Text(inner) => format!("'{inner}'"),
         other => format!("{other:?}"),
     }
@@ -2258,9 +2340,9 @@ fn binary_text(op: BinaryOp) -> &'static str {
 }
 
 /// Whether an expression is exactly an aggregation call, returning the
-/// function, optional argument and star flag.
+/// function, its arguments and the star flag.
 #[allow(clippy::type_complexity)]
-fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool, bool)>> {
+fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Vec<&Expr>, bool, bool)>> {
     let Expr::Function {
         name,
         distinct,
@@ -2277,6 +2359,10 @@ fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool, boo
         "min" => AggFn::Min,
         "max" => AggFn::Max,
         "collect" => AggFn::Collect,
+        "percentilecont" => AggFn::PercentileCont,
+        "percentiledisc" => AggFn::PercentileDisc,
+        "stdev" => AggFn::StDev,
+        "stdevp" => AggFn::StDevP,
         _ => return Ok(None),
     };
     if *star {
@@ -2286,29 +2372,40 @@ fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool, boo
         if *distinct {
             return Err(Error::syntax("count(DISTINCT *) is not valid"));
         }
-        return Ok(Some((func, None, true, false)));
+        return Ok(Some((func, Vec::new(), true, false)));
     }
-    match args.len() {
-        1 => Ok(Some((func, Some(&args[0]), false, *distinct))),
-        0 => Err(Error::syntax(format!("{name} requires an argument"))),
-        _ => Err(Error::unsupported("aggregations with multiple arguments")),
+    let expected = match func {
+        AggFn::PercentileCont | AggFn::PercentileDisc => 2,
+        _ => 1,
+    };
+    if args.len() != expected {
+        return Err(Error::syntax(format!(
+            "{name}() expects {expected} argument(s)"
+        )));
     }
+    Ok(Some((func, args.iter().collect(), false, *distinct)))
 }
 
-/// The argument of an aggregation, with `count(*)` becoming `count(1)`.
-fn aggregate_argument(
+/// The arguments of an aggregation, with `count(*)` becoming `count(1)`.
+fn aggregate_arguments(
     func: AggFn,
-    argument: Option<&Expr>,
+    arguments: &[&Expr],
     star: bool,
     scope: &FastMap<String, VarKind>,
-) -> Result<Expr> {
+) -> Result<Vec<Expr>> {
     if star {
-        return Ok(Expr::Literal(Value::Int(1)));
+        return Ok(vec![Expr::Literal(Value::Int(1))]);
     }
-    let argument =
-        argument.ok_or_else(|| Error::syntax(format!("{func:?} requires an argument")))?;
-    validate_expr(argument, scope)?;
-    Ok(argument.clone())
+    if arguments.is_empty() {
+        return Err(Error::syntax(format!("{func:?} requires an argument")));
+    }
+    for argument in arguments {
+        validate_expr(argument, scope)?;
+    }
+    Ok(arguments
+        .iter()
+        .map(|argument| (*argument).clone())
+        .collect())
 }
 
 /// Rewrite an expression top-down; `f` may replace a subexpression and stop
@@ -2592,17 +2689,448 @@ fn expr_references(expr: &Expr, pred: &mut dyn FnMut(&str) -> bool) -> bool {
     }
 }
 
-/// Whether `expr` references a variable that is not a grouping key or an
-/// aggregation output.
-fn references_unresolved(expr: &Expr, groups: &[(Expr, String)], aggs: &[AggItem]) -> bool {
-    expr_references(expr, &mut |name| {
-        !groups.iter().any(|(_, group)| group == name) && !aggs.iter().any(|item| item.name == name)
-    })
-}
-
 /// Whether `expr` references an aggregation output.
 fn references_aggregation(expr: &Expr, aggs: &[AggItem]) -> bool {
     expr_references(expr, &mut |name| aggs.iter().any(|item| item.name == name))
+}
+
+/// Where the free variables of an expression live, relative to the grouping
+/// keys and aggregations of a post-aggregation projection.
+#[derive(Default)]
+struct FreeRefs {
+    /// A free variable that is neither a grouping key nor an aggregation.
+    unresolved: bool,
+    /// A free variable bound by an enclosing comprehension, quantifier or
+    /// `reduce`; hoisting such an expression would move the reference out of
+    /// its binder.
+    ancestor_bound: bool,
+}
+
+/// Classify the free-variable references of `expr`. Variables bound inside
+/// `expr` itself (comprehension, quantifier, `reduce` and pattern binders)
+/// are not free.
+fn free_refs(
+    expr: &Expr,
+    initially_bound: &[String],
+    groups: &[(Expr, String)],
+    aggs: &[AggItem],
+) -> FreeRefs {
+    fn walk(
+        expr: &Expr,
+        bound: &mut Vec<String>,
+        base: usize,
+        groups: &[(Expr, String)],
+        aggs: &[AggItem],
+        out: &mut FreeRefs,
+    ) {
+        match expr {
+            Expr::Variable(name) => match bound.iter().position(|entry| entry == name) {
+                Some(position) if position < base => out.ancestor_bound = true,
+                Some(_) => {}
+                None => {
+                    let resolved = groups.iter().any(|(_, group)| group == name)
+                        || aggs.iter().any(|item| &item.name == name);
+                    if !resolved {
+                        out.unresolved = true;
+                    }
+                }
+            },
+            Expr::Literal(_) | Expr::Parameter(_) => {}
+            Expr::Pattern(path) => walk_pattern(path, bound, base, groups, aggs, out),
+            Expr::PatternComprehension {
+                path,
+                predicate,
+                projection,
+            } => {
+                walk_pattern(path, bound, base, groups, aggs, out);
+                let mark = bound.len();
+                pattern_variables(path, bound);
+                if let Some(predicate) = predicate {
+                    walk(predicate, bound, base, groups, aggs, out);
+                }
+                walk(projection, bound, base, groups, aggs, out);
+                bound.truncate(mark);
+            }
+            Expr::Property { base: inner, .. } | Expr::Unary { expr: inner, .. } => {
+                walk(inner, bound, base, groups, aggs, out);
+            }
+            Expr::Subscript {
+                base: target,
+                index,
+            } => {
+                walk(target, bound, base, groups, aggs, out);
+                walk(index, bound, base, groups, aggs, out);
+            }
+            Expr::Slice {
+                base: target,
+                lower,
+                upper,
+            } => {
+                walk(target, bound, base, groups, aggs, out);
+                if let Some(lower) = lower {
+                    walk(lower, bound, base, groups, aggs, out);
+                }
+                if let Some(upper) = upper {
+                    walk(upper, bound, base, groups, aggs, out);
+                }
+            }
+            Expr::ListComprehension {
+                var,
+                list,
+                predicate,
+                projection,
+            } => {
+                walk(list, bound, base, groups, aggs, out);
+                bound.push(var.clone());
+                if let Some(predicate) = predicate {
+                    walk(predicate, bound, base, groups, aggs, out);
+                }
+                if let Some(projection) = projection {
+                    walk(projection, bound, base, groups, aggs, out);
+                }
+                bound.pop();
+            }
+            Expr::Quantifier {
+                var,
+                list,
+                predicate,
+                ..
+            } => {
+                walk(list, bound, base, groups, aggs, out);
+                bound.push(var.clone());
+                walk(predicate, bound, base, groups, aggs, out);
+                bound.pop();
+            }
+            Expr::Reduce {
+                accumulator,
+                init,
+                var,
+                list,
+                expression,
+            } => {
+                walk(init, bound, base, groups, aggs, out);
+                walk(list, bound, base, groups, aggs, out);
+                bound.push(accumulator.clone());
+                bound.push(var.clone());
+                walk(expression, bound, base, groups, aggs, out);
+                bound.pop();
+                bound.pop();
+            }
+            Expr::Binary { left, right, .. } => {
+                walk(left, bound, base, groups, aggs, out);
+                walk(right, bound, base, groups, aggs, out);
+            }
+            Expr::Function { args, .. } => {
+                for arg in args {
+                    walk(arg, bound, base, groups, aggs, out);
+                }
+            }
+            Expr::List(items) => {
+                for item in items {
+                    walk(item, bound, base, groups, aggs, out);
+                }
+            }
+            Expr::Map(entries) => {
+                for (_, value) in entries {
+                    walk(value, bound, base, groups, aggs, out);
+                }
+            }
+            Expr::Case {
+                subject,
+                alternatives,
+                default,
+            } => {
+                if let Some(subject) = subject {
+                    walk(subject, bound, base, groups, aggs, out);
+                }
+                for (when, then) in alternatives {
+                    walk(when, bound, base, groups, aggs, out);
+                    walk(then, bound, base, groups, aggs, out);
+                }
+                if let Some(default) = default {
+                    walk(default, bound, base, groups, aggs, out);
+                }
+            }
+            Expr::IsNull { expr: inner, .. } | Expr::LabelCheck { expr: inner, .. } => {
+                walk(inner, bound, base, groups, aggs, out);
+            }
+        }
+    }
+
+    fn walk_pattern(
+        path: &PatternPath,
+        bound: &mut Vec<String>,
+        base: usize,
+        groups: &[(Expr, String)],
+        aggs: &[AggItem],
+        out: &mut FreeRefs,
+    ) {
+        if let Some(properties) = &path.start.properties {
+            walk(properties, bound, base, groups, aggs, out);
+        }
+        for segment in &path.segments {
+            if let Some(properties) = &segment.relationship.properties {
+                walk(properties, bound, base, groups, aggs, out);
+            }
+        }
+    }
+
+    let mut bound = initially_bound.to_vec();
+    let base = bound.len();
+    let mut out = FreeRefs::default();
+    walk(expr, &mut bound, base, groups, aggs, &mut out);
+    out
+}
+
+/// Rewrite a post-aggregation residual, hoisting every subexpression that
+/// references a pre-aggregation variable onto a grouping key. References to
+/// variables bound inside comprehensions, quantifiers and `reduce` bodies
+/// stay in place: they are resolved by their binder, not by a grouping key.
+fn hoist_groups(
+    expr: &Expr,
+    groups: &mut Vec<(Expr, String)>,
+    aggs: &[AggItem],
+    scope: &FastMap<String, VarKind>,
+) -> Result<Expr> {
+    hoist_walk(expr, groups, aggs, scope, &[])
+}
+
+fn hoist_walk(
+    expr: &Expr,
+    groups: &mut Vec<(Expr, String)>,
+    aggs: &[AggItem],
+    scope: &FastMap<String, VarKind>,
+    bound: &[String],
+) -> Result<Expr> {
+    if let Some((_, group)) = groups.iter().find(|(group, _)| group == expr) {
+        return Ok(Expr::Variable(group.clone()));
+    }
+    let refs = free_refs(expr, bound, groups, aggs);
+    if refs.unresolved && !refs.ancestor_bound && !references_aggregation(expr, aggs) {
+        validate_expr(expr, scope)?;
+        let hidden = format!("  grp{}", groups.len());
+        groups.push((expr.clone(), hidden.clone()));
+        return Ok(Expr::Variable(hidden));
+    }
+    Ok(match expr {
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => expr.clone(),
+        Expr::Pattern(path) => {
+            Expr::Pattern(Box::new(hoist_pattern(path, groups, aggs, scope, bound)?))
+        }
+        Expr::PatternComprehension {
+            path,
+            predicate,
+            projection,
+        } => {
+            let path = hoist_pattern(path, groups, aggs, scope, bound)?;
+            let mut inner = bound.to_vec();
+            pattern_variables(&path, &mut inner);
+            Expr::PatternComprehension {
+                path: Box::new(path),
+                predicate: predicate
+                    .as_deref()
+                    .map(|predicate| {
+                        hoist_walk(predicate, groups, aggs, scope, &inner).map(Box::new)
+                    })
+                    .transpose()?,
+                projection: Box::new(hoist_walk(projection, groups, aggs, scope, &inner)?),
+            }
+        }
+        Expr::Property { base, key } => Expr::Property {
+            base: Box::new(hoist_walk(base, groups, aggs, scope, bound)?),
+            key: key.clone(),
+        },
+        Expr::Subscript { base, index } => Expr::Subscript {
+            base: Box::new(hoist_walk(base, groups, aggs, scope, bound)?),
+            index: Box::new(hoist_walk(index, groups, aggs, scope, bound)?),
+        },
+        Expr::Slice { base, lower, upper } => Expr::Slice {
+            base: Box::new(hoist_walk(base, groups, aggs, scope, bound)?),
+            lower: lower
+                .as_deref()
+                .map(|lower| hoist_walk(lower, groups, aggs, scope, bound).map(Box::new))
+                .transpose()?,
+            upper: upper
+                .as_deref()
+                .map(|upper| hoist_walk(upper, groups, aggs, scope, bound).map(Box::new))
+                .transpose()?,
+        },
+        Expr::ListComprehension {
+            var,
+            list,
+            predicate,
+            projection,
+        } => {
+            let list = Box::new(hoist_walk(list, groups, aggs, scope, bound)?);
+            let mut inner = bound.to_vec();
+            inner.push(var.clone());
+            Expr::ListComprehension {
+                var: var.clone(),
+                list,
+                predicate: predicate
+                    .as_deref()
+                    .map(|predicate| {
+                        hoist_walk(predicate, groups, aggs, scope, &inner).map(Box::new)
+                    })
+                    .transpose()?,
+                projection: projection
+                    .as_deref()
+                    .map(|projection| {
+                        hoist_walk(projection, groups, aggs, scope, &inner).map(Box::new)
+                    })
+                    .transpose()?,
+            }
+        }
+        Expr::Quantifier {
+            kind,
+            var,
+            list,
+            predicate,
+        } => {
+            let list = Box::new(hoist_walk(list, groups, aggs, scope, bound)?);
+            let mut inner = bound.to_vec();
+            inner.push(var.clone());
+            Expr::Quantifier {
+                kind: *kind,
+                var: var.clone(),
+                list,
+                predicate: Box::new(hoist_walk(predicate, groups, aggs, scope, &inner)?),
+            }
+        }
+        Expr::Reduce {
+            accumulator,
+            init,
+            var,
+            list,
+            expression,
+        } => {
+            let init = Box::new(hoist_walk(init, groups, aggs, scope, bound)?);
+            let list = Box::new(hoist_walk(list, groups, aggs, scope, bound)?);
+            let mut inner = bound.to_vec();
+            inner.push(accumulator.clone());
+            inner.push(var.clone());
+            Expr::Reduce {
+                accumulator: accumulator.clone(),
+                init,
+                var: var.clone(),
+                list,
+                expression: Box::new(hoist_walk(expression, groups, aggs, scope, &inner)?),
+            }
+        }
+        Expr::Unary { op, expr: operand } => Expr::Unary {
+            op: *op,
+            expr: Box::new(hoist_walk(operand, groups, aggs, scope, bound)?),
+        },
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(hoist_walk(left, groups, aggs, scope, bound)?),
+            right: Box::new(hoist_walk(right, groups, aggs, scope, bound)?),
+        },
+        Expr::Function {
+            name,
+            distinct,
+            star,
+            args,
+        } => Expr::Function {
+            name: name.clone(),
+            distinct: *distinct,
+            star: *star,
+            args: args
+                .iter()
+                .map(|arg| hoist_walk(arg, groups, aggs, scope, bound))
+                .collect::<Result<_>>()?,
+        },
+        Expr::List(items) => Expr::List(
+            items
+                .iter()
+                .map(|item| hoist_walk(item, groups, aggs, scope, bound))
+                .collect::<Result<_>>()?,
+        ),
+        Expr::Map(entries) => Expr::Map(
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    Ok((key.clone(), hoist_walk(value, groups, aggs, scope, bound)?))
+                })
+                .collect::<Result<_>>()?,
+        ),
+        Expr::Case {
+            subject,
+            alternatives,
+            default,
+        } => Expr::Case {
+            subject: subject
+                .as_deref()
+                .map(|subject| hoist_walk(subject, groups, aggs, scope, bound).map(Box::new))
+                .transpose()?,
+            alternatives: alternatives
+                .iter()
+                .map(|(when, then)| {
+                    Ok((
+                        hoist_walk(when, groups, aggs, scope, bound)?,
+                        hoist_walk(then, groups, aggs, scope, bound)?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
+            default: default
+                .as_deref()
+                .map(|default| hoist_walk(default, groups, aggs, scope, bound).map(Box::new))
+                .transpose()?,
+        },
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => Expr::IsNull {
+            expr: Box::new(hoist_walk(inner, groups, aggs, scope, bound)?),
+            negated: *negated,
+        },
+        Expr::LabelCheck {
+            expr: inner,
+            labels,
+        } => Expr::LabelCheck {
+            expr: Box::new(hoist_walk(inner, groups, aggs, scope, bound)?),
+            labels: labels.clone(),
+        },
+    })
+}
+
+/// Hoist the free variables of a pattern's inline property maps.
+fn hoist_pattern(
+    path: &PatternPath,
+    groups: &mut Vec<(Expr, String)>,
+    aggs: &[AggItem],
+    scope: &FastMap<String, VarKind>,
+    bound: &[String],
+) -> Result<PatternPath> {
+    let mut path = path.clone();
+    if let Some(properties) = &path.start.properties {
+        path.start.properties = Some(hoist_walk(properties, groups, aggs, scope, bound)?);
+    }
+    for segment in &mut path.segments {
+        if let Some(properties) = &segment.relationship.properties {
+            segment.relationship.properties =
+                Some(hoist_walk(properties, groups, aggs, scope, bound)?);
+        }
+    }
+    Ok(path)
+}
+
+/// Append the variables a pattern path binds to `names`.
+fn pattern_variables(path: &PatternPath, names: &mut Vec<String>) {
+    if let Some(name) = &path.variable {
+        names.push(name.clone());
+    }
+    if let Some(name) = &path.start.variable {
+        names.push(name.clone());
+    }
+    for segment in &path.segments {
+        if let Some(name) = &segment.relationship.variable {
+            names.push(name.clone());
+        }
+        if let Some(name) = &segment.node.variable {
+            names.push(name.clone());
+        }
+    }
 }
 
 /// Whether an aggregation appears inside a comprehension body, quantifier
@@ -2696,7 +3224,16 @@ fn contains_aggregation(expr: &Expr) -> bool {
             let lower = name.to_ascii_lowercase();
             matches!(
                 lower.as_str(),
-                "count" | "sum" | "avg" | "min" | "max" | "collect"
+                "count"
+                    | "sum"
+                    | "avg"
+                    | "min"
+                    | "max"
+                    | "collect"
+                    | "percentilecont"
+                    | "percentiledisc"
+                    | "stdev"
+                    | "stdevp"
             ) || args.iter().any(contains_aggregation)
         }
         Expr::Property { base, .. } | Expr::Unary { expr: base, .. } => contains_aggregation(base),

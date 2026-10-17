@@ -22,6 +22,14 @@ pub enum AggFn {
     Max,
     /// `collect(x)`
     Collect,
+    /// `percentileCont(value, percentile)`
+    PercentileCont,
+    /// `percentileDisc(value, percentile)`
+    PercentileDisc,
+    /// `stDev(x)`
+    StDev,
+    /// `stDevP(x)`
+    StDevP,
 }
 
 /// One aggregation in an [`Plan::Aggregate`].
@@ -29,8 +37,8 @@ pub enum AggFn {
 pub struct AggItem {
     /// Aggregation function.
     pub func: AggFn,
-    /// Argument expression.
-    pub argument: Expr,
+    /// Argument expressions, in written order.
+    pub arguments: Vec<Expr>,
     /// Whether `DISTINCT` was written.
     pub distinct: bool,
     /// Output name.
