@@ -57,14 +57,11 @@ Explicit gaps (currently clear `Unsupported` errors):
 
 Silently absent areas: none of the openCypher value types.
 
-Known semantic deviations to close:
+Known limitations:
 
-- Comparing values of different temporal types (a date with a datetime, for
-  example) yields null instead of Neo4j's error; the Phase 4 comparison
-  sweep pins the exact rules.
-- `+` does not coerce the non-string operand to text, so `'p-' + 1` errors.
 - A pattern comprehension inside a list comprehension is rejected (one
-  allow-listed scenario).
+  allow-listed scenario; a general fix needs nested-plan evaluation, so it is
+  not scheduled).
 
 ## Phases
 
