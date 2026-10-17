@@ -107,7 +107,7 @@ tests/          end-to-end Cypher suites by feature area, CLI tests, helpers
 ffi/            C ABI crate, header and language examples
 tck-runner/     openCypher TCK harness (see docs/tck.md)
 third_party/    vendored openCypher TCK (submodule)
-docs/           format.md, ffi.md, tck.md, roadmap.md
+docs/           format.md, ffi.md, tck.md, roadmap.md, benchmarks.md
 ```
 
 ## Installation
@@ -430,28 +430,12 @@ $ cargo bench              # criterion: storage, queries, insert
 
 ## Performance
 
-10 000 inserts in one transaction, Apple silicon, release build
-(`cargo bench --bench insert`); the SQLite column uses `rusqlite` with bundled
-SQLite as a baseline:
-
-| Workload | grafile | SQLite |
-|---|---:|---:|
-| nodes, in-memory | 2.9 ms | 1.2 ms |
-| nodes + unique index, in-memory | 10.5 ms | 2.3 ms |
-| chain edges, in-memory | 6.7 ms | — |
-| `UNWIND … CREATE` (20 batches) | 6.4 ms | — |
-| nodes, real file (2 transactions) | 13.0 ms | 1.8 ms (1 transaction) |
-
-Reads are served from the bitmap adjacency index rather than by scanning.
-End-to-end Cypher latency on a 5 000-node chain graph (in-memory, release
-build, `cargo bench --bench queries`; each measurement includes parsing,
-planning, compilation and execution):
-
-| Query | Time |
-|---|---:|
-| indexed point lookup (`MATCH (n:Person {seed: $id})`) | 2.8 µs |
-| indexed one-hop traversal (`MATCH (a:Person {seed: $id})-[:KNOWS]->(b)`) | 4.5 µs |
-| label count over 5 000 nodes (`count(*)`) | 1.6 µs |
+`cargo bench` measures the storage layer, end-to-end Cypher latency and write
+workloads against SQLite baselines. Point lookups are single-digit
+microseconds, label counts run at ~50 ns per row, indexed equality is
+thousands of times faster than a label scan and 30 KB overflow values read in
+under a microsecond. Current numbers, methodology and the baseline-comparison
+workflow live in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Contributing
 
