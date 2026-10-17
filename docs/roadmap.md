@@ -88,8 +88,8 @@ registers test procedures).
   (93 scenarios).
 - [ ] Pattern predicates in `WHERE`, `exists()`, and `shortestPath()` /
   `allShortestPaths()`; pattern comprehensions depend on them (~50).
-- [ ] Non-literal property values in `MATCH` patterns (`{key: expr}`) compile
-  to runtime filters while literals keep index seeks; `MERGE` already
+- [done] Non-literal property values in `MATCH` patterns (`{key: expr}`)
+  compile to runtime filters while literals keep index seeks; `MERGE` already
   supports expressions. TCK-blind: unit and integration tests only.
 
 #### 1C — Comprehensions, quantifiers, reduce [done]

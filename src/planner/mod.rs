@@ -322,6 +322,7 @@ impl<'a> Planner<'a> {
             types: Vec<u32>,
             direction: RelDirection,
             props: Vec<(u32, Value)>,
+            prop_exprs: Vec<(String, Expr)>,
             var_length: Option<crate::cypher::VarLength>,
         }
         let mut rels: Vec<RelInfo> = Vec::new();
@@ -334,17 +335,23 @@ impl<'a> Planner<'a> {
                 None => self.anon_name("rel"),
             };
             let types = self.resolve_types(&rel.types);
-            let props = self
-                .pattern_props(rel.properties.as_ref(), "relationship")?
-                .into_iter()
-                .map(|(_, key_id, value)| (key_id, value))
-                .collect();
+            let (literals, prop_exprs) =
+                self.pattern_props(rel.properties.as_ref(), "relationship", scope)?;
+            if rel.var_length.is_some() && !prop_exprs.is_empty() {
+                return Err(Error::unsupported(
+                    "variable-length relationship patterns require literal property filters",
+                ));
+            }
             rels.push(RelInfo {
                 index: nodes.len() - 2,
                 var,
                 types,
                 direction: rel.direction,
-                props,
+                props: literals
+                    .into_iter()
+                    .map(|(_, key_id, value)| (key_id, value))
+                    .collect(),
+                prop_exprs,
                 var_length: rel.var_length,
             });
         }
@@ -408,6 +415,7 @@ impl<'a> Planner<'a> {
                     },
                 };
                 constrain_edge(plan, &edge_var, &rel.var, edge_bound);
+                constrain_edge_props(plan, &edge_var, &rel.prop_exprs);
                 scope.insert(nodes[to_idx].var.clone(), VarKind::Node);
                 bound[to_idx] = true;
                 handled[idx] = true;
@@ -468,6 +476,7 @@ impl<'a> Planner<'a> {
                     ),
                 };
                 constrain_edge(plan, &edge_var, &rel.var, edge_bound);
+                constrain_edge_props(plan, &edge_var, &rel.prop_exprs);
                 handled[idx] = true;
                 progressed = true;
                 break;
@@ -655,50 +664,59 @@ impl<'a> Planner<'a> {
             // but the variable is still bound.
             label_ids.push(self.db.label_id(label).unwrap_or(u32::MAX));
         }
-        let props = self.pattern_props(pattern.properties.as_ref(), "node")?;
-        let _ = scope;
+        let (literals, prop_exprs) =
+            self.pattern_props(pattern.properties.as_ref(), "node", scope)?;
         Ok(PlannedNode {
             var,
             label_ids,
             label_names: pattern.labels.clone(),
-            props: props
+            props: literals
                 .iter()
                 .map(|(_, key_id, value)| (*key_id, value.clone()))
                 .collect(),
-            prop_literals: props
+            prop_literals: literals
                 .into_iter()
                 .map(|(name, _, value)| (name, value))
                 .collect(),
+            prop_exprs,
         })
     }
 
+    /// Split pattern properties into literal filters (usable for index seeks
+    /// and scans) and runtime expressions (lowered to filters).
+    #[allow(clippy::type_complexity)]
     fn pattern_props(
         &self,
         properties: Option<&Expr>,
         what: &str,
-    ) -> Result<Vec<(String, u32, Value)>> {
+        scope: &FastMap<String, VarKind>,
+    ) -> Result<(Vec<(String, u32, Value)>, Vec<(String, Expr)>)> {
         let Some(properties) = properties else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         };
         let Expr::Map(entries) = properties else {
             return Err(Error::unsupported(format!(
                 "{what} pattern properties must be a map literal"
             )));
         };
-        let mut props = Vec::new();
+        let mut literals = Vec::new();
+        let mut exprs = Vec::new();
         for (key, value) in entries {
-            let Expr::Literal(value) = value else {
-                return Err(Error::unsupported(format!(
-                    "{what} pattern property values must be literals in this version"
-                )));
-            };
-            if value.is_null() {
-                continue;
+            match value {
+                Expr::Literal(value) => {
+                    if value.is_null() {
+                        continue;
+                    }
+                    let key_id = self.db.property_key_id(key).unwrap_or(NO_KEY);
+                    literals.push((key.clone(), key_id, value.clone()));
+                }
+                value => {
+                    validate_expr(value, scope)?;
+                    exprs.push((key.clone(), value.clone()));
+                }
             }
-            let key_id = self.db.property_key_id(key).unwrap_or(NO_KEY);
-            props.push((key.clone(), key_id, value.clone()));
         }
-        Ok(props)
+        Ok((literals, exprs))
     }
 
     fn resolve_types(&self, types: &[String]) -> Vec<u32> {
@@ -1240,6 +1258,7 @@ struct PlannedNode {
     label_names: Vec<String>,
     props: Vec<(u32, Value)>,
     prop_literals: Vec<(String, Value)>,
+    prop_exprs: Vec<(String, Expr)>,
 }
 
 /// `expr = expr`, used to constrain expansions to pre-bound elements.
@@ -1253,6 +1272,22 @@ fn eq_expr(left: Expr, right: Expr) -> Expr {
 
 /// When the pattern's relationship variable was already bound, the expansion
 /// binds a fresh variable; constrain it to the bound one.
+/// Lower non-literal relationship property values to runtime filters.
+fn constrain_edge_props(plan: &mut Plan, edge_var: &str, props: &[(String, Expr)]) {
+    for (key, value) in props {
+        *plan = Plan::Filter {
+            input: Box::new(plan.clone()),
+            predicate: eq_expr(
+                Expr::Property {
+                    base: Box::new(Expr::Variable(edge_var.to_owned())),
+                    key: key.clone(),
+                },
+                value.clone(),
+            ),
+        };
+    }
+}
+
 fn constrain_edge(plan: &mut Plan, edge_var: &str, rel_var: &str, edge_bound: bool) {
     if !edge_bound {
         return;
@@ -1283,6 +1318,8 @@ fn node_constraints(node: &PlannedNode, scanned: bool) -> Option<Expr> {
         });
     }
     if !scanned {
+        // Scans apply literal properties themselves; bound nodes need them
+        // re-checked.
         for (key, value) in &node.prop_literals {
             predicates.push(Expr::Binary {
                 op: BinaryOp::Eq,
@@ -1293,6 +1330,17 @@ fn node_constraints(node: &PlannedNode, scanned: bool) -> Option<Expr> {
                 right: Box::new(Expr::Literal(value.clone())),
             });
         }
+    }
+    // Expression properties always become runtime filters.
+    for (key, value) in &node.prop_exprs {
+        predicates.push(Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Property {
+                base: Box::new(Expr::Variable(node.var.clone())),
+                key: key.clone(),
+            }),
+            right: Box::new(value.clone()),
+        });
     }
     predicates.into_iter().reduce(|left, right| Expr::Binary {
         op: BinaryOp::And,

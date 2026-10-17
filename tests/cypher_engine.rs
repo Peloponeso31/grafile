@@ -910,3 +910,48 @@ fn rebinding_a_relationship_in_the_same_section_is_rejected() {
     );
     assert_eq!(rows, vec![vec!["true"]]);
 }
+
+// ---- non-literal pattern properties ----
+
+#[test]
+fn non_literal_pattern_properties_filter_at_runtime() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A {num: 1})-[:T {w: 5}]->(:B {num: 2})")
+        .expect("create");
+    let rows = query(
+        &mut conn,
+        "WITH 1 AS x MATCH (n {num: x}) RETURN n.num AS n",
+    );
+    assert_eq!(rows, vec![vec!["1"]]);
+    let rows = query(
+        &mut conn,
+        "WITH 5 AS w MATCH (a)-[r:T {w: w}]->(b) RETURN a.num AS a, b.num AS b",
+    );
+    assert_eq!(rows, vec![vec!["1", "2"]]);
+    let rows = query(
+        &mut conn,
+        "UNWIND [1, 3] AS x MATCH (n {num: x}) RETURN count(*) AS c",
+    );
+    assert_eq!(rows, vec![vec!["1"]]);
+    let rows = query(
+        &mut conn,
+        "OPTIONAL MATCH (n {num: 99}) RETURN n IS NULL AS missing",
+    );
+    assert_eq!(rows, vec![vec!["true"]]);
+}
+
+#[test]
+fn literal_pattern_properties_still_seek_indexes() {
+    let mut conn = connection();
+    conn.execute("CREATE (:Person {seed: 1})").expect("create");
+    conn.create_node_index("seed", Some("Person"), false)
+        .expect("index");
+    let plan = conn
+        .explain("MATCH (n:Person {seed: 1}) RETURN n")
+        .expect("explain");
+    assert!(!plan.contains("seek=-"), "{plan}");
+    let plan = conn
+        .explain("WITH 1 AS s MATCH (n:Person {seed: s}) RETURN n")
+        .expect("explain");
+    assert!(plan.contains("seek=-"), "{plan}");
+}
