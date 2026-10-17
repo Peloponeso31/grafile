@@ -240,12 +240,103 @@ fn bench_sqlite_baseline(c: &mut Criterion) {
     });
 }
 
+fn bench_update_nodes(c: &mut Criterion) {
+    c.bench_function("grafile_update_nodes_10k", |b| {
+        let mut conn = mem_connection("bench-update.db");
+        let ids = create_database(&mut conn);
+        conn.begin().expect("begin");
+        insert_nodes(conn.database_mut(), (ids.0, ids.2, ids.3), NODES);
+        conn.commit().expect("commit");
+
+        b.iter(|| {
+            conn.execute("MATCH (n:Person) SET n.seed = n.seed")
+                .expect("update");
+        });
+    });
+}
+
+fn bench_delete_nodes(c: &mut Criterion) {
+    c.bench_function("grafile_delete_nodes_10k", |b| {
+        b.iter_batched(
+            || {
+                let mut conn = mem_connection("bench-delete.db");
+                let ids = create_database(&mut conn);
+                conn.begin().expect("begin");
+                insert_nodes(conn.database_mut(), (ids.0, ids.2, ids.3), NODES);
+                conn.commit().expect("commit");
+                conn
+            },
+            |mut conn| {
+                conn.execute("MATCH (n:Person) DETACH DELETE n")
+                    .expect("delete");
+                black_box(conn);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
+/// An in-memory SQLite table holding the same 10k rows as the grafile
+/// workloads.
+fn sqlite_seeded() -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().expect("sqlite");
+    conn.execute(
+        "CREATE TABLE person(id INTEGER PRIMARY KEY, seed INTEGER, name TEXT)",
+        [],
+    )
+    .expect("table");
+    let tx = conn.unchecked_transaction().expect("txn");
+    {
+        let mut stmt = tx
+            .prepare("INSERT INTO person(seed, name) VALUES (?1, ?2)")
+            .expect("prepare");
+        for index in 0..NODES {
+            stmt.execute(rusqlite::params![index as i64, format!("node{index}")])
+                .expect("insert");
+        }
+    }
+    tx.commit().expect("commit");
+    conn
+}
+
+fn bench_sqlite_update_delete(c: &mut Criterion) {
+    c.bench_function("sqlite_update_10k_memory", |b| {
+        b.iter_batched(
+            sqlite_seeded,
+            |conn| {
+                let tx = conn.unchecked_transaction().expect("txn");
+                tx.execute("UPDATE person SET seed = seed", [])
+                    .expect("update");
+                tx.commit().expect("commit");
+                black_box(conn);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+
+    c.bench_function("sqlite_delete_10k_memory", |b| {
+        b.iter_batched(
+            sqlite_seeded,
+            |conn| {
+                let tx = conn.unchecked_transaction().expect("txn");
+                tx.execute("DELETE FROM person", []).expect("delete");
+                tx.commit().expect("commit");
+                black_box(conn);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+}
+
 criterion_group!(
     benches,
     bench_create_nodes,
     bench_create_edges,
     bench_cypher_unwind_create,
     bench_create_nodes_file,
-    bench_sqlite_baseline
+    bench_update_nodes,
+    bench_delete_nodes,
+    bench_sqlite_baseline,
+    bench_sqlite_update_delete
 );
 criterion_main!(benches);
