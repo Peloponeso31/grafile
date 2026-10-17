@@ -40,23 +40,26 @@ impl JournalHeader {
 
     /// Parse a journal header block.
     ///
-    /// Returns `Ok(None)` when the magic is zeroed (no transaction in flight
-    /// or a crash before the commit header was written). Returns `Corrupt`
-    /// when the magic is present but the header does not validate.
+    /// Returns `Ok(None)` when the block does not hold a valid transaction
+    /// header: the magic is zeroed (no transaction in flight or a crash
+    /// before the commit header was written), partially written, or the
+    /// header checksum does not match. An incomplete header is never
+    /// corruption: the commit protocol writes the header before any database
+    /// page, so a header that fails validation means the database was either
+    /// never touched or the transaction was already committed and is being
+    /// invalidated. `Corrupt` is reserved for input that cannot be a header
+    /// at all (truncated block).
     pub fn parse(block: &[u8]) -> Result<Option<Self>> {
         if block.len() < JOURNAL_HEADER_SIZE {
             return Err(Error::corrupt("journal header block truncated"));
         }
         if block[..8] != JOURNAL_MAGIC {
-            if block[..8].iter().all(|byte| *byte == 0) {
-                return Ok(None);
-            }
-            return Err(Error::corrupt("journal header magic mismatch"));
+            return Ok(None);
         }
         let stored = u32::from_le_bytes([block[32], block[33], block[34], block[35]]);
         let computed = crc32c::crc32c(&block[..32]);
         if stored != computed {
-            return Err(Error::corrupt("journal header checksum mismatch"));
+            return Ok(None);
         }
         let header = Self {
             page_size: u32::from_le_bytes([block[8], block[9], block[10], block[11]]),
@@ -219,16 +222,40 @@ mod tests {
     }
 
     #[test]
-    fn tampered_header_is_corrupt() {
-        let mut block = vec![0u8; 512];
-        let header = JournalHeader {
-            page_size: 8192,
-            change_counter: 3,
-            salt: 7,
-            record_count: 1,
+    fn damaged_headers_are_stale_not_corrupt() {
+        let valid = |block: &mut [u8]| {
+            JournalHeader {
+                page_size: 8192,
+                change_counter: 3,
+                salt: 7,
+                record_count: 1,
+            }
+            .encode(block);
         };
-        header.encode(&mut block);
+
+        // The commit protocol zeroes the magic to invalidate the journal; a
+        // crash mid-write leaves it partially zeroed.
+        let mut block = vec![0u8; 512];
+        valid(&mut block);
+        block[..4].fill(0);
+        assert_eq!(JournalHeader::parse(&block).expect("parse"), None);
+
+        // Arbitrary magic corruption is equally not a hot journal.
+        let mut block = vec![0u8; 512];
+        valid(&mut block);
+        block[..8].copy_from_slice(b"XXXXXXXX");
+        assert_eq!(JournalHeader::parse(&block).expect("parse"), None);
+
+        // A header write torn after the magic leaves a checksum mismatch.
+        let mut block = vec![0u8; 512];
+        valid(&mut block);
         block[16] ^= 0xFF;
+        assert_eq!(JournalHeader::parse(&block).expect("parse"), None);
+    }
+
+    #[test]
+    fn truncated_header_blocks_are_corrupt() {
+        let block = vec![0u8; JOURNAL_HEADER_SIZE - 1];
         assert!(JournalHeader::parse(&block).is_err());
     }
 

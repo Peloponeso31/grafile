@@ -1242,22 +1242,12 @@ mod tests {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(24))]
+        #![proptest_config(ProptestConfig::with_cases(64))]
 
         /// A commit interrupted at a random I/O operation (with or without a
         /// torn write) must leave the database at a consistent state: either
         /// every page and the version show the committed prefix, or all of
         /// them show the new transaction. Mixed states are corruption.
-        ///
-        /// Ignored: exposes a real recovery bug, not a bad expectation.
-        ///
-        /// A torn write during the final commit can leave a journal whose
-        /// header magic is only partially zeroed; recovery rejects it with
-        /// `Corrupt: journal header magic mismatch` instead of treating the
-        /// journal as invalid and rolling back. Minimal failing input:
-        /// `committed_txns = 3, fail_after = Some(10), torn = true` (seed in
-        /// `proptest-regressions/pager/mod.txt`).
-        #[ignore = "bug: torn journal during commit leaves the database unrecoverable (journal header magic mismatch)"]
         #[test]
         fn interrupted_commits_recover_to_a_consistent_state(
             committed_txns in 1u32..4,

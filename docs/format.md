@@ -269,13 +269,16 @@ Commit protocol:
 
 Crash recovery, performed under an exclusive lock on open:
 
-- No journal, or journal header magic zero/invalid: delete the journal if
-  writable; the database is consistent.
+- No journal, or an invalid journal header (magic zeroed or partially
+  zeroed, or a failed header checksum): delete the journal if writable; the
+  database is consistent.
 - Valid journal header: restore each recorded page image, stopping at the
   first record whose checksum fails; then delete the journal.
 
 Because database pages are only written after a valid, synced journal header,
-a torn journal can never correspond to a partially written database.
+a torn journal can never correspond to a partially written database. An
+invalid header is therefore stale, never `Corrupt`: the transaction either
+never touched the database or was already committed and is being invalidated.
 
 ### Multi-connection behavior
 
