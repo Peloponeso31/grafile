@@ -1038,7 +1038,7 @@ impl<'a> Executor<'a> {
             Op::HasLabel { node, label, dest } => {
                 let label_id = self.resolve_label(*label)?;
                 let result = match (self.regs[*node as usize].clone(), label_id) {
-                    (Reg::Node(id), Some(label)) => self
+                    (Reg::Node(id) | Reg::Value(Value::Node(id)), Some(label)) => self
                         .db
                         .get_node(id)?
                         .map(|record| record.labels.contains(&label))
@@ -1463,20 +1463,20 @@ impl<'a> Executor<'a> {
             Op::SetProperty { target, key, value } => {
                 let key_name = self.reg_text(*key)?;
                 let value = self.reg_value(*value)?;
-                match self.regs[*target as usize].clone() {
-                    Reg::Node(id) => {
+                match self.reg_value(*target)? {
+                    Value::Node(id) => {
                         let key_id = self.db.ensure_property_key(&key_name)?;
                         self.db.set_node_property(id, key_id, value)?;
                     }
-                    Reg::Edge(id) => {
+                    Value::Edge(id) => {
                         let key_id = self.db.ensure_property_key(&key_name)?;
                         self.db.set_edge_property(id, key_id, value)?;
                     }
-                    Reg::Value(Value::Null) => {}
+                    Value::Null => {}
                     other => {
                         return Err(Error::type_error(format!(
                             "SET expects a node or relationship, got {}",
-                            other.to_value().type_name()
+                            other.type_name()
                         )));
                     }
                 }
@@ -1521,18 +1521,18 @@ impl<'a> Executor<'a> {
                     }
                 };
                 // Replacing properties on a null binding is a no-op.
-                match self.regs[*target as usize].clone() {
-                    Reg::Value(Value::Null) => {}
-                    Reg::Node(id) => {
+                match self.reg_value(*target)? {
+                    Value::Null => {}
+                    Value::Node(id) => {
                         self.db.replace_node_properties(id, entries)?;
                     }
-                    Reg::Edge(id) => {
+                    Value::Edge(id) => {
                         self.db.replace_edge_properties(id, entries)?;
                     }
                     other => {
                         return Err(Error::type_error(format!(
                             "SET expects a node or relationship, got {}",
-                            other.to_value().type_name()
+                            other.type_name()
                         )));
                     }
                 }
@@ -1542,38 +1542,38 @@ impl<'a> Executor<'a> {
                 // value remove the property, like `SET n.key = null`.
                 if !matches!(self.regs[*target as usize], Reg::Value(Value::Null)) {
                     let entries = self.resolve_props(*props)?;
-                    match self.regs[*target as usize] {
-                        Reg::Node(id) => {
+                    match self.reg_value(*target)? {
+                        Value::Node(id) => {
                             for (key, value) in entries {
                                 self.db.set_node_property(id, key, value)?;
                             }
                         }
-                        Reg::Edge(id) => {
+                        Value::Edge(id) => {
                             for (key, value) in entries {
                                 self.db.set_edge_property(id, key, value)?;
                             }
                         }
-                        ref other => {
+                        other => {
                             return Err(Error::type_error(format!(
                                 "SET += expects a node or relationship, got {}",
-                                other.to_value().type_name()
+                                other.type_name()
                             )));
                         }
                     }
                 }
             }
-            Op::DeleteAny { target, detach } => match self.regs[*target as usize].clone() {
-                Reg::Node(id) => {
+            Op::DeleteAny { target, detach } => match self.reg_value(*target)? {
+                Value::Node(id) => {
                     self.db.delete_node(id, *detach)?;
                 }
-                Reg::Edge(id) => {
+                Value::Edge(id) => {
                     self.db.delete_edge(id)?;
                 }
-                Reg::Value(Value::Null) => {}
+                Value::Null => {}
                 other => {
                     return Err(Error::type_error(format!(
                         "DELETE expects a node or relationship, got {}",
-                        other.to_value().type_name()
+                        other.type_name()
                     )));
                 }
             },
@@ -1591,6 +1591,9 @@ impl<'a> Executor<'a> {
     fn reg_node(&self, reg: u32) -> Result<u64> {
         match self.regs.get(reg as usize) {
             Some(Reg::Node(id)) => Ok(*id),
+            // Entities that travelled through a list (collect/UNWIND) lose
+            // their bound-register form and arrive as plain values.
+            Some(Reg::Value(Value::Node(id))) => Ok(*id),
             Some(other) => Err(Error::type_error(format!(
                 "expected a node, got {}",
                 other.to_value().type_name()

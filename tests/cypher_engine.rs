@@ -572,6 +572,28 @@ fn union_uses_first_part_column_names() {
 }
 
 #[test]
+fn default_column_names_keep_necessary_parentheses() {
+    let mut conn = connection();
+    let mut rows = conn
+        .query(
+            "RETURN 12 / 4 * (3 - 2 * 4), 1 + 2 + 3, 2 ^ 3 ^ 2, -(3 * 4)",
+            &Params::new(),
+        )
+        .expect("query");
+    assert_eq!(
+        rows.columns(),
+        &[
+            "12 / 4 * (3 - 2 * 4)".to_owned(),
+            "1 + 2 + 3".to_owned(),
+            "2 ^ 3 ^ 2".to_owned(),
+            "-(3 * 4)".to_owned(),
+        ]
+    );
+    let values = rows_to_strings(&mut rows);
+    assert_eq!(values, vec![vec!["-15", "6", "512", "-12"]]);
+}
+
+#[test]
 fn union_rejects_different_columns() {
     let mut conn = connection();
     let err = conn
@@ -754,6 +776,29 @@ fn list_comprehensions() {
         "WITH [1, 2, 3, 4] AS list RETURN [x IN list WHERE x > 2] AS a, [x IN list | x * 10] AS b, [x IN list WHERE x < 3 | x + 1] AS c",
     );
     assert_eq!(rows, vec![vec!["[3, 4]", "[10, 20, 30, 40]", "[2, 3]"]]);
+}
+
+#[test]
+fn comprehension_over_inline_aggregation() {
+    let mut conn = connection();
+    seed(&mut conn);
+    let rows = query(
+        &mut conn,
+        "MATCH (n:Person) RETURN [x IN collect(n) WHERE x.age > 28 | x.name] AS names",
+    );
+    assert_eq!(rows, vec![vec!["[alice, carol]"]]);
+}
+
+#[test]
+fn comprehension_body_hoists_free_variables() {
+    let mut conn = connection();
+    seed(&mut conn);
+    let rows = query(
+        &mut conn,
+        "MATCH (n:Person) WITH n, 10 AS extra \
+         RETURN size([x IN collect(n) | x.age + extra]) AS s, extra",
+    );
+    assert_eq!(rows, vec![vec!["3", "10"]]);
 }
 
 #[test]
@@ -1076,6 +1121,31 @@ fn set_entity_copies_properties() {
         "MATCH (n:Person {name: 'ravi'}) RETURN count(*), max(n.age)",
     );
     assert_eq!(rows, vec![vec!["2", "40"]]);
+}
+
+#[test]
+fn writes_on_entities_unwound_from_lists() {
+    let mut conn = connection();
+    conn.execute("CREATE (:Person {name: 'ravi', age: 40})")
+        .expect("seed");
+    let rows = query(
+        &mut conn,
+        "MATCH (a:Person) WITH collect(a) AS people UNWIND people AS n \
+         SET n.age = 41, n.city = 'oslo' RETURN n.age, n.city",
+    );
+    assert_eq!(rows, vec![vec!["41", "oslo"]]);
+    let rows = query(
+        &mut conn,
+        "MATCH (a:Person) WITH collect(a) AS people UNWIND people AS n \
+         REMOVE n.city RETURN n.city",
+    );
+    assert_eq!(rows, vec![vec!["null"]]);
+    let rows = query(
+        &mut conn,
+        "MATCH (a:Person) WITH collect(a) AS people UNWIND people AS n \
+         DETACH DELETE n RETURN count(*)",
+    );
+    assert_eq!(rows, vec![vec!["1"]]);
 }
 
 #[test]

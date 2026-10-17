@@ -153,14 +153,6 @@
       }
     },
     "clauses/delete/Delete5.feature": {
-      "[3] Delete nodes from a map": {
-        "reason": "not-implemented",
-        "note": "expected -2 nodes, got +0; expected -1 labels, got +0"
-      },
-      "[4] Delete relationships from a map": {
-        "reason": "not-implemented",
-        "note": "expected -2 relationships, got +0"
-      },
       "[7] Delete paths from nested map/list": {
         "reason": "not-implemented",
         "note": "expected no rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident); expected -2 nodes, got +0; expected -2 relationships, got +0; e..."
@@ -1925,18 +1917,6 @@
       }
     },
     "expressions/list/List12.feature": {
-      "[1] Collect and extract using a list comprehension": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 4 column 25 (found Pipe); expected -1 properties, got +0"
-      },
-      "[2] Collect and filter using a list comprehension": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: expected ']' to close a list literal at line 4 column 25 (found Where); expected -1 properties, got +0"
-      },
-      "[3] Size of list comprehension": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Syntax: OPTIONAL MATCH is not supported yet at line 3 column 16 (found LParen)"
-      },
       "[4] Returning a list comprehension": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
@@ -2220,12 +2200,6 @@
       "*": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Unsupported: function `sqrt` is not supported yet"
-      }
-    },
-    "expressions/mathematical/Mathematical8.feature": {
-      "[2] Arithmetic precedence with parenthesis test": {
-        "reason": "not-implemented",
-        "note": "expected column `12 / 4 * (3 - 2 * 4)`, got `12 / 4 * 3 - 2 * 4`"
       }
     },
     "expressions/path/Path2.feature": {
