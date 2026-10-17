@@ -469,6 +469,96 @@ impl Database {
         Ok(out)
     }
 
+    /// Shortest trails from `src`, breadth-first by hop count. With a target,
+    /// returns one trail to it (or every trail of minimal length when `all`);
+    /// without a target, returns one trail per reachable node (or every trail
+    /// of minimal length per node).
+    #[allow(clippy::too_many_arguments)]
+    pub fn var_shortest_paths(
+        &mut self,
+        src: u64,
+        dst: Option<u64>,
+        directions: &[Direction],
+        types: &[u32],
+        props: &[(String, Value)],
+        min: u32,
+        max: Option<u32>,
+        all: bool,
+    ) -> Result<Vec<(Vec<u64>, u64)>> {
+        // Property key names are resolved per call, so keys created by the
+        // same statement are seen. An unknown key matches nothing.
+        let mut keyed = Vec::with_capacity(props.len());
+        for (name, value) in props {
+            match self.property_key_id(name) {
+                Some(key_id) => keyed.push((key_id, value.clone())),
+                None => return Ok(Vec::new()),
+            }
+        }
+        // Shortest paths are simple: a node may not repeat. Each frontier
+        // entry carries its edge list and visited nodes.
+        let mut out: Vec<(Vec<u64>, u64)> = Vec::new();
+        let mut frontier: Vec<(u64, Vec<u64>, Vec<u64>)> = vec![(src, Vec::new(), vec![src])];
+        let mut length = 0u32;
+        let mut emitted: Vec<u64> = Vec::new();
+        loop {
+            if length >= min {
+                match dst {
+                    Some(target) => {
+                        let mut found: Vec<(Vec<u64>, u64)> = frontier
+                            .iter()
+                            .filter(|(node, _, _)| *node == target)
+                            .map(|(node, trail, _)| (trail.clone(), *node))
+                            .collect();
+                        if !found.is_empty() {
+                            if !all {
+                                found.truncate(1);
+                            }
+                            return Ok(found);
+                        }
+                    }
+                    None => {
+                        let mut found: Vec<(Vec<u64>, u64)> = frontier
+                            .iter()
+                            .filter(|(node, _, _)| !emitted.contains(node))
+                            .map(|(node, trail, _)| (trail.clone(), *node))
+                            .collect();
+                        if !found.is_empty() {
+                            found.sort_unstable_by_key(|(_, node)| *node);
+                            if !all {
+                                found.dedup_by_key(|(_, node)| *node);
+                            }
+                            emitted.extend(found.iter().map(|(_, node)| *node));
+                            out.extend(found);
+                        }
+                    }
+                }
+            }
+            if max.is_some_and(|max| length >= max) {
+                return Ok(out);
+            }
+            let mut next: Vec<(u64, Vec<u64>, Vec<u64>)> = Vec::new();
+            for (node, trail, nodes) in &frontier {
+                for direction in directions {
+                    for (edge, neighbour) in self.expand(*node, *direction, types)? {
+                        if nodes.contains(&neighbour) || !self.edge_matches(edge, &keyed)? {
+                            continue;
+                        }
+                        let mut extended = trail.clone();
+                        extended.push(edge);
+                        let mut extended_nodes = nodes.clone();
+                        extended_nodes.push(neighbour);
+                        next.push((neighbour, extended, extended_nodes));
+                    }
+                }
+            }
+            if next.is_empty() {
+                return Ok(out);
+            }
+            frontier = next;
+            length += 1;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn var_expand_rec(
         &mut self,

@@ -381,6 +381,30 @@ impl<'a> Parser<'a> {
             variable = Some(self.parse_name()?);
             self.expect(Token::Equals, "'=' after the path variable")?;
         }
+        // `shortestPath((a)-[*]->(b))` wraps the pattern.
+        let mut shortest = Shortest::Plain;
+        if matches!(self.peek(), Some(Token::Ident)) {
+            let spanned = self.tokens[self.pos];
+            let name = &self.source[spanned.start..spanned.end];
+            if (name == "shortestPath" || name == "allShortestPaths")
+                && self.tokens.get(self.pos + 1).map(|entry| entry.token) == Some(Token::LParen)
+            {
+                shortest = if name == "allShortestPaths" {
+                    Shortest::AllShortest
+                } else {
+                    Shortest::Shortest
+                };
+                self.advance();
+                self.advance();
+                let inner = self.parse_path()?;
+                self.expect(Token::RParen, "')' to close shortestPath")?;
+                return Ok(PatternPath {
+                    variable,
+                    shortest,
+                    ..inner
+                });
+            }
+        }
         let start = self.parse_node_pattern()?;
         let mut segments = Vec::new();
         while matches!(self.peek(), Some(Token::Minus) | Some(Token::ArrowLeft)) {
@@ -390,6 +414,7 @@ impl<'a> Parser<'a> {
         }
         Ok(PatternPath {
             variable,
+            shortest,
             start,
             segments,
         })

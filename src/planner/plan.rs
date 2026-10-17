@@ -147,6 +147,29 @@ pub enum Plan {
         /// variable-length relationship lists into individual edges.
         elements: Vec<(String, bool)>,
     },
+    /// Shortest-path search from one endpoint to the other.
+    ShortestPath {
+        /// Input plan.
+        input: Box<Plan>,
+        /// Source node variable.
+        src: String,
+        /// Target node variable.
+        dst: String,
+        /// Relationship variable bound to the edge list.
+        edge: Option<String>,
+        /// Direction.
+        direction: crate::cypher::RelDirection,
+        /// Restricting edge type names.
+        types: Vec<String>,
+        /// Literal property filters applied at every hop.
+        props: Vec<(String, crate::record::Value)>,
+        /// Minimum hops.
+        min: u32,
+        /// Maximum hops; `None` is unbounded.
+        max: Option<u32>,
+        /// Whether every path of minimal length is produced.
+        all: bool,
+    },
     /// Pattern predicate: binds `var` to whether the inner plan matches.
     PatternPredicate {
         /// Input plan.
@@ -408,6 +431,19 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
             out.push_str(&format!(
                 "{pad}BindPath {var} ({} elements)\n",
                 elements.len()
+            ));
+            explain(input, indent + 1, out);
+        }
+        Plan::ShortestPath {
+            input,
+            src,
+            dst,
+            all,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{pad}ShortestPath {src} -> {dst}{}\n",
+                if *all { " (all)" } else { "" }
             ));
             explain(input, indent + 1, out);
         }

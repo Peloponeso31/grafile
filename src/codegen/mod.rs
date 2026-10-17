@@ -379,6 +379,68 @@ impl Codegen {
                 ctx.window_len = cg.next_reg - ctx.window_start;
                 out(cg, ctx)
             }),
+            Plan::ShortestPath {
+                input,
+                src,
+                dst,
+                edge,
+                direction,
+                types,
+                props,
+                min,
+                max,
+                all,
+            } => self.compile(input, ctx, &mut |cg, ctx| {
+                let src_reg = *ctx.vars.get(src).ok_or_else(|| undefined(src))?;
+                // An unbound target searches for the shortest path to every
+                // reachable node; the search binds the variable below.
+                let dst_reg = ctx.vars.get(dst).copied();
+                let cursor = cg.alloc_cursor();
+                let direction_code = match direction {
+                    crate::cypher::RelDirection::Outgoing => 0u8,
+                    crate::cypher::RelDirection::Incoming => 1u8,
+                    crate::cypher::RelDirection::Undirected => 2u8,
+                };
+                let type_regs: Vec<u32> = types
+                    .iter()
+                    .map(|name| cg.const_index(Value::from(name.as_str())))
+                    .collect();
+                cg.emit(Op::ShortestOpen {
+                    cursor,
+                    src: src_reg,
+                    dst: dst_reg,
+                    direction: direction_code,
+                    types: type_regs,
+                    any_type: types.is_empty(),
+                    props: props.clone(),
+                    min: *min,
+                    max: *max,
+                    all: *all,
+                });
+                let loop_start = cg.ops.len() as u32;
+                let edge_reg = cg.alloc_reg();
+                let node_reg = cg.alloc_reg();
+                let jump = cg.emit(Op::VarExpandNext {
+                    cursor,
+                    edges: edge_reg,
+                    node: node_reg,
+                    target: 0,
+                });
+                if let Some(edge_var) = edge {
+                    ctx.vars.insert(edge_var.clone(), edge_reg);
+                }
+                // A bound target keeps its register; only an unbound target
+                // is bound by the search.
+                if dst_reg.is_none() {
+                    ctx.vars.insert(dst.clone(), node_reg);
+                }
+                ctx.window_len = cg.next_reg - ctx.window_start;
+                out(cg, ctx)?;
+                cg.emit(Op::Goto { target: loop_start });
+                let end = cg.ops.len() as u32;
+                cg.patch(jump, end)?;
+                Ok(())
+            }),
             Plan::PatternPredicate { input, inner, var } => {
                 self.compile(input, ctx, &mut |cg, outer_ctx| {
                     let cursor = cg.alloc_cursor();

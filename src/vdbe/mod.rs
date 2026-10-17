@@ -406,6 +406,29 @@ pub enum Op {
         /// Maximum hops; `None` is unbounded.
         max: Option<u32>,
     },
+    /// Open a shortest-path search from a node to a target node.
+    ShortestOpen {
+        /// Cursor slot.
+        cursor: u32,
+        /// Source node register.
+        src: u32,
+        /// Target node register; `None` targets every reachable node.
+        dst: Option<u32>,
+        /// Direction code: 0 out, 1 in, 2 both.
+        direction: u8,
+        /// Constant indices of restricting edge type names.
+        types: Vec<u32>,
+        /// Whether the pattern had no type filter.
+        any_type: bool,
+        /// Literal property filters applied at every hop, by key name.
+        props: Vec<(String, Value)>,
+        /// Minimum hops.
+        min: u32,
+        /// Maximum hops; `None` is unbounded.
+        max: Option<u32>,
+        /// Whether every shortest path is produced.
+        all: bool,
+    },
     /// Advance a variable-length expansion; jump when exhausted.
     VarExpandNext {
         /// Cursor slot.
@@ -1249,6 +1272,53 @@ impl<'a> Executor<'a> {
                         let filter: &[u32] = types.as_deref().unwrap_or(&[]);
                         self.db
                             .var_expand(node, &directions, filter, props, *min, *max)?
+                    }
+                };
+                self.cursors[*cursor as usize] = Cursor::Trails { items, pos: 0 };
+            }
+            Op::ShortestOpen {
+                cursor,
+                src,
+                dst,
+                direction,
+                types,
+                any_type,
+                props,
+                min,
+                max,
+                all,
+            } => {
+                let types = self.resolve_types(types, *any_type)?;
+                // A null endpoint matches nothing.
+                let target = match dst {
+                    Some(reg) => match self.reg_value(*reg)? {
+                        Value::Null => Some(None),
+                        _ => Some(Some(self.reg_node(*reg)?)),
+                    },
+                    None => Some(None),
+                };
+                let items = match (&types, &self.regs[*src as usize], target) {
+                    (Some(types), _, _) if types.is_empty() => Vec::new(),
+                    (_, Reg::Value(Value::Null), _) => Vec::new(),
+                    (_, _, None) => Vec::new(),
+                    (_, _, Some(target)) => {
+                        let source = self.reg_node(*src)?;
+                        let directions: Vec<Direction> = match direction {
+                            0 => vec![Direction::Out],
+                            1 => vec![Direction::In],
+                            _ => vec![Direction::Out, Direction::In],
+                        };
+                        let filter: &[u32] = types.as_deref().unwrap_or(&[]);
+                        self.db.var_shortest_paths(
+                            source,
+                            target,
+                            &directions,
+                            filter,
+                            props,
+                            *min,
+                            *max,
+                            *all,
+                        )?
                     }
                 };
                 self.cursors[*cursor as usize] = Cursor::Trails { items, pos: 0 };

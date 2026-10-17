@@ -1225,3 +1225,108 @@ fn nested_pattern_expression_is_rejected() {
         .expect_err("nested pattern expressions must be rejected");
     assert!(err.to_string().contains("list comprehensions"), "{err}");
 }
+
+fn shortest_graph(conn: &mut Connection) {
+    conn.execute(
+        "CREATE (a:N {name: 'a'})-[:R]->(b:N {name: 'b'}), \
+         (b)-[:R]->(c:N {name: 'c'}), \
+         (a)-[:R]->(c), \
+         (c)-[:R]->(d:N {name: 'd'}), \
+         (b)-[:R]->(d), \
+         (a)-[:S]->(d)",
+    )
+    .expect("seed");
+}
+
+#[test]
+fn shortest_path_prefers_fewer_hops() {
+    let mut conn = connection();
+    shortest_graph(&mut conn);
+    let rows = query(
+        &mut conn,
+        "MATCH (a:N {name: 'a'}), (d:N {name: 'd'}) \
+         MATCH p = shortestPath((a)-[:R*]->(d)) RETURN length(p)",
+    );
+    assert_eq!(rows, vec![vec!["2"]]);
+    let rows = query(
+        &mut conn,
+        "MATCH (a:N {name: 'a'}), (d:N {name: 'd'}) \
+         MATCH p = shortestPath((a)-[:S*]->(d)) RETURN length(p)",
+    );
+    assert_eq!(rows, vec![vec!["1"]]);
+}
+
+#[test]
+fn all_shortest_paths_returns_every_minimal_path() {
+    let mut conn = connection();
+    shortest_graph(&mut conn);
+    let rows = query(
+        &mut conn,
+        "MATCH (a:N {name: 'a'}), (d:N {name: 'd'}) \
+         MATCH p = allShortestPaths((a)-[:R*]->(d)) RETURN length(p) ORDER BY length(p)",
+    );
+    assert_eq!(rows, vec![vec!["2"], vec!["2"]]);
+}
+
+#[test]
+fn shortest_path_honours_bounds_and_direction() {
+    let mut conn = connection();
+    shortest_graph(&mut conn);
+    let rows = query(
+        &mut conn,
+        "MATCH (a:N {name: 'a'}), (d:N {name: 'd'}) \
+         MATCH p = shortestPath((a)-[:R*3..4]->(d)) RETURN length(p)",
+    );
+    assert_eq!(rows, vec![vec!["3"]]);
+    let rows = query(
+        &mut conn,
+        "MATCH (a:N {name: 'a'}), (d:N {name: 'd'}) \
+         MATCH p = shortestPath((d)-[:R*]-(a)) RETURN length(p)",
+    );
+    assert_eq!(rows, vec![vec!["2"]]);
+}
+
+#[test]
+fn shortest_path_binds_unbound_target_per_node() {
+    let mut conn = connection();
+    shortest_graph(&mut conn);
+    let rows = query(
+        &mut conn,
+        "MATCH (a:N {name: 'a'}) MATCH p = shortestPath((a)-[:R*]->(x)) \
+         RETURN x.name ORDER BY x.name",
+    );
+    assert_eq!(rows, vec![vec!["b"], vec!["c"], vec!["d"]]);
+}
+
+#[test]
+fn shortest_path_expression_is_null_when_absent() {
+    let mut conn = connection();
+    shortest_graph(&mut conn);
+    let rows = query(
+        &mut conn,
+        "MATCH (d:N {name: 'd'}), (b:N {name: 'b'}) \
+         RETURN shortestPath((d)-[:R*]->(b)) IS NULL AS missing, \
+         length(shortestPath((b)-[:R*]->(d))) AS len",
+    );
+    assert_eq!(rows, vec![vec!["true", "1"]]);
+}
+
+#[test]
+fn shortest_path_requires_variable_length_single_segment() {
+    let mut conn = connection();
+    shortest_graph(&mut conn);
+    let err = conn
+        .query(
+            "MATCH p = shortestPath((a)-[:R]->(b)) RETURN p",
+            &Params::new(),
+        )
+        .expect_err("fixed-length shortestPath must be rejected");
+    assert!(err.to_string().contains("variable-length"), "{err}");
+    let err = conn
+        .query(
+            "MATCH p = shortestPath((a)-[:R*]->(b)-[:R*]->(c)) RETURN p",
+            &Params::new(),
+        )
+        .expect_err("multi-segment shortestPath must be rejected");
+    assert!(err.to_string().contains("exactly one"), "{err}");
+}

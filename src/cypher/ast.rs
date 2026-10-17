@@ -270,11 +270,25 @@ pub struct PathSegment {
     pub node: NodePattern,
 }
 
+/// How a path pattern searches for paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Shortest {
+    /// Match every path.
+    #[default]
+    Plain,
+    /// `shortestPath(...)`: one path of minimal length.
+    Shortest,
+    /// `allShortestPaths(...)`: every path of minimal length.
+    AllShortest,
+}
+
 /// A path pattern starting at a node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatternPath {
     /// Optional path variable (`p = (a)-->(b)`).
     pub variable: Option<String>,
+    /// Whether the pattern is wrapped in `shortestPath`/`allShortestPaths`.
+    pub shortest: Shortest,
     /// Starting node.
     pub start: NodePattern,
     /// Steps.

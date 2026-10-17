@@ -15,7 +15,7 @@ use hashlink::LinkedHashMap as FastMap;
 
 use crate::cypher::{
     BinaryOp, Clause, Expr, MatchClause, NodePattern, PatternPath, Query, RelDirection, ReturnItem,
-    SetItem, SortItem, UnaryOp,
+    SetItem, Shortest, SortItem, UnaryOp,
 };
 use crate::engine::Database;
 use crate::error::{Error, ErrorCode, Result};
@@ -328,6 +328,52 @@ impl<'a> Planner<'a> {
         context: PatternContext,
     ) -> Result<()> {
         if let Expr::Function { name, args, .. } = expr
+            && args.len() == 1
+            && (name.eq_ignore_ascii_case("shortestPath")
+                || name.eq_ignore_ascii_case("allShortestPaths"))
+            && let Expr::Pattern(path) = &args[0]
+        {
+            let all = name.eq_ignore_ascii_case("allShortestPaths");
+            let mut path = (**path).clone();
+            path.variable = None;
+            for segment in &mut path.segments {
+                segment.relationship.variable = None;
+            }
+            for node in std::iter::once(&path.start).chain(path.segments.iter().map(|s| &s.node)) {
+                if let Some(var) = &node.variable
+                    && !scope.contains_key(var)
+                {
+                    return Err(undefined_variable(var));
+                }
+            }
+            let hidden = self.anon_name("spath");
+            // A pattern expression yields null when no path exists, so the
+            // search runs inside an optional plan.
+            let mut inner = Plan::Empty;
+            let mut inner_scope = scope.clone();
+            self.plan_shortest(
+                &path,
+                all,
+                Some(hidden.clone()),
+                true,
+                &mut inner,
+                &mut inner_scope,
+            )?;
+            let vars: Vec<String> = inner_scope
+                .keys()
+                .filter(|var| !scope.contains_key(*var))
+                .cloned()
+                .collect();
+            *scope = inner_scope;
+            *plan = Plan::OptionalMatch {
+                input: Box::new(std::mem::replace(plan, Plan::Empty)),
+                inner: Box::new(inner),
+                vars,
+            };
+            *expr = Expr::Variable(hidden);
+            return Ok(());
+        }
+        if let Expr::Function { name, args, .. } = expr
             && name.eq_ignore_ascii_case("exists")
             && args.len() == 1
         {
@@ -559,12 +605,149 @@ impl<'a> Planner<'a> {
         Ok(hidden)
     }
 
+    /// Plan `shortestPath`/`allShortestPaths`: a single variable-length
+    /// relationship searched breadth-first from a bound endpoint (or from
+    /// every scanned start node when neither endpoint is bound).
+    fn plan_shortest(
+        &mut self,
+        path: &PatternPath,
+        all: bool,
+        bind_path: Option<String>,
+        require_bound: bool,
+        plan: &mut Plan,
+        scope: &mut FastMap<String, VarKind>,
+    ) -> Result<()> {
+        let segment = match path.segments.as_slice() {
+            [segment] => segment,
+            _ => {
+                return Err(Error::syntax(
+                    "shortestPath requires exactly one relationship pattern",
+                ));
+            }
+        };
+        let rel = &segment.relationship;
+        let Some(bounds) = &rel.var_length else {
+            return Err(Error::syntax(
+                "shortestPath requires a variable-length relationship pattern",
+            ));
+        };
+        let (props, prop_exprs) =
+            self.pattern_props(rel.properties.as_ref(), "relationship", scope)?;
+        if !prop_exprs.is_empty() {
+            return Err(Error::unsupported(
+                "shortestPath requires literal property filters",
+            ));
+        }
+        let start = self.planned_node(&path.start, scope)?;
+        let end = self.planned_node(&segment.node, scope)?;
+        let src_bound = scope.contains_key(&start.var);
+        let dst_bound = scope.contains_key(&end.var);
+        if require_bound {
+            // Expression form: both endpoints must already be bound.
+            if !src_bound {
+                return Err(undefined_variable(&start.var));
+            }
+            if !dst_bound {
+                return Err(undefined_variable(&end.var));
+            }
+        }
+        // Search from a bound endpoint when there is one so bound variables
+        // keep their values; the path value stays in the written order.
+        let (src_node, dst_node, direction) = if !src_bound && dst_bound {
+            (&end, &start, flip(rel.direction))
+        } else {
+            (&start, &end, rel.direction)
+        };
+        if !scope.contains_key(&src_node.var) {
+            let (label, seek, scan_props) = self.anchor_plan(src_node)?;
+            *plan = Plan::NodeScan {
+                input: Box::new(plan.clone()),
+                var: src_node.var.clone(),
+                label,
+                seek,
+                props: scan_props,
+            };
+            scope.insert(src_node.var.clone(), VarKind::Node);
+            if let Some(predicate) = node_constraints(src_node, true) {
+                *plan = Plan::Filter {
+                    input: Box::new(plan.clone()),
+                    predicate,
+                };
+            }
+        } else if let Some(predicate) = node_constraints(src_node, false) {
+            *plan = Plan::Filter {
+                input: Box::new(plan.clone()),
+                predicate,
+            };
+        }
+        if !scope.contains_key(&dst_node.var) {
+            scope.insert(dst_node.var.clone(), VarKind::Node);
+        }
+        let edge_var = match &rel.variable {
+            Some(var) => {
+                if scope.contains_key(var) {
+                    return Err(Error::syntax(format!("variable `{var}` is already bound")));
+                }
+                scope.insert(var.clone(), VarKind::Edge);
+                self.pattern_rels.insert(var.clone());
+                var.clone()
+            }
+            None => self.anon_name("rel"),
+        };
+        *plan = Plan::ShortestPath {
+            input: Box::new(plan.clone()),
+            src: src_node.var.clone(),
+            dst: dst_node.var.clone(),
+            edge: Some(edge_var.clone()),
+            direction,
+            types: rel.types.clone(),
+            props: props
+                .into_iter()
+                .map(|(name, _, value)| (name, value))
+                .collect(),
+            min: bounds.min,
+            max: bounds.max,
+            all,
+        };
+        // The search binds the target; labels and properties it does not
+        // enforce become a post-filter.
+        if let Some(predicate) = node_constraints(dst_node, false) {
+            *plan = Plan::Filter {
+                input: Box::new(plan.clone()),
+                predicate,
+            };
+        }
+        if let Some(path_var) = bind_path {
+            if scope.contains_key(&path_var) {
+                return Err(Error::syntax(format!(
+                    "variable `{path_var}` is already bound"
+                )));
+            }
+            let elements = vec![
+                (start.var.clone(), false),
+                (edge_var.clone(), true),
+                (end.var.clone(), false),
+            ];
+            scope.insert(path_var.clone(), VarKind::Path);
+            *plan = Plan::BindPath {
+                input: Box::new(plan.clone()),
+                var: path_var,
+                elements,
+            };
+        }
+        Ok(())
+    }
+
     fn plan_path(
         &mut self,
         path: &PatternPath,
         plan: &mut Plan,
         scope: &mut FastMap<String, VarKind>,
     ) -> Result<()> {
+        if path.shortest != Shortest::Plain {
+            let all = path.shortest == Shortest::AllShortest;
+            return self.plan_shortest(path, all, path.variable.clone(), false, plan, scope);
+        }
         let mut nodes: Vec<PlannedNode> = Vec::new();
         nodes.push(self.planned_node(&path.start, scope)?);
         struct RelInfo {
