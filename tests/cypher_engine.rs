@@ -380,6 +380,97 @@ fn ddl_composite_and_edge_forms() {
 }
 
 #[test]
+fn not_null_constraints_are_enforced() {
+    let mut conn = connection();
+    conn.execute("CREATE CONSTRAINT person_name FOR (n:Person) REQUIRE n.name IS NOT NULL")
+        .expect("constraint");
+    conn.execute("CREATE (:Person {name: 'alice'})")
+        .expect("create ok");
+    let err = conn.execute("CREATE (:Person)").expect_err("missing");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    // Property removal in all its spellings.
+    let err = conn
+        .execute("MATCH (n:Person {name: 'alice'}) SET n.name = null")
+        .expect_err("set null");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    let err = conn
+        .execute("MATCH (n:Person {name: 'alice'}) REMOVE n.name")
+        .expect_err("remove");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    let err = conn
+        .execute("MATCH (n:Person {name: 'alice'}) SET n = {other: 1}")
+        .expect_err("replace");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    let err = conn
+        .execute("MATCH (n:Person {name: 'alice'}) SET n += {name: null}")
+        .expect_err("merge null");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    // Adding the label later still enforces existence.
+    conn.execute("CREATE (:Other)").expect("other");
+    let err = conn
+        .execute("MATCH (n:Other) SET n:Person")
+        .expect_err("label add");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    conn.execute("CREATE (:Other {name: 'bob'})")
+        .expect("other with name");
+    conn.execute("MATCH (n:Other {name: 'bob'}) SET n:Person")
+        .expect("label add ok");
+    // Dropping the constraint lifts the rule.
+    conn.execute("DROP CONSTRAINT person_name").expect("drop");
+    conn.execute("CREATE (:Person)").expect("now allowed");
+}
+
+#[test]
+fn edge_not_null_constraints_are_enforced() {
+    let mut conn = connection();
+    conn.execute("CREATE CONSTRAINT knows_weight FOR ()-[r:KNOWS]-() REQUIRE r.weight IS NOT NULL")
+        .expect("constraint");
+    conn.execute("CREATE (a:N)-[:KNOWS {weight: 1}]->(b:N)")
+        .expect("create ok");
+    let err = conn
+        .execute("CREATE (a:N)-[:KNOWS]->(b:N)")
+        .expect_err("missing");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    let err = conn
+        .execute("MATCH ()-[r:KNOWS]->() SET r.weight = null")
+        .expect_err("set null");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    let err = conn
+        .execute("MATCH ()-[r:KNOWS]->() SET r = {}")
+        .expect_err("replace");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+}
+
+#[test]
+fn node_key_constraints_check_existence_and_uniqueness() {
+    let mut conn = connection();
+    conn.execute(
+        "CREATE CONSTRAINT person_key FOR (n:Person) REQUIRE (n.first, n.last) IS NODE KEY",
+    )
+    .expect("constraint");
+    conn.execute("CREATE (:Person {first: 'a', last: 'b'})")
+        .expect("create ok");
+    let err = conn
+        .execute("CREATE (:Person {first: 'a'})")
+        .expect_err("missing key");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    let err = conn
+        .execute("CREATE (:Person {first: 'a', last: 'b'})")
+        .expect_err("duplicate");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    conn.execute("CREATE (:Person {first: 'a', last: 'c'})")
+        .expect("distinct ok");
+    let err = conn
+        .execute("MATCH (n:Person {last: 'c'}) SET n.last = 'b'")
+        .expect_err("collision");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    let err = conn
+        .execute("MATCH (n:Person {last: 'c'}) SET n.first = null")
+        .expect_err("removal");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+}
+
+#[test]
 fn ddl_is_rejected_where_unsupported() {
     let mut conn = connection();
     let err = conn.execute("SHOW INDEXES").expect_err("show");

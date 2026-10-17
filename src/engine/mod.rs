@@ -262,6 +262,7 @@ impl Database {
         let mut labels = labels.to_vec();
         labels.sort_unstable();
         labels.dedup();
+        check_node_existence(self.schema(), &labels, &props)?;
         let record = NodeRecord {
             labels,
             props: normalize_props(props)?,
@@ -329,6 +330,7 @@ impl Database {
         dst: u64,
         props: Vec<(u32, Value)>,
     ) -> Result<u64> {
+        check_edge_existence(self.schema(), edge_type, &props)?;
         let record = EdgeRecord {
             edge_type,
             src,
@@ -474,6 +476,9 @@ impl Database {
                 format!("node {node_id} does not exist"),
             ));
         };
+        if value.is_null() {
+            check_node_removal(self.schema(), &record.labels, key_id)?;
+        }
         self.unindex_node_property(&record, node_id, key_id)?;
         if value.is_null() {
             record.remove(key_id);
@@ -500,6 +505,9 @@ impl Database {
                 format!("edge {edge_id} does not exist"),
             ));
         };
+        if value.is_null() {
+            check_edge_removal(self.schema(), record.edge_type, key_id)?;
+        }
         self.unindex_edge_property(&record, edge_id, key_id)?;
         if value.is_null() {
             record.remove(key_id);
@@ -1292,6 +1300,11 @@ impl Database {
                 format!("node {node_id} does not exist"),
             ));
         };
+        let mut combined = record.labels.clone();
+        combined.extend_from_slice(labels);
+        combined.sort_unstable();
+        combined.dedup();
+        check_node_existence(self.schema(), &combined, &record.props)?;
         self.unindex_node(&record, node_id)?;
         for label in labels {
             if !record.labels.contains(label) {
@@ -1348,6 +1361,7 @@ impl Database {
                 format!("node {node_id} does not exist"),
             ));
         };
+        check_node_existence(self.schema(), &record.labels, &props)?;
         self.unindex_node(&record, node_id)?;
         record.props = normalize_props(props)?;
         let key_bytes = node_id.to_be_bytes();
@@ -1374,6 +1388,7 @@ impl Database {
                 format!("edge {edge_id} does not exist"),
             ));
         };
+        check_edge_existence(self.schema(), record.edge_type, &props)?;
         self.unindex_edge(&record, edge_id)?;
         record.props = normalize_props(props)?;
         let key_bytes = edge_id.to_be_bytes();
@@ -1679,6 +1694,111 @@ impl Database {
         }
         Ok(())
     }
+}
+
+/// Enforce `IS NOT NULL` and NODE KEY existence when a node is written.
+fn check_node_existence(schema: &Schema, labels: &[u32], props: &[(u32, Value)]) -> Result<()> {
+    let has = |key_id: u32| {
+        props
+            .iter()
+            .any(|(key, value)| *key == key_id && !value.is_null())
+    };
+    for constraint in &schema.node_constraints {
+        if constraint.label_id != 0 && !labels.contains(&constraint.label_id) {
+            continue;
+        }
+        if !has(constraint.key_id) {
+            return Err(missing_property(
+                schema,
+                &constraint.name,
+                constraint.key_id,
+            ));
+        }
+    }
+    for index in &schema.node_indexes {
+        if index.kind != IndexKind::NodeKey {
+            continue;
+        }
+        if index.label_id != 0 && !labels.contains(&index.label_id) {
+            continue;
+        }
+        for key_id in &index.key_ids {
+            if !has(*key_id) {
+                return Err(missing_property(
+                    schema,
+                    index.name.as_deref().unwrap_or("-"),
+                    *key_id,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Enforce `IS NOT NULL` and NODE KEY existence when one node property goes
+/// away (`SET n.key = null`, `REMOVE n.key`).
+fn check_node_removal(schema: &Schema, labels: &[u32], key_id: u32) -> Result<()> {
+    for constraint in &schema.node_constraints {
+        if constraint.key_id == key_id
+            && (constraint.label_id == 0 || labels.contains(&constraint.label_id))
+        {
+            return Err(missing_property(schema, &constraint.name, key_id));
+        }
+    }
+    for index in &schema.node_indexes {
+        if index.kind == IndexKind::NodeKey
+            && index.key_ids.contains(&key_id)
+            && (index.label_id == 0 || labels.contains(&index.label_id))
+        {
+            return Err(missing_property(
+                schema,
+                index.name.as_deref().unwrap_or("-"),
+                key_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Enforce `IS NOT NULL` existence when an edge is written.
+fn check_edge_existence(schema: &Schema, edge_type: u32, props: &[(u32, Value)]) -> Result<()> {
+    let has = |key_id: u32| {
+        props
+            .iter()
+            .any(|(key, value)| *key == key_id && !value.is_null())
+    };
+    for constraint in &schema.edge_constraints {
+        if constraint.type_id != 0 && constraint.type_id != edge_type {
+            continue;
+        }
+        if !has(constraint.key_id) {
+            return Err(missing_property(
+                schema,
+                &constraint.name,
+                constraint.key_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Enforce `IS NOT NULL` existence when one edge property goes away.
+fn check_edge_removal(schema: &Schema, edge_type: u32, key_id: u32) -> Result<()> {
+    for constraint in &schema.edge_constraints {
+        if constraint.key_id == key_id
+            && (constraint.type_id == 0 || constraint.type_id == edge_type)
+        {
+            return Err(missing_property(schema, &constraint.name, key_id));
+        }
+    }
+    Ok(())
+}
+
+fn missing_property(schema: &Schema, object: &str, key_id: u32) -> Error {
+    Error::constraint(format!(
+        "constraint `{object}` requires the property `{}` to exist",
+        schema.property_key_name(key_id).unwrap_or("?")
+    ))
 }
 
 fn normalize_props(props: Vec<(u32, Value)>) -> Result<Vec<(u32, Value)>> {
