@@ -79,6 +79,61 @@ pub enum Expr {
         /// Index expression.
         index: Box<Expr>,
     },
+    /// `[var IN list WHERE predicate | projection]` list comprehension.
+    ListComprehension {
+        /// Loop variable.
+        var: String,
+        /// Source list.
+        list: Box<Expr>,
+        /// Optional filter.
+        predicate: Option<Box<Expr>>,
+        /// Optional projection; defaults to the loop variable.
+        projection: Option<Box<Expr>>,
+    },
+    /// `all|any|none|single(var IN list WHERE predicate)`.
+    Quantifier {
+        /// Which quantifier.
+        kind: QuantifierKind,
+        /// Loop variable.
+        var: String,
+        /// Source list.
+        list: Box<Expr>,
+        /// Predicate each element is tested against.
+        predicate: Box<Expr>,
+    },
+    /// `reduce(accumulator = init, var IN list | expression)`.
+    Reduce {
+        /// Accumulator variable.
+        accumulator: String,
+        /// Initial accumulator value.
+        init: Box<Expr>,
+        /// Loop variable.
+        var: String,
+        /// Source list.
+        list: Box<Expr>,
+        /// Fold expression over the accumulator and the element.
+        expression: Box<Expr>,
+    },
+    /// `expr[lower..upper]` list slice; omitted bounds are open.
+    Slice {
+        /// Base expression.
+        base: Box<Expr>,
+        /// Inclusive start, from the end when negative.
+        lower: Option<Box<Expr>>,
+        /// Exclusive end, from the end when negative.
+        upper: Option<Box<Expr>>,
+    },
+    /// Pattern predicate `(a)-[:T]->(b)`; true when the pattern matches.
+    Pattern(Box<PatternPath>),
+    /// `[p = (a)-[:T]->(b) WHERE predicate | projection]` comprehension.
+    PatternComprehension {
+        /// Pattern matched for every input row.
+        path: Box<PatternPath>,
+        /// Optional filter.
+        predicate: Option<Box<Expr>>,
+        /// Value produced per match.
+        projection: Box<Expr>,
+    },
     /// Unary operation.
     Unary {
         /// Operator.
@@ -133,6 +188,31 @@ pub enum Expr {
         /// Label names.
         labels: Vec<String>,
     },
+}
+
+/// The four list quantifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantifierKind {
+    /// `all`
+    All,
+    /// `any`
+    Any,
+    /// `none`
+    None,
+    /// `single`
+    Single,
+}
+
+impl QuantifierKind {
+    /// The name as written.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Any => "any",
+            Self::None => "none",
+            Self::Single => "single",
+        }
+    }
 }
 
 /// Direction of a relationship pattern as written.
@@ -190,9 +270,25 @@ pub struct PathSegment {
     pub node: NodePattern,
 }
 
+/// How a path pattern searches for paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Shortest {
+    /// Match every path.
+    #[default]
+    Plain,
+    /// `shortestPath(...)`: one path of minimal length.
+    Shortest,
+    /// `allShortestPaths(...)`: every path of minimal length.
+    AllShortest,
+}
+
 /// A path pattern starting at a node.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PatternPath {
+    /// Optional path variable (`p = (a)-->(b)`).
+    pub variable: Option<String>,
+    /// Whether the pattern is wrapped in `shortestPath`/`allShortestPaths`.
+    pub shortest: Shortest,
     /// Starting node.
     pub start: NodePattern,
     /// Steps.
@@ -247,6 +343,13 @@ pub enum SetItem {
         /// Target variable.
         variable: String,
         /// New value (map or entity).
+        value: Expr,
+    },
+    /// `n += {props}`
+    Append {
+        /// Target variable.
+        variable: String,
+        /// Map of properties to merge.
         value: Expr,
     },
     /// `n:Label` (SET) or `n:Label` (REMOVE)
@@ -320,11 +423,39 @@ pub enum Clause {
         /// Alias for each element.
         alias: String,
     },
+    /// `FOREACH (var IN list | updating clauses)`.
+    Foreach {
+        /// Loop variable.
+        var: String,
+        /// List expression.
+        list: Expr,
+        /// Updating clauses run once per element.
+        clauses: Vec<Clause>,
+    },
+    /// `CALL procedure(args) YIELD column [AS alias]`.
+    Call {
+        /// Dotted procedure name.
+        procedure: String,
+        /// Argument expressions.
+        args: Vec<Expr>,
+        /// Yielded columns with optional aliases.
+        yields: Vec<(String, Option<String>)>,
+    },
 }
 
-/// A parsed query: a pipeline of clauses.
+/// A parsed query: one or more union parts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
+    /// Query parts; more than one means `UNION` / `UNION ALL`.
+    pub parts: Vec<QueryPart>,
+}
+
+/// One part of a query, a pipeline of clauses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueryPart {
+    /// Whether this part is joined to the previous one with `UNION ALL`
+    /// (meaningless for the first part).
+    pub union_all: bool,
     /// Clauses in order.
     pub clauses: Vec<Clause>,
 }

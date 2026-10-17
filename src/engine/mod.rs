@@ -433,6 +433,182 @@ impl Database {
 
     /// Edge ids incident to `node_id` in `direction`, optionally filtered by
     /// edge types. An empty `types` slice uses the combined "any" plane.
+    /// Enumerate every trail from `src` whose length is within `min..=max`
+    /// (`max` of `None` is unbounded), returning `(edge ids, end node)`.
+    /// Relationships never repeat within a trail; nodes may.
+    ///
+    /// # Errors
+    ///
+    /// Propagates storage errors while expanding.
+    pub fn var_expand(
+        &mut self,
+        src: u64,
+        directions: &[Direction],
+        types: &[u32],
+        props: &[(String, Value)],
+        min: u32,
+        max: Option<u32>,
+    ) -> Result<Vec<(Vec<u64>, u64)>> {
+        // Property key names are resolved per call, so keys created by the
+        // same statement are seen. An unknown key matches nothing.
+        let mut keyed = Vec::with_capacity(props.len());
+        for (name, value) in props {
+            match self.property_key_id(name) {
+                Some(key_id) => keyed.push((key_id, value.clone())),
+                None => return Ok(Vec::new()),
+            }
+        }
+        let mut out = Vec::new();
+        if min == 0 {
+            out.push((Vec::new(), src));
+        }
+        let mut trail = Vec::new();
+        self.var_expand_rec(
+            src, directions, types, &keyed, min, max, &mut trail, &mut out,
+        )?;
+        Ok(out)
+    }
+
+    /// Shortest trails from `src`, breadth-first by hop count. With a target,
+    /// returns one trail to it (or every trail of minimal length when `all`);
+    /// without a target, returns one trail per reachable node (or every trail
+    /// of minimal length per node).
+    #[allow(clippy::too_many_arguments)]
+    pub fn var_shortest_paths(
+        &mut self,
+        src: u64,
+        dst: Option<u64>,
+        directions: &[Direction],
+        types: &[u32],
+        props: &[(String, Value)],
+        min: u32,
+        max: Option<u32>,
+        all: bool,
+    ) -> Result<Vec<(Vec<u64>, u64)>> {
+        // Property key names are resolved per call, so keys created by the
+        // same statement are seen. An unknown key matches nothing.
+        let mut keyed = Vec::with_capacity(props.len());
+        for (name, value) in props {
+            match self.property_key_id(name) {
+                Some(key_id) => keyed.push((key_id, value.clone())),
+                None => return Ok(Vec::new()),
+            }
+        }
+        // Shortest paths are simple: a node may not repeat. Each frontier
+        // entry carries its edge list and visited nodes.
+        let mut out: Vec<(Vec<u64>, u64)> = Vec::new();
+        let mut frontier: Vec<(u64, Vec<u64>, Vec<u64>)> = vec![(src, Vec::new(), vec![src])];
+        let mut length = 0u32;
+        let mut emitted: Vec<u64> = Vec::new();
+        loop {
+            if length >= min {
+                match dst {
+                    Some(target) => {
+                        let mut found: Vec<(Vec<u64>, u64)> = frontier
+                            .iter()
+                            .filter(|(node, _, _)| *node == target)
+                            .map(|(node, trail, _)| (trail.clone(), *node))
+                            .collect();
+                        if !found.is_empty() {
+                            if !all {
+                                found.truncate(1);
+                            }
+                            return Ok(found);
+                        }
+                    }
+                    None => {
+                        let mut found: Vec<(Vec<u64>, u64)> = frontier
+                            .iter()
+                            .filter(|(node, _, _)| !emitted.contains(node))
+                            .map(|(node, trail, _)| (trail.clone(), *node))
+                            .collect();
+                        if !found.is_empty() {
+                            found.sort_unstable_by_key(|(_, node)| *node);
+                            if !all {
+                                found.dedup_by_key(|(_, node)| *node);
+                            }
+                            emitted.extend(found.iter().map(|(_, node)| *node));
+                            out.extend(found);
+                        }
+                    }
+                }
+            }
+            if max.is_some_and(|max| length >= max) {
+                return Ok(out);
+            }
+            let mut next: Vec<(u64, Vec<u64>, Vec<u64>)> = Vec::new();
+            for (node, trail, nodes) in &frontier {
+                for direction in directions {
+                    for (edge, neighbour) in self.expand(*node, *direction, types)? {
+                        if nodes.contains(&neighbour) || !self.edge_matches(edge, &keyed)? {
+                            continue;
+                        }
+                        let mut extended = trail.clone();
+                        extended.push(edge);
+                        let mut extended_nodes = nodes.clone();
+                        extended_nodes.push(neighbour);
+                        next.push((neighbour, extended, extended_nodes));
+                    }
+                }
+            }
+            if next.is_empty() {
+                return Ok(out);
+            }
+            frontier = next;
+            length += 1;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn var_expand_rec(
+        &mut self,
+        node: u64,
+        directions: &[Direction],
+        types: &[u32],
+        props: &[(u32, Value)],
+        min: u32,
+        max: Option<u32>,
+        trail: &mut Vec<u64>,
+        out: &mut Vec<(Vec<u64>, u64)>,
+    ) -> Result<()> {
+        if let Some(max) = max
+            && trail.len() as u32 >= max
+        {
+            return Ok(());
+        }
+        let mut neighbours = Vec::new();
+        for direction in directions {
+            neighbours.extend(self.expand(node, *direction, types)?);
+        }
+        neighbours.sort_unstable();
+        neighbours.dedup();
+        for (edge, next) in neighbours {
+            if trail.contains(&edge) || !self.edge_matches(edge, props)? {
+                continue;
+            }
+            trail.push(edge);
+            if trail.len() as u32 >= min {
+                out.push((trail.clone(), next));
+            }
+            self.var_expand_rec(next, directions, types, props, min, max, trail, out)?;
+            trail.pop();
+        }
+        Ok(())
+    }
+
+    /// Whether an edge carries all the literal property filters.
+    fn edge_matches(&mut self, edge_id: u64, props: &[(u32, Value)]) -> Result<bool> {
+        if props.is_empty() {
+            return Ok(true);
+        }
+        let Some(record) = self.get_edge(edge_id)? else {
+            return Ok(false);
+        };
+        Ok(props
+            .iter()
+            .all(|(key, value)| record.get(*key) == Some(value)))
+    }
+
     pub fn node_edges(
         &mut self,
         node_id: u64,
@@ -790,6 +966,31 @@ impl Database {
         self.nodes
             .insert(&mut self.pager, &key_bytes, &record.encode())?;
         self.index_node(&record, node_id)
+    }
+
+    /// Replace every property of an edge.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` when the edge does not exist.
+    pub fn replace_edge_properties(
+        &mut self,
+        edge_id: u64,
+        props: Vec<(u32, Value)>,
+    ) -> Result<()> {
+        self.require_write()?;
+        let Some(mut record) = self.get_edge(edge_id)? else {
+            return Err(Error::new(
+                ErrorCode::NotFound,
+                format!("edge {edge_id} does not exist"),
+            ));
+        };
+        let key_bytes = edge_id.to_be_bytes();
+        self.edges.delete(&mut self.pager, &key_bytes)?;
+        record.props = normalize_props(props)?;
+        self.edges
+            .insert(&mut self.pager, &key_bytes, &record.encode())?;
+        Ok(())
     }
 
     fn require_write(&self) -> Result<()> {

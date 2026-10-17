@@ -24,6 +24,19 @@ pub enum AggFn {
     Collect,
 }
 
+/// One aggregation in an [`Plan::Aggregate`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggItem {
+    /// Aggregation function.
+    pub func: AggFn,
+    /// Argument expression.
+    pub argument: Expr,
+    /// Whether `DISTINCT` was written.
+    pub distinct: bool,
+    /// Output name.
+    pub name: String,
+}
+
 /// A property index seek chosen by the planner.
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexSeek {
@@ -49,12 +62,12 @@ pub enum Plan {
         input: Box<Plan>,
         /// Variable to bind.
         var: String,
-        /// Label id, or `None` for any label.
-        label: Option<u32>,
+        /// Label name, or `None` for any label.
+        label: Option<String>,
         /// Index seek when a usable index exists.
         seek: Option<IndexSeek>,
-        /// Residual literal property filters.
-        props: Vec<(u32, crate::record::Value)>,
+        /// Residual literal property filters, by key name.
+        props: Vec<(String, crate::record::Value)>,
     },
     /// Scan every node.
     AllNodesScan {
@@ -72,6 +85,27 @@ pub enum Plan {
         /// Edge type id, or `None` for any type.
         edge_type: Option<u32>,
     },
+    /// Expand from a bound node through trails of bounded length.
+    VarExpand {
+        /// Input rows (cross-product nesting).
+        input: Box<Plan>,
+        /// Bound source variable.
+        src: String,
+        /// Optional variable for the edge list.
+        edge: Option<String>,
+        /// Variable for the end node.
+        dst: String,
+        /// Pattern direction.
+        direction: RelDirection,
+        /// Restricting edge type names (empty = any).
+        types: Vec<String>,
+        /// Literal property filters applied at every hop, by key name.
+        props: Vec<(String, crate::record::Value)>,
+        /// Minimum hops.
+        min: u32,
+        /// Maximum hops; `None` is unbounded.
+        max: Option<u32>,
+    },
     /// Expand from a bound node to its neighbors.
     Expand {
         /// Input rows (cross-product nesting).
@@ -84,10 +118,10 @@ pub enum Plan {
         dst: String,
         /// Pattern direction.
         direction: RelDirection,
-        /// Restricting edge type ids (empty = any).
-        types: Vec<u32>,
-        /// Literal property filters on the edge.
-        props: Vec<(u32, crate::record::Value)>,
+        /// Restricting edge type names (empty = any).
+        types: Vec<String>,
+        /// Literal property filters on the edge, by key name.
+        props: Vec<(String, crate::record::Value)>,
     },
     /// Filter rows by a predicate.
     Filter {
@@ -95,6 +129,88 @@ pub enum Plan {
         input: Box<Plan>,
         /// Predicate expression.
         predicate: Expr,
+    },
+    /// Concatenate the rows of several query parts (`UNION` / `UNION ALL`).
+    Union {
+        /// Query parts, each producing the same output columns.
+        parts: Vec<Plan>,
+        /// Whether this is `UNION ALL` (keep duplicates).
+        all: bool,
+    },
+    /// Bind a variable to the path built from already bound elements.
+    BindPath {
+        /// Input plan.
+        input: Box<Plan>,
+        /// Variable to bind.
+        var: String,
+        /// `(variable, splice)` elements in path order; splice extends
+        /// variable-length relationship lists into individual edges.
+        elements: Vec<(String, bool)>,
+    },
+    /// Run updating clauses once per element of a list.
+    Foreach {
+        /// Input plan.
+        input: Box<Plan>,
+        /// Loop variable.
+        var: String,
+        /// List expression.
+        list: Expr,
+        /// Body, evaluated per element.
+        plan: Box<Plan>,
+    },
+    /// Call a built-in procedure and bind its outputs.
+    ProcedureCall {
+        /// Input plan.
+        input: Box<Plan>,
+        /// Dotted procedure name.
+        procedure: String,
+        /// Output columns in order.
+        columns: Vec<String>,
+        /// `(column, alias)` pairs to bind.
+        yields: Vec<(String, String)>,
+    },
+    /// Shortest-path search from one endpoint to the other.
+    ShortestPath {
+        /// Input plan.
+        input: Box<Plan>,
+        /// Source node variable.
+        src: String,
+        /// Target node variable.
+        dst: String,
+        /// Relationship variable bound to the edge list.
+        edge: Option<String>,
+        /// Direction.
+        direction: crate::cypher::RelDirection,
+        /// Restricting edge type names.
+        types: Vec<String>,
+        /// Literal property filters applied at every hop.
+        props: Vec<(String, crate::record::Value)>,
+        /// Minimum hops.
+        min: u32,
+        /// Maximum hops; `None` is unbounded.
+        max: Option<u32>,
+        /// Whether every path of minimal length is produced.
+        all: bool,
+    },
+    /// Pattern predicate: binds `var` to whether the inner plan matches.
+    PatternPredicate {
+        /// Input plan.
+        input: Box<Plan>,
+        /// Pattern plan, rooted at `Empty`, referencing input variables.
+        inner: Box<Plan>,
+        /// Hidden boolean variable.
+        var: String,
+    },
+    /// Pattern comprehension: binds `var` to the projected list.
+    PatternComprehension {
+        /// Input plan.
+        input: Box<Plan>,
+        /// Pattern plan, rooted at `Empty`, referencing input variables.
+        inner: Box<Plan>,
+        /// Value produced per match.
+        project: Expr,
+        /// Hidden list variable.
+        var: String,
     },
     /// Match a pattern per input row, keeping the row with null bindings when
     /// the pattern does not match.
@@ -119,8 +235,8 @@ pub enum Plan {
         input: Box<Plan>,
         /// `(expression, output name)` grouping keys.
         groups: Vec<(Expr, String)>,
-        /// `(function, argument, output name)` aggregations.
-        aggs: Vec<(AggFn, Expr, String)>,
+        /// Aggregations.
+        aggs: Vec<AggItem>,
     },
     /// Remove duplicate rows.
     Distinct {
@@ -164,15 +280,25 @@ pub enum Plan {
         /// Elements in creation order.
         items: Vec<CreateItem>,
     },
-    /// Match or create elements (a node, or a node plus a relationship).
+    /// Match a whole pattern, creating its unbound elements when nothing
+    /// matches.
     Merge {
         /// Input plan.
         input: Box<Plan>,
-        /// Elements to merge, in order.
+        /// Pattern plan rooted at `Empty`, using the same variable names as
+        /// the create items.
+        match_plan: Box<Plan>,
+        /// Elements created when the pattern does not match.
         items: Vec<CreateItem>,
-        /// Applied when any element was created.
+        /// Path variable and its `(variable, splice)` elements, in path
+        /// order.
+        path: Option<(String, Vec<(String, bool)>)>,
+        /// Every pattern variable in path order, then the path variable;
+        /// both merge paths collect rows in this order.
+        path_vars: Vec<String>,
+        /// Applied to created rows.
         on_create: Vec<SetItem>,
-        /// Applied when every element already existed.
+        /// Applied to matched rows.
         on_match: Vec<SetItem>,
     },
     /// `SET` properties and labels.
@@ -274,6 +400,23 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
             out.push_str(&format!("{pad}EdgeScan {var} type={edge_type:?}\n"));
             explain(input, indent + 1, out);
         }
+        Plan::VarExpand {
+            input,
+            src,
+            edge,
+            dst,
+            direction,
+            types,
+            props,
+            min,
+            max,
+        } => {
+            out.push_str(&format!(
+                "{pad}VarExpand {src}-[{edge:?}:{types:?} {direction:?} {min}..{max:?}]->{dst} props={}\n",
+                props.len()
+            ));
+            explain(input, indent + 1, out);
+        }
         Plan::Expand {
             input,
             src,
@@ -291,6 +434,74 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
         }
         Plan::Filter { input, .. } => {
             out.push_str(&format!("{pad}Filter\n"));
+            explain(input, indent + 1, out);
+        }
+        Plan::Union { parts, all } => {
+            out.push_str(&format!(
+                "{pad}Union {}\n",
+                if *all { "all" } else { "distinct" }
+            ));
+            for part in parts {
+                explain(part, indent + 1, out);
+            }
+        }
+        Plan::BindPath {
+            input,
+            var,
+            elements,
+        } => {
+            out.push_str(&format!(
+                "{pad}BindPath {var} ({} elements)\n",
+                elements.len()
+            ));
+            explain(input, indent + 1, out);
+        }
+        Plan::ShortestPath {
+            input,
+            src,
+            dst,
+            all,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{pad}ShortestPath {src} -> {dst}{}\n",
+                if *all { " (all)" } else { "" }
+            ));
+            explain(input, indent + 1, out);
+        }
+        Plan::Foreach {
+            input, plan, var, ..
+        } => {
+            out.push_str(&format!("{pad}Foreach {var}\n"));
+            explain(plan, indent + 1, out);
+            explain(input, indent + 1, out);
+        }
+        Plan::ProcedureCall {
+            input,
+            procedure,
+            yields,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{pad}ProcedureCall {procedure} {}\n",
+                yields
+                    .iter()
+                    .map(|(column, alias)| format!("{column} AS {alias}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            explain(input, indent + 1, out);
+        }
+        Plan::PatternPredicate { input, inner, var } => {
+            out.push_str(&format!("{pad}PatternPredicate {var}\n"));
+            explain(inner, indent + 1, out);
+            explain(input, indent + 1, out);
+        }
+        Plan::PatternComprehension {
+            input, inner, var, ..
+        } => {
+            out.push_str(&format!("{pad}PatternComprehension {var}\n"));
+            explain(inner, indent + 1, out);
             explain(input, indent + 1, out);
         }
         Plan::OptionalMatch { input, inner, vars } => {
@@ -311,7 +522,7 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
                 "{pad}Aggregate groups={} aggs={}\n",
                 names(groups),
                 aggs.iter()
-                    .map(|(_, _, name)| name.clone())
+                    .map(|item| item.name.clone())
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
@@ -348,7 +559,12 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
             ));
             explain(input, indent + 1, out);
         }
-        Plan::Merge { input, items, .. } => {
+        Plan::Merge {
+            input,
+            match_plan,
+            items,
+            ..
+        } => {
             out.push_str(&format!(
                 "{pad}Merge {}\n",
                 items
@@ -357,6 +573,7 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
+            explain(match_plan, indent + 1, out);
             explain(input, indent + 1, out);
         }
         Plan::SetItems { input, items } => {

@@ -15,13 +15,13 @@ use hashlink::LinkedHashMap as FastMap;
 
 use crate::cypher::{
     BinaryOp, Clause, Expr, MatchClause, NodePattern, PatternPath, Query, RelDirection, ReturnItem,
-    SetItem, SortItem, UnaryOp,
+    SetItem, Shortest, SortItem, UnaryOp,
 };
 use crate::engine::Database;
 use crate::error::{Error, ErrorCode, Result};
 use crate::record::Value;
 use crate::vdbe::NO_KEY;
-use plan::{AggFn, CreateItem, IndexSeek, Plan};
+use plan::{AggFn, AggItem, CreateItem, IndexSeek, Plan};
 
 pub use plan::explain;
 
@@ -42,12 +42,32 @@ enum VarKind {
     Node,
     Edge,
     Value,
+    /// A named path; usable neither as a node nor as a relationship.
+    Path,
+}
+
+/// Where a pattern expression appears, which decides whether plan-level
+/// extraction is legal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatternContext {
+    /// Predicate position: bare patterns and comprehensions are legal.
+    Predicate,
+    /// Value position: only comprehensions are legal.
+    Value,
+    /// Inside a list-comprehension, quantifier or `reduce` body, where the
+    /// code generator evaluates the expression per element without plan
+    /// nodes, so pattern expressions cannot be extracted.
+    Nested,
 }
 
 /// Planner state.
 struct Planner<'a> {
     db: &'a mut Database,
     anon_counter: u32,
+    /// Relationship variables bound by patterns since the last projection;
+    /// re-binding one of these is an error, while a relationship carried
+    /// through `WITH` may constrain a later pattern.
+    pattern_rels: std::collections::HashSet<String>,
 }
 
 /// Plan a parsed query with the given parameter values.
@@ -60,95 +80,115 @@ pub fn plan_query(
     let mut planner = Planner {
         db,
         anon_counter: 0,
+        pattern_rels: std::collections::HashSet::new(),
     };
     planner.run(&query)
 }
 
 impl<'a> Planner<'a> {
     fn run(&mut self, query: &Query) -> Result<Prepared> {
+        let mut plans = Vec::with_capacity(query.parts.len());
+        let mut columns: Option<Vec<String>> = None;
+        let mut mutating = false;
+        for part in &query.parts {
+            let (plan, part_columns, part_mutating) = self.plan_part(&part.clauses)?;
+            match &columns {
+                Some(first) if *first != part_columns => {
+                    return Err(Error::syntax(
+                        "all subqueries in a UNION must have the same column names",
+                    ));
+                }
+                Some(_) => {}
+                None => columns = Some(part_columns),
+            }
+            mutating |= part_mutating;
+            plans.push(plan);
+        }
+        let columns = columns.unwrap_or_default();
+        let plan = if plans.len() == 1 {
+            plans.pop().expect("single query part")
+        } else {
+            let all = query.parts[1].union_all;
+            let union = Plan::Union { parts: plans, all };
+            if all {
+                union
+            } else {
+                Plan::Distinct {
+                    input: Box::new(union),
+                }
+            }
+        };
+        Ok(Prepared {
+            plan,
+            columns,
+            mutating,
+        })
+    }
+
+    /// Plan one query part (a pipeline of clauses) on its own scope.
+    fn plan_part(&mut self, clauses: &[Clause]) -> Result<(Plan, Vec<String>, bool)> {
         let mut plan = Plan::Empty;
         let mut scope: FastMap<String, VarKind> = FastMap::new();
         let mut columns = Vec::new();
         let mut mutating = false;
-        for clause in &query.clauses {
+        for clause in clauses {
             match clause {
                 Clause::Match(matched) => {
                     self.plan_match(matched, &mut plan, &mut scope)?;
                 }
-                Clause::Create(patterns) => {
-                    let items = self.plan_create(patterns, &scope)?;
-                    for item in &items {
-                        let kind = match item {
-                            CreateItem::Node { .. } => VarKind::Node,
-                            CreateItem::Edge { .. } => VarKind::Edge,
-                        };
-                        scope.insert(item.var().to_owned(), kind);
+                clause @ (Clause::Create(_)
+                | Clause::Merge { .. }
+                | Clause::Set(_)
+                | Clause::Remove(_)
+                | Clause::Delete { .. }
+                | Clause::Foreach { .. }) => {
+                    if self.plan_updating_clause(clause, &mut plan, &mut scope)? {
+                        mutating = true;
+                        columns.clear();
                     }
-                    plan = Plan::Create {
-                        input: Box::new(plan),
-                        items,
-                    };
-                    mutating = true;
-                    columns.clear();
                 }
-                Clause::Merge {
-                    pattern,
-                    on_create,
-                    on_match,
+                Clause::Call {
+                    procedure,
+                    args,
+                    yields,
                 } => {
-                    let items = self.plan_merge(pattern, &scope)?;
-                    for item in &items {
-                        let kind = match item {
-                            CreateItem::Node { .. } => VarKind::Node,
-                            CreateItem::Edge { .. } => VarKind::Edge,
-                        };
-                        scope.insert(item.var().to_owned(), kind);
+                    if !args.is_empty() {
+                        return Err(Error::unsupported(
+                            "procedures with arguments are not supported",
+                        ));
                     }
-                    for set_item in on_create.iter().chain(on_match) {
-                        self.validate_set_item(set_item, &scope)?;
-                    }
-                    plan = Plan::Merge {
-                        input: Box::new(plan),
-                        items,
-                        on_create: on_create.clone(),
-                        on_match: on_match.clone(),
+                    let outputs = procedure_columns(procedure)?;
+                    let yields: Vec<(String, String)> = if yields.is_empty() {
+                        outputs
+                            .iter()
+                            .map(|name| (name.clone(), name.clone()))
+                            .collect()
+                    } else {
+                        let mut out = Vec::with_capacity(yields.len());
+                        for (column, alias) in yields {
+                            if !outputs.contains(column) {
+                                return Err(Error::syntax(format!(
+                                    "procedure `{procedure}` has no column `{column}`"
+                                )));
+                            }
+                            out.push((
+                                column.clone(),
+                                alias.clone().unwrap_or_else(|| column.clone()),
+                            ));
+                        }
+                        out
                     };
-                    mutating = true;
-                    columns.clear();
-                }
-                Clause::Set(items) => {
-                    for item in items {
-                        self.validate_set_item(item, &scope)?;
+                    for (_, alias) in &yields {
+                        scope.insert(alias.clone(), VarKind::Value);
                     }
-                    plan = Plan::SetItems {
+                    plan = Plan::ProcedureCall {
                         input: Box::new(plan),
-                        items: items.clone(),
+                        procedure: procedure.clone(),
+                        columns: outputs,
+                        yields: yields.clone(),
                     };
-                    mutating = true;
                     columns.clear();
-                }
-                Clause::Remove(items) => {
-                    for item in items {
-                        self.validate_set_item(item, &scope)?;
-                    }
-                    plan = Plan::RemoveItems {
-                        input: Box::new(plan),
-                        items: items.clone(),
-                    };
-                    mutating = true;
-                    columns.clear();
-                }
-                Clause::Delete { detach, exprs } => {
-                    for expr in exprs {
-                        validate_expr(expr, &scope)?;
-                    }
-                    plan = Plan::Delete {
-                        input: Box::new(plan),
-                        exprs: exprs.clone(),
-                        detach: *detach,
-                    };
-                    mutating = true;
-                    columns.clear();
+                    columns.extend(yields.iter().map(|(_, alias)| alias.clone()));
                 }
                 Clause::Unwind { expr, alias } => {
                     validate_expr(expr, &scope)?;
@@ -179,6 +219,7 @@ impl<'a> Planner<'a> {
                     )?;
                     plan = new_plan;
                     scope = new_scope;
+                    self.pattern_rels.clear();
                     columns.clear();
                 }
                 Clause::Return {
@@ -194,14 +235,96 @@ impl<'a> Planner<'a> {
                     plan = new_plan;
                     columns = new_columns;
                     scope.clear();
+                    self.pattern_rels.clear();
                 }
             }
         }
-        Ok(Prepared {
-            plan,
-            columns,
-            mutating,
-        })
+        Ok((plan, columns, mutating))
+    }
+
+    /// Plan one updating clause (`CREATE`, `MERGE`, `SET`, `REMOVE`,
+    /// `DELETE`, `FOREACH`). Returns whether it writes to the database.
+    fn plan_updating_clause(
+        &mut self,
+        clause: &Clause,
+        plan: &mut Plan,
+        scope: &mut FastMap<String, VarKind>,
+    ) -> Result<bool> {
+        match clause {
+            Clause::Create(patterns) => {
+                let items = self.plan_create(patterns, scope)?;
+                for item in &items {
+                    let kind = match item {
+                        CreateItem::Node { .. } => VarKind::Node,
+                        CreateItem::Edge { .. } => VarKind::Edge,
+                    };
+                    scope.insert(item.var().to_owned(), kind);
+                }
+                *plan = Plan::Create {
+                    input: Box::new(std::mem::replace(plan, Plan::Empty)),
+                    items,
+                };
+                Ok(true)
+            }
+            Clause::Merge {
+                pattern,
+                on_create,
+                on_match,
+            } => {
+                self.plan_merge(pattern, on_create, on_match, plan, scope)?;
+                Ok(true)
+            }
+            Clause::Set(items) => {
+                for item in items {
+                    self.validate_set_item(item, scope)?;
+                }
+                *plan = Plan::SetItems {
+                    input: Box::new(std::mem::replace(plan, Plan::Empty)),
+                    items: items.clone(),
+                };
+                Ok(true)
+            }
+            Clause::Remove(items) => {
+                for item in items {
+                    self.validate_set_item(item, scope)?;
+                }
+                *plan = Plan::RemoveItems {
+                    input: Box::new(std::mem::replace(plan, Plan::Empty)),
+                    items: items.clone(),
+                };
+                Ok(true)
+            }
+            Clause::Delete { detach, exprs } => {
+                for expr in exprs {
+                    validate_expr(expr, scope)?;
+                }
+                *plan = Plan::Delete {
+                    input: Box::new(std::mem::replace(plan, Plan::Empty)),
+                    exprs: exprs.clone(),
+                    detach: *detach,
+                };
+                Ok(true)
+            }
+            Clause::Foreach { var, list, clauses } => {
+                validate_expr(list, scope)?;
+                let mut inner = Plan::Empty;
+                let mut inner_scope = scope.clone();
+                inner_scope.insert(var.clone(), VarKind::Value);
+                for clause in clauses {
+                    self.plan_updating_clause(clause, &mut inner, &mut inner_scope)?;
+                }
+                *plan = Plan::Foreach {
+                    input: Box::new(std::mem::replace(plan, Plan::Empty)),
+                    var: var.clone(),
+                    list: list.clone(),
+                    plan: Box::new(inner),
+                };
+                Ok(true)
+            }
+            _ => Err(Error::syntax(
+                "only updating clauses are allowed in FOREACH",
+            )),
+        }
     }
 
     // ---- MATCH ----
@@ -219,10 +342,12 @@ impl<'a> Planner<'a> {
             self.plan_path(path, plan, scope)?;
         }
         if let Some(predicate) = &clause.where_clause {
-            validate_expr(predicate, scope)?;
+            let mut predicate = predicate.clone();
+            self.extract_patterns(&mut predicate, plan, scope, PatternContext::Predicate)?;
+            validate_expr(&predicate, scope)?;
             *plan = Plan::Filter {
                 input: Box::new(plan.clone()),
-                predicate: predicate.clone(),
+                predicate,
             };
         }
         Ok(())
@@ -243,10 +368,17 @@ impl<'a> Planner<'a> {
             self.plan_path(path, &mut inner, &mut inner_scope)?;
         }
         if let Some(predicate) = &clause.where_clause {
-            validate_expr(predicate, &inner_scope)?;
+            let mut predicate = predicate.clone();
+            self.extract_patterns(
+                &mut predicate,
+                &mut inner,
+                &mut inner_scope,
+                PatternContext::Predicate,
+            )?;
+            validate_expr(&predicate, &inner_scope)?;
             inner = Plan::Filter {
                 input: Box::new(inner),
-                predicate: predicate.clone(),
+                predicate,
             };
         }
         let vars: Vec<String> = inner_scope
@@ -263,47 +395,478 @@ impl<'a> Planner<'a> {
         Ok(())
     }
 
+    // ---- Pattern expressions ----
+
+    /// Extract pattern expressions into hidden variables bound by wrapping
+    /// plan nodes: pattern predicates become booleans, pattern
+    /// comprehensions become lists.
+    fn extract_patterns(
+        &mut self,
+        expr: &mut Expr,
+        plan: &mut Plan,
+        scope: &mut FastMap<String, VarKind>,
+        context: PatternContext,
+    ) -> Result<()> {
+        if let Expr::Function { name, args, .. } = expr
+            && args.len() == 1
+            && (name.eq_ignore_ascii_case("shortestPath")
+                || name.eq_ignore_ascii_case("allShortestPaths"))
+            && let Expr::Pattern(path) = &args[0]
+        {
+            let all = name.eq_ignore_ascii_case("allShortestPaths");
+            let mut path = (**path).clone();
+            path.variable = None;
+            for segment in &mut path.segments {
+                segment.relationship.variable = None;
+            }
+            for node in std::iter::once(&path.start).chain(path.segments.iter().map(|s| &s.node)) {
+                if let Some(var) = &node.variable
+                    && !scope.contains_key(var)
+                {
+                    return Err(undefined_variable(var));
+                }
+            }
+            let hidden = self.anon_name("spath");
+            // A pattern expression yields null when no path exists, so the
+            // search runs inside an optional plan.
+            let mut inner = Plan::Empty;
+            let mut inner_scope = scope.clone();
+            self.plan_shortest(
+                &path,
+                all,
+                Some(hidden.clone()),
+                true,
+                &mut inner,
+                &mut inner_scope,
+            )?;
+            let vars: Vec<String> = inner_scope
+                .keys()
+                .filter(|var| !scope.contains_key(*var))
+                .cloned()
+                .collect();
+            *scope = inner_scope;
+            *plan = Plan::OptionalMatch {
+                input: Box::new(std::mem::replace(plan, Plan::Empty)),
+                inner: Box::new(inner),
+                vars,
+            };
+            *expr = Expr::Variable(hidden);
+            return Ok(());
+        }
+        if let Expr::Function { name, args, .. } = expr
+            && name.eq_ignore_ascii_case("exists")
+            && args.len() == 1
+        {
+            self.extract_patterns(&mut args[0], plan, scope, PatternContext::Predicate)?;
+            let arg = args[0].clone();
+            *expr = match arg {
+                Expr::Variable(_) => arg,
+                other => Expr::IsNull {
+                    expr: Box::new(other),
+                    negated: true,
+                },
+            };
+            return Ok(());
+        }
+        match expr {
+            Expr::Pattern(_) | Expr::PatternComprehension { .. } => {
+                if context == PatternContext::Nested {
+                    return Err(Error::unsupported(
+                        "pattern expressions inside list comprehensions are not supported",
+                    ));
+                }
+                if context == PatternContext::Value && matches!(expr, Expr::Pattern(_)) {
+                    return Err(Error::syntax(
+                        "pattern expressions are only allowed in predicates",
+                    ));
+                }
+                match expr {
+                    Expr::Pattern(path) => {
+                        let hidden = self.extract_pattern_predicate(path, plan, scope)?;
+                        *expr = Expr::Variable(hidden);
+                    }
+                    Expr::PatternComprehension {
+                        path,
+                        predicate,
+                        projection,
+                    } => {
+                        let hidden = self.extract_pattern_comprehension(
+                            path, predicate, projection, plan, scope,
+                        )?;
+                        *expr = Expr::Variable(hidden);
+                    }
+                    _ => return Err(Error::internal("pattern extraction mismatch")),
+                }
+                Ok(())
+            }
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr: inner,
+            } => self.extract_patterns(inner, plan, scope, PatternContext::Predicate),
+            Expr::Binary { op, left, right } => {
+                let context = if matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Xor)
+                    && context != PatternContext::Nested
+                {
+                    PatternContext::Predicate
+                } else {
+                    context
+                };
+                self.extract_patterns(left, plan, scope, context)?;
+                self.extract_patterns(right, plan, scope, context)
+            }
+            Expr::Function { args, .. } => {
+                for arg in args.iter_mut() {
+                    self.extract_patterns(arg, plan, scope, context)?;
+                }
+                Ok(())
+            }
+            Expr::Quantifier {
+                list, predicate, ..
+            } => {
+                self.extract_patterns(list, plan, scope, context)?;
+                self.extract_patterns(predicate, plan, scope, PatternContext::Nested)
+            }
+            Expr::ListComprehension {
+                list,
+                predicate,
+                projection,
+                ..
+            } => {
+                self.extract_patterns(list, plan, scope, context)?;
+                if let Some(predicate) = predicate {
+                    self.extract_patterns(predicate, plan, scope, PatternContext::Nested)?;
+                }
+                if let Some(projection) = projection {
+                    self.extract_patterns(projection, plan, scope, PatternContext::Nested)?;
+                }
+                Ok(())
+            }
+            Expr::Case {
+                subject,
+                alternatives,
+                default,
+            } => {
+                if let Some(subject) = subject {
+                    self.extract_patterns(subject, plan, scope, context)?;
+                }
+                for (when, then) in alternatives.iter_mut() {
+                    self.extract_patterns(when, plan, scope, PatternContext::Predicate)?;
+                    self.extract_patterns(then, plan, scope, context)?;
+                }
+                if let Some(default) = default {
+                    self.extract_patterns(default, plan, scope, context)?;
+                }
+                Ok(())
+            }
+            Expr::Reduce {
+                init,
+                list,
+                expression,
+                ..
+            } => {
+                self.extract_patterns(init, plan, scope, context)?;
+                self.extract_patterns(list, plan, scope, context)?;
+                self.extract_patterns(expression, plan, scope, PatternContext::Nested)
+            }
+            Expr::List(items) => {
+                for item in items.iter_mut() {
+                    self.extract_patterns(item, plan, scope, context)?;
+                }
+                Ok(())
+            }
+            Expr::Map(entries) => {
+                for (_, value) in entries.iter_mut() {
+                    self.extract_patterns(value, plan, scope, context)?;
+                }
+                Ok(())
+            }
+            Expr::Unary { expr: inner, .. }
+            | Expr::Property { base: inner, .. }
+            | Expr::IsNull { expr: inner, .. }
+            | Expr::LabelCheck { expr: inner, .. } => {
+                self.extract_patterns(inner, plan, scope, context)
+            }
+            Expr::Subscript { base, index } => {
+                self.extract_patterns(base, plan, scope, context)?;
+                self.extract_patterns(index, plan, scope, context)
+            }
+            Expr::Slice { base, lower, upper } => {
+                self.extract_patterns(base, plan, scope, context)?;
+                if let Some(lower) = lower {
+                    self.extract_patterns(lower, plan, scope, context)?;
+                }
+                match upper {
+                    Some(upper) => self.extract_patterns(upper, plan, scope, context),
+                    None => Ok(()),
+                }
+            }
+            Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => Ok(()),
+        }
+    }
+
+    /// Wrap the plan in a pattern predicate node: the inner pattern plan runs
+    /// per row and binds a hidden boolean.
+    fn extract_pattern_predicate(
+        &mut self,
+        path: &PatternPath,
+        plan: &mut Plan,
+        scope: &mut FastMap<String, VarKind>,
+    ) -> Result<String> {
+        for node in std::iter::once(&path.start).chain(path.segments.iter().map(|s| &s.node)) {
+            if let Some(var) = &node.variable
+                && !scope.contains_key(var)
+            {
+                return Err(undefined_variable(var));
+            }
+        }
+        for segment in &path.segments {
+            if let Some(var) = &segment.relationship.variable
+                && !scope.contains_key(var)
+            {
+                return Err(undefined_variable(var));
+            }
+        }
+        let mut inner = Plan::Empty;
+        let mut inner_scope = scope.clone();
+        self.plan_path(path, &mut inner, &mut inner_scope)?;
+        let hidden = self.anon_name("pred");
+        scope.insert(hidden.clone(), VarKind::Value);
+        *plan = Plan::PatternPredicate {
+            input: Box::new(std::mem::replace(plan, Plan::Empty)),
+            inner: Box::new(inner),
+            var: hidden.clone(),
+        };
+        Ok(hidden)
+    }
+
+    /// Wrap the plan in a pattern comprehension node: the inner pattern plan
+    /// runs per row and binds a hidden list of projected values.
+    fn extract_pattern_comprehension(
+        &mut self,
+        path: &PatternPath,
+        predicate: &Option<Box<Expr>>,
+        projection: &Expr,
+        plan: &mut Plan,
+        scope: &mut FastMap<String, VarKind>,
+    ) -> Result<String> {
+        let mut inner = Plan::Empty;
+        let mut inner_scope = scope.clone();
+        self.plan_path(path, &mut inner, &mut inner_scope)?;
+        if let Some(predicate) = predicate {
+            let mut predicate = (**predicate).clone();
+            self.extract_patterns(
+                &mut predicate,
+                &mut inner,
+                &mut inner_scope,
+                PatternContext::Predicate,
+            )?;
+            validate_expr(&predicate, &inner_scope)?;
+            inner = Plan::Filter {
+                input: Box::new(inner),
+                predicate,
+            };
+        }
+        let mut projection = projection.clone();
+        self.extract_patterns(
+            &mut projection,
+            &mut inner,
+            &mut inner_scope,
+            PatternContext::Value,
+        )?;
+        validate_expr(&projection, &inner_scope)?;
+        let hidden = self.anon_name("comp");
+        scope.insert(hidden.clone(), VarKind::Value);
+        *plan = Plan::PatternComprehension {
+            input: Box::new(std::mem::replace(plan, Plan::Empty)),
+            inner: Box::new(inner),
+            project: projection,
+            var: hidden.clone(),
+        };
+        Ok(hidden)
+    }
+
+    /// Plan `shortestPath`/`allShortestPaths`: a single variable-length
+    /// relationship searched breadth-first from a bound endpoint (or from
+    /// every scanned start node when neither endpoint is bound).
+    fn plan_shortest(
+        &mut self,
+        path: &PatternPath,
+        all: bool,
+        bind_path: Option<String>,
+        require_bound: bool,
+        plan: &mut Plan,
+        scope: &mut FastMap<String, VarKind>,
+    ) -> Result<()> {
+        let segment = match path.segments.as_slice() {
+            [segment] => segment,
+            _ => {
+                return Err(Error::syntax(
+                    "shortestPath requires exactly one relationship pattern",
+                ));
+            }
+        };
+        let rel = &segment.relationship;
+        let Some(bounds) = &rel.var_length else {
+            return Err(Error::syntax(
+                "shortestPath requires a variable-length relationship pattern",
+            ));
+        };
+        let (props, prop_exprs) =
+            self.pattern_props(rel.properties.as_ref(), "relationship", scope)?;
+        if !prop_exprs.is_empty() {
+            return Err(Error::unsupported(
+                "shortestPath requires literal property filters",
+            ));
+        }
+        let start = self.planned_node(&path.start, scope)?;
+        let end = self.planned_node(&segment.node, scope)?;
+        let src_bound = scope.contains_key(&start.var);
+        let dst_bound = scope.contains_key(&end.var);
+        if require_bound {
+            // Expression form: both endpoints must already be bound.
+            if !src_bound {
+                return Err(undefined_variable(&start.var));
+            }
+            if !dst_bound {
+                return Err(undefined_variable(&end.var));
+            }
+        }
+        // Search from a bound endpoint when there is one so bound variables
+        // keep their values; the path value stays in the written order.
+        let (src_node, dst_node, direction) = if !src_bound && dst_bound {
+            (&end, &start, flip(rel.direction))
+        } else {
+            (&start, &end, rel.direction)
+        };
+        if !scope.contains_key(&src_node.var) {
+            let (label, seek, scan_props) = self.anchor_plan(src_node)?;
+            *plan = Plan::NodeScan {
+                input: Box::new(plan.clone()),
+                var: src_node.var.clone(),
+                label,
+                seek,
+                props: scan_props,
+            };
+            scope.insert(src_node.var.clone(), VarKind::Node);
+            if let Some(predicate) = node_constraints(src_node, true) {
+                *plan = Plan::Filter {
+                    input: Box::new(plan.clone()),
+                    predicate,
+                };
+            }
+        } else if let Some(predicate) = node_constraints(src_node, false) {
+            *plan = Plan::Filter {
+                input: Box::new(plan.clone()),
+                predicate,
+            };
+        }
+        if !scope.contains_key(&dst_node.var) {
+            scope.insert(dst_node.var.clone(), VarKind::Node);
+        }
+        let edge_var = match &rel.variable {
+            Some(var) => {
+                if scope.contains_key(var) {
+                    return Err(Error::syntax(format!("variable `{var}` is already bound")));
+                }
+                scope.insert(var.clone(), VarKind::Edge);
+                self.pattern_rels.insert(var.clone());
+                var.clone()
+            }
+            None => self.anon_name("rel"),
+        };
+        *plan = Plan::ShortestPath {
+            input: Box::new(plan.clone()),
+            src: src_node.var.clone(),
+            dst: dst_node.var.clone(),
+            edge: Some(edge_var.clone()),
+            direction,
+            types: rel.types.clone(),
+            props: props
+                .into_iter()
+                .map(|(name, _, value)| (name, value))
+                .collect(),
+            min: bounds.min,
+            max: bounds.max,
+            all,
+        };
+        // The search binds the target; labels and properties it does not
+        // enforce become a post-filter.
+        if let Some(predicate) = node_constraints(dst_node, false) {
+            *plan = Plan::Filter {
+                input: Box::new(plan.clone()),
+                predicate,
+            };
+        }
+        if let Some(path_var) = bind_path {
+            if scope.contains_key(&path_var) {
+                return Err(Error::syntax(format!(
+                    "variable `{path_var}` is already bound"
+                )));
+            }
+            let elements = vec![
+                (start.var.clone(), false),
+                (edge_var.clone(), true),
+                (end.var.clone(), false),
+            ];
+            scope.insert(path_var.clone(), VarKind::Path);
+            *plan = Plan::BindPath {
+                input: Box::new(plan.clone()),
+                var: path_var,
+                elements,
+            };
+        }
+        Ok(())
+    }
+
     fn plan_path(
         &mut self,
         path: &PatternPath,
         plan: &mut Plan,
         scope: &mut FastMap<String, VarKind>,
     ) -> Result<()> {
+        if path.shortest != Shortest::Plain {
+            let all = path.shortest == Shortest::AllShortest;
+            return self.plan_shortest(path, all, path.variable.clone(), false, plan, scope);
+        }
         let mut nodes: Vec<PlannedNode> = Vec::new();
         nodes.push(self.planned_node(&path.start, scope)?);
         struct RelInfo {
             index: usize,
             var: String,
-            types: Vec<u32>,
+            types: Vec<String>,
             direction: RelDirection,
-            props: Vec<(u32, Value)>,
+            props: Vec<(String, Value)>,
+            prop_exprs: Vec<(String, Expr)>,
+            var_length: Option<crate::cypher::VarLength>,
         }
         let mut rels: Vec<RelInfo> = Vec::new();
         for segment in &path.segments {
             let rel = &segment.relationship;
-            if rel.var_length.is_some() {
-                return Err(Error::unsupported(
-                    "variable-length relationship patterns are not supported yet",
-                ));
-            }
             let node = self.planned_node(&segment.node, scope)?;
             nodes.push(node);
             let var = match &rel.variable {
                 Some(var) => var.clone(),
                 None => self.anon_name("rel"),
             };
-            let types = self.resolve_types(&rel.types);
-            let props = self
-                .pattern_props(rel.properties.as_ref(), "relationship")?
-                .into_iter()
-                .map(|(_, key_id, value)| (key_id, value))
-                .collect();
+            let types = rel.types.clone();
+            let (literals, prop_exprs) =
+                self.pattern_props(rel.properties.as_ref(), "relationship", scope)?;
+            if rel.var_length.is_some() && !prop_exprs.is_empty() {
+                return Err(Error::unsupported(
+                    "variable-length relationship patterns require literal property filters",
+                ));
+            }
             rels.push(RelInfo {
                 index: nodes.len() - 2,
                 var,
                 types,
                 direction: rel.direction,
-                props,
+                props: literals
+                    .into_iter()
+                    .map(|(name, _, value)| (name, value))
+                    .collect(),
+                prop_exprs,
+                var_length: rel.var_length,
             });
         }
 
@@ -334,23 +897,39 @@ impl<'a> Planner<'a> {
                 let Some((from_idx, to_idx, direction)) = direction else {
                     continue;
                 };
-                let edge_bound = scope.contains_key(&rel.var);
+                let edge_bound =
+                    self.bound_relationship(&rel.var, rel.var_length.is_some(), scope)?;
                 let edge_var = if edge_bound {
                     self.anon_name("rel")
                 } else {
                     scope.insert(rel.var.clone(), VarKind::Edge);
+                    self.pattern_rels.insert(rel.var.clone());
                     rel.var.clone()
                 };
-                *plan = Plan::Expand {
-                    input: Box::new(plan.clone()),
-                    src: nodes[from_idx].var.clone(),
-                    edge: Some(edge_var.clone()),
-                    dst: nodes[to_idx].var.clone(),
-                    direction,
-                    types: rel.types.clone(),
-                    props: rel.props.clone(),
+                *plan = match rel.var_length {
+                    Some(bounds) => Plan::VarExpand {
+                        input: Box::new(plan.clone()),
+                        src: nodes[from_idx].var.clone(),
+                        edge: Some(edge_var.clone()),
+                        dst: nodes[to_idx].var.clone(),
+                        direction,
+                        types: rel.types.clone(),
+                        props: rel.props.clone(),
+                        min: bounds.min,
+                        max: bounds.max,
+                    },
+                    None => Plan::Expand {
+                        input: Box::new(plan.clone()),
+                        src: nodes[from_idx].var.clone(),
+                        edge: Some(edge_var.clone()),
+                        dst: nodes[to_idx].var.clone(),
+                        direction,
+                        types: rel.types.clone(),
+                        props: rel.props.clone(),
+                    },
                 };
                 constrain_edge(plan, &edge_var, &rel.var, edge_bound);
+                constrain_edge_props(plan, &edge_var, &rel.prop_exprs);
                 scope.insert(nodes[to_idx].var.clone(), VarKind::Node);
                 bound[to_idx] = true;
                 handled[idx] = true;
@@ -371,21 +950,36 @@ impl<'a> Planner<'a> {
                     continue;
                 }
                 let fresh_node = self.anon_name("node");
-                let edge_bound = scope.contains_key(&rel.var);
+                let edge_bound =
+                    self.bound_relationship(&rel.var, rel.var_length.is_some(), scope)?;
                 let edge_var = if edge_bound {
                     self.anon_name("rel")
                 } else {
                     scope.insert(rel.var.clone(), VarKind::Edge);
+                    self.pattern_rels.insert(rel.var.clone());
                     rel.var.clone()
                 };
-                *plan = Plan::Expand {
-                    input: Box::new(plan.clone()),
-                    src: nodes[from].var.clone(),
-                    edge: Some(edge_var.clone()),
-                    dst: fresh_node.clone(),
-                    direction: rel.direction,
-                    types: rel.types.clone(),
-                    props: rel.props.clone(),
+                *plan = match rel.var_length {
+                    Some(bounds) => Plan::VarExpand {
+                        input: Box::new(plan.clone()),
+                        src: nodes[from].var.clone(),
+                        edge: Some(edge_var.clone()),
+                        dst: fresh_node.clone(),
+                        direction: rel.direction,
+                        types: rel.types.clone(),
+                        props: rel.props.clone(),
+                        min: bounds.min,
+                        max: bounds.max,
+                    },
+                    None => Plan::Expand {
+                        input: Box::new(plan.clone()),
+                        src: nodes[from].var.clone(),
+                        edge: Some(edge_var.clone()),
+                        dst: fresh_node.clone(),
+                        direction: rel.direction,
+                        types: rel.types.clone(),
+                        props: rel.props.clone(),
+                    },
                 };
                 scope.insert(fresh_node.clone(), VarKind::Node);
                 *plan = Plan::Filter {
@@ -396,6 +990,7 @@ impl<'a> Planner<'a> {
                     ),
                 };
                 constrain_edge(plan, &edge_var, &rel.var, edge_bound);
+                constrain_edge_props(plan, &edge_var, &rel.prop_exprs);
                 handled[idx] = true;
                 progressed = true;
                 break;
@@ -431,7 +1026,62 @@ impl<'a> Planner<'a> {
                 };
             }
         }
+        // `p = (a)-[...]->(b)` binds the alternating node/relationship value.
+        if let Some(path_var) = &path.variable {
+            if scope.contains_key(path_var) {
+                return Err(Error::syntax(format!(
+                    "variable `{path_var}` is already bound"
+                )));
+            }
+            let mut elements = vec![(nodes[0].var.clone(), false)];
+            for (idx, rel) in rels.iter().enumerate() {
+                elements.push((rel.var.clone(), rel.var_length.is_some()));
+                elements.push((nodes[idx + 1].var.clone(), false));
+            }
+            scope.insert(path_var.clone(), VarKind::Path);
+            *plan = Plan::BindPath {
+                input: Box::new(plan.clone()),
+                var: path_var.clone(),
+                elements,
+            };
+        }
         Ok(())
+    }
+
+    /// Whether a relationship variable is already bound. A variable carried
+    /// through a projection may constrain a pattern; one bound by an earlier
+    /// pattern in the same section may not be bound again.
+    fn bound_relationship(
+        &self,
+        var: &str,
+        var_length: bool,
+        scope: &FastMap<String, VarKind>,
+    ) -> Result<bool> {
+        let Some(kind) = scope.get(var) else {
+            return Ok(false);
+        };
+        match kind {
+            // A value may hold a relationship, or a relationship list when
+            // the pattern is variable-length.
+            VarKind::Value => return Ok(true),
+            VarKind::Edge => {}
+            VarKind::Node | VarKind::Path => {
+                return Err(Error::syntax(format!(
+                    "variable `{var}` is already bound to a {}",
+                    if *kind == VarKind::Node {
+                        "node"
+                    } else {
+                        "path"
+                    }
+                )));
+            }
+        }
+        if !var_length && self.pattern_rels.contains(var) {
+            return Err(Error::syntax(format!(
+                "variable `{var}` is already bound in a preceding pattern"
+            )));
+        }
+        Ok(true)
     }
 
     fn best_anchor(&self, nodes: &[PlannedNode], bound: &[bool]) -> usize {
@@ -458,7 +1108,7 @@ impl<'a> Planner<'a> {
     /// Whether a literal property of this node can be served by an index.
     fn has_usable_index(&self, node: &PlannedNode) -> bool {
         let schema = self.db.schema();
-        node.props.iter().any(|(key_id, _)| {
+        node.props.iter().any(|(_, key_id, _)| {
             schema.node_indexes.iter().any(|index| {
                 index.key_id == *key_id
                     && (index.label_id == 0 || node.label_ids.contains(&index.label_id))
@@ -470,23 +1120,23 @@ impl<'a> Planner<'a> {
     fn anchor_plan(
         &self,
         node: &PlannedNode,
-    ) -> Result<(Option<u32>, Option<IndexSeek>, Vec<(u32, Value)>)> {
+    ) -> Result<(Option<String>, Option<IndexSeek>, Vec<(String, Value)>)> {
         let schema = self.db.schema();
         // Prefer an index seek on a literal property.
-        for (key_id, value) in &node.props {
+        for (_, key_id, value) in &node.props {
             let index = schema.node_indexes.iter().find(|index| {
                 index.key_id == *key_id
                     && (index.label_id == 0 || node.label_ids.contains(&index.label_id))
             });
             if let Some(index) = index {
-                let remaining: Vec<(u32, Value)> = node
+                let remaining: Vec<(String, Value)> = node
                     .props
                     .iter()
-                    .filter(|(key, _)| *key != *key_id)
-                    .cloned()
+                    .filter(|(_, key, _)| *key != *key_id)
+                    .map(|(name, _, value)| (name.clone(), value.clone()))
                     .collect();
                 return Ok((
-                    node.label_ids.first().copied(),
+                    node.label_names.first().cloned(),
                     Some(IndexSeek {
                         index_id: index.id,
                         key_id: *key_id,
@@ -496,7 +1146,14 @@ impl<'a> Planner<'a> {
                 ));
             }
         }
-        Ok((node.label_ids.first().copied(), None, node.props.clone()))
+        Ok((
+            node.label_names.first().cloned(),
+            None,
+            node.props
+                .iter()
+                .map(|(name, _, value)| (name.clone(), value.clone()))
+                .collect(),
+        ))
     }
 
     fn planned_node(
@@ -505,7 +1162,21 @@ impl<'a> Planner<'a> {
         scope: &FastMap<String, VarKind>,
     ) -> Result<PlannedNode> {
         let var = match &pattern.variable {
-            Some(var) => var.clone(),
+            Some(var) => {
+                if let Some(kind) = scope.get(var)
+                    && matches!(kind, VarKind::Edge | VarKind::Path)
+                {
+                    return Err(Error::syntax(format!(
+                        "variable `{var}` is already bound to a {}",
+                        if *kind == VarKind::Edge {
+                            "relationship"
+                        } else {
+                            "path"
+                        }
+                    )));
+                }
+                var.clone()
+            }
             None => self.anon_name("node"),
         };
         let mut label_ids = Vec::new();
@@ -514,66 +1185,51 @@ impl<'a> Planner<'a> {
             // but the variable is still bound.
             label_ids.push(self.db.label_id(label).unwrap_or(u32::MAX));
         }
-        let props = self.pattern_props(pattern.properties.as_ref(), "node")?;
-        let _ = scope;
+        let (props, prop_exprs) = self.pattern_props(pattern.properties.as_ref(), "node", scope)?;
         Ok(PlannedNode {
             var,
             label_ids,
             label_names: pattern.labels.clone(),
-            props: props
-                .iter()
-                .map(|(_, key_id, value)| (*key_id, value.clone()))
-                .collect(),
-            prop_literals: props
-                .into_iter()
-                .map(|(name, _, value)| (name, value))
-                .collect(),
+            props,
+            prop_exprs,
         })
     }
 
+    /// Split pattern properties into literal filters (usable for index seeks
+    /// and scans) and runtime expressions (lowered to filters).
+    #[allow(clippy::type_complexity)]
     fn pattern_props(
         &self,
         properties: Option<&Expr>,
         what: &str,
-    ) -> Result<Vec<(String, u32, Value)>> {
+        scope: &FastMap<String, VarKind>,
+    ) -> Result<(Vec<(String, u32, Value)>, Vec<(String, Expr)>)> {
         let Some(properties) = properties else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         };
         let Expr::Map(entries) = properties else {
             return Err(Error::unsupported(format!(
                 "{what} pattern properties must be a map literal"
             )));
         };
-        let mut props = Vec::new();
+        let mut literals = Vec::new();
+        let mut exprs = Vec::new();
         for (key, value) in entries {
-            let Expr::Literal(value) = value else {
-                return Err(Error::unsupported(format!(
-                    "{what} pattern property values must be literals in this version"
-                )));
-            };
-            if value.is_null() {
-                continue;
+            match value {
+                Expr::Literal(value) => {
+                    if value.is_null() {
+                        continue;
+                    }
+                    let key_id = self.db.property_key_id(key).unwrap_or(NO_KEY);
+                    literals.push((key.clone(), key_id, value.clone()));
+                }
+                value => {
+                    validate_expr(value, scope)?;
+                    exprs.push((key.clone(), value.clone()));
+                }
             }
-            let key_id = self.db.property_key_id(key).unwrap_or(NO_KEY);
-            props.push((key.clone(), key_id, value.clone()));
         }
-        Ok(props)
-    }
-
-    fn resolve_types(&self, types: &[String]) -> Vec<u32> {
-        if types.is_empty() {
-            return Vec::new();
-        }
-        let mut ids: Vec<u32> = types
-            .iter()
-            .filter_map(|name| self.db.edge_type_id(name))
-            .collect();
-        if ids.is_empty() {
-            // No such type: an impossible id keeps the variable bound while
-            // yielding no rows.
-            ids.push(u32::MAX);
-        }
-        ids
+        Ok((literals, exprs))
     }
 
     fn anon_name(&mut self, prefix: &str) -> String {
@@ -685,9 +1341,9 @@ impl<'a> Planner<'a> {
         let mut exprs = Vec::new();
         for (key, value) in entries {
             if let Expr::Literal(value) = value {
-                if !value.is_null() {
-                    literals.push((key.clone(), value.clone()));
-                }
+                // Null literals are kept so MERGE can reject them; creating
+                // simply drops them.
+                literals.push((key.clone(), value.clone()));
             } else {
                 validate_expr(value, scope)?;
                 exprs.push((key.clone(), value.clone()));
@@ -696,31 +1352,65 @@ impl<'a> Planner<'a> {
         Ok((literals, exprs))
     }
 
+    /// Plan `MERGE`: the whole pattern is matched first (one row per match);
+    /// when nothing matches, the unbound elements are created and the
+    /// `ON CREATE` items apply.
     fn plan_merge(
         &mut self,
         path: &PatternPath,
-        scope: &FastMap<String, VarKind>,
-    ) -> Result<Vec<CreateItem>> {
-        if path.segments.is_empty() {
-            let Some(item) = self.create_node_item(&path.start, scope)? else {
-                let name = path.start.variable.as_deref().unwrap_or("?");
-                return Err(Error::syntax(format!(
-                    "variable `{name}` is already bound and cannot be merged"
-                )));
-            };
-            return Ok(vec![item]);
-        }
-        if path.segments.len() > 1 {
-            return Err(Error::unsupported(
-                "MERGE with multiple relationships is not supported yet",
+        on_create: &[SetItem],
+        on_match: &[SetItem],
+        plan: &mut Plan,
+        scope: &mut FastMap<String, VarKind>,
+    ) -> Result<()> {
+        if path
+            .segments
+            .iter()
+            .any(|segment| segment.relationship.var_length.is_some())
+        {
+            return Err(Error::syntax(
+                "variable-length relationships cannot be merged",
             ));
         }
-        let segment = &path.segments[0];
-        let mut items = Vec::new();
+        for node in std::iter::once(&path.start).chain(path.segments.iter().map(|s| &s.node)) {
+            if let Some(var) = &node.variable
+                && scope.contains_key(var)
+                && !node.labels.is_empty()
+            {
+                return Err(Error::syntax(format!(
+                    "MERGE cannot add labels to the bound variable `{var}`"
+                )));
+            }
+        }
+        for segment in &path.segments {
+            let rel = &segment.relationship;
+            if rel.types.len() != 1 {
+                return Err(Error::syntax(
+                    "relationships in MERGE must have exactly one type",
+                ));
+            }
+            if let Some(var) = &rel.variable
+                && scope.contains_key(var)
+            {
+                return Err(Error::syntax(format!(
+                    "MERGE cannot re-bind the relationship variable `{var}`"
+                )));
+            }
+        }
+
+        // Create items for the unbound elements, in creation order, while
+        // recording the variable each path element uses.
+        let mut items: Vec<CreateItem> = Vec::new();
+        let mut path_vars: Vec<String> = Vec::new();
         let mut local = scope.clone();
-        // Unbound endpoints are merged as nodes first.
         let start_item = self.create_node_item(&path.start, &local)?;
-        let src = match &start_item {
+        if path.segments.is_empty() && start_item.is_none() {
+            let name = path.start.variable.as_deref().unwrap_or("?");
+            return Err(Error::syntax(format!(
+                "variable `{name}` is already bound and cannot be merged"
+            )));
+        }
+        let start_var = match &start_item {
             Some(item) => {
                 local.insert(item.var().to_owned(), VarKind::Node);
                 item.var().to_owned()
@@ -729,56 +1419,99 @@ impl<'a> Planner<'a> {
                 .start
                 .variable
                 .clone()
-                .ok_or_else(|| Error::unsupported("MERGE requires a variable or new node"))?,
+                .ok_or_else(|| Error::syntax("MERGE requires a variable or a new node"))?,
         };
+        path_vars.push(start_var.clone());
         if let Some(item) = start_item {
             items.push(item);
         }
-        let node_item = self.create_node_item(&segment.node, &local)?;
-        let dst = match &node_item {
-            Some(item) => {
-                local.insert(item.var().to_owned(), VarKind::Node);
-                item.var().to_owned()
+        let mut src = start_var;
+        for segment in &path.segments {
+            let rel = &segment.relationship;
+            let node_item = self.create_node_item(&segment.node, &local)?;
+            let node_var = match &node_item {
+                Some(item) => {
+                    local.insert(item.var().to_owned(), VarKind::Node);
+                    item.var().to_owned()
+                }
+                None => segment
+                    .node
+                    .variable
+                    .clone()
+                    .ok_or_else(|| Error::syntax("MERGE requires a variable or a new node"))?,
+            };
+            if let Some(item) = node_item {
+                items.push(item);
             }
-            None => segment
-                .node
-                .variable
-                .clone()
-                .ok_or_else(|| Error::unsupported("MERGE requires a variable or new node"))?,
-        };
-        if let Some(item) = node_item {
-            items.push(item);
+            let var = match &rel.variable {
+                Some(var) => var.clone(),
+                None => self.anon_name("rel"),
+            };
+            let (from, to) = match rel.direction {
+                RelDirection::Incoming => (node_var.clone(), src),
+                RelDirection::Outgoing | RelDirection::Undirected => (src, node_var.clone()),
+            };
+            let (props, prop_exprs) = self.create_props(rel.properties.as_ref(), scope)?;
+            items.push(CreateItem::Edge {
+                var: var.clone(),
+                edge_type: rel.types[0].clone(),
+                src: from,
+                dst: to,
+                props,
+                prop_exprs,
+            });
+            path_vars.push(var);
+            path_vars.push(node_var.clone());
+            src = node_var;
         }
-        let rel = &segment.relationship;
-        if rel.types.len() != 1 {
-            return Err(Error::syntax(
-                "relationships in MERGE must have exactly one type",
-            ));
+
+        // The match plan uses the same variable names, with the pattern's
+        // unbound elements still unbound.
+        let mut match_pattern = path.clone();
+        match_pattern.start.variable = Some(path_vars[0].clone());
+        let mut index = 1;
+        for segment in &mut match_pattern.segments {
+            segment.relationship.variable = Some(path_vars[index].clone());
+            segment.node.variable = Some(path_vars[index + 1].clone());
+            index += 2;
         }
-        if rel.var_length.is_some() {
-            return Err(Error::unsupported(
-                "variable-length relationships cannot be merged",
-            ));
+        let mut match_plan = Plan::Empty;
+        let mut match_scope = scope.clone();
+        self.plan_path(&match_pattern, &mut match_plan, &mut match_scope)?;
+
+        // Created elements are bound from here on.
+        for item in &items {
+            let kind = match item {
+                CreateItem::Node { .. } => VarKind::Node,
+                CreateItem::Edge { .. } => VarKind::Edge,
+            };
+            scope.insert(item.var().to_owned(), kind);
         }
-        let (src, dst) = match rel.direction {
-            RelDirection::Outgoing => (src, dst),
-            RelDirection::Incoming => (dst, src),
-            RelDirection::Undirected => (src, dst),
-        };
-        let var = match &rel.variable {
-            Some(var) => var.clone(),
-            None => self.anon_name("rel"),
-        };
-        let (props, prop_exprs) = self.create_props(rel.properties.as_ref(), scope)?;
-        items.push(CreateItem::Edge {
-            var,
-            edge_type: rel.types[0].clone(),
-            src,
-            dst,
-            props,
-            prop_exprs,
+        for set_item in on_create.iter().chain(on_match) {
+            self.validate_set_item(set_item, scope)?;
+        }
+
+        let path_binding = path.variable.as_ref().map(|var| {
+            let mut elements = Vec::with_capacity(path_vars.len());
+            for element in &path_vars {
+                elements.push((element.clone(), false));
+            }
+            (var.clone(), elements)
         });
-        Ok(items)
+        if let Some(var) = &path.variable {
+            path_vars.push(var.clone());
+            scope.insert(var.clone(), VarKind::Path);
+        }
+        *plan = Plan::Merge {
+            input: Box::new(plan.clone()),
+            match_plan: Box::new(match_plan),
+            items,
+            path: path_binding,
+            path_vars,
+            on_create: on_create.to_vec(),
+            on_match: on_match.to_vec(),
+        };
+        Ok(())
     }
 
     fn validate_set_item(&self, item: &SetItem, scope: &FastMap<String, VarKind>) -> Result<()> {
@@ -794,6 +1527,12 @@ impl<'a> Planner<'a> {
                 validate_expr(value, scope)
             }
             SetItem::Replace { variable, value } => {
+                if !scope.contains_key(variable) {
+                    return Err(undefined_variable(variable));
+                }
+                validate_expr(value, scope)
+            }
+            SetItem::Append { variable, value } => {
                 if !scope.contains_key(variable) {
                     return Err(undefined_variable(variable));
                 }
@@ -844,49 +1583,107 @@ impl<'a> Planner<'a> {
         if expanded.is_empty() {
             return Err(Error::syntax("RETURN/WITH requires at least one item"));
         }
+        let mut input = input;
+        let mut scope = scope.clone();
+        for (expr, _) in expanded.iter_mut() {
+            self.extract_patterns(expr, &mut input, &mut scope, PatternContext::Value)?;
+        }
         for (expr, _) in &expanded {
-            validate_expr(expr, scope)?;
+            validate_expr(expr, &scope)?;
         }
 
         // A `WITH ... WHERE` may reference variables of the incoming scope
         // (not only the projected aliases); those predicates filter before
         // the projection. Aliases take precedence when they resolve.
-        let mut input = input;
         let mut filter_after = None;
         if let Some(predicate) = where_clause {
             let projected: FastMap<String, VarKind> = expanded
                 .iter()
-                .map(|(expr, name)| (name.clone(), expr_kind(expr, scope)))
+                .map(|(expr, name)| (name.clone(), expr_kind(expr, &scope)))
                 .collect();
             if validate_expr(predicate, &projected).is_ok() {
                 filter_after = Some(predicate.clone());
             } else {
-                validate_expr(predicate, scope)?;
+                let mut predicate = predicate.clone();
+                self.extract_patterns(
+                    &mut predicate,
+                    &mut input,
+                    &mut scope,
+                    PatternContext::Predicate,
+                )?;
+                validate_expr(&predicate, &scope)?;
                 input = Plan::Filter {
                     input: Box::new(input),
-                    predicate: predicate.clone(),
+                    predicate,
                 };
             }
         }
 
-        let mut groups = Vec::new();
-        let mut aggs: Vec<(AggFn, Expr, String)> = Vec::new();
+        // Partition the projection items: plain expressions become grouping
+        // keys, plain aggregation calls become aggregations, and expressions
+        // containing aggregations are evaluated after aggregation over
+        // references to the grouping keys and aggregations.
+        let mut groups: Vec<(Expr, String)> = Vec::new();
+        let mut aggs: Vec<AggItem> = Vec::new();
+        let mut post: Vec<(Expr, String)> = Vec::new();
         for (expr, name) in &expanded {
-            if let Some((func, argument, star)) = aggregate_call(expr)? {
-                if star {
-                    aggs.push((func, Expr::Literal(Value::Int(1)), name.clone()));
-                } else {
-                    let argument = argument
-                        .ok_or_else(|| Error::syntax(format!("{func:?} requires an argument")))?;
-                    validate_expr(argument, scope)?;
-                    aggs.push((func, argument.clone(), name.clone()));
-                }
-            } else if contains_aggregation(expr) {
-                return Err(Error::unsupported(
-                    "expressions mixing aggregation and non-aggregated values are not supported yet",
+            if has_aggregation_inside_comprehension(expr) {
+                return Err(Error::syntax(
+                    "aggregations are not allowed inside list comprehensions",
                 ));
+            }
+            if let Some((func, argument, star, distinct)) = aggregate_call(expr)? {
+                aggs.push(AggItem {
+                    func,
+                    argument: aggregate_argument(func, argument, star, &scope)?,
+                    distinct,
+                    name: name.clone(),
+                });
+            } else if contains_aggregation(expr) {
+                let mut residual = rewrite_expr(expr, &mut |sub| {
+                    let Some((func, argument, star, distinct)) = aggregate_call(sub)? else {
+                        return Ok(None);
+                    };
+                    let hidden = format!("  agg{}", aggs.len());
+                    aggs.push(AggItem {
+                        func,
+                        argument: aggregate_argument(func, argument, star, &scope)?,
+                        distinct,
+                        name: hidden.clone(),
+                    });
+                    Ok(Some(Expr::Variable(hidden)))
+                })?;
+                residual = rewrite_expr(&residual, &mut |sub| {
+                    if let Some((_, group)) = groups.iter().find(|(group, _)| group == sub) {
+                        return Ok(Some(Expr::Variable(group.clone())));
+                    }
+                    if references_unresolved(sub, &groups, &aggs)
+                        && !references_aggregation(sub, &aggs)
+                    {
+                        let hidden = format!("  grp{}", groups.len());
+                        validate_expr(sub, &scope)?;
+                        groups.push((sub.clone(), hidden.clone()));
+                        return Ok(Some(Expr::Variable(hidden)));
+                    }
+                    Ok(None)
+                })?;
+                post.push((residual, name.clone()));
             } else {
                 groups.push((expr.clone(), name.clone()));
+            }
+        }
+        // Post-aggregation expressions may only reference grouping keys,
+        // aggregations and constants.
+        if !post.is_empty() {
+            let mut post_scope: FastMap<String, VarKind> = FastMap::new();
+            for (_, group) in &groups {
+                post_scope.insert(group.clone(), VarKind::Value);
+            }
+            for item in &aggs {
+                post_scope.insert(item.name.clone(), VarKind::Value);
+            }
+            for (residual, _) in &post {
+                validate_expr(residual, &post_scope)?;
             }
         }
 
@@ -897,7 +1694,7 @@ impl<'a> Planner<'a> {
         if !order.is_empty() {
             let visible_names: FastMap<String, VarKind> = expanded
                 .iter()
-                .map(|(expr, name)| (name.clone(), expr_kind(expr, scope)))
+                .map(|(expr, name)| (name.clone(), expr_kind(expr, &scope)))
                 .collect();
             for key in order {
                 let expr =
@@ -906,7 +1703,7 @@ impl<'a> Planner<'a> {
                     } else if validate_expr(&key.expr, &visible_names).is_ok() {
                         key.expr.clone()
                     } else if aggs.is_empty() && !distinct {
-                        validate_expr(&key.expr, scope)?;
+                        validate_expr(&key.expr, &scope)?;
                         let hidden = format!("  sort{}", hidden_keys.len());
                         hidden_keys.push((key.expr.clone(), hidden.clone()));
                         Expr::Variable(hidden)
@@ -934,7 +1731,7 @@ impl<'a> Planner<'a> {
                 items: projection_items.clone(),
             };
             for (expr, name) in &projection_items {
-                new_scope.insert(name.clone(), expr_kind(expr, scope));
+                new_scope.insert(name.clone(), expr_kind(expr, &scope));
             }
         } else {
             plan = Plan::Aggregate {
@@ -945,26 +1742,43 @@ impl<'a> Planner<'a> {
             for (_, name) in &groups {
                 new_scope.insert(name.clone(), VarKind::Value);
             }
-            for (_, _, name) in &aggs {
-                new_scope.insert(name.clone(), VarKind::Value);
+            for item in &aggs {
+                new_scope.insert(item.name.clone(), VarKind::Value);
             }
-            // The aggregate window holds groups before aggregations; reorder
-            // it to the written item order so values line up with columns.
+            // The aggregate window holds groups before aggregations; project
+            // the items in written order when that differs or when a
+            // post-aggregation expression has to be evaluated.
             let window_names: Vec<&str> = groups
                 .iter()
                 .map(|(_, name)| name.as_str())
-                .chain(aggs.iter().map(|(_, _, name)| name.as_str()))
+                .chain(aggs.iter().map(|item| item.name.as_str()))
                 .collect();
             let item_names: Vec<&str> = expanded.iter().map(|(_, name)| name.as_str()).collect();
-            if window_names != item_names {
-                let visible: Vec<(Expr, String)> = expanded
+            if window_names != item_names || !post.is_empty() {
+                let items: Vec<(Expr, String)> = expanded
                     .iter()
-                    .map(|(_, name)| (Expr::Variable(name.clone()), name.clone()))
+                    .map(|(expr, name)| {
+                        let rewritten = if let Some((residual, _)) =
+                            post.iter().find(|(_, item_name)| item_name == name)
+                        {
+                            residual.clone()
+                        } else if groups.iter().any(|(_, group)| group == name)
+                            || aggs.iter().any(|item| &item.name == name)
+                        {
+                            Expr::Variable(name.clone())
+                        } else {
+                            expr.clone()
+                        };
+                        (rewritten, name.clone())
+                    })
                     .collect();
                 plan = Plan::Project {
                     input: Box::new(plan),
-                    items: visible,
+                    items,
                 };
+            }
+            for (_, name) in &post {
+                new_scope.insert(name.clone(), VarKind::Value);
             }
         }
 
@@ -1015,7 +1829,7 @@ impl<'a> Planner<'a> {
         // Output scope maps names to output registers; nodes keep their kind.
         let mut output_scope = FastMap::new();
         for (expr, name) in &expanded {
-            output_scope.insert(name.clone(), expr_kind(expr, scope));
+            output_scope.insert(name.clone(), expr_kind(expr, &scope));
         }
         let _ = std::mem::replace(&mut new_scope, output_scope);
         Ok((plan, new_scope, columns))
@@ -1027,8 +1841,9 @@ struct PlannedNode {
     var: String,
     label_ids: Vec<u32>,
     label_names: Vec<String>,
-    props: Vec<(u32, Value)>,
-    prop_literals: Vec<(String, Value)>,
+    /// Literal properties as `(name, key id, value)`.
+    props: Vec<(String, u32, Value)>,
+    prop_exprs: Vec<(String, Expr)>,
 }
 
 /// `expr = expr`, used to constrain expansions to pre-bound elements.
@@ -1042,6 +1857,22 @@ fn eq_expr(left: Expr, right: Expr) -> Expr {
 
 /// When the pattern's relationship variable was already bound, the expansion
 /// binds a fresh variable; constrain it to the bound one.
+/// Lower non-literal relationship property values to runtime filters.
+fn constrain_edge_props(plan: &mut Plan, edge_var: &str, props: &[(String, Expr)]) {
+    for (key, value) in props {
+        *plan = Plan::Filter {
+            input: Box::new(plan.clone()),
+            predicate: eq_expr(
+                Expr::Property {
+                    base: Box::new(Expr::Variable(edge_var.to_owned())),
+                    key: key.clone(),
+                },
+                value.clone(),
+            ),
+        };
+    }
+}
+
 fn constrain_edge(plan: &mut Plan, edge_var: &str, rel_var: &str, edge_bound: bool) {
     if !edge_bound {
         return;
@@ -1072,7 +1903,9 @@ fn node_constraints(node: &PlannedNode, scanned: bool) -> Option<Expr> {
         });
     }
     if !scanned {
-        for (key, value) in &node.prop_literals {
+        // Scans apply literal properties themselves; bound nodes need them
+        // re-checked.
+        for (key, _, value) in &node.props {
             predicates.push(Expr::Binary {
                 op: BinaryOp::Eq,
                 left: Box::new(Expr::Property {
@@ -1082,6 +1915,17 @@ fn node_constraints(node: &PlannedNode, scanned: bool) -> Option<Expr> {
                 right: Box::new(Expr::Literal(value.clone())),
             });
         }
+    }
+    // Expression properties always become runtime filters.
+    for (key, value) in &node.prop_exprs {
+        predicates.push(Expr::Binary {
+            op: BinaryOp::Eq,
+            left: Box::new(Expr::Property {
+                base: Box::new(Expr::Variable(node.var.clone())),
+                key: key.clone(),
+            }),
+            right: Box::new(value.clone()),
+        });
     }
     predicates.into_iter().reduce(|left, right| Expr::Binary {
         op: BinaryOp::And,
@@ -1095,6 +1939,18 @@ fn flip(direction: RelDirection) -> RelDirection {
         RelDirection::Outgoing => RelDirection::Incoming,
         RelDirection::Incoming => RelDirection::Outgoing,
         RelDirection::Undirected => RelDirection::Undirected,
+    }
+}
+
+/// Output columns of a supported built-in procedure.
+fn procedure_columns(name: &str) -> Result<Vec<String>> {
+    match name {
+        "db.labels" => Ok(vec!["label".to_owned()]),
+        "db.propertyKeys" => Ok(vec!["propertyKey".to_owned()]),
+        "db.relationshipTypes" => Ok(vec!["relationshipType".to_owned()]),
+        _ => Err(Error::unsupported(format!(
+            "procedure `{name}` is not supported"
+        ))),
     }
 }
 
@@ -1121,6 +1977,61 @@ fn validate_expr(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
             validate_expr(base, scope)?;
             validate_expr(index, scope)
         }
+        Expr::Slice { base, lower, upper } => {
+            validate_expr(base, scope)?;
+            if let Some(lower) = lower {
+                validate_expr(lower, scope)?;
+            }
+            if let Some(upper) = upper {
+                validate_expr(upper, scope)?;
+            }
+            Ok(())
+        }
+        Expr::ListComprehension {
+            var,
+            list,
+            predicate,
+            projection,
+        } => {
+            validate_expr(list, scope)?;
+            let mut inner = scope.clone();
+            inner.insert(var.clone(), VarKind::Value);
+            if let Some(predicate) = predicate {
+                validate_expr(predicate, &inner)?;
+            }
+            if let Some(projection) = projection {
+                validate_expr(projection, &inner)?;
+            }
+            Ok(())
+        }
+        Expr::Quantifier {
+            var,
+            list,
+            predicate,
+            ..
+        } => {
+            validate_expr(list, scope)?;
+            let mut inner = scope.clone();
+            inner.insert(var.clone(), VarKind::Value);
+            validate_expr(predicate, &inner)
+        }
+        Expr::Reduce {
+            accumulator,
+            init,
+            var,
+            list,
+            expression,
+        } => {
+            validate_expr(init, scope)?;
+            validate_expr(list, scope)?;
+            let mut inner = scope.clone();
+            inner.insert(var.clone(), VarKind::Value);
+            inner.insert(accumulator.clone(), VarKind::Value);
+            validate_expr(expression, &inner)
+        }
+        Expr::Pattern(_) | Expr::PatternComprehension { .. } => Err(Error::syntax(
+            "pattern expressions are only allowed in predicates",
+        )),
         Expr::Unary { expr, .. } => validate_expr(expr, scope),
         Expr::Binary { left, right, .. } => {
             validate_expr(left, scope)?;
@@ -1176,12 +2087,60 @@ fn expr_kind(expr: &Expr, scope: &FastMap<String, VarKind>) -> VarKind {
 fn default_name(expr: &Expr) -> String {
     match expr {
         Expr::Variable(name) => name.clone(),
+        Expr::Pattern(_) => "pattern".to_owned(),
+        Expr::PatternComprehension { projection, .. } => {
+            format!("[pattern | {}]", default_name(projection))
+        }
         Expr::Parameter(name) => format!("${name}"),
         Expr::Literal(value) => literal_text(value),
-        Expr::Property { base, key } => format!("{}.{}", atomic_name(base), key),
+        Expr::Property { base, key } => format!("{}.{}", property_base_name(base), key),
         Expr::Subscript { base, index } => {
-            format!("{}[{}]", atomic_name(base), default_name(index))
+            format!("{}[{}]", subscript_base_name(base), default_name(index))
         }
+        Expr::Slice { base, lower, upper } => {
+            let lower = lower.as_ref().map(|e| default_name(e)).unwrap_or_default();
+            let upper = upper.as_ref().map(|e| default_name(e)).unwrap_or_default();
+            format!("{}[{lower}..{upper}]", subscript_base_name(base))
+        }
+        Expr::ListComprehension {
+            var,
+            list,
+            predicate,
+            projection,
+        } => {
+            let mut text = format!("[{var} IN {}]", default_name(list));
+            if let Some(predicate) = predicate {
+                text.push_str(&format!(" WHERE {}", default_name(predicate)));
+            }
+            if let Some(projection) = projection {
+                text.push_str(&format!(" | {}", default_name(projection)));
+            }
+            text.insert(text.len() - 1, ' ');
+            text
+        }
+        Expr::Quantifier {
+            kind,
+            var,
+            list,
+            predicate,
+        } => format!(
+            "{}({var} IN {} WHERE {})",
+            kind.name(),
+            default_name(list),
+            default_name(predicate)
+        ),
+        Expr::Reduce {
+            accumulator,
+            init,
+            var,
+            list,
+            expression,
+        } => format!(
+            "reduce({accumulator} = {}, {var} IN {} | {})",
+            default_name(init),
+            default_name(list),
+            default_name(expression)
+        ),
         Expr::Function {
             name,
             distinct,
@@ -1234,10 +2193,30 @@ fn default_name(expr: &Expr) -> String {
     }
 }
 
-/// Render a base expression, parenthesising anything that is not atomic.
-fn atomic_name(expr: &Expr) -> String {
+/// Render the base of a property access; indexing expressions are wrapped so
+/// `(list[1]).missing` reads unambiguously.
+fn property_base_name(expr: &Expr) -> String {
     match expr {
-        Expr::Variable(_) | Expr::Property { .. } | Expr::Subscript { .. } => default_name(expr),
+        Expr::Variable(_)
+        | Expr::Property { .. }
+        | Expr::List(_)
+        | Expr::Map(_)
+        | Expr::Function { .. } => default_name(expr),
+        other => format!("({})", default_name(other)),
+    }
+}
+
+/// Render the base of a subscript or slice; literals and indexing chains need
+/// no parentheses.
+fn subscript_base_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Variable(_)
+        | Expr::Property { .. }
+        | Expr::Subscript { .. }
+        | Expr::Slice { .. }
+        | Expr::List(_)
+        | Expr::Map(_)
+        | Expr::Function { .. } => default_name(expr),
         other => format!("({})", default_name(other)),
     }
 }
@@ -1280,7 +2259,8 @@ fn binary_text(op: BinaryOp) -> &'static str {
 
 /// Whether an expression is exactly an aggregation call, returning the
 /// function, optional argument and star flag.
-fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool)>> {
+#[allow(clippy::type_complexity)]
+fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool, bool)>> {
     let Expr::Function {
         name,
         distinct,
@@ -1299,21 +2279,414 @@ fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool)>> {
         "collect" => AggFn::Collect,
         _ => return Ok(None),
     };
-    if *distinct {
-        return Err(Error::unsupported(
-            "DISTINCT inside aggregations is not supported yet",
-        ));
-    }
     if *star {
         if func != AggFn::Count {
             return Err(Error::syntax("only count(*) accepts *"));
         }
-        return Ok(Some((func, None, true)));
+        if *distinct {
+            return Err(Error::syntax("count(DISTINCT *) is not valid"));
+        }
+        return Ok(Some((func, None, true, false)));
     }
     match args.len() {
-        1 => Ok(Some((func, Some(&args[0]), false))),
+        1 => Ok(Some((func, Some(&args[0]), false, *distinct))),
         0 => Err(Error::syntax(format!("{name} requires an argument"))),
         _ => Err(Error::unsupported("aggregations with multiple arguments")),
+    }
+}
+
+/// The argument of an aggregation, with `count(*)` becoming `count(1)`.
+fn aggregate_argument(
+    func: AggFn,
+    argument: Option<&Expr>,
+    star: bool,
+    scope: &FastMap<String, VarKind>,
+) -> Result<Expr> {
+    if star {
+        return Ok(Expr::Literal(Value::Int(1)));
+    }
+    let argument =
+        argument.ok_or_else(|| Error::syntax(format!("{func:?} requires an argument")))?;
+    validate_expr(argument, scope)?;
+    Ok(argument.clone())
+}
+
+/// Rewrite an expression top-down; `f` may replace a subexpression and stop
+/// the descent by returning `Some`.
+fn rewrite_expr(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>) -> Result<Expr> {
+    if let Some(replacement) = f(expr)? {
+        return Ok(replacement);
+    }
+    Ok(match expr {
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => expr.clone(),
+        Expr::Pattern(path) => Expr::Pattern(Box::new(rewrite_pattern(path, f)?)),
+        Expr::PatternComprehension {
+            path,
+            predicate,
+            projection,
+        } => Expr::PatternComprehension {
+            path: Box::new(rewrite_pattern(path, f)?),
+            predicate: predicate
+                .as_ref()
+                .map(|predicate| rewrite_expr(predicate, f).map(Box::new))
+                .transpose()?,
+            projection: Box::new(rewrite_expr(projection, f)?),
+        },
+        Expr::Property { base, key } => Expr::Property {
+            base: Box::new(rewrite_expr(base, f)?),
+            key: key.clone(),
+        },
+        Expr::Subscript { base, index } => Expr::Subscript {
+            base: Box::new(rewrite_expr(base, f)?),
+            index: Box::new(rewrite_expr(index, f)?),
+        },
+        Expr::Slice { base, lower, upper } => Expr::Slice {
+            base: Box::new(rewrite_expr(base, f)?),
+            lower: lower
+                .as_ref()
+                .map(|lower| rewrite_expr(lower, f).map(Box::new))
+                .transpose()?,
+            upper: upper
+                .as_ref()
+                .map(|upper| rewrite_expr(upper, f).map(Box::new))
+                .transpose()?,
+        },
+        Expr::ListComprehension {
+            var,
+            list,
+            predicate,
+            projection,
+        } => Expr::ListComprehension {
+            var: var.clone(),
+            list: Box::new(rewrite_expr(list, f)?),
+            predicate: predicate
+                .as_ref()
+                .map(|predicate| rewrite_expr(predicate, f).map(Box::new))
+                .transpose()?,
+            projection: projection
+                .as_ref()
+                .map(|projection| rewrite_expr(projection, f).map(Box::new))
+                .transpose()?,
+        },
+        Expr::Quantifier {
+            kind,
+            var,
+            list,
+            predicate,
+        } => Expr::Quantifier {
+            kind: *kind,
+            var: var.clone(),
+            list: Box::new(rewrite_expr(list, f)?),
+            predicate: Box::new(rewrite_expr(predicate, f)?),
+        },
+        Expr::Reduce {
+            accumulator,
+            init,
+            var,
+            list,
+            expression,
+        } => Expr::Reduce {
+            accumulator: accumulator.clone(),
+            init: Box::new(rewrite_expr(init, f)?),
+            var: var.clone(),
+            list: Box::new(rewrite_expr(list, f)?),
+            expression: Box::new(rewrite_expr(expression, f)?),
+        },
+        Expr::Unary { op, expr: inner } => Expr::Unary {
+            op: *op,
+            expr: Box::new(rewrite_expr(inner, f)?),
+        },
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(rewrite_expr(left, f)?),
+            right: Box::new(rewrite_expr(right, f)?),
+        },
+        Expr::Function {
+            name,
+            distinct,
+            star,
+            args,
+        } => Expr::Function {
+            name: name.clone(),
+            distinct: *distinct,
+            star: *star,
+            args: args
+                .iter()
+                .map(|arg| rewrite_expr(arg, f))
+                .collect::<Result<_>>()?,
+        },
+        Expr::List(items) => Expr::List(
+            items
+                .iter()
+                .map(|item| rewrite_expr(item, f))
+                .collect::<Result<_>>()?,
+        ),
+        Expr::Map(entries) => Expr::Map(
+            entries
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), rewrite_expr(value, f)?)))
+                .collect::<Result<_>>()?,
+        ),
+        Expr::Case {
+            subject,
+            alternatives,
+            default,
+        } => Expr::Case {
+            subject: subject
+                .as_ref()
+                .map(|subject| rewrite_expr(subject, f).map(Box::new))
+                .transpose()?,
+            alternatives: alternatives
+                .iter()
+                .map(|(when, then)| Ok((rewrite_expr(when, f)?, rewrite_expr(then, f)?)))
+                .collect::<Result<_>>()?,
+            default: default
+                .as_ref()
+                .map(|default| rewrite_expr(default, f).map(Box::new))
+                .transpose()?,
+        },
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => Expr::IsNull {
+            expr: Box::new(rewrite_expr(inner, f)?),
+            negated: *negated,
+        },
+        Expr::LabelCheck {
+            expr: inner,
+            labels,
+        } => Expr::LabelCheck {
+            expr: Box::new(rewrite_expr(inner, f)?),
+            labels: labels.clone(),
+        },
+    })
+}
+
+/// Rewrite the inline property expressions of a pattern path.
+fn rewrite_pattern(
+    path: &PatternPath,
+    f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>,
+) -> Result<PatternPath> {
+    let mut path = path.clone();
+    if let Some(properties) = &path.start.properties {
+        path.start.properties = Some(rewrite_expr(properties, f)?);
+    }
+    for segment in &mut path.segments {
+        if let Some(properties) = &segment.relationship.properties {
+            segment.relationship.properties = Some(rewrite_expr(properties, f)?);
+        }
+    }
+    Ok(path)
+}
+
+/// Whether the inline property expressions of a pattern path reference a
+/// variable satisfying `pred`.
+fn pattern_references(path: &PatternPath, pred: &mut dyn FnMut(&str) -> bool) -> bool {
+    path.start
+        .properties
+        .as_ref()
+        .is_some_and(|expr| expr_references(expr, pred))
+        || path.segments.iter().any(|segment| {
+            segment
+                .relationship
+                .properties
+                .as_ref()
+                .is_some_and(|expr| expr_references(expr, pred))
+        })
+}
+
+/// Whether the inline property expressions of a pattern path contain an
+/// aggregation.
+fn pattern_has_aggregation(path: &PatternPath) -> bool {
+    path.start
+        .properties
+        .as_ref()
+        .is_some_and(contains_aggregation)
+        || path.segments.iter().any(|segment| {
+            segment
+                .relationship
+                .properties
+                .as_ref()
+                .is_some_and(contains_aggregation)
+        })
+}
+
+/// Whether any variable reference in `expr` satisfies `pred`.
+fn expr_references(expr: &Expr, pred: &mut dyn FnMut(&str) -> bool) -> bool {
+    match expr {
+        Expr::Variable(name) => pred(name),
+        Expr::Literal(_) | Expr::Parameter(_) => false,
+        Expr::Pattern(path) => pattern_references(path, pred),
+        Expr::PatternComprehension {
+            path,
+            predicate,
+            projection,
+        } => {
+            pattern_references(path, pred)
+                || predicate
+                    .as_deref()
+                    .is_some_and(|e| expr_references(e, pred))
+                || expr_references(projection, pred)
+        }
+        Expr::Property { base, .. } => expr_references(base, pred),
+        Expr::Subscript { base, index } => {
+            expr_references(base, pred) || expr_references(index, pred)
+        }
+        Expr::Slice { base, lower, upper } => {
+            expr_references(base, pred)
+                || lower.as_deref().is_some_and(|e| expr_references(e, pred))
+                || upper.as_deref().is_some_and(|e| expr_references(e, pred))
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            projection,
+            ..
+        } => {
+            expr_references(list, pred)
+                || predicate
+                    .as_deref()
+                    .is_some_and(|e| expr_references(e, pred))
+                || projection
+                    .as_deref()
+                    .is_some_and(|e| expr_references(e, pred))
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => expr_references(list, pred) || expr_references(predicate, pred),
+        Expr::Reduce {
+            init,
+            list,
+            expression,
+            ..
+        } => {
+            expr_references(init, pred)
+                || expr_references(list, pred)
+                || expr_references(expression, pred)
+        }
+        Expr::Unary { expr, .. } => expr_references(expr, pred),
+        Expr::Binary { left, right, .. } => {
+            expr_references(left, pred) || expr_references(right, pred)
+        }
+        Expr::Function { args, .. } => args.iter().any(|arg| expr_references(arg, pred)),
+        Expr::List(items) => items.iter().any(|item| expr_references(item, pred)),
+        Expr::Map(entries) => entries
+            .iter()
+            .any(|(_, value)| expr_references(value, pred)),
+        Expr::Case {
+            subject,
+            alternatives,
+            default,
+        } => {
+            subject
+                .as_deref()
+                .is_some_and(|subject| expr_references(subject, pred))
+                || alternatives
+                    .iter()
+                    .any(|(when, then)| expr_references(when, pred) || expr_references(then, pred))
+                || default
+                    .as_deref()
+                    .is_some_and(|default| expr_references(default, pred))
+        }
+        Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => expr_references(expr, pred),
+    }
+}
+
+/// Whether `expr` references a variable that is not a grouping key or an
+/// aggregation output.
+fn references_unresolved(expr: &Expr, groups: &[(Expr, String)], aggs: &[AggItem]) -> bool {
+    expr_references(expr, &mut |name| {
+        !groups.iter().any(|(_, group)| group == name) && !aggs.iter().any(|item| item.name == name)
+    })
+}
+
+/// Whether `expr` references an aggregation output.
+fn references_aggregation(expr: &Expr, aggs: &[AggItem]) -> bool {
+    expr_references(expr, &mut |name| aggs.iter().any(|item| item.name == name))
+}
+
+/// Whether an aggregation appears inside a comprehension body, quantifier
+/// predicate or `reduce` expression, where openCypher forbids it.
+fn has_aggregation_inside_comprehension(expr: &Expr) -> bool {
+    match expr {
+        Expr::PatternComprehension {
+            path,
+            predicate,
+            projection,
+        } => {
+            pattern_has_aggregation(path)
+                || predicate.as_deref().is_some_and(contains_aggregation)
+                || contains_aggregation(projection)
+        }
+        Expr::Pattern(path) => pattern_has_aggregation(path),
+        Expr::ListComprehension {
+            list,
+            predicate,
+            projection,
+            ..
+        } => {
+            predicate.as_deref().is_some_and(contains_aggregation)
+                || projection.as_deref().is_some_and(contains_aggregation)
+                || has_aggregation_inside_comprehension(list)
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => contains_aggregation(predicate) || has_aggregation_inside_comprehension(list),
+        Expr::Reduce {
+            init,
+            list,
+            expression,
+            ..
+        } => {
+            contains_aggregation(expression)
+                || has_aggregation_inside_comprehension(init)
+                || has_aggregation_inside_comprehension(list)
+        }
+        Expr::Property { base, .. } | Expr::Unary { expr: base, .. } => {
+            has_aggregation_inside_comprehension(base)
+        }
+        Expr::Subscript { base, index } => {
+            has_aggregation_inside_comprehension(base)
+                || has_aggregation_inside_comprehension(index)
+        }
+        Expr::Slice { base, lower, upper } => {
+            has_aggregation_inside_comprehension(base)
+                || lower
+                    .as_deref()
+                    .is_some_and(has_aggregation_inside_comprehension)
+                || upper
+                    .as_deref()
+                    .is_some_and(has_aggregation_inside_comprehension)
+        }
+        Expr::Binary { left, right, .. } => {
+            has_aggregation_inside_comprehension(left)
+                || has_aggregation_inside_comprehension(right)
+        }
+        Expr::Function { args, .. } => args.iter().any(has_aggregation_inside_comprehension),
+        Expr::List(items) => items.iter().any(has_aggregation_inside_comprehension),
+        Expr::Map(entries) => entries
+            .iter()
+            .any(|(_, value)| has_aggregation_inside_comprehension(value)),
+        Expr::Case {
+            subject,
+            alternatives,
+            default,
+        } => {
+            subject
+                .as_deref()
+                .is_some_and(has_aggregation_inside_comprehension)
+                || alternatives.iter().any(|(when, then)| {
+                    has_aggregation_inside_comprehension(when)
+                        || has_aggregation_inside_comprehension(then)
+                })
+                || default
+                    .as_deref()
+                    .is_some_and(has_aggregation_inside_comprehension)
+        }
+        Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => {
+            has_aggregation_inside_comprehension(expr)
+        }
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => false,
     }
 }
 
@@ -1329,6 +2702,34 @@ fn contains_aggregation(expr: &Expr) -> bool {
         Expr::Property { base, .. } | Expr::Unary { expr: base, .. } => contains_aggregation(base),
         Expr::Subscript { base, index } => {
             contains_aggregation(base) || contains_aggregation(index)
+        }
+        Expr::Slice { base, lower, upper } => {
+            contains_aggregation(base)
+                || lower.as_deref().is_some_and(contains_aggregation)
+                || upper.as_deref().is_some_and(contains_aggregation)
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            projection,
+            ..
+        } => {
+            contains_aggregation(list)
+                || predicate.as_deref().is_some_and(contains_aggregation)
+                || projection.as_deref().is_some_and(contains_aggregation)
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => contains_aggregation(list) || contains_aggregation(predicate),
+        Expr::Reduce {
+            init,
+            list,
+            expression,
+            ..
+        } => {
+            contains_aggregation(init)
+                || contains_aggregation(list)
+                || contains_aggregation(expression)
         }
         Expr::Binary { left, right, .. } => {
             contains_aggregation(left) || contains_aggregation(right)
@@ -1347,6 +2748,16 @@ fn contains_aggregation(expr: &Expr) -> bool {
                 || default.as_ref().is_some_and(|d| contains_aggregation(d))
         }
         Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => contains_aggregation(expr),
+        Expr::Pattern(path) => pattern_has_aggregation(path),
+        Expr::PatternComprehension {
+            path,
+            predicate,
+            projection,
+        } => {
+            pattern_has_aggregation(path)
+                || predicate.as_deref().is_some_and(contains_aggregation)
+                || contains_aggregation(projection)
+        }
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => false,
     }
 }
@@ -1355,8 +2766,10 @@ fn contains_aggregation(expr: &Expr) -> bool {
 
 fn substitute_query(query: &Query, params: &HashMap<String, Value>) -> Result<Query> {
     let mut out = query.clone();
-    for clause in &mut out.clauses {
-        substitute_clause(clause, params)?;
+    for part in &mut out.parts {
+        for clause in &mut part.clauses {
+            substitute_clause(clause, params)?;
+        }
     }
     Ok(out)
 }
@@ -1375,6 +2788,19 @@ fn substitute_clause(clause: &mut Clause, params: &HashMap<String, Value>) -> Re
         Clause::Create(patterns) => {
             for path in &mut patterns.iter_mut() {
                 substitute_path(path, params)?;
+            }
+            Ok(())
+        }
+        Clause::Foreach { list, clauses, .. } => {
+            substitute_expr(list, params)?;
+            for clause in clauses.iter_mut() {
+                substitute_clause(clause, params)?;
+            }
+            Ok(())
+        }
+        Clause::Call { args, .. } => {
+            for arg in args.iter_mut() {
+                substitute_expr(arg, params)?;
             }
             Ok(())
         }
@@ -1450,9 +2876,9 @@ fn substitute_items(
 
 fn substitute_set_item(item: &mut SetItem, params: &HashMap<String, Value>) -> Result<()> {
     match item {
-        SetItem::Property { value, .. } | SetItem::Replace { value, .. } => {
-            substitute_expr(value, params)
-        }
+        SetItem::Property { value, .. }
+        | SetItem::Replace { value, .. }
+        | SetItem::Append { value, .. } => substitute_expr(value, params),
         SetItem::Label { .. } => Ok(()),
     }
 }
@@ -1475,6 +2901,19 @@ fn substitute_node(node: &mut NodePattern, params: &HashMap<String, Value>) -> R
     Ok(())
 }
 
+/// Substitute parameters inside a pattern's inline property expressions.
+fn substitute_pattern(path: &mut PatternPath, params: &HashMap<String, Value>) -> Result<()> {
+    if let Some(properties) = &mut path.start.properties {
+        substitute_expr(properties, params)?;
+    }
+    for segment in &mut path.segments {
+        if let Some(properties) = &mut segment.relationship.properties {
+            substitute_expr(properties, params)?;
+        }
+    }
+    Ok(())
+}
+
 fn substitute_expr(expr: &mut Expr, params: &HashMap<String, Value>) -> Result<()> {
     match expr {
         Expr::Parameter(name) => {
@@ -1487,10 +2926,63 @@ fn substitute_expr(expr: &mut Expr, params: &HashMap<String, Value>) -> Result<(
             *expr = Expr::Literal(value);
             Ok(())
         }
+        Expr::Pattern(path) => substitute_pattern(path, params),
+        Expr::PatternComprehension {
+            path,
+            predicate,
+            projection,
+        } => {
+            substitute_pattern(path, params)?;
+            if let Some(predicate) = predicate {
+                substitute_expr(predicate, params)?;
+            }
+            substitute_expr(projection, params)
+        }
         Expr::Property { base, .. } => substitute_expr(base, params),
         Expr::Subscript { base, index } => {
             substitute_expr(base, params)?;
             substitute_expr(index, params)
+        }
+        Expr::Slice { base, lower, upper } => {
+            substitute_expr(base, params)?;
+            if let Some(lower) = lower {
+                substitute_expr(lower, params)?;
+            }
+            if let Some(upper) = upper {
+                substitute_expr(upper, params)?;
+            }
+            Ok(())
+        }
+        Expr::ListComprehension {
+            list,
+            predicate,
+            projection,
+            ..
+        } => {
+            substitute_expr(list, params)?;
+            if let Some(predicate) = predicate {
+                substitute_expr(predicate, params)?;
+            }
+            if let Some(projection) = projection {
+                substitute_expr(projection, params)?;
+            }
+            Ok(())
+        }
+        Expr::Quantifier {
+            list, predicate, ..
+        } => {
+            substitute_expr(list, params)?;
+            substitute_expr(predicate, params)
+        }
+        Expr::Reduce {
+            init,
+            list,
+            expression,
+            ..
+        } => {
+            substitute_expr(init, params)?;
+            substitute_expr(list, params)?;
+            substitute_expr(expression, params)
         }
         Expr::Unary { expr, .. } => substitute_expr(expr, params),
         Expr::Binary { left, right, .. } => {

@@ -78,23 +78,46 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_query(&mut self) -> Result<Query> {
-        let mut clauses = Vec::new();
-        while self.peek().is_some() && self.peek() != Some(Token::Semicolon) {
-            if self.peek() == Some(Token::Union) {
-                return self.fail("UNION is not supported yet");
+        let mut parts = vec![QueryPart {
+            union_all: false,
+            clauses: self.parse_clauses()?,
+        }];
+        let mut union_all = None;
+        while self.eat(Token::Union) {
+            let all = self.eat(Token::All);
+            match union_all {
+                None => union_all = Some(all),
+                Some(previous) if previous != all => {
+                    return self.fail("UNION and UNION ALL cannot be mixed");
+                }
+                Some(_) => {}
             }
-            let clause = self.parse_clause()?;
-            clauses.push(clause);
+            parts.push(QueryPart {
+                union_all: all,
+                clauses: self.parse_clauses()?,
+            });
         }
         // Optional trailing semicolon.
         self.eat(Token::Semicolon);
         if self.peek().is_some() {
             return self.fail("unexpected input after end of query");
         }
+        Ok(Query { parts })
+    }
+
+    /// Parse the clauses of one query part, up to `UNION` or the end.
+    fn parse_clauses(&mut self) -> Result<Vec<Clause>> {
+        let mut clauses = Vec::new();
+        while self.peek().is_some()
+            && self.peek() != Some(Token::Semicolon)
+            && self.peek() != Some(Token::Union)
+        {
+            clauses.push(self.parse_clause()?);
+        }
         if clauses.is_empty() {
             return self.fail("empty query");
         }
-        Ok(Query { clauses })
+        Ok(clauses)
     }
 
     fn parse_clause(&mut self) -> Result<Clause> {
@@ -154,6 +177,8 @@ impl<'a> Parser<'a> {
                     exprs: self.parse_expr_list()?,
                 })
             }
+            Some(Token::Foreach) => self.parse_foreach_clause(),
+            Some(Token::Call) => self.parse_call_clause(),
             _ => self.fail("expected a clause"),
         }
     }
@@ -321,6 +346,9 @@ impl<'a> Parser<'a> {
                     labels.push(self.parse_name()?);
                 }
                 items.push(SetItem::Label { variable, labels });
+            } else if !remove && self.eat(Token::PlusEquals) {
+                let value = self.parse_expr()?;
+                items.push(SetItem::Append { variable, value });
             } else if !remove && self.eat(Token::Equals) {
                 let value = self.parse_expr()?;
                 items.push(SetItem::Replace { variable, value });
@@ -328,7 +356,7 @@ impl<'a> Parser<'a> {
                 return self.fail(if remove {
                     "expected '.' or ':' in REMOVE item"
                 } else {
-                    "expected '.', ':' or '=' in SET item"
+                    "expected '.', ':', '+=' or '=' in SET item"
                 });
             }
             if !self.eat(Token::Comma) {
@@ -347,6 +375,38 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_path(&mut self) -> Result<PatternPath> {
+        // `p = (a)-->(b)` names the path.
+        let mut variable = None;
+        if matches!(self.peek(), Some(Token::Ident) | Some(Token::EscapedIdent))
+            && self.tokens.get(self.pos + 1).map(|entry| entry.token) == Some(Token::Equals)
+        {
+            variable = Some(self.parse_name()?);
+            self.expect(Token::Equals, "'=' after the path variable")?;
+        }
+        // `shortestPath((a)-[*]->(b))` wraps the pattern.
+        let mut shortest = Shortest::Plain;
+        if matches!(self.peek(), Some(Token::Ident)) {
+            let spanned = self.tokens[self.pos];
+            let name = &self.source[spanned.start..spanned.end];
+            if (name == "shortestPath" || name == "allShortestPaths")
+                && self.tokens.get(self.pos + 1).map(|entry| entry.token) == Some(Token::LParen)
+            {
+                shortest = if name == "allShortestPaths" {
+                    Shortest::AllShortest
+                } else {
+                    Shortest::Shortest
+                };
+                self.advance();
+                self.advance();
+                let inner = self.parse_path()?;
+                self.expect(Token::RParen, "')' to close shortestPath")?;
+                return Ok(PatternPath {
+                    variable,
+                    shortest,
+                    ..inner
+                });
+            }
+        }
         let start = self.parse_node_pattern()?;
         let mut segments = Vec::new();
         while matches!(self.peek(), Some(Token::Minus) | Some(Token::ArrowLeft)) {
@@ -354,7 +414,114 @@ impl<'a> Parser<'a> {
             let node = self.parse_node_pattern()?;
             segments.push(PathSegment { relationship, node });
         }
-        Ok(PatternPath { start, segments })
+        Ok(PatternPath {
+            variable,
+            shortest,
+            start,
+            segments,
+        })
+    }
+
+    /// Parse a pattern predicate when the parenthesis starts one; restore
+    /// the position and return `None` when it does not.
+    fn try_parse_pattern_expr(&mut self) -> Result<Option<Expr>> {
+        let saved = self.pos;
+        match self.parse_path() {
+            Ok(path) if pattern_expression_shape(&path) => Ok(Some(Expr::Pattern(Box::new(path)))),
+            _ => {
+                self.pos = saved;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Parse `[p = (a)-[:T]->(b) WHERE predicate | projection]`; restore the
+    /// position and return `None` when the bracket does not start one.
+    fn try_parse_pattern_comprehension(&mut self) -> Result<Option<Expr>> {
+        let starts_pattern = matches!(self.peek(), Some(Token::LParen))
+            || (matches!(self.peek(), Some(Token::Ident) | Some(Token::EscapedIdent))
+                && self.tokens.get(self.pos + 1).map(|entry| entry.token) == Some(Token::Equals));
+        if !starts_pattern {
+            return Ok(None);
+        }
+        let saved = self.pos;
+        let Ok(path) = self.parse_path() else {
+            self.pos = saved;
+            return Ok(None);
+        };
+        if path.segments.is_empty() {
+            self.pos = saved;
+            return Ok(None);
+        }
+        let predicate = if self.eat(Token::Where) {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        if !self.eat(Token::Pipe) {
+            self.pos = saved;
+            return Ok(None);
+        }
+        let projection = self.parse_expr()?;
+        self.expect(Token::RBracket, "']' to close a pattern comprehension")?;
+        Ok(Some(Expr::PatternComprehension {
+            path: Box::new(path),
+            predicate,
+            projection: Box::new(projection),
+        }))
+    }
+
+    fn parse_foreach_clause(&mut self) -> Result<Clause> {
+        self.advance();
+        self.expect(Token::LParen, "'(' after FOREACH")?;
+        let var = self.parse_name()?;
+        self.expect(Token::In, "IN after the FOREACH variable")?;
+        let list = self.parse_expr()?;
+        self.expect(Token::Pipe, "'|' before the FOREACH body")?;
+        let mut clauses = Vec::new();
+        while self.peek() != Some(Token::RParen) {
+            clauses.push(self.parse_clause()?);
+        }
+        self.expect(Token::RParen, "')' to close FOREACH")?;
+        if clauses.is_empty() {
+            return self.fail("FOREACH requires at least one updating clause");
+        }
+        Ok(Clause::Foreach { var, list, clauses })
+    }
+
+    fn parse_call_clause(&mut self) -> Result<Clause> {
+        self.advance();
+        let mut procedure = self.parse_name()?;
+        while self.eat(Token::Dot) {
+            procedure.push('.');
+            procedure.push_str(&self.parse_name()?);
+        }
+        self.expect(Token::LParen, "'(' after the procedure name")?;
+        let mut args = Vec::new();
+        if self.peek() != Some(Token::RParen) {
+            args = self.parse_expr_list()?;
+        }
+        self.expect(Token::RParen, "')' to close the procedure call")?;
+        let mut yields = Vec::new();
+        if self.eat(Token::Yield) {
+            loop {
+                let column = self.parse_name()?;
+                let alias = if self.eat(Token::As) {
+                    Some(self.parse_name()?)
+                } else {
+                    None
+                };
+                yields.push((column, alias));
+                if !self.eat(Token::Comma) {
+                    break;
+                }
+            }
+        }
+        Ok(Clause::Call {
+            procedure,
+            args,
+            yields,
+        })
     }
 
     fn parse_node_pattern(&mut self) -> Result<NodePattern> {
@@ -421,14 +588,17 @@ impl<'a> Parser<'a> {
     fn parse_var_length(&mut self) -> Result<VarLength> {
         let mut min = 1u32;
         let mut max = None;
+        let mut explicit = false;
         if self.peek() == Some(Token::Integer) {
             min = self.parse_u32("relationship length")?;
+            explicit = true;
         }
         if self.eat(Token::DotDot) {
             if self.peek() == Some(Token::Integer) {
                 max = Some(self.parse_u32("relationship length")?);
             }
-        } else {
+        } else if explicit {
+            // `*2` means exactly two hops.
             max = Some(min);
         }
         Ok(VarLength { min, max })
@@ -444,6 +614,25 @@ impl<'a> Parser<'a> {
         self.source[spanned.start..spanned.end]
             .parse::<u32>()
             .map_err(|_| Error::syntax(format!("invalid {what}")))
+    }
+
+    /// Map keys: identifiers, escaped identifiers, quoted strings and
+    /// reserved words (which are plain strings in this position, case kept).
+    fn parse_map_key(&mut self) -> Result<String> {
+        match self.peek() {
+            Some(Token::StringSingle) | Some(Token::StringDouble) => {
+                let spanned = self.tokens[self.pos];
+                self.advance();
+                unescape_string(&self.source[spanned.start + 1..spanned.end - 1])
+            }
+            Some(Token::Ident) | Some(Token::EscapedIdent) => self.parse_name(),
+            Some(token) if token.is_keyword() => {
+                let spanned = self.tokens[self.pos];
+                self.advance();
+                Ok(self.source[spanned.start..spanned.end].to_owned())
+            }
+            _ => self.fail("expected a map key"),
+        }
     }
 
     fn parse_name(&mut self) -> Result<String> {
@@ -619,12 +808,33 @@ impl<'a> Parser<'a> {
                 }
                 Some(Token::LBracket) => {
                     self.advance();
-                    let index = self.parse_expr()?;
-                    self.expect(Token::RBracket, "']' after subscript")?;
-                    expr = Expr::Subscript {
-                        base: Box::new(expr),
-                        index: Box::new(index),
+                    let lower = if self.peek() == Some(Token::DotDot) {
+                        None
+                    } else {
+                        Some(Box::new(self.parse_expr()?))
                     };
+                    if self.eat(Token::DotDot) {
+                        let upper = if self.peek() == Some(Token::RBracket) {
+                            None
+                        } else {
+                            Some(Box::new(self.parse_expr()?))
+                        };
+                        self.expect(Token::RBracket, "']' after slice")?;
+                        expr = Expr::Slice {
+                            base: Box::new(expr),
+                            lower,
+                            upper,
+                        };
+                    } else {
+                        let Some(index) = lower else {
+                            return self.fail("expected an index or a slice");
+                        };
+                        self.expect(Token::RBracket, "']' after subscript")?;
+                        expr = Expr::Subscript {
+                            base: Box::new(expr),
+                            index,
+                        };
+                    }
                 }
                 Some(Token::Colon) => {
                     self.advance();
@@ -688,6 +898,59 @@ impl<'a> Parser<'a> {
             Token::Ident | Token::EscapedIdent => {
                 let name = self.parse_name()?;
                 if self.peek() == Some(Token::LParen) {
+                    let lower = name.to_ascii_lowercase();
+                    let quantifier = match lower.as_str() {
+                        "all" => Some(QuantifierKind::All),
+                        "any" => Some(QuantifierKind::Any),
+                        "none" => Some(QuantifierKind::None),
+                        "single" => Some(QuantifierKind::Single),
+                        _ => None,
+                    };
+                    let followed_by_var_in = |parser: &Self, offset: usize| {
+                        matches!(
+                            parser
+                                .tokens
+                                .get(parser.pos + offset)
+                                .map(|entry| entry.token),
+                            Some(Token::Ident) | Some(Token::EscapedIdent)
+                        ) && parser
+                            .tokens
+                            .get(parser.pos + offset + 1)
+                            .map(|entry| entry.token)
+                            == Some(Token::In)
+                    };
+                    if let Some(kind) = quantifier
+                        && followed_by_var_in(self, 1)
+                    {
+                        return self.parse_quantifier(kind);
+                    }
+                    if lower == "reduce"
+                        && matches!(
+                            self.tokens.get(self.pos + 1).map(|entry| entry.token),
+                            Some(Token::Ident) | Some(Token::EscapedIdent)
+                        )
+                        && self.tokens.get(self.pos + 2).map(|entry| entry.token)
+                            == Some(Token::Equals)
+                    {
+                        self.advance();
+                        let accumulator = self.parse_name()?;
+                        self.expect(Token::Equals, "= after the reduce accumulator")?;
+                        let init = self.parse_expr()?;
+                        self.expect(Token::Comma, "',' after the reduce initial value")?;
+                        let var = self.parse_name()?;
+                        self.expect(Token::In, "IN in reduce")?;
+                        let list = self.parse_expr()?;
+                        self.expect(Token::Pipe, "'|' in reduce")?;
+                        let expression = self.parse_expr()?;
+                        self.expect(Token::RParen, "')' to close reduce")?;
+                        return Ok(Expr::Reduce {
+                            accumulator,
+                            init: Box::new(init),
+                            var,
+                            list: Box::new(list),
+                            expression: Box::new(expression),
+                        });
+                    }
                     self.advance();
                     let distinct = self.eat(Token::Distinct);
                     let mut star = false;
@@ -713,13 +976,59 @@ impl<'a> Parser<'a> {
                 }
             }
             Token::LParen => {
+                if let Some(pattern) = self.try_parse_pattern_expr()? {
+                    return Ok(pattern);
+                }
                 self.advance();
                 let expr = self.parse_expr()?;
                 self.expect(Token::RParen, "')' to close a parenthesized expression")?;
                 Ok(expr)
             }
+            Token::All => {
+                // `all(x IN list WHERE predicate)`; `ALL` is otherwise only
+                // valid in `UNION ALL`.
+                self.advance();
+                if self.peek() == Some(Token::LParen)
+                    && matches!(
+                        self.tokens.get(self.pos + 1).map(|entry| entry.token),
+                        Some(Token::Ident) | Some(Token::EscapedIdent)
+                    )
+                    && self.tokens.get(self.pos + 2).map(|entry| entry.token) == Some(Token::In)
+                {
+                    return self.parse_quantifier(QuantifierKind::All);
+                }
+                self.fail("unexpected ALL")
+            }
             Token::LBracket => {
                 self.advance();
+                if let Some(comprehension) = self.try_parse_pattern_comprehension()? {
+                    return Ok(comprehension);
+                }
+                // `[x IN list WHERE predicate | projection]`.
+                if matches!(self.peek(), Some(Token::Ident) | Some(Token::EscapedIdent))
+                    && self.tokens.get(self.pos + 1).map(|entry| entry.token) == Some(Token::In)
+                {
+                    let var = self.parse_name()?;
+                    self.expect(Token::In, "IN after the comprehension variable")?;
+                    let list = self.parse_expr()?;
+                    let predicate = if self.eat(Token::Where) {
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
+                    };
+                    let projection = if self.eat(Token::Pipe) {
+                        Some(Box::new(self.parse_expr()?))
+                    } else {
+                        None
+                    };
+                    self.expect(Token::RBracket, "']' to close a list comprehension")?;
+                    return Ok(Expr::ListComprehension {
+                        var,
+                        list: Box::new(list),
+                        predicate,
+                        projection,
+                    });
+                }
                 let mut items = Vec::new();
                 if self.peek() != Some(Token::RBracket) {
                     items.push(self.parse_expr()?);
@@ -736,19 +1045,29 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse the body of a quantifier; the current token is `(`.
+    fn parse_quantifier(&mut self, kind: QuantifierKind) -> Result<Expr> {
+        self.expect(Token::LParen, "'(' to open the quantifier")?;
+        let var = self.parse_name()?;
+        self.expect(Token::In, "IN after the quantifier variable")?;
+        let list = self.parse_expr()?;
+        self.expect(Token::Where, "WHERE in a quantifier")?;
+        let predicate = self.parse_expr()?;
+        self.expect(Token::RParen, "')' to close the quantifier")?;
+        Ok(Expr::Quantifier {
+            kind,
+            var,
+            list: Box::new(list),
+            predicate: Box::new(predicate),
+        })
+    }
+
     fn parse_map_literal(&mut self) -> Result<Expr> {
         self.expect(Token::LBrace, "'{' to start a map")?;
         let mut entries = Vec::new();
         if self.peek() != Some(Token::RBrace) {
             loop {
-                let key = match self.peek() {
-                    Some(Token::StringSingle) | Some(Token::StringDouble) => {
-                        let spanned = self.tokens[self.pos];
-                        self.advance();
-                        unescape_string(&self.source[spanned.start + 1..spanned.end - 1])?
-                    }
-                    _ => self.parse_name()?,
-                };
+                let key = self.parse_map_key()?;
                 self.expect(Token::Colon, "':' in map entry")?;
                 let value = self.parse_expr()?;
                 entries.push((key, value));
@@ -847,22 +1166,68 @@ fn describe(token: Token) -> String {
     format!("{token:?}")
 }
 
+/// A pattern used as an expression needs a relationship or an element
+/// constraint; `(x)` alone stays a parenthesized expression.
+fn pattern_expression_shape(path: &PatternPath) -> bool {
+    !path.segments.is_empty()
+        || path.variable.is_some()
+        || !path.start.labels.is_empty()
+        || path.start.properties.is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn expr_of(query: &str) -> Expr {
         let parsed = parse(query).expect("parse");
-        match &parsed.clauses[0] {
+        match &parsed.parts[0].clauses[0] {
             Clause::Return { items, .. } => items[0].expr.clone(),
             other => panic!("unexpected clause {other:?}"),
         }
     }
 
     #[test]
+    fn parses_set_append() {
+        let query = parse("MATCH (n) SET n += {num: 42} RETURN n").expect("parse");
+        let Clause::Set(items) = &query.parts[0].clauses[1] else {
+            panic!("expected SET");
+        };
+        assert!(matches!(&items[0], SetItem::Append { variable, .. } if variable == "n"));
+    }
+
+    #[test]
+    fn parses_union_parts() {
+        let query =
+            parse("RETURN 1 AS x UNION ALL RETURN 2 AS x UNION ALL RETURN 3 AS x").expect("parse");
+        assert_eq!(query.parts.len(), 3);
+        assert!(!query.parts[0].union_all);
+        assert!(query.parts[1].union_all);
+        assert!(query.parts[2].union_all);
+        assert_eq!(query.parts[0].clauses.len(), 1);
+
+        let distinct = parse("RETURN 1 AS x UNION RETURN 2 AS x").expect("parse");
+        assert_eq!(distinct.parts.len(), 2);
+        assert!(!distinct.parts[1].union_all);
+    }
+
+    #[test]
+    fn rejects_mixed_union_kinds() {
+        assert!(parse("RETURN 1 AS x UNION RETURN 2 AS x UNION RETURN 3 AS x").is_ok());
+        assert!(parse("RETURN 1 AS x UNION RETURN 2 AS x UNION ALL RETURN 3 AS x").is_err());
+        assert!(parse("RETURN 1 AS x UNION ALL RETURN 2 AS x UNION RETURN 3 AS x").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_union_part() {
+        assert!(parse("RETURN 1 AS x UNION").is_err());
+        assert!(parse("UNION RETURN 1 AS x").is_err());
+    }
+
+    #[test]
     fn parses_optional_match() {
         let query = parse("OPTIONAL MATCH (n)-[:T]->(m) WHERE m.x = 1 RETURN n").expect("parse");
-        let Clause::Match(matched) = &query.clauses[0] else {
+        let Clause::Match(matched) = &query.parts[0].clauses[0] else {
             panic!("expected MATCH");
         };
         assert!(matched.optional);
@@ -872,7 +1237,7 @@ mod tests {
     #[test]
     fn parses_remove_without_equals() {
         let query = parse("MATCH (n) REMOVE n.name, n:Label RETURN n").expect("parse");
-        let Clause::Remove(items) = &query.clauses[1] else {
+        let Clause::Remove(items) = &query.parts[0].clauses[1] else {
             panic!("expected REMOVE");
         };
         assert_eq!(items.len(), 2);
@@ -888,8 +1253,8 @@ mod tests {
     fn parses_simple_match_return() {
         let query = parse("MATCH (n:Person {name: 'alice'})-[r:KNOWS]->(m) WHERE n.age > 30 RETURN n, m.name AS friend LIMIT 10")
             .expect("parse");
-        assert_eq!(query.clauses.len(), 2);
-        let Clause::Match(matched) = &query.clauses[0] else {
+        assert_eq!(query.parts[0].clauses.len(), 2);
+        let Clause::Match(matched) = &query.parts[0].clauses[0] else {
             panic!("expected MATCH");
         };
         assert_eq!(matched.patterns.len(), 1);
@@ -970,7 +1335,7 @@ mod tests {
     #[test]
     fn unwind_with_parameters() {
         let query = parse("UNWIND $names AS name RETURN name").expect("parse");
-        let Clause::Unwind { expr, alias } = &query.clauses[0] else {
+        let Clause::Unwind { expr, alias } = &query.parts[0].clauses[0] else {
             panic!("expected UNWIND");
         };
         assert_eq!(expr, &Expr::Parameter("names".to_owned()));
@@ -982,7 +1347,7 @@ mod tests {
         let query =
             parse("CREATE (a:Person {name: 'a'})-[:KNOWS]->(b:Person {name: 'b'}) RETURN a")
                 .expect("parse");
-        assert!(matches!(query.clauses[0], Clause::Create(_)));
+        assert!(matches!(query.parts[0].clauses[0], Clause::Create(_)));
 
         let query =
             parse("MERGE (n:Person {name: 'a'}) ON CREATE SET n.age = 1 ON MATCH SET n.age = 2")
@@ -991,7 +1356,7 @@ mod tests {
             on_create,
             on_match,
             ..
-        } = &query.clauses[0]
+        } = &query.parts[0].clauses[0]
         else {
             panic!("expected MERGE");
         };
@@ -999,7 +1364,7 @@ mod tests {
         assert_eq!(on_match.len(), 1);
 
         let query = parse("MATCH (n) SET n.age = 1, n:Label RETURN n").expect("parse");
-        let Clause::Set(items) = &query.clauses[1] else {
+        let Clause::Set(items) = &query.parts[0].clauses[1] else {
             panic!("expected SET");
         };
         assert_eq!(items.len(), 2);
@@ -1008,11 +1373,11 @@ mod tests {
     #[test]
     fn detach_delete_and_with_where() {
         let query = parse("MATCH (n) WITH n WHERE n.age > 1 DETACH DELETE n").expect("parse");
-        let Clause::With { where_clause, .. } = &query.clauses[1] else {
+        let Clause::With { where_clause, .. } = &query.parts[0].clauses[1] else {
             panic!("expected WITH");
         };
         assert!(where_clause.is_some());
-        let Clause::Delete { detach, .. } = &query.clauses[2] else {
+        let Clause::Delete { detach, .. } = &query.parts[0].clauses[2] else {
             panic!("expected DELETE");
         };
         assert!(detach);
@@ -1021,7 +1386,7 @@ mod tests {
     #[test]
     fn relationship_directions_and_var_length() {
         let query = parse("MATCH (a)<-[r:KNOWS*1..3]-(b) RETURN r").expect("parse");
-        let Clause::Match(matched) = &query.clauses[0] else {
+        let Clause::Match(matched) = &query.parts[0].clauses[0] else {
             panic!("expected MATCH");
         };
         let rel = &matched.patterns[0].segments[0].relationship;

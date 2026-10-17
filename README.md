@@ -238,7 +238,9 @@ for row in rows.iter() {
 ```
 
 Property indexes are a DDL extension (openCypher has no DDL, and the shell
-does not expose index creation yet):
+does not expose index creation yet; Cypher `CREATE INDEX` / `CREATE
+CONSTRAINT` statements are scheduled in [docs/roadmap.md](docs/roadmap.md)
+Phase 5):
 
 ```rust
 conn.create_node_index("name", Some("Person"), true)?; // unique index
@@ -286,17 +288,22 @@ Implemented: `MATCH` (node and relationship patterns, directions, type
 disjunction, inline property filters), `WHERE`, `RETURN` and `WITH` (with
 `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`), `UNWIND`, `CREATE`, `MERGE` (with
 `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE` /
-`DETACH DELETE`, parameters (`$name`), list and map literals, `CASE`,
+`DETACH DELETE`, `UNION` / `UNION ALL`, `SET n += {…}`, parameters
+(`$name`), list and map literals, map field access and subscript
+(`m.k`, `m['k']`), list indexing and slicing (`list[1..3]`), list
+comprehensions, quantifiers (`all`, `any`, `none`, `single`), `reduce()`,
+variable-length paths (`*1..3`), named paths (`p = …`) with `nodes(p)`,
+`relationships(p)` and `length(p)`, `CASE`,
 `IS [NOT] NULL`, string predicates (`STARTS WITH`, `ENDS WITH`, `CONTAINS`,
 `=~`), label predicates, three-valued logic, and the aggregations `count`,
-`sum`, `avg`, `min`, `max`, `collect`. Scalar functions: `id`, `labels`,
+`sum`, `avg`, `min`, `max`, `collect` (with `DISTINCT` and expressions over
+aggregations). Scalar functions: `id`, `labels`,
 `type`, `startNode`, `endNode`, `coalesce`, `toString`, `toInteger`,
 `toFloat`, `size`, `properties`, `keys`.
 
 Explicit gaps fail with clear `Unsupported` errors instead of wrong results:
-`OPTIONAL MATCH`, `UNION`, variable-length paths, named paths and path values,
-pattern predicates, list and pattern comprehensions, map projections,
-`FOREACH`, `CALL`, most of the function library, and temporal/spatial types.
+pattern predicates and pattern comprehensions, map projections, `FOREACH`,
+`CALL`, most of the function library, and temporal/spatial types.
 The plan to close them, ordered by TCK scenario share, is in
 [docs/roadmap.md](docs/roadmap.md). Storage-side work tracked alongside it:
 WAL mode for concurrent readers, delete rebalancing and `VACUUM`-style
@@ -316,7 +323,7 @@ $ cargo run -p tck-runner --release      # exits 0 when the gate passes
 The gate fails on unexpected failures, harness errors (steps or cells the
 runner cannot evaluate) and **stale allow-list entries**, so a fix must prune
 its allow-list entries in the same commit. Current baseline: 3897 scenarios,
-1187 passing (30.5% of the suite, 100% of applicable scenarios), 2710
+2084 passing (53.5% of the suite, 100% of applicable scenarios), 1813
 allow-listed, zero harness errors. Run instructions, error mapping and
 comparison semantics are documented in [docs/tck.md](docs/tck.md).
 

@@ -67,6 +67,8 @@ pub struct AggSpec {
     pub func: AggFn,
     /// Whether the argument is `*` (only meaningful for `count`).
     pub star: bool,
+    /// Whether only distinct argument values are aggregated.
+    pub distinct: bool,
 }
 
 /// A VDBE instruction.
@@ -76,7 +78,7 @@ pub enum Op {
     OpenNodeScan {
         /// Cursor slot.
         cursor: u32,
-        /// Label id filter.
+        /// Constant index of the label name to filter by.
         label: Option<u32>,
     },
     /// Open an edge scan (all edges, or a type bitmap).
@@ -103,8 +105,10 @@ pub enum Op {
         src: u32,
         /// Direction code (0 out, 1 in, 2 undirected).
         direction: u8,
-        /// Restricting edge type ids.
+        /// Constant indices of restricting edge type names.
         types: Vec<u32>,
+        /// Whether the pattern had no type filter (empty `types` means any).
+        any_type: bool,
     },
     /// Position a cursor on its first row; jump when empty.
     Rewind {
@@ -211,7 +215,7 @@ pub enum Op {
     HasLabel {
         /// Node register.
         node: u32,
-        /// Label id.
+        /// Constant index of the label name.
         label: u32,
         /// Destination register.
         dest: u32,
@@ -321,6 +325,20 @@ pub enum Op {
         /// Jump target when exhausted.
         target: u32,
     },
+    /// Test whether a row cursor holds any rows.
+    CtxHasRows {
+        /// Cursor slot.
+        cursor: u32,
+        /// Destination register.
+        dest: u32,
+    },
+    /// Collect the first register of every row into a list.
+    CtxToList {
+        /// Cursor slot.
+        cursor: u32,
+        /// Destination register.
+        dest: u32,
+    },
     /// Load the current row into a register window.
     CtxData {
         /// Cursor slot.
@@ -329,6 +347,105 @@ pub enum Op {
         start: u32,
         /// Number of registers.
         count: u32,
+    },
+    /// Read a property by name from a node, relationship or map.
+    Property {
+        /// Entity or map register.
+        target: u32,
+        /// Constant index of the property key name.
+        name: u32,
+        /// Destination register.
+        dest: u32,
+    },
+    /// Slice a list: `base[lower..upper]`.
+    Slice {
+        /// List register.
+        base: u32,
+        /// Lower bound register (ignored when `open_lower`).
+        lower: u32,
+        /// Upper bound register (ignored when `open_upper`).
+        upper: u32,
+        /// Whether the lower bound was omitted.
+        open_lower: bool,
+        /// Whether the upper bound was omitted.
+        open_upper: bool,
+        /// Destination register.
+        dest: u32,
+    },
+    /// Build a path value: an alternating node/relationship list, splicing
+    /// variable-length relationship lists into individual edges.
+    BuildPath {
+        /// Destination register.
+        dest: u32,
+        /// `(register, splice)` elements in path order.
+        elements: Vec<(u32, bool)>,
+    },
+    /// Append a value to a list register (rebuilding the list).
+    ListPush {
+        /// List register, updated in place.
+        list: u32,
+        /// Value register.
+        value: u32,
+    },
+    /// Open a variable-length expansion from a node.
+    VarExpandOpen {
+        /// Cursor slot.
+        cursor: u32,
+        /// Source node register.
+        src: u32,
+        /// Direction code: 0 out, 1 in, 2 both.
+        direction: u8,
+        /// Constant indices of restricting edge type names.
+        types: Vec<u32>,
+        /// Whether the pattern had no type filter.
+        any_type: bool,
+        /// Literal property filters applied at every hop, by key name.
+        props: Vec<(String, Value)>,
+        /// Minimum hops.
+        min: u32,
+        /// Maximum hops; `None` is unbounded.
+        max: Option<u32>,
+    },
+    /// Open a built-in procedure, filling a row cursor with its output.
+    ProcedureCallOpen {
+        /// Cursor slot.
+        cursor: u32,
+        /// Constant index of the procedure name.
+        name: u32,
+    },
+    /// Open a shortest-path search from a node to a target node.
+    ShortestOpen {
+        /// Cursor slot.
+        cursor: u32,
+        /// Source node register.
+        src: u32,
+        /// Target node register; `None` targets every reachable node.
+        dst: Option<u32>,
+        /// Direction code: 0 out, 1 in, 2 both.
+        direction: u8,
+        /// Constant indices of restricting edge type names.
+        types: Vec<u32>,
+        /// Whether the pattern had no type filter.
+        any_type: bool,
+        /// Literal property filters applied at every hop, by key name.
+        props: Vec<(String, Value)>,
+        /// Minimum hops.
+        min: u32,
+        /// Maximum hops; `None` is unbounded.
+        max: Option<u32>,
+        /// Whether every shortest path is produced.
+        all: bool,
+    },
+    /// Advance a variable-length expansion; jump when exhausted.
+    VarExpandNext {
+        /// Cursor slot.
+        cursor: u32,
+        /// Destination register for the edge list.
+        edges: u32,
+        /// Destination register for the end node.
+        node: u32,
+        /// Jump target when exhausted.
+        target: u32,
     },
     /// Start unwinding a list.
     UnwindInit {
@@ -368,31 +485,10 @@ pub enum Op {
         /// Destination register.
         dest: u32,
     },
-    /// Match or create a node; writes `true` to `created` on creation.
-    MergeNode {
-        /// Register holding a list of label names.
-        labels: u32,
+    /// Reject null property values, which MERGE does not allow.
+    CheckMergeProps {
         /// Register holding a property map.
         props: u32,
-        /// Destination register.
-        dest: u32,
-        /// Register receiving whether the node was created.
-        created: u32,
-    },
-    /// Match or create an edge.
-    MergeEdge {
-        /// Register holding the edge type name.
-        edge_type: u32,
-        /// Source node register.
-        src: u32,
-        /// Destination node register.
-        dst: u32,
-        /// Register holding a property map.
-        props: u32,
-        /// Destination register.
-        dest: u32,
-        /// Register receiving whether the edge was created.
-        created: u32,
     },
     /// Set a property on a node or edge.
     SetProperty {
@@ -415,6 +511,13 @@ pub enum Op {
     /// Replace all properties of a node.
     ReplaceProperties {
         /// Node register.
+        target: u32,
+        /// Register holding a property map.
+        props: u32,
+    },
+    /// Merge a property map into a node or relationship.
+    MergeProperties {
+        /// Node or edge register.
         target: u32,
         /// Register holding a property map.
         props: u32,
@@ -457,6 +560,12 @@ pub mod func {
     pub const PROPERTIES: u8 = 10;
     /// `keys(x)`
     pub const KEYS: u8 = 11;
+    /// `nodes(path)`
+    pub const NODES: u8 = 12;
+    /// `relationships(path)`
+    pub const RELATIONSHIPS: u8 = 13;
+    /// `length(path)`
+    pub const LENGTH: u8 = 14;
 }
 
 /// A compiled VDBE program.
@@ -484,6 +593,8 @@ pub fn execute(db: &mut Database, program: &Program) -> Result<Vec<Vec<Value>>> 
         regs: vec![Reg::Value(Value::Null); program.register_count],
         cursors: (0..program.cursor_count).map(|_| Cursor::Empty).collect(),
         results: Vec::new(),
+        key_ids: vec![None; program.constants.len()],
+        label_ids: vec![None; program.constants.len()],
         pc: 0,
         steps: 0,
     };
@@ -505,6 +616,10 @@ enum Cursor {
         items: Vec<(u64, u64)>,
         pos: usize,
     },
+    Trails {
+        items: Vec<(Vec<u64>, u64)>,
+        pos: usize,
+    },
     Rows {
         rows: Vec<Vec<Reg>>,
         pos: usize,
@@ -521,6 +636,8 @@ struct Executor<'a> {
     regs: Vec<Reg>,
     cursors: Vec<Cursor>,
     results: Vec<Vec<Value>>,
+    key_ids: Vec<Option<u32>>,
+    label_ids: Vec<Option<u32>>,
     pc: usize,
     steps: u64,
 }
@@ -546,7 +663,10 @@ impl<'a> Executor<'a> {
         match op {
             Op::OpenNodeScan { cursor, label } => {
                 let ids = match label {
-                    Some(label) => self.db.label_nodes(*label)?,
+                    Some(label) => match self.resolve_label(*label)? {
+                        Some(label) => self.db.label_nodes(label)?,
+                        None => Vec::new(),
+                    },
                     None => self.db.all_node_ids()?,
                 };
                 self.cursors[*cursor as usize] = Cursor::Ids {
@@ -584,22 +704,40 @@ impl<'a> Executor<'a> {
                 src,
                 direction,
                 types,
+                any_type,
             } => {
+                let types = self.resolve_types(types, *any_type)?;
                 // Expanding from a null binding (an optional match that
                 // missed) matches nothing instead of failing.
-                let items = if matches!(self.regs[*src as usize], Reg::Value(Value::Null)) {
-                    Vec::new()
-                } else {
-                    let node = self.reg_node(*src)?;
-                    match direction {
-                        0 => self.db.expand(node, Direction::Out, types)?,
-                        1 => self.db.expand(node, Direction::In, types)?,
-                        _ => {
-                            let mut both = self.db.expand(node, Direction::Out, types)?;
-                            both.extend(self.db.expand(node, Direction::In, types)?);
-                            both.sort_unstable();
-                            both.dedup();
-                            both
+                let items = match (&types, &self.regs[*src as usize]) {
+                    (Some(types), _) if types.is_empty() => Vec::new(),
+                    (_, Reg::Value(Value::Null)) => Vec::new(),
+                    (None, _) => {
+                        let node = self.reg_node(*src)?;
+                        match direction {
+                            0 => self.db.expand(node, Direction::Out, &[])?,
+                            1 => self.db.expand(node, Direction::In, &[])?,
+                            _ => {
+                                let mut both = self.db.expand(node, Direction::Out, &[])?;
+                                both.extend(self.db.expand(node, Direction::In, &[])?);
+                                both.sort_unstable();
+                                both.dedup();
+                                both
+                            }
+                        }
+                    }
+                    (Some(types), _) => {
+                        let node = self.reg_node(*src)?;
+                        match direction {
+                            0 => self.db.expand(node, Direction::Out, types)?,
+                            1 => self.db.expand(node, Direction::In, types)?,
+                            _ => {
+                                let mut both = self.db.expand(node, Direction::Out, types)?;
+                                both.extend(self.db.expand(node, Direction::In, types)?);
+                                both.sort_unstable();
+                                both.dedup();
+                                both
+                            }
                         }
                     }
                 };
@@ -727,6 +865,7 @@ impl<'a> Executor<'a> {
                 let base_value = self.reg_value(*base)?;
                 let index_value = self.reg_value(*index)?;
                 let result = match (base_value, index_value) {
+                    (Value::Null, _) | (_, Value::Null) => Value::Null,
                     (Value::List(items), Value::Int(index)) => {
                         let len = items.len() as i64;
                         let resolved = if index < 0 { len + index } else { index };
@@ -736,7 +875,98 @@ impl<'a> Executor<'a> {
                             items[resolved as usize].clone()
                         }
                     }
-                    _ => Value::Null,
+                    (Value::Map(entries), Value::Text(key)) => entries
+                        .iter()
+                        .find(|(entry, _)| entry.as_ref() == key.as_ref())
+                        .map(|(_, value)| value.clone())
+                        .unwrap_or(Value::Null),
+                    // Dynamic property access: `n[key]` / `r[key]`.
+                    (Value::Node(id), Value::Text(key)) => {
+                        let key_id = self.db.property_key_id(&key);
+                        key_id
+                            .and_then(|key_id| {
+                                self.db
+                                    .get_node(id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|record| record.get(key_id).cloned())
+                            })
+                            .unwrap_or(Value::Null)
+                    }
+                    (Value::Edge(id), Value::Text(key)) => {
+                        let key_id = self.db.property_key_id(&key);
+                        key_id
+                            .and_then(|key_id| {
+                                self.db
+                                    .get_edge(id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|record| record.get(key_id).cloned())
+                            })
+                            .unwrap_or(Value::Null)
+                    }
+                    (Value::List(_), other) => {
+                        return Err(Error::type_error(format!(
+                            "list index must be an integer, got {}",
+                            other.type_name()
+                        )));
+                    }
+                    (Value::Map(_), other) => {
+                        return Err(Error::type_error(format!(
+                            "map key must be a string, got {}",
+                            other.type_name()
+                        )));
+                    }
+                    (other, _) => {
+                        return Err(Error::type_error(format!(
+                            "cannot index into {}",
+                            other.type_name()
+                        )));
+                    }
+                };
+                self.regs[*dest as usize] = normalize_reg(result);
+            }
+            Op::Slice {
+                base,
+                lower,
+                upper,
+                open_lower,
+                open_upper,
+                dest,
+            } => {
+                let base_value = self.reg_value(*base)?;
+                let result = match base_value {
+                    Value::Null => Value::Null,
+                    Value::List(items) => {
+                        let lower_value = self.reg_value(*lower)?;
+                        let upper_value = self.reg_value(*upper)?;
+                        // An explicitly null bound makes the slice null.
+                        if (!open_lower && lower_value.is_null())
+                            || (!open_upper && upper_value.is_null())
+                        {
+                            Value::Null
+                        } else {
+                            let len = items.len() as i64;
+                            let start = if *open_lower {
+                                0
+                            } else {
+                                slice_bound("lower", &lower_value, len)?
+                            };
+                            let end = if *open_upper {
+                                len as usize
+                            } else {
+                                slice_bound("upper", &upper_value, len)?
+                            };
+                            let end = end.max(start);
+                            Value::List(items[start..end].to_vec().into())
+                        }
+                    }
+                    other => {
+                        return Err(Error::type_error(format!(
+                            "cannot slice {}",
+                            other.type_name()
+                        )));
+                    }
                 };
                 self.regs[*dest as usize] = normalize_reg(result);
             }
@@ -747,16 +977,71 @@ impl<'a> Executor<'a> {
                     .collect::<Result<_>>()?;
                 self.regs[*dest as usize] = Reg::Value(Value::List(values.into()));
             }
+            Op::Property { target, name, dest } => {
+                // Keys may be created by the very statement that reads them,
+                // so resolve lazily and only cache successful lookups.
+                let key = match self.key_ids.get(*name as usize).copied() {
+                    Some(Some(key)) => Some(key),
+                    Some(None) => {
+                        let Value::Text(key_name) = &self.program.constants[*name as usize] else {
+                            return Err(Error::internal("property name is not a string"));
+                        };
+                        let resolved = self.db.property_key_id(key_name);
+                        if resolved.is_some() {
+                            self.key_ids[*name as usize] = resolved;
+                        }
+                        resolved
+                    }
+                    None => return Err(Error::internal("constant index out of range")),
+                };
+                let value = match self.regs[*target as usize].clone() {
+                    Reg::Value(Value::Null) => Value::Null,
+                    Reg::Node(id) | Reg::Value(Value::Node(id)) => match key {
+                        Some(key) => self
+                            .db
+                            .get_node(id)?
+                            .and_then(|record| record.get(key).cloned())
+                            .unwrap_or(Value::Null),
+                        None => Value::Null,
+                    },
+                    Reg::Edge(id) | Reg::Value(Value::Edge(id)) => match key {
+                        Some(key) => self
+                            .db
+                            .get_edge(id)?
+                            .and_then(|record| record.get(key).cloned())
+                            .unwrap_or(Value::Null),
+                        None => Value::Null,
+                    },
+                    Reg::Value(Value::Map(entries)) => {
+                        let Value::Text(name) = &self.program.constants[*name as usize] else {
+                            return Err(Error::internal("property name is not a string"));
+                        };
+                        entries
+                            .iter()
+                            .find(|(entry, _)| entry.as_ref() == name.as_ref())
+                            .map(|(_, value)| value.clone())
+                            .unwrap_or(Value::Null)
+                    }
+                    other => {
+                        return Err(Error::type_error(format!(
+                            "property access on {}",
+                            other.to_value().type_name()
+                        )));
+                    }
+                };
+                self.regs[*dest as usize] = Reg::Value(value);
+            }
             Op::IsNull { src, dest } => {
                 let value = self.reg_value(*src)?;
                 self.regs[*dest as usize] = Reg::Value(Value::Bool(value.is_null()));
             }
             Op::HasLabel { node, label, dest } => {
-                let result = match self.regs[*node as usize].clone() {
-                    Reg::Node(id) => self
+                let label_id = self.resolve_label(*label)?;
+                let result = match (self.regs[*node as usize].clone(), label_id) {
+                    (Reg::Node(id), Some(label)) => self
                         .db
                         .get_node(id)?
-                        .map(|record| record.labels.contains(label))
+                        .map(|record| record.labels.contains(&label))
                         .unwrap_or(false),
                     _ => false,
                 };
@@ -904,6 +1189,27 @@ impl<'a> Executor<'a> {
                     rows.truncate(limit);
                 }
             }
+            Op::CtxHasRows { cursor, dest } => {
+                let has_rows = match &self.cursors[*cursor as usize] {
+                    Cursor::Rows { rows, .. } => !rows.is_empty(),
+                    _ => return Err(Error::internal("CtxHasRows on a non-row cursor")),
+                };
+                self.regs[*dest as usize] = Reg::Value(Value::Bool(has_rows));
+            }
+            Op::CtxToList { cursor, dest } => {
+                let values = match &self.cursors[*cursor as usize] {
+                    Cursor::Rows { rows, .. } => rows
+                        .iter()
+                        .map(|row| {
+                            row.first()
+                                .map(Reg::to_value)
+                                .ok_or_else(|| Error::internal("CtxToList on an empty row"))
+                        })
+                        .collect::<Result<Vec<Value>>>()?,
+                    _ => return Err(Error::internal("CtxToList on a non-row cursor")),
+                };
+                self.regs[*dest as usize] = Reg::Value(Value::List(values.into()));
+            }
             Op::CtxRewind { cursor, target } => {
                 let empty = match &mut self.cursors[*cursor as usize] {
                     Cursor::Rows { rows, pos } => {
@@ -947,6 +1253,142 @@ impl<'a> Executor<'a> {
                         .clone();
                     self.regs[(*start as usize) + idx] = value;
                 }
+            }
+            Op::VarExpandOpen {
+                cursor,
+                src,
+                direction,
+                types,
+                any_type,
+                props,
+                min,
+                max,
+            } => {
+                let types = self.resolve_types(types, *any_type)?;
+                // Expanding from a null binding matches nothing.
+                let items = match (&types, &self.regs[*src as usize]) {
+                    (Some(types), _) if types.is_empty() => Vec::new(),
+                    (_, Reg::Value(Value::Null)) => Vec::new(),
+                    _ => {
+                        let node = self.reg_node(*src)?;
+                        let directions: Vec<Direction> = match direction {
+                            0 => vec![Direction::Out],
+                            1 => vec![Direction::In],
+                            _ => vec![Direction::Out, Direction::In],
+                        };
+                        let filter: &[u32] = types.as_deref().unwrap_or(&[]);
+                        self.db
+                            .var_expand(node, &directions, filter, props, *min, *max)?
+                    }
+                };
+                self.cursors[*cursor as usize] = Cursor::Trails { items, pos: 0 };
+            }
+            Op::ProcedureCallOpen { cursor, name } => {
+                let name = match &self.program.constants[*name as usize] {
+                    Value::Text(name) => name.clone(),
+                    _ => return Err(Error::internal("procedure name is not text")),
+                };
+                let rows = self.procedure_rows(&name)?;
+                self.cursors[*cursor as usize] = Cursor::Rows { rows, pos: 0 };
+            }
+            Op::ShortestOpen {
+                cursor,
+                src,
+                dst,
+                direction,
+                types,
+                any_type,
+                props,
+                min,
+                max,
+                all,
+            } => {
+                let types = self.resolve_types(types, *any_type)?;
+                // A null endpoint matches nothing.
+                let target = match dst {
+                    Some(reg) => match self.reg_value(*reg)? {
+                        Value::Null => Some(None),
+                        _ => Some(Some(self.reg_node(*reg)?)),
+                    },
+                    None => Some(None),
+                };
+                let items = match (&types, &self.regs[*src as usize], target) {
+                    (Some(types), _, _) if types.is_empty() => Vec::new(),
+                    (_, Reg::Value(Value::Null), _) => Vec::new(),
+                    (_, _, None) => Vec::new(),
+                    (_, _, Some(target)) => {
+                        let source = self.reg_node(*src)?;
+                        let directions: Vec<Direction> = match direction {
+                            0 => vec![Direction::Out],
+                            1 => vec![Direction::In],
+                            _ => vec![Direction::Out, Direction::In],
+                        };
+                        let filter: &[u32] = types.as_deref().unwrap_or(&[]);
+                        self.db.var_shortest_paths(
+                            source,
+                            target,
+                            &directions,
+                            filter,
+                            props,
+                            *min,
+                            *max,
+                            *all,
+                        )?
+                    }
+                };
+                self.cursors[*cursor as usize] = Cursor::Trails { items, pos: 0 };
+            }
+            Op::VarExpandNext {
+                cursor,
+                edges,
+                node,
+                target,
+            } => {
+                let next = match &mut self.cursors[*cursor as usize] {
+                    Cursor::Trails { items, pos } => {
+                        let next = items.get(*pos).cloned();
+                        if next.is_some() {
+                            *pos += 1;
+                        }
+                        next
+                    }
+                    _ => return Err(Error::internal("VarExpandNext on a non-trail cursor")),
+                };
+                match next {
+                    Some((edge_ids, end)) => {
+                        let values: Vec<Value> =
+                            edge_ids.iter().map(|id| Value::Edge(*id)).collect();
+                        self.regs[*edges as usize] = Reg::Value(Value::List(values.into()));
+                        self.regs[*node as usize] = Reg::Node(end);
+                    }
+                    None => self.pc = *target as usize,
+                }
+            }
+            Op::BuildPath { dest, elements } => {
+                let mut items: Vec<Value> = Vec::new();
+                for (reg, splice) in elements {
+                    let value = self.reg_value(*reg)?;
+                    match (splice, value) {
+                        (true, Value::List(inner)) => items.extend(inner.iter().cloned()),
+                        (_, value) => items.push(value),
+                    }
+                }
+                self.regs[*dest as usize] = Reg::Value(Value::List(items.into()));
+            }
+            Op::ListPush { list, value } => {
+                let value = self.reg_value(*value)?;
+                let items = match self.reg_value(*list)? {
+                    Value::List(items) => items,
+                    other => {
+                        return Err(Error::internal(format!(
+                            "ListPush on {}",
+                            other.type_name()
+                        )));
+                    }
+                };
+                let mut new_items = items.to_vec();
+                new_items.push(value);
+                self.regs[*list as usize] = Reg::Value(Value::List(new_items.into()));
             }
             Op::UnwindInit { cursor, list } => {
                 let value = self.reg_value(*list)?;
@@ -1010,35 +1452,13 @@ impl<'a> Executor<'a> {
                     .create_edge_unchecked(type_id, src_id, dst_id, props)?;
                 self.regs[*dest as usize] = Reg::Edge(id);
             }
-            Op::MergeNode {
-                labels,
-                props,
-                dest,
-                created,
-            } => {
-                let label_ids = self.resolve_labels(*labels)?;
+            Op::CheckMergeProps { props } => {
                 let props = self.resolve_props(*props)?;
-                let (id, was_created) = self.db.match_or_create_node(&label_ids, props)?;
-                self.regs[*dest as usize] = Reg::Node(id);
-                self.regs[*created as usize] = Reg::Value(Value::Bool(was_created));
-            }
-            Op::MergeEdge {
-                edge_type,
-                src,
-                dst,
-                props,
-                dest,
-                created,
-            } => {
-                let type_id = self.resolve_edge_type(*edge_type)?;
-                let src_id = self.reg_node(*src)?;
-                let dst_id = self.reg_node(*dst)?;
-                let props = self.resolve_props(*props)?;
-                let (id, was_created) = self
-                    .db
-                    .match_or_create_edge(type_id, src_id, dst_id, props)?;
-                self.regs[*dest as usize] = Reg::Edge(id);
-                self.regs[*created as usize] = Reg::Value(Value::Bool(was_created));
+                if props.iter().any(|(_, value)| value.is_null()) {
+                    return Err(Error::unsupported(
+                        "MERGE does not allow null property values",
+                    ));
+                }
             }
             Op::SetProperty { target, key, value } => {
                 let key_name = self.reg_text(*key)?;
@@ -1078,11 +1498,68 @@ impl<'a> Executor<'a> {
                 }
             }
             Op::ReplaceProperties { target, props } => {
+                // `SET x = y` copies y's properties when y is an entity.
+                let value = self.reg_value(*props)?;
+                let entries = match value {
+                    Value::Map(_) => self.resolve_props(*props)?,
+                    Value::Node(id) => self
+                        .db
+                        .get_node(id)?
+                        .map(|record| record.props)
+                        .unwrap_or_default(),
+                    Value::Edge(id) => self
+                        .db
+                        .get_edge(id)?
+                        .map(|record| record.props)
+                        .unwrap_or_default(),
+                    Value::Null => Vec::new(),
+                    other => {
+                        return Err(Error::type_error(format!(
+                            "SET expects a map, node or relationship, got {}",
+                            other.type_name()
+                        )));
+                    }
+                };
                 // Replacing properties on a null binding is a no-op.
+                match self.regs[*target as usize].clone() {
+                    Reg::Value(Value::Null) => {}
+                    Reg::Node(id) => {
+                        self.db.replace_node_properties(id, entries)?;
+                    }
+                    Reg::Edge(id) => {
+                        self.db.replace_edge_properties(id, entries)?;
+                    }
+                    other => {
+                        return Err(Error::type_error(format!(
+                            "SET expects a node or relationship, got {}",
+                            other.to_value().type_name()
+                        )));
+                    }
+                }
+            }
+            Op::MergeProperties { target, props } => {
+                // Merging into a null binding is a no-op. Entries with a null
+                // value remove the property, like `SET n.key = null`.
                 if !matches!(self.regs[*target as usize], Reg::Value(Value::Null)) {
-                    let id = self.reg_node(*target)?;
-                    let props = self.resolve_props(*props)?;
-                    self.db.replace_node_properties(id, props)?;
+                    let entries = self.resolve_props(*props)?;
+                    match self.regs[*target as usize] {
+                        Reg::Node(id) => {
+                            for (key, value) in entries {
+                                self.db.set_node_property(id, key, value)?;
+                            }
+                        }
+                        Reg::Edge(id) => {
+                            for (key, value) in entries {
+                                self.db.set_edge_property(id, key, value)?;
+                            }
+                        }
+                        ref other => {
+                            return Err(Error::type_error(format!(
+                                "SET += expects a node or relationship, got {}",
+                                other.to_value().type_name()
+                            )));
+                        }
+                    }
                 }
             }
             Op::DeleteAny { target, detach } => match self.regs[*target as usize].clone() {
@@ -1188,6 +1665,44 @@ impl<'a> Executor<'a> {
         self.db.ensure_edge_type(&name)
     }
 
+    /// Resolve a label name constant to its id, caching successes only so
+    /// labels created by the same statement are still found.
+    fn resolve_label(&mut self, name: u32) -> Result<Option<u32>> {
+        match self.label_ids.get(name as usize).copied() {
+            Some(Some(id)) => Ok(Some(id)),
+            Some(None) => {
+                let Value::Text(label) = &self.program.constants[name as usize] else {
+                    return Err(Error::internal("label name is not a string"));
+                };
+                let resolved = self.db.label_id(label);
+                if resolved.is_some() {
+                    self.label_ids[name as usize] = resolved;
+                }
+                Ok(resolved)
+            }
+            None => Err(Error::internal("constant index out of range")),
+        }
+    }
+
+    /// Resolve edge type name constants to ids. `None` means the pattern had
+    /// no type filter (any type); `Some` with an empty list means no listed
+    /// type exists, so nothing can match.
+    fn resolve_types(&mut self, names: &[u32], any_type: bool) -> Result<Option<Vec<u32>>> {
+        if any_type {
+            return Ok(None);
+        }
+        let mut types = Vec::with_capacity(names.len());
+        for name in names {
+            let Value::Text(ty) = &self.program.constants[*name as usize] else {
+                return Err(Error::internal("edge type name is not a string"));
+            };
+            if let Some(id) = self.db.edge_type_id(ty) {
+                types.push(id);
+            }
+        }
+        Ok(Some(types))
+    }
+
     fn resolve_props(&mut self, reg: u32) -> Result<Vec<(u32, Value)>> {
         let value = self.reg_value(reg)?;
         let entries = match value {
@@ -1208,6 +1723,33 @@ impl<'a> Executor<'a> {
         Ok(props)
     }
 
+    /// Output rows of a supported built-in procedure.
+    fn procedure_rows(&self, name: &str) -> Result<Vec<Vec<Reg>>> {
+        let schema = self.db.schema();
+        let mut values = Vec::new();
+        let mut id = 1u32;
+        loop {
+            let next = match name {
+                "db.labels" => schema.label_name(id),
+                "db.propertyKeys" => schema.property_key_name(id),
+                "db.relationshipTypes" => schema.edge_type_name(id),
+                other => {
+                    return Err(Error::unsupported(format!(
+                        "procedure `{other}` is not supported"
+                    )));
+                }
+            };
+            match next {
+                Some(entry) => {
+                    values.push(Reg::Value(Value::Text(entry.into())));
+                    id += 1;
+                }
+                None => break,
+            }
+        }
+        Ok(values.into_iter().map(|value| vec![value]).collect())
+    }
+
     fn rows_mut(&mut self, cursor: u32) -> Result<(&mut Vec<Vec<Reg>>, usize)> {
         match &mut self.cursors[cursor as usize] {
             Cursor::Rows { rows, pos } => Ok((rows, *pos)),
@@ -1226,12 +1768,12 @@ impl<'a> Executor<'a> {
         let rows = std::mem::take(rows);
         let prefix = prefix as usize;
         let group_count = groups as usize;
-        let mut table: BTreeMap<Vec<Reg>, Vec<Accumulator>> = BTreeMap::new();
+        let mut table: BTreeMap<Vec<Reg>, Vec<AggState>> = BTreeMap::new();
         for row in &rows {
             let key: Vec<Reg> = row[prefix..prefix + group_count].to_vec();
             let accumulators = table
                 .entry(key)
-                .or_insert_with(|| aggs.iter().map(|spec| Accumulator::new(*spec)).collect());
+                .or_insert_with(|| aggs.iter().map(|spec| AggState::new(*spec)).collect());
             for (idx, spec) in aggs.iter().enumerate() {
                 let input = &row[prefix + group_count + idx];
                 accumulators[idx].step(spec, input);
@@ -1242,15 +1784,15 @@ impl<'a> Executor<'a> {
             // the aggregations' default values (e.g. count(*) = 0).
             table.insert(
                 Vec::new(),
-                aggs.iter().map(|spec| Accumulator::new(*spec)).collect(),
+                aggs.iter().map(|spec| AggState::new(*spec)).collect(),
             );
         }
         let mut output = Vec::with_capacity(table.len());
         for (key, mut accumulators) in table {
             let mut row = key;
             for (idx, spec) in aggs.iter().enumerate() {
-                let accumulator = std::mem::replace(&mut accumulators[idx], Accumulator::Count(0));
-                row.push(Reg::Value(accumulator.finish(spec)));
+                let state = std::mem::replace(&mut accumulators[idx], AggState::new(*spec));
+                row.push(Reg::Value(state.finish(spec)));
             }
             output.push(row);
         }
@@ -1345,6 +1887,37 @@ impl<'a> Executor<'a> {
                 Some(Value::Text(text)) => Value::Int(text.chars().count() as i64),
                 _ => Value::Null,
             }),
+            func::NODES => Ok(match args.first() {
+                Some(Value::List(items)) => Value::List(
+                    items
+                        .iter()
+                        .filter(|item| matches!(item, Value::Node(_)))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                _ => Value::Null,
+            }),
+            func::RELATIONSHIPS => Ok(match args.first() {
+                Some(Value::List(items)) => Value::List(
+                    items
+                        .iter()
+                        .filter(|item| matches!(item, Value::Edge(_)))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .into(),
+                ),
+                _ => Value::Null,
+            }),
+            func::LENGTH => Ok(match args.first() {
+                Some(Value::List(items)) => Value::Int(
+                    items
+                        .iter()
+                        .filter(|item| matches!(item, Value::Edge(_)))
+                        .count() as i64,
+                ),
+                _ => Value::Null,
+            }),
             func::PROPERTIES => match args.first() {
                 Some(Value::Node(id)) => {
                     let Some(record) = self.db.get_node(*id)? else {
@@ -1373,6 +1946,13 @@ impl<'a> Executor<'a> {
                     };
                     Ok(Value::List(self.prop_keys(&record.props).into()))
                 }
+                Some(Value::Map(entries)) => Ok(Value::List(
+                    entries
+                        .iter()
+                        .map(|(key, _)| Value::Text(key.clone()))
+                        .collect::<Vec<_>>()
+                        .into(),
+                )),
                 _ => Ok(Value::Null),
             },
             _ => Err(Error::internal("unknown function code")),
@@ -1405,6 +1985,36 @@ impl<'a> Executor<'a> {
                     .map(|name| Value::Text(std::sync::Arc::from(name)))
             })
             .collect()
+    }
+}
+
+/// One group's aggregation state: the accumulator plus, for `DISTINCT`
+/// aggregations, the values already seen.
+struct AggState {
+    accumulator: Accumulator,
+    seen: std::collections::BTreeSet<Value>,
+}
+
+impl AggState {
+    fn new(spec: AggSpec) -> Self {
+        Self {
+            accumulator: Accumulator::new(spec),
+            seen: std::collections::BTreeSet::new(),
+        }
+    }
+
+    fn step(&mut self, spec: &AggSpec, input: &Reg) {
+        if spec.distinct {
+            let value = input.to_value();
+            if value.is_null() || !self.seen.insert(value) {
+                return;
+            }
+        }
+        self.accumulator.step(spec, input);
+    }
+
+    fn finish(self, spec: &AggSpec) -> Value {
+        self.accumulator.finish(spec)
     }
 }
 
@@ -1670,12 +2280,39 @@ fn numeric_or_concat(
     if let (Value::Text(x), Value::Text(y)) = (a, b) {
         return Ok(Value::Text(format!("{x}{y}").into()));
     }
-    if let (Value::List(x), Value::List(y)) = (a, b) {
-        let mut items = x.to_vec();
-        items.extend(y.iter().cloned());
-        return Ok(Value::List(items.into()));
+    match (a, b) {
+        (Value::List(x), Value::List(y)) => {
+            let mut items = x.to_vec();
+            items.extend(y.iter().cloned());
+            return Ok(Value::List(items.into()));
+        }
+        // A scalar concatenates onto a list on either side.
+        (Value::List(x), other) => {
+            let mut items = x.to_vec();
+            items.push(other.clone());
+            return Ok(Value::List(items.into()));
+        }
+        (other, Value::List(y)) => {
+            let mut items = vec![other.clone()];
+            items.extend(y.iter().cloned());
+            return Ok(Value::List(items.into()));
+        }
+        _ => {}
     }
     numeric(a, b, float_op, int_op)
+}
+
+/// Resolve a slice bound against the list length: negative bounds count from
+/// the end and everything is clamped into range.
+fn slice_bound(which: &str, value: &Value, len: i64) -> Result<usize> {
+    let Value::Int(index) = value else {
+        return Err(Error::type_error(format!(
+            "list slice {which} bound must be an integer, got {}",
+            value.type_name()
+        )));
+    };
+    let resolved = if *index < 0 { len + index } else { *index };
+    Ok(resolved.clamp(0, len) as usize)
 }
 
 fn type_error(operation: &str, a: &Value, b: &Value) -> Error {
