@@ -379,6 +379,54 @@ impl Codegen {
                 ctx.window_len = cg.next_reg - ctx.window_start;
                 out(cg, ctx)
             }),
+            Plan::PatternPredicate { input, inner, var } => {
+                self.compile(input, ctx, &mut |cg, outer_ctx| {
+                    let cursor = cg.alloc_cursor();
+                    cg.emit(Op::CollectOpen { cursor });
+                    cg.compile(inner, outer_ctx, &mut |cg, inner_ctx| {
+                        cg.emit(Op::CollectRow {
+                            cursor,
+                            start: inner_ctx.window_start,
+                            count: inner_ctx.window_len,
+                        });
+                        Ok(())
+                    })?;
+                    let dest = cg.alloc_reg();
+                    cg.emit(Op::CtxHasRows { cursor, dest });
+                    let mut out_ctx = outer_ctx.clone();
+                    out_ctx.vars.insert(var.clone(), dest);
+                    out(cg, &mut out_ctx)
+                })
+            }
+            Plan::PatternComprehension {
+                input,
+                inner,
+                project,
+                var,
+            } => self.compile(input, ctx, &mut |cg, outer_ctx| {
+                let cursor = cg.alloc_cursor();
+                cg.emit(Op::CollectOpen { cursor });
+                let mut slot = 0;
+                cg.compile(inner, outer_ctx, &mut |cg, inner_ctx| {
+                    let value = cg.compile_expr(project, inner_ctx)?;
+                    slot = cg.alloc_reg();
+                    cg.emit(Op::Copy {
+                        dest: slot,
+                        src: value,
+                    });
+                    cg.emit(Op::CollectRow {
+                        cursor,
+                        start: slot,
+                        count: 1,
+                    });
+                    Ok(())
+                })?;
+                let dest = cg.alloc_reg();
+                cg.emit(Op::CtxToList { cursor, dest });
+                let mut out_ctx = outer_ctx.clone();
+                out_ctx.vars.insert(var.clone(), dest);
+                out(cg, &mut out_ctx)
+            }),
             Plan::OptionalMatch { input, inner, vars } => {
                 self.compile(input, ctx, &mut |cg, outer_ctx| {
                     let cursor = cg.alloc_cursor();
@@ -1587,6 +1635,11 @@ impl Codegen {
                 } else {
                     self.emit(Op::Copy { dest, src: test });
                 }
+            }
+            Expr::Pattern(_) | Expr::PatternComprehension { .. } => {
+                return Err(Error::syntax(
+                    "pattern expressions are only allowed in predicates",
+                ));
             }
             Expr::LabelCheck { expr, labels } => {
                 let node_reg = self.compile_expr(expr, ctx)?;

@@ -123,6 +123,17 @@ pub enum Expr {
         /// Exclusive end, from the end when negative.
         upper: Option<Box<Expr>>,
     },
+    /// Pattern predicate `(a)-[:T]->(b)`; true when the pattern matches.
+    Pattern(Box<PatternPath>),
+    /// `[p = (a)-[:T]->(b) WHERE predicate | projection]` comprehension.
+    PatternComprehension {
+        /// Pattern matched for every input row.
+        path: Box<PatternPath>,
+        /// Optional filter.
+        predicate: Option<Box<Expr>>,
+        /// Value produced per match.
+        projection: Box<Expr>,
+    },
     /// Unary operation.
     Unary {
         /// Operator.

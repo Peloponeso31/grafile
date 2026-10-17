@@ -395,6 +395,55 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// Parse a pattern predicate when the parenthesis starts one; restore
+    /// the position and return `None` when it does not.
+    fn try_parse_pattern_expr(&mut self) -> Result<Option<Expr>> {
+        let saved = self.pos;
+        match self.parse_path() {
+            Ok(path) if pattern_expression_shape(&path) => Ok(Some(Expr::Pattern(Box::new(path)))),
+            _ => {
+                self.pos = saved;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Parse `[p = (a)-[:T]->(b) WHERE predicate | projection]`; restore the
+    /// position and return `None` when the bracket does not start one.
+    fn try_parse_pattern_comprehension(&mut self) -> Result<Option<Expr>> {
+        let starts_pattern = matches!(self.peek(), Some(Token::LParen))
+            || (matches!(self.peek(), Some(Token::Ident) | Some(Token::EscapedIdent))
+                && self.tokens.get(self.pos + 1).map(|entry| entry.token) == Some(Token::Equals));
+        if !starts_pattern {
+            return Ok(None);
+        }
+        let saved = self.pos;
+        let Ok(path) = self.parse_path() else {
+            self.pos = saved;
+            return Ok(None);
+        };
+        if path.segments.is_empty() {
+            self.pos = saved;
+            return Ok(None);
+        }
+        let predicate = if self.eat(Token::Where) {
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        if !self.eat(Token::Pipe) {
+            self.pos = saved;
+            return Ok(None);
+        }
+        let projection = self.parse_expr()?;
+        self.expect(Token::RBracket, "']' to close a pattern comprehension")?;
+        Ok(Some(Expr::PatternComprehension {
+            path: Box::new(path),
+            predicate,
+            projection: Box::new(projection),
+        }))
+    }
+
     fn parse_node_pattern(&mut self) -> Result<NodePattern> {
         self.expect(Token::LParen, "'(' to start a node pattern")?;
         let mut pattern = NodePattern::default();
@@ -847,6 +896,9 @@ impl<'a> Parser<'a> {
                 }
             }
             Token::LParen => {
+                if let Some(pattern) = self.try_parse_pattern_expr()? {
+                    return Ok(pattern);
+                }
                 self.advance();
                 let expr = self.parse_expr()?;
                 self.expect(Token::RParen, "')' to close a parenthesized expression")?;
@@ -869,6 +921,9 @@ impl<'a> Parser<'a> {
             }
             Token::LBracket => {
                 self.advance();
+                if let Some(comprehension) = self.try_parse_pattern_comprehension()? {
+                    return Ok(comprehension);
+                }
                 // `[x IN list WHERE predicate | projection]`.
                 if matches!(self.peek(), Some(Token::Ident) | Some(Token::EscapedIdent))
                     && self.tokens.get(self.pos + 1).map(|entry| entry.token) == Some(Token::In)
@@ -1029,6 +1084,15 @@ fn unescape_string(raw: &str) -> Result<String> {
 
 fn describe(token: Token) -> String {
     format!("{token:?}")
+}
+
+/// A pattern used as an expression needs a relationship or an element
+/// constraint; `(x)` alone stays a parenthesized expression.
+fn pattern_expression_shape(path: &PatternPath) -> bool {
+    !path.segments.is_empty()
+        || path.variable.is_some()
+        || !path.start.labels.is_empty()
+        || path.start.properties.is_some()
 }
 
 #[cfg(test)]

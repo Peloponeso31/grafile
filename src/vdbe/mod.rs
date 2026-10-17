@@ -325,6 +325,20 @@ pub enum Op {
         /// Jump target when exhausted.
         target: u32,
     },
+    /// Test whether a row cursor holds any rows.
+    CtxHasRows {
+        /// Cursor slot.
+        cursor: u32,
+        /// Destination register.
+        dest: u32,
+    },
+    /// Collect the first register of every row into a list.
+    CtxToList {
+        /// Cursor slot.
+        cursor: u32,
+        /// Destination register.
+        dest: u32,
+    },
     /// Load the current row into a register window.
     CtxData {
         /// Cursor slot.
@@ -1144,6 +1158,27 @@ impl<'a> Executor<'a> {
                 if let Some(limit) = limit {
                     rows.truncate(limit);
                 }
+            }
+            Op::CtxHasRows { cursor, dest } => {
+                let has_rows = match &self.cursors[*cursor as usize] {
+                    Cursor::Rows { rows, .. } => !rows.is_empty(),
+                    _ => return Err(Error::internal("CtxHasRows on a non-row cursor")),
+                };
+                self.regs[*dest as usize] = Reg::Value(Value::Bool(has_rows));
+            }
+            Op::CtxToList { cursor, dest } => {
+                let values = match &self.cursors[*cursor as usize] {
+                    Cursor::Rows { rows, .. } => rows
+                        .iter()
+                        .map(|row| {
+                            row.first()
+                                .map(Reg::to_value)
+                                .ok_or_else(|| Error::internal("CtxToList on an empty row"))
+                        })
+                        .collect::<Result<Vec<Value>>>()?,
+                    _ => return Err(Error::internal("CtxToList on a non-row cursor")),
+                };
+                self.regs[*dest as usize] = Reg::Value(Value::List(values.into()));
             }
             Op::CtxRewind { cursor, target } => {
                 let empty = match &mut self.cursors[*cursor as usize] {

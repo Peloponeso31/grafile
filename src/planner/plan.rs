@@ -147,6 +147,26 @@ pub enum Plan {
         /// variable-length relationship lists into individual edges.
         elements: Vec<(String, bool)>,
     },
+    /// Pattern predicate: binds `var` to whether the inner plan matches.
+    PatternPredicate {
+        /// Input plan.
+        input: Box<Plan>,
+        /// Pattern plan, rooted at `Empty`, referencing input variables.
+        inner: Box<Plan>,
+        /// Hidden boolean variable.
+        var: String,
+    },
+    /// Pattern comprehension: binds `var` to the projected list.
+    PatternComprehension {
+        /// Input plan.
+        input: Box<Plan>,
+        /// Pattern plan, rooted at `Empty`, referencing input variables.
+        inner: Box<Plan>,
+        /// Value produced per match.
+        project: Expr,
+        /// Hidden list variable.
+        var: String,
+    },
     /// Match a pattern per input row, keeping the row with null bindings when
     /// the pattern does not match.
     OptionalMatch {
@@ -389,6 +409,18 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
                 "{pad}BindPath {var} ({} elements)\n",
                 elements.len()
             ));
+            explain(input, indent + 1, out);
+        }
+        Plan::PatternPredicate { input, inner, var } => {
+            out.push_str(&format!("{pad}PatternPredicate {var}\n"));
+            explain(inner, indent + 1, out);
+            explain(input, indent + 1, out);
+        }
+        Plan::PatternComprehension {
+            input, inner, var, ..
+        } => {
+            out.push_str(&format!("{pad}PatternComprehension {var}\n"));
+            explain(inner, indent + 1, out);
             explain(input, indent + 1, out);
         }
         Plan::OptionalMatch { input, inner, vars } => {

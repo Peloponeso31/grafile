@@ -46,6 +46,20 @@ enum VarKind {
     Path,
 }
 
+/// Where a pattern expression appears, which decides whether plan-level
+/// extraction is legal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PatternContext {
+    /// Predicate position: bare patterns and comprehensions are legal.
+    Predicate,
+    /// Value position: only comprehensions are legal.
+    Value,
+    /// Inside a list-comprehension, quantifier or `reduce` body, where the
+    /// code generator evaluates the expression per element without plan
+    /// nodes, so pattern expressions cannot be extracted.
+    Nested,
+}
+
 /// Planner state.
 struct Planner<'a> {
     db: &'a mut Database,
@@ -248,10 +262,12 @@ impl<'a> Planner<'a> {
             self.plan_path(path, plan, scope)?;
         }
         if let Some(predicate) = &clause.where_clause {
-            validate_expr(predicate, scope)?;
+            let mut predicate = predicate.clone();
+            self.extract_patterns(&mut predicate, plan, scope, PatternContext::Predicate)?;
+            validate_expr(&predicate, scope)?;
             *plan = Plan::Filter {
                 input: Box::new(plan.clone()),
-                predicate: predicate.clone(),
+                predicate,
             };
         }
         Ok(())
@@ -272,10 +288,17 @@ impl<'a> Planner<'a> {
             self.plan_path(path, &mut inner, &mut inner_scope)?;
         }
         if let Some(predicate) = &clause.where_clause {
-            validate_expr(predicate, &inner_scope)?;
+            let mut predicate = predicate.clone();
+            self.extract_patterns(
+                &mut predicate,
+                &mut inner,
+                &mut inner_scope,
+                PatternContext::Predicate,
+            )?;
+            validate_expr(&predicate, &inner_scope)?;
             inner = Plan::Filter {
                 input: Box::new(inner),
-                predicate: predicate.clone(),
+                predicate,
             };
         }
         let vars: Vec<String> = inner_scope
@@ -290,6 +313,250 @@ impl<'a> Planner<'a> {
             vars,
         };
         Ok(())
+    }
+
+    // ---- Pattern expressions ----
+
+    /// Extract pattern expressions into hidden variables bound by wrapping
+    /// plan nodes: pattern predicates become booleans, pattern
+    /// comprehensions become lists.
+    fn extract_patterns(
+        &mut self,
+        expr: &mut Expr,
+        plan: &mut Plan,
+        scope: &mut FastMap<String, VarKind>,
+        context: PatternContext,
+    ) -> Result<()> {
+        if let Expr::Function { name, args, .. } = expr
+            && name.eq_ignore_ascii_case("exists")
+            && args.len() == 1
+        {
+            self.extract_patterns(&mut args[0], plan, scope, PatternContext::Predicate)?;
+            let arg = args[0].clone();
+            *expr = match arg {
+                Expr::Variable(_) => arg,
+                other => Expr::IsNull {
+                    expr: Box::new(other),
+                    negated: true,
+                },
+            };
+            return Ok(());
+        }
+        match expr {
+            Expr::Pattern(_) | Expr::PatternComprehension { .. } => {
+                if context == PatternContext::Nested {
+                    return Err(Error::unsupported(
+                        "pattern expressions inside list comprehensions are not supported",
+                    ));
+                }
+                if context == PatternContext::Value && matches!(expr, Expr::Pattern(_)) {
+                    return Err(Error::syntax(
+                        "pattern expressions are only allowed in predicates",
+                    ));
+                }
+                match expr {
+                    Expr::Pattern(path) => {
+                        let hidden = self.extract_pattern_predicate(path, plan, scope)?;
+                        *expr = Expr::Variable(hidden);
+                    }
+                    Expr::PatternComprehension {
+                        path,
+                        predicate,
+                        projection,
+                    } => {
+                        let hidden = self.extract_pattern_comprehension(
+                            path, predicate, projection, plan, scope,
+                        )?;
+                        *expr = Expr::Variable(hidden);
+                    }
+                    _ => return Err(Error::internal("pattern extraction mismatch")),
+                }
+                Ok(())
+            }
+            Expr::Unary {
+                op: UnaryOp::Not,
+                expr: inner,
+            } => self.extract_patterns(inner, plan, scope, PatternContext::Predicate),
+            Expr::Binary { op, left, right } => {
+                let context = if matches!(op, BinaryOp::And | BinaryOp::Or | BinaryOp::Xor)
+                    && context != PatternContext::Nested
+                {
+                    PatternContext::Predicate
+                } else {
+                    context
+                };
+                self.extract_patterns(left, plan, scope, context)?;
+                self.extract_patterns(right, plan, scope, context)
+            }
+            Expr::Function { args, .. } => {
+                for arg in args.iter_mut() {
+                    self.extract_patterns(arg, plan, scope, context)?;
+                }
+                Ok(())
+            }
+            Expr::Quantifier {
+                list, predicate, ..
+            } => {
+                self.extract_patterns(list, plan, scope, context)?;
+                self.extract_patterns(predicate, plan, scope, PatternContext::Nested)
+            }
+            Expr::ListComprehension {
+                list,
+                predicate,
+                projection,
+                ..
+            } => {
+                self.extract_patterns(list, plan, scope, context)?;
+                if let Some(predicate) = predicate {
+                    self.extract_patterns(predicate, plan, scope, PatternContext::Nested)?;
+                }
+                if let Some(projection) = projection {
+                    self.extract_patterns(projection, plan, scope, PatternContext::Nested)?;
+                }
+                Ok(())
+            }
+            Expr::Case {
+                subject,
+                alternatives,
+                default,
+            } => {
+                if let Some(subject) = subject {
+                    self.extract_patterns(subject, plan, scope, context)?;
+                }
+                for (when, then) in alternatives.iter_mut() {
+                    self.extract_patterns(when, plan, scope, PatternContext::Predicate)?;
+                    self.extract_patterns(then, plan, scope, context)?;
+                }
+                if let Some(default) = default {
+                    self.extract_patterns(default, plan, scope, context)?;
+                }
+                Ok(())
+            }
+            Expr::Reduce {
+                init,
+                list,
+                expression,
+                ..
+            } => {
+                self.extract_patterns(init, plan, scope, context)?;
+                self.extract_patterns(list, plan, scope, context)?;
+                self.extract_patterns(expression, plan, scope, PatternContext::Nested)
+            }
+            Expr::List(items) => {
+                for item in items.iter_mut() {
+                    self.extract_patterns(item, plan, scope, context)?;
+                }
+                Ok(())
+            }
+            Expr::Map(entries) => {
+                for (_, value) in entries.iter_mut() {
+                    self.extract_patterns(value, plan, scope, context)?;
+                }
+                Ok(())
+            }
+            Expr::Unary { expr: inner, .. }
+            | Expr::Property { base: inner, .. }
+            | Expr::IsNull { expr: inner, .. }
+            | Expr::LabelCheck { expr: inner, .. } => {
+                self.extract_patterns(inner, plan, scope, context)
+            }
+            Expr::Subscript { base, index } => {
+                self.extract_patterns(base, plan, scope, context)?;
+                self.extract_patterns(index, plan, scope, context)
+            }
+            Expr::Slice { base, lower, upper } => {
+                self.extract_patterns(base, plan, scope, context)?;
+                if let Some(lower) = lower {
+                    self.extract_patterns(lower, plan, scope, context)?;
+                }
+                match upper {
+                    Some(upper) => self.extract_patterns(upper, plan, scope, context),
+                    None => Ok(()),
+                }
+            }
+            Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => Ok(()),
+        }
+    }
+
+    /// Wrap the plan in a pattern predicate node: the inner pattern plan runs
+    /// per row and binds a hidden boolean.
+    fn extract_pattern_predicate(
+        &mut self,
+        path: &PatternPath,
+        plan: &mut Plan,
+        scope: &mut FastMap<String, VarKind>,
+    ) -> Result<String> {
+        for node in std::iter::once(&path.start).chain(path.segments.iter().map(|s| &s.node)) {
+            if let Some(var) = &node.variable
+                && !scope.contains_key(var)
+            {
+                return Err(undefined_variable(var));
+            }
+        }
+        for segment in &path.segments {
+            if let Some(var) = &segment.relationship.variable
+                && !scope.contains_key(var)
+            {
+                return Err(undefined_variable(var));
+            }
+        }
+        let mut inner = Plan::Empty;
+        let mut inner_scope = scope.clone();
+        self.plan_path(path, &mut inner, &mut inner_scope)?;
+        let hidden = self.anon_name("pred");
+        scope.insert(hidden.clone(), VarKind::Value);
+        *plan = Plan::PatternPredicate {
+            input: Box::new(std::mem::replace(plan, Plan::Empty)),
+            inner: Box::new(inner),
+            var: hidden.clone(),
+        };
+        Ok(hidden)
+    }
+
+    /// Wrap the plan in a pattern comprehension node: the inner pattern plan
+    /// runs per row and binds a hidden list of projected values.
+    fn extract_pattern_comprehension(
+        &mut self,
+        path: &PatternPath,
+        predicate: &Option<Box<Expr>>,
+        projection: &Expr,
+        plan: &mut Plan,
+        scope: &mut FastMap<String, VarKind>,
+    ) -> Result<String> {
+        let mut inner = Plan::Empty;
+        let mut inner_scope = scope.clone();
+        self.plan_path(path, &mut inner, &mut inner_scope)?;
+        if let Some(predicate) = predicate {
+            let mut predicate = (**predicate).clone();
+            self.extract_patterns(
+                &mut predicate,
+                &mut inner,
+                &mut inner_scope,
+                PatternContext::Predicate,
+            )?;
+            validate_expr(&predicate, &inner_scope)?;
+            inner = Plan::Filter {
+                input: Box::new(inner),
+                predicate,
+            };
+        }
+        let mut projection = projection.clone();
+        self.extract_patterns(
+            &mut projection,
+            &mut inner,
+            &mut inner_scope,
+            PatternContext::Value,
+        )?;
+        validate_expr(&projection, &inner_scope)?;
+        let hidden = self.anon_name("comp");
+        scope.insert(hidden.clone(), VarKind::Value);
+        *plan = Plan::PatternComprehension {
+            input: Box::new(std::mem::replace(plan, Plan::Empty)),
+            inner: Box::new(inner),
+            project: projection,
+            var: hidden.clone(),
+        };
+        Ok(hidden)
     }
 
     fn plan_path(
@@ -1053,27 +1320,38 @@ impl<'a> Planner<'a> {
         if expanded.is_empty() {
             return Err(Error::syntax("RETURN/WITH requires at least one item"));
         }
+        let mut input = input;
+        let mut scope = scope.clone();
+        for (expr, _) in expanded.iter_mut() {
+            self.extract_patterns(expr, &mut input, &mut scope, PatternContext::Value)?;
+        }
         for (expr, _) in &expanded {
-            validate_expr(expr, scope)?;
+            validate_expr(expr, &scope)?;
         }
 
         // A `WITH ... WHERE` may reference variables of the incoming scope
         // (not only the projected aliases); those predicates filter before
         // the projection. Aliases take precedence when they resolve.
-        let mut input = input;
         let mut filter_after = None;
         if let Some(predicate) = where_clause {
             let projected: FastMap<String, VarKind> = expanded
                 .iter()
-                .map(|(expr, name)| (name.clone(), expr_kind(expr, scope)))
+                .map(|(expr, name)| (name.clone(), expr_kind(expr, &scope)))
                 .collect();
             if validate_expr(predicate, &projected).is_ok() {
                 filter_after = Some(predicate.clone());
             } else {
-                validate_expr(predicate, scope)?;
+                let mut predicate = predicate.clone();
+                self.extract_patterns(
+                    &mut predicate,
+                    &mut input,
+                    &mut scope,
+                    PatternContext::Predicate,
+                )?;
+                validate_expr(&predicate, &scope)?;
                 input = Plan::Filter {
                     input: Box::new(input),
-                    predicate: predicate.clone(),
+                    predicate,
                 };
             }
         }
@@ -1094,7 +1372,7 @@ impl<'a> Planner<'a> {
             if let Some((func, argument, star, distinct)) = aggregate_call(expr)? {
                 aggs.push(AggItem {
                     func,
-                    argument: aggregate_argument(func, argument, star, scope)?,
+                    argument: aggregate_argument(func, argument, star, &scope)?,
                     distinct,
                     name: name.clone(),
                 });
@@ -1106,7 +1384,7 @@ impl<'a> Planner<'a> {
                     let hidden = format!("  agg{}", aggs.len());
                     aggs.push(AggItem {
                         func,
-                        argument: aggregate_argument(func, argument, star, scope)?,
+                        argument: aggregate_argument(func, argument, star, &scope)?,
                         distinct,
                         name: hidden.clone(),
                     });
@@ -1120,7 +1398,7 @@ impl<'a> Planner<'a> {
                         && !references_aggregation(sub, &aggs)
                     {
                         let hidden = format!("  grp{}", groups.len());
-                        validate_expr(sub, scope)?;
+                        validate_expr(sub, &scope)?;
                         groups.push((sub.clone(), hidden.clone()));
                         return Ok(Some(Expr::Variable(hidden)));
                     }
@@ -1153,7 +1431,7 @@ impl<'a> Planner<'a> {
         if !order.is_empty() {
             let visible_names: FastMap<String, VarKind> = expanded
                 .iter()
-                .map(|(expr, name)| (name.clone(), expr_kind(expr, scope)))
+                .map(|(expr, name)| (name.clone(), expr_kind(expr, &scope)))
                 .collect();
             for key in order {
                 let expr =
@@ -1162,7 +1440,7 @@ impl<'a> Planner<'a> {
                     } else if validate_expr(&key.expr, &visible_names).is_ok() {
                         key.expr.clone()
                     } else if aggs.is_empty() && !distinct {
-                        validate_expr(&key.expr, scope)?;
+                        validate_expr(&key.expr, &scope)?;
                         let hidden = format!("  sort{}", hidden_keys.len());
                         hidden_keys.push((key.expr.clone(), hidden.clone()));
                         Expr::Variable(hidden)
@@ -1190,7 +1468,7 @@ impl<'a> Planner<'a> {
                 items: projection_items.clone(),
             };
             for (expr, name) in &projection_items {
-                new_scope.insert(name.clone(), expr_kind(expr, scope));
+                new_scope.insert(name.clone(), expr_kind(expr, &scope));
             }
         } else {
             plan = Plan::Aggregate {
@@ -1288,7 +1566,7 @@ impl<'a> Planner<'a> {
         // Output scope maps names to output registers; nodes keep their kind.
         let mut output_scope = FastMap::new();
         for (expr, name) in &expanded {
-            output_scope.insert(name.clone(), expr_kind(expr, scope));
+            output_scope.insert(name.clone(), expr_kind(expr, &scope));
         }
         let _ = std::mem::replace(&mut new_scope, output_scope);
         Ok((plan, new_scope, columns))
@@ -1476,6 +1754,9 @@ fn validate_expr(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
             inner.insert(accumulator.clone(), VarKind::Value);
             validate_expr(expression, &inner)
         }
+        Expr::Pattern(_) | Expr::PatternComprehension { .. } => Err(Error::syntax(
+            "pattern expressions are only allowed in predicates",
+        )),
         Expr::Unary { expr, .. } => validate_expr(expr, scope),
         Expr::Binary { left, right, .. } => {
             validate_expr(left, scope)?;
@@ -1531,6 +1812,10 @@ fn expr_kind(expr: &Expr, scope: &FastMap<String, VarKind>) -> VarKind {
 fn default_name(expr: &Expr) -> String {
     match expr {
         Expr::Variable(name) => name.clone(),
+        Expr::Pattern(_) => "pattern".to_owned(),
+        Expr::PatternComprehension { projection, .. } => {
+            format!("[pattern | {}]", default_name(projection))
+        }
         Expr::Parameter(name) => format!("${name}"),
         Expr::Literal(value) => literal_text(value),
         Expr::Property { base, key } => format!("{}.{}", property_base_name(base), key),
@@ -1759,6 +2044,19 @@ fn rewrite_expr(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>) -
     }
     Ok(match expr {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => expr.clone(),
+        Expr::Pattern(path) => Expr::Pattern(Box::new(rewrite_pattern(path, f)?)),
+        Expr::PatternComprehension {
+            path,
+            predicate,
+            projection,
+        } => Expr::PatternComprehension {
+            path: Box::new(rewrite_pattern(path, f)?),
+            predicate: predicate
+                .as_ref()
+                .map(|predicate| rewrite_expr(predicate, f).map(Box::new))
+                .transpose()?,
+            projection: Box::new(rewrite_expr(projection, f)?),
+        },
         Expr::Property { base, key } => Expr::Property {
             base: Box::new(rewrite_expr(base, f)?),
             key: key.clone(),
@@ -1889,11 +2187,72 @@ fn rewrite_expr(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>) -
     })
 }
 
+/// Rewrite the inline property expressions of a pattern path.
+fn rewrite_pattern(
+    path: &PatternPath,
+    f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>,
+) -> Result<PatternPath> {
+    let mut path = path.clone();
+    if let Some(properties) = &path.start.properties {
+        path.start.properties = Some(rewrite_expr(properties, f)?);
+    }
+    for segment in &mut path.segments {
+        if let Some(properties) = &segment.relationship.properties {
+            segment.relationship.properties = Some(rewrite_expr(properties, f)?);
+        }
+    }
+    Ok(path)
+}
+
+/// Whether the inline property expressions of a pattern path reference a
+/// variable satisfying `pred`.
+fn pattern_references(path: &PatternPath, pred: &mut dyn FnMut(&str) -> bool) -> bool {
+    path.start
+        .properties
+        .as_ref()
+        .is_some_and(|expr| expr_references(expr, pred))
+        || path.segments.iter().any(|segment| {
+            segment
+                .relationship
+                .properties
+                .as_ref()
+                .is_some_and(|expr| expr_references(expr, pred))
+        })
+}
+
+/// Whether the inline property expressions of a pattern path contain an
+/// aggregation.
+fn pattern_has_aggregation(path: &PatternPath) -> bool {
+    path.start
+        .properties
+        .as_ref()
+        .is_some_and(contains_aggregation)
+        || path.segments.iter().any(|segment| {
+            segment
+                .relationship
+                .properties
+                .as_ref()
+                .is_some_and(contains_aggregation)
+        })
+}
+
 /// Whether any variable reference in `expr` satisfies `pred`.
 fn expr_references(expr: &Expr, pred: &mut dyn FnMut(&str) -> bool) -> bool {
     match expr {
         Expr::Variable(name) => pred(name),
         Expr::Literal(_) | Expr::Parameter(_) => false,
+        Expr::Pattern(path) => pattern_references(path, pred),
+        Expr::PatternComprehension {
+            path,
+            predicate,
+            projection,
+        } => {
+            pattern_references(path, pred)
+                || predicate
+                    .as_deref()
+                    .is_some_and(|e| expr_references(e, pred))
+                || expr_references(projection, pred)
+        }
         Expr::Property { base, .. } => expr_references(base, pred),
         Expr::Subscript { base, index } => {
             expr_references(base, pred) || expr_references(index, pred)
@@ -1975,6 +2334,16 @@ fn references_aggregation(expr: &Expr, aggs: &[AggItem]) -> bool {
 /// predicate or `reduce` expression, where openCypher forbids it.
 fn has_aggregation_inside_comprehension(expr: &Expr) -> bool {
     match expr {
+        Expr::PatternComprehension {
+            path,
+            predicate,
+            projection,
+        } => {
+            pattern_has_aggregation(path)
+                || predicate.as_deref().is_some_and(contains_aggregation)
+                || contains_aggregation(projection)
+        }
+        Expr::Pattern(path) => pattern_has_aggregation(path),
         Expr::ListComprehension {
             list,
             predicate,
@@ -2104,6 +2473,16 @@ fn contains_aggregation(expr: &Expr) -> bool {
                 || default.as_ref().is_some_and(|d| contains_aggregation(d))
         }
         Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => contains_aggregation(expr),
+        Expr::Pattern(path) => pattern_has_aggregation(path),
+        Expr::PatternComprehension {
+            path,
+            predicate,
+            projection,
+        } => {
+            pattern_has_aggregation(path)
+                || predicate.as_deref().is_some_and(contains_aggregation)
+                || contains_aggregation(projection)
+        }
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => false,
     }
 }
@@ -2234,6 +2613,19 @@ fn substitute_node(node: &mut NodePattern, params: &HashMap<String, Value>) -> R
     Ok(())
 }
 
+/// Substitute parameters inside a pattern's inline property expressions.
+fn substitute_pattern(path: &mut PatternPath, params: &HashMap<String, Value>) -> Result<()> {
+    if let Some(properties) = &mut path.start.properties {
+        substitute_expr(properties, params)?;
+    }
+    for segment in &mut path.segments {
+        if let Some(properties) = &mut segment.relationship.properties {
+            substitute_expr(properties, params)?;
+        }
+    }
+    Ok(())
+}
+
 fn substitute_expr(expr: &mut Expr, params: &HashMap<String, Value>) -> Result<()> {
     match expr {
         Expr::Parameter(name) => {
@@ -2245,6 +2637,18 @@ fn substitute_expr(expr: &mut Expr, params: &HashMap<String, Value>) -> Result<(
             })?;
             *expr = Expr::Literal(value);
             Ok(())
+        }
+        Expr::Pattern(path) => substitute_pattern(path, params),
+        Expr::PatternComprehension {
+            path,
+            predicate,
+            projection,
+        } => {
+            substitute_pattern(path, params)?;
+            if let Some(predicate) = predicate {
+                substitute_expr(predicate, params)?;
+            }
+            substitute_expr(projection, params)
         }
         Expr::Property { base, .. } => substitute_expr(base, params),
         Expr::Subscript { base, index } => {
