@@ -674,3 +674,112 @@ fn names(items: &[(Expr, String)]) -> String {
         .collect::<Vec<_>>()
         .join(", ")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::record::Value;
+
+    fn render(plan: &Plan) -> String {
+        let mut out = String::new();
+        explain(plan, 0, &mut out);
+        out
+    }
+
+    #[test]
+    fn renders_leaf_operators() {
+        assert_eq!(render(&Plan::Empty), "Empty\n");
+        assert_eq!(render(&Plan::EmptyResult), "EmptyResult\n");
+    }
+
+    #[test]
+    fn renders_node_scan_with_seek_and_residuals() {
+        let plan = Plan::NodeScan {
+            input: Box::new(Plan::Empty),
+            var: "n".to_owned(),
+            label: Some("Person".to_owned()),
+            seek: Some(IndexSeek {
+                index_id: 7,
+                key_id: 1,
+                value: Value::Int(3),
+            }),
+            props: vec![("name".to_owned(), Value::from("x"))],
+        };
+        assert_eq!(
+            render(&plan),
+            "NodeScan n label=Some(\"Person\") seek=7 props=1\n  Empty\n"
+        );
+    }
+
+    #[test]
+    fn renders_var_expand_type_filters() {
+        let plan = |types: Option<Vec<String>>| Plan::VarExpand {
+            input: Box::new(Plan::Empty),
+            src: "a".to_owned(),
+            edge: None,
+            dst: "b".to_owned(),
+            direction: crate::cypher::RelDirection::Outgoing,
+            types,
+            props: Vec::new(),
+            min: 1,
+            max: None,
+            reverse: false,
+            nodes: None,
+        };
+        assert!(render(&plan(None)).starts_with("VarExpand a-[None:any Outgoing 1..None]->b"));
+        assert!(render(&plan(Some(Vec::new()))).starts_with("VarExpand a-[None:none Outgoing"));
+        let named = plan(Some(vec!["A".to_owned(), "B".to_owned()]));
+        assert!(render(&named).starts_with("VarExpand a-[None:A|B Outgoing"));
+    }
+
+    #[test]
+    fn renders_pipeline_chain_in_nesting_order() {
+        let plan = Plan::Limit {
+            input: Box::new(Plan::Skip {
+                input: Box::new(Plan::Sort {
+                    input: Box::new(Plan::Empty),
+                    keys: vec![(Expr::Variable("n".to_owned()), true)],
+                }),
+                count: Expr::Literal(Value::Int(1)),
+            }),
+            count: Expr::Literal(Value::Int(2)),
+        };
+        assert_eq!(
+            render(&plan),
+            "Limit\n  Skip\n    Sort 1 keys\n      Empty\n"
+        );
+    }
+
+    #[test]
+    fn renders_detach_delete_and_union_kinds() {
+        let delete = Plan::Delete {
+            input: Box::new(Plan::Empty),
+            exprs: Vec::new(),
+            detach: true,
+        };
+        assert!(render(&delete).starts_with("DetachDelete\n"));
+        let union = Plan::Union {
+            parts: vec![Plan::Empty, Plan::Empty],
+            all: false,
+        };
+        assert!(render(&union).starts_with("Union distinct\n"));
+    }
+
+    #[test]
+    fn renders_shortest_path_all_flag() {
+        let plan = Plan::ShortestPath {
+            input: Box::new(Plan::Empty),
+            src: "a".to_owned(),
+            dst: "b".to_owned(),
+            edge: None,
+            direction: crate::cypher::RelDirection::Outgoing,
+            types: None,
+            props: Vec::new(),
+            min: 1,
+            max: None,
+            all: true,
+            nodes: None,
+        };
+        assert!(render(&plan).starts_with("ShortestPath a -> b (all)\n"));
+    }
+}

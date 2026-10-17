@@ -4575,3 +4575,333 @@ fn substitute_expr(expr: &mut Expr, params: &HashMap<String, Value>) -> Result<(
         Expr::Literal(_) | Expr::Variable(_) => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::vfs::mem::MemVfs;
+
+    fn test_db() -> Database {
+        Database::create(Arc::new(MemVfs::new()), Path::new("plan.db"), 4096).expect("create db")
+    }
+
+    fn prepare(db: &mut Database, source: &str) -> Prepared {
+        let query = crate::cypher::parse(source).expect("parse");
+        plan_query(db, &query, &HashMap::new()).expect("plan")
+    }
+
+    fn text(prepared: &Prepared) -> String {
+        let mut out = String::new();
+        explain(&prepared.plan, 0, &mut out);
+        out
+    }
+
+    #[test]
+    fn unlabeled_match_scans_every_node() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH (n) RETURN n");
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::NodeScan { var, label, .. } = input.as_ref() else {
+            panic!("expected NodeScan, got {input:?}");
+        };
+        assert_eq!(var, "n");
+        assert!(label.is_none());
+    }
+
+    #[test]
+    fn label_scan_keeps_residual_properties() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH (n:Person {name: 'alice'}) RETURN n");
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::NodeScan {
+            var,
+            label,
+            seek,
+            props,
+            ..
+        } = input.as_ref()
+        else {
+            panic!("expected NodeScan, got {input:?}");
+        };
+        assert_eq!(var, "n");
+        assert_eq!(label.as_deref(), Some("Person"));
+        assert!(seek.is_none());
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].0, "name");
+    }
+
+    #[test]
+    fn index_seek_is_chosen_for_literal_equality() {
+        let mut db = test_db();
+        let index_id = db
+            .write(|db| db.create_node_index("name", Some("Person"), false))
+            .expect("index");
+        let prepared = prepare(&mut db, "MATCH (n:Person {name: 'alice'}) RETURN n");
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::NodeScan { seek, props, .. } = input.as_ref() else {
+            panic!("expected NodeScan, got {input:?}");
+        };
+        let seek = seek.as_ref().expect("seek");
+        assert_eq!(seek.index_id, index_id);
+        assert_eq!(seek.value, Value::from("alice"));
+        assert!(props.is_empty(), "the lookup consumes the literal");
+    }
+
+    #[test]
+    fn index_seek_is_not_used_for_non_literal_properties() {
+        let mut db = test_db();
+        db.write(|db| db.create_node_index("name", Some("Person"), false))
+            .expect("index");
+        let prepared = prepare(
+            &mut db,
+            "WITH 'alice' AS s MATCH (n:Person {name: s}) RETURN n",
+        );
+        assert!(text(&prepared).contains("seek=-"), "{}", text(&prepared));
+    }
+
+    #[test]
+    fn where_clause_becomes_a_filter_above_the_scan() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH (n) WHERE n.age > 30 RETURN n");
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::Filter { input, .. } = input.as_ref() else {
+            panic!("expected Filter, got {input:?}");
+        };
+        assert!(matches!(input.as_ref(), Plan::NodeScan { label: None, .. }));
+    }
+
+    #[test]
+    fn optional_match_wraps_an_inner_plan() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "OPTIONAL MATCH (n) RETURN n");
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::OptionalMatch { vars, .. } = input.as_ref() else {
+            panic!("expected OptionalMatch, got {input:?}");
+        };
+        assert_eq!(vars, &["n".to_owned()]);
+    }
+
+    #[test]
+    fn var_expand_carries_bounds_and_direction() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH (a:A)-[*1..2]->(b) RETURN b");
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::VarExpand {
+            src,
+            edge,
+            dst,
+            direction,
+            min,
+            max,
+            ..
+        } = input.as_ref()
+        else {
+            panic!("expected VarExpand, got {input:?}");
+        };
+        assert_eq!((src.as_str(), dst.as_str()), ("a", "b"));
+        assert!(
+            edge.as_deref()
+                .is_some_and(|name| name.starts_with("  rel"))
+        );
+        assert_eq!(*direction, RelDirection::Outgoing);
+        assert_eq!((*min, *max), (1, Some(2)));
+    }
+
+    #[test]
+    fn var_expand_defaults_to_unbounded_and_binds_edge_list() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH (a:A)-[r*]->(b) RETURN b");
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::VarExpand { edge, min, max, .. } = input.as_ref() else {
+            panic!("expected VarExpand, got {input:?}");
+        };
+        assert_eq!(edge.as_deref(), Some("r"));
+        assert_eq!(*min, 1);
+        assert_eq!(*max, None);
+    }
+
+    #[test]
+    fn shortest_path_plans_a_search_operator() {
+        let mut db = test_db();
+        let prepared = prepare(
+            &mut db,
+            "MATCH (a:A), (b:B) MATCH p = shortestPath((a)-[:R*]->(b)) RETURN p",
+        );
+        assert!(
+            text(&prepared).contains("ShortestPath a -> b"),
+            "{}",
+            text(&prepared)
+        );
+        let all = prepare(
+            &mut db,
+            "MATCH (a:A), (b:B) MATCH p = allShortestPaths((a)-[:R*]->(b)) RETURN p",
+        );
+        assert!(
+            text(&all).contains("ShortestPath a -> b (all)"),
+            "{}",
+            text(&all)
+        );
+    }
+
+    #[test]
+    fn aggregate_splits_groups_and_aggregations() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH (n:Person) RETURN n.age, count(*) AS c");
+        let Plan::Aggregate { groups, aggs, .. } = &prepared.plan else {
+            panic!("expected Aggregate, got {:?}", prepared.plan);
+        };
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1, "n.age");
+        assert_eq!(aggs.len(), 1);
+        assert_eq!(aggs[0].func, AggFn::Count);
+        assert_eq!(aggs[0].name, "c");
+    }
+
+    #[test]
+    fn distinct_wraps_the_projection() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH (n) RETURN DISTINCT n.age");
+        let Plan::Distinct { input } = &prepared.plan else {
+            panic!("expected Distinct, got {:?}", prepared.plan);
+        };
+        assert!(matches!(input.as_ref(), Plan::Project { .. }));
+    }
+
+    #[test]
+    fn order_skip_and_limit_stack_in_order() {
+        let mut db = test_db();
+        let prepared = prepare(
+            &mut db,
+            "MATCH (n) RETURN n ORDER BY n.age DESC SKIP 1 LIMIT 2",
+        );
+        let Plan::Limit { input, .. } = &prepared.plan else {
+            panic!("expected Limit, got {:?}", prepared.plan);
+        };
+        let Plan::Skip { input, .. } = input.as_ref() else {
+            panic!("expected Skip, got {input:?}");
+        };
+        let Plan::Sort { keys, .. } = input.as_ref() else {
+            panic!("expected Sort, got {input:?}");
+        };
+        assert_eq!(keys.len(), 1);
+        assert!(!keys[0].1, "DESC orders descending");
+    }
+
+    #[test]
+    fn union_all_skips_deduplication() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "RETURN 1 AS x UNION RETURN 2 AS x");
+        let Plan::Distinct { input } = &prepared.plan else {
+            panic!("expected Distinct, got {:?}", prepared.plan);
+        };
+        let Plan::Union { parts, all } = input.as_ref() else {
+            panic!("expected Union, got {input:?}");
+        };
+        assert!(!all);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(prepared.columns, vec!["x".to_owned()]);
+
+        let prepared = prepare(&mut db, "RETURN 1 AS x UNION ALL RETURN 2 AS x");
+        let Plan::Union { all, .. } = &prepared.plan else {
+            panic!("expected Union, got {:?}", prepared.plan);
+        };
+        assert!(all);
+    }
+
+    #[test]
+    fn merge_keeps_the_match_plan_and_creation_items() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MERGE (n:Person {name: 'x'})");
+        let Plan::Merge {
+            match_plan, items, ..
+        } = &prepared.plan
+        else {
+            panic!("expected Merge, got {:?}", prepared.plan);
+        };
+        assert_eq!(items.len(), 1);
+        assert!(matches!(match_plan.as_ref(), Plan::NodeScan { .. }));
+        assert!(prepared.mutating);
+    }
+
+    #[test]
+    fn create_items_mark_the_query_as_mutating() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "CREATE (:A)");
+        let Plan::Create { items, .. } = &prepared.plan else {
+            panic!("expected Create, got {:?}", prepared.plan);
+        };
+        assert_eq!(items.len(), 1);
+        assert!(prepared.mutating);
+        assert!(prepared.columns.is_empty());
+    }
+
+    #[test]
+    fn procedure_call_binds_yield_columns() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "CALL db.labels() YIELD label RETURN label");
+        let rendered = text(&prepared);
+        assert!(
+            rendered.contains("ProcedureCall db.labels label AS label"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn load_csv_keeps_headers_and_terminator() {
+        let mut db = test_db();
+        let prepared = prepare(
+            &mut db,
+            "LOAD CSV WITH HEADERS FROM 'x.csv' AS row FIELDTERMINATOR ';' RETURN row",
+        );
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::LoadCsv {
+            alias,
+            with_headers,
+            field_terminator,
+            ..
+        } = input.as_ref()
+        else {
+            panic!("expected LoadCsv, got {input:?}");
+        };
+        assert_eq!(alias, "row");
+        assert!(*with_headers);
+        assert_eq!(*field_terminator, Some(';'));
+    }
+
+    #[test]
+    fn return_aliases_become_output_columns() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "RETURN 1 AS x, 2 AS y");
+        assert_eq!(prepared.columns, vec!["x".to_owned(), "y".to_owned()]);
+        assert!(!prepared.mutating);
+    }
+
+    #[test]
+    fn anonymous_variables_get_stable_names() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH ()-[r]->() RETURN r");
+        let rendered = text(&prepared);
+        assert!(rendered.contains("node1"), "{rendered}");
+        assert!(rendered.contains("node2"), "{rendered}");
+        assert!(rendered.contains("Expand"), "{rendered}");
+    }
+}

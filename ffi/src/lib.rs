@@ -1305,4 +1305,158 @@ mod tests {
         assert_eq!(value, 0);
         unsafe { grafile_finalize(stmt) };
     }
+
+    #[test]
+    fn error_state_recovers_after_a_successful_statement() {
+        let db = TestDb::new("recover.db");
+        assert_eq!(db.exec("MATCH (n RETURN n"), GRAFILE_ERROR);
+        assert_eq!(unsafe { grafile_errcode(db.db) }, GRAFILE_ERROR);
+        let message = unsafe { CStr::from_ptr(grafile_errmsg(db.db)) };
+        assert!(message.to_str().expect("utf8").contains("Syntax"));
+
+        // A successful statement clears the error code for the handle.
+        assert_eq!(db.exec("RETURN 1"), GRAFILE_OK);
+        assert_eq!(unsafe { grafile_errcode(db.db) }, GRAFILE_OK);
+    }
+
+    #[test]
+    fn missing_params_fail_until_bound_and_rebinding_reexecutes() {
+        let db = TestDb::new("params-lifecycle.db");
+        assert_eq!(
+            db.exec("CREATE (:Person {age: 20}), (:Person {age: 30}), (:Person {age: 40})"),
+            GRAFILE_OK
+        );
+        let stmt = db.prepare("MATCH (n:Person) WHERE n.age > $min RETURN count(*) AS n");
+        assert_eq!(unsafe { grafile_step(stmt) }, GRAFILE_NOTFOUND);
+        let message = unsafe { CStr::from_ptr(grafile_errmsg(db.db)) };
+        assert!(message.to_str().expect("utf8").contains("$min"));
+
+        let low = CString::new("{\"min\": 25}").expect("cstring");
+        assert_eq!(
+            unsafe { grafile_bind_params_json(stmt, low.as_ptr()) },
+            GRAFILE_OK
+        );
+        assert_eq!(unsafe { grafile_step(stmt) }, GRAFILE_ROW);
+        let mut count = 0i64;
+        assert_eq!(
+            unsafe { grafile_column_int64(stmt, 0, &mut count) },
+            GRAFILE_OK
+        );
+        assert_eq!(count, 2);
+        assert_eq!(unsafe { grafile_step(stmt) }, GRAFILE_DONE);
+
+        // Rebinding clears the materialized result, so the next step
+        // re-executes with the new parameters.
+        let high = CString::new("{\"min\": 35}").expect("cstring");
+        assert_eq!(
+            unsafe { grafile_bind_params_json(stmt, high.as_ptr()) },
+            GRAFILE_OK
+        );
+        assert_eq!(unsafe { grafile_step(stmt) }, GRAFILE_ROW);
+        assert_eq!(
+            unsafe { grafile_column_int64(stmt, 0, &mut count) },
+            GRAFILE_OK
+        );
+        assert_eq!(count, 1);
+        unsafe { grafile_finalize(stmt) };
+    }
+
+    #[test]
+    fn invalid_params_json_is_misuse_and_recoverable() {
+        let db = TestDb::new("params-invalid.db");
+        let stmt = db.prepare("RETURN 1 AS x");
+        let bad = CString::new("{oops").expect("cstring");
+        assert_eq!(
+            unsafe { grafile_bind_params_json(stmt, bad.as_ptr()) },
+            GRAFILE_MISUSE
+        );
+        let good = CString::new("{}").expect("cstring");
+        assert_eq!(
+            unsafe { grafile_bind_params_json(stmt, good.as_ptr()) },
+            GRAFILE_OK
+        );
+        assert_eq!(unsafe { grafile_step(stmt) }, GRAFILE_ROW);
+        unsafe { grafile_finalize(stmt) };
+    }
+
+    #[test]
+    fn read_only_open_rejects_writes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("readonly.db");
+        let c_path = CString::new(path.to_str().expect("path")).expect("cstring");
+        {
+            let mut db: *mut GrafileDb = std::ptr::null_mut();
+            assert_eq!(
+                unsafe { grafile_open(c_path.as_ptr(), &mut db, std::ptr::null_mut()) },
+                GRAFILE_OK
+            );
+            let cypher = CString::new("CREATE (:X {v: 1})").expect("cstring");
+            assert_eq!(
+                unsafe { grafile_exec(db, cypher.as_ptr(), std::ptr::null()) },
+                GRAFILE_OK
+            );
+            unsafe { grafile_close(db) };
+        }
+
+        let mut db: *mut GrafileDb = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { grafile_open_v2(c_path.as_ptr(), GRAFILE_OPEN_READONLY, &mut db, &mut err,) },
+            GRAFILE_OK
+        );
+        assert!(err.is_null(), "no error message on success");
+        let read = CString::new("MATCH (n:X) RETURN count(*) AS n").expect("cstring");
+        let mut out: *mut c_char = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { grafile_query_json(db, read.as_ptr(), std::ptr::null(), &mut out) },
+            GRAFILE_OK
+        );
+        unsafe { grafile_free(out as *mut c_void) };
+        let write = CString::new("CREATE (:Y)").expect("cstring");
+        assert_eq!(
+            unsafe { grafile_exec(db, write.as_ptr(), std::ptr::null()) },
+            GRAFILE_READONLY
+        );
+        unsafe { grafile_close(db) };
+    }
+
+    #[test]
+    fn open_error_reports_a_message_for_missing_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing.db");
+        let c_path = CString::new(path.to_str().expect("path")).expect("cstring");
+        let mut db: *mut GrafileDb = std::ptr::null_mut();
+        let mut err: *mut c_char = std::ptr::null_mut();
+        let code =
+            unsafe { grafile_open_v2(c_path.as_ptr(), GRAFILE_OPEN_READWRITE, &mut db, &mut err) };
+        assert_eq!(code, GRAFILE_NOTFOUND);
+        assert!(db.is_null());
+        assert!(!err.is_null(), "out_err must carry the message");
+        let message = unsafe { CStr::from_ptr(err) }.to_str().expect("utf8");
+        assert!(message.to_lowercase().contains("no such file"), "{message}");
+        unsafe { grafile_free(err as *mut c_void) };
+    }
+
+    #[test]
+    fn column_kind_covers_temporal_and_point_values() {
+        let db = TestDb::new("kinds.db");
+        let stmt = db.prepare(
+            "RETURN date('2020-01-01') AS d, localdatetime('2020-01-01T00:00:00') AS ldt, \
+             duration('P1D') AS du, point({x: 1, y: 2}) AS p",
+        );
+        assert_eq!(unsafe { grafile_step(stmt) }, GRAFILE_ROW);
+        let kinds: Vec<c_int> = (0..4)
+            .map(|index| unsafe { grafile_column_kind(stmt, index) })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                GRAFILE_DATE,
+                GRAFILE_LOCALDATETIME,
+                GRAFILE_DURATION,
+                GRAFILE_POINT
+            ]
+        );
+        unsafe { grafile_finalize(stmt) };
+    }
 }

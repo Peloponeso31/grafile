@@ -71,7 +71,7 @@ impl Direction {
 ///
 /// Sparse fragments (the common case) store sorted bit offsets and never
 /// touch the full 8 KiB word array; dense fragments fall back to the word
-/// representation once a fragment exceeds [`SPARSE_MAX`] bits.
+/// representation once a fragment exceeds `SPARSE_MAX` bits.
 #[derive(Clone)]
 pub struct Fragment {
     repr: Repr,
@@ -793,6 +793,73 @@ mod tests {
         assert!(Fragment::decode(&[0, 1, 0, 2]).is_err());
         assert!(Fragment::decode(&[0, 5, 0, 5, 0]).is_err());
         assert!(Fragment::decode(&[1, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn sparse_to_dense_transition_is_lossless() {
+        let mut fragment = Fragment::new();
+        for bit in 0..SPARSE_MAX as u16 {
+            fragment.set(bit);
+        }
+        assert_eq!(fragment.cardinality(), SPARSE_MAX as u32);
+        assert_eq!(fragment.encode()[0], 0, "still sparse at the threshold");
+
+        // One bit past the threshold switches to the dense representation.
+        fragment.set(SPARSE_MAX as u16);
+        assert_eq!(fragment.cardinality(), SPARSE_MAX as u32 + 1);
+        assert_eq!(fragment.encode()[0], 1, "dense above the threshold");
+        assert!(fragment.test(0));
+        assert!(fragment.test(SPARSE_MAX as u16));
+        assert!(!fragment.test(SPARSE_MAX as u16 + 1));
+
+        // Clearing everything leaves an empty, decodable fragment.
+        for bit in 0..=SPARSE_MAX as u16 {
+            fragment.clear(bit);
+        }
+        assert!(fragment.is_empty());
+        assert_eq!(fragment.cardinality(), 0);
+        let decoded = Fragment::decode(&fragment.encode()).expect("decode");
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn fragment_keys_round_trip_through_their_encoding() {
+        let keys = [
+            FragmentKey::incidence(Direction::Out, 7, 1000, 20_000),
+            FragmentKey::incidence(Direction::In, 7, 20_000, 1000),
+            FragmentKey::label(3, 42),
+            FragmentKey::edge_type(9, 42),
+        ];
+        for key in keys {
+            let encoded = key.encode();
+            let decoded = FragmentKey::decode(&encoded).expect("decode");
+            assert_eq!(decoded, key);
+        }
+        assert!(FragmentKey::decode(&[0u8; 12]).is_err(), "short input");
+    }
+
+    #[test]
+    fn cache_eviction_reloads_fragments_from_pages() {
+        let mut pager = test_pager();
+        pager.begin_write().expect("begin");
+        let mut store = FragmentStore::create(&mut pager).expect("store");
+        store.set_cache_capacity(1);
+        let key_a = FragmentKey::incidence(Direction::Out, 1, 300, 700);
+        let key_b = FragmentKey::incidence(Direction::Out, 1, 800, 1500);
+        store
+            .set_bit(&mut pager, &key_a, FragmentKey::incidence_bit(300, 700))
+            .expect("set a");
+        store
+            .set_bit(&mut pager, &key_b, FragmentKey::incidence_bit(800, 1500))
+            .expect("set b");
+        // Reading both keys with a one-fragment cache forces a reload for the
+        // evicted one.
+        let a = store.get(&mut pager, &key_a).expect("get a").expect("a");
+        let b = store.get(&mut pager, &key_b).expect("get b").expect("b");
+        assert!(a.test(FragmentKey::incidence_bit(300, 700)));
+        assert!(b.test(FragmentKey::incidence_bit(800, 1500)));
+        assert_eq!((a.cardinality(), b.cardinality()), (1, 1));
+        pager.commit().expect("commit");
     }
 
     #[test]

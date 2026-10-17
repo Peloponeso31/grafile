@@ -2192,4 +2192,108 @@ mod tests {
         };
         assert_eq!(text.as_ref(), "a\nA");
     }
+
+    #[test]
+    fn rejects_unterminated_strings_and_backticks() {
+        for source in ["RETURN 'abc", "RETURN \"abc", "RETURN `abc"] {
+            let err = parse(source).expect_err(source);
+            assert!(err.message().contains("line 1"), "{source}: {err}");
+        }
+        assert!(parse("RETURN 'a\\q'").is_err(), "invalid escape");
+    }
+
+    #[test]
+    fn rejects_malformed_relationship_patterns() {
+        for source in [
+            "MATCH (a)-[r->(b) RETURN a",
+            "MATCH (a)-[r:]->(b) RETURN a",
+            "MATCH (a)-[:KNOWS (b) RETURN a",
+            "MATCH (a)-[r] RETURN a",
+        ] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn variable_length_bounds_parse_in_both_directions() {
+        // Inverted bounds are an empty interval per the TCK, not a parse
+        // error: the engine returns no rows for them.
+        let query = parse("MATCH (a)-[*2..1]->(b) RETURN a").expect("inverted bounds");
+        let Clause::Match(matched) = &query.parts[0].clauses[0] else {
+            panic!("expected MATCH");
+        };
+        assert_eq!(
+            matched.patterns[0].segments[0].relationship.var_length,
+            Some(VarLength {
+                min: 2,
+                max: Some(1)
+            })
+        );
+        for source in [
+            "MATCH (a)-[*]->(b) RETURN a",
+            "MATCH (a)-[*1..]->(b) RETURN a",
+            "MATCH (a)-[*..3]->(b) RETURN a",
+            "MATCH (a)-[*..0]->(b) RETURN a",
+        ] {
+            assert!(parse(source).is_ok(), "{source}");
+        }
+    }
+
+    #[test]
+    fn rejects_multichar_field_terminators() {
+        let err = parse_statement("LOAD CSV FROM 'x.csv' AS row FIELDTERMINATOR 'ab' RETURN row")
+            .expect_err("two bytes");
+        assert!(err.message().contains("single-character"), "{err}");
+        // A one-byte terminator other than the default still parses.
+        assert!(
+            parse_statement("LOAD CSV FROM 'x.csv' AS row FIELDTERMINATOR ';' RETURN row").is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_property_access() {
+        for source in ["RETURN n.", "RETURN .name", "RETURN n..name"] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn rejects_missing_expressions() {
+        for source in [
+            "RETURN",
+            "MATCH (n) WHERE RETURN n",
+            "MATCH (n) WHERE n.age > RETURN n",
+            "UNWIND AS x RETURN x",
+        ] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_input_and_trailing_junk() {
+        assert!(parse("").is_err());
+        assert!(parse("   ").is_err());
+        assert!(parse("RETURN 1 2").is_err(), "trailing literal");
+        assert!(parse("RETURN 1 AS").is_err(), "dangling alias");
+    }
+
+    #[test]
+    fn parses_load_csv_headers_and_fields() {
+        let statement =
+            parse_statement("LOAD CSV WITH HEADERS FROM 'people.csv' AS row RETURN row.name")
+                .expect("parse");
+        let Statement::Query(query) = statement else {
+            panic!("expected query");
+        };
+        let Clause::LoadCsv {
+            with_headers,
+            field_terminator,
+            ..
+        } = &query.parts[0].clauses[0]
+        else {
+            panic!("expected LOAD CSV");
+        };
+        assert!(*with_headers);
+        assert_eq!(*field_terminator, None);
+    }
 }

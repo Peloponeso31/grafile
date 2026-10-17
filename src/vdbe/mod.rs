@@ -4290,3 +4290,569 @@ fn load_csv_rows(path: &str, with_headers: bool, terminator: u8) -> Result<Vec<V
     }
     Ok(rows)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::vfs::mem::MemVfs;
+
+    fn test_db() -> Database {
+        Database::create(Arc::new(MemVfs::new()), Path::new("vdbe.db"), 4096).expect("create db")
+    }
+
+    /// A three-node graph: two `Person` nodes and one `KNOWS` edge.
+    fn seeded_db() -> (Database, u64, u64, u64) {
+        let mut db = test_db();
+        let (alice, bob, edge) = db
+            .write(|db| {
+                let person = db.ensure_label("Person")?;
+                let knows = db.ensure_edge_type("KNOWS")?;
+                let name = db.ensure_property_key("name")?;
+                let alice = db.create_node(&[person], vec![(name, Value::from("alice"))])?;
+                let bob = db.create_node(&[person], vec![(name, Value::from("bob"))])?;
+                let edge = db.create_edge(knows, alice, bob, Vec::new())?;
+                Ok((alice, bob, edge))
+            })
+            .expect("seed");
+        (db, alice, bob, edge)
+    }
+
+    fn program(ops: Vec<Op>, constants: Vec<Value>, registers: u32, cursors: u32) -> Program {
+        Program {
+            ops,
+            constants,
+            cursor_count: cursors as usize,
+            register_count: registers as usize,
+            columns: Vec::new(),
+            mutating: false,
+        }
+    }
+
+    fn run(db: &mut Database, program: &Program) -> Result<Vec<Vec<Value>>> {
+        db.begin_read().expect("begin read");
+        let result = execute(db, program);
+        let _ = db.end_read();
+        result
+    }
+
+    #[test]
+    fn scan_loop_binds_every_node() {
+        let (mut db, alice, bob, _) = seeded_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Rewind {
+                    cursor: 0,
+                    target: 6,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+                Op::ResultRow { start: 0, count: 1 },
+                Op::Next {
+                    cursor: 0,
+                    target: 6,
+                },
+                Op::Goto { target: 2 },
+                Op::Halt,
+            ],
+            Vec::new(),
+            1,
+            1,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(rows, vec![vec![Value::Node(alice)], vec![Value::Node(bob)]]);
+    }
+
+    #[test]
+    fn rewind_skips_an_empty_cursor() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Rewind {
+                    cursor: 0,
+                    target: 3,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+                Op::Halt,
+            ],
+            Vec::new(),
+            1,
+            1,
+        );
+        assert_eq!(
+            run(&mut db, &program).expect("run"),
+            Vec::<Vec<Value>>::new()
+        );
+    }
+
+    #[test]
+    fn bind_on_an_exhausted_cursor_is_an_error() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+            ],
+            Vec::new(),
+            1,
+            1,
+        );
+        assert!(run(&mut db, &program).is_err());
+    }
+
+    #[test]
+    fn expand_binds_edge_and_neighbor() {
+        let (mut db, _, bob, edge) = seeded_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Rewind {
+                    cursor: 0,
+                    target: 11,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+                Op::OpenExpand {
+                    cursor: 1,
+                    src: 0,
+                    direction: 0,
+                    types: Vec::new(),
+                    any_type: true,
+                },
+                Op::Rewind {
+                    cursor: 1,
+                    target: 9,
+                },
+                Op::BindExpand {
+                    cursor: 1,
+                    edge: 1,
+                    node: 2,
+                },
+                Op::ResultRow { start: 1, count: 2 },
+                Op::Next {
+                    cursor: 1,
+                    target: 9,
+                },
+                Op::Goto { target: 5 },
+                Op::Next {
+                    cursor: 0,
+                    target: 11,
+                },
+                Op::Goto { target: 2 },
+                Op::Halt,
+            ],
+            Vec::new(),
+            3,
+            2,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(rows, vec![vec![Value::Edge(edge), Value::Node(bob)]]);
+    }
+
+    #[test]
+    fn property_reads_resolve_key_names() {
+        let (mut db, ..) = seeded_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Rewind {
+                    cursor: 0,
+                    target: 7,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+                Op::Property {
+                    target: 0,
+                    name: 0,
+                    dest: 1,
+                },
+                Op::ResultRow { start: 1, count: 1 },
+                Op::Next {
+                    cursor: 0,
+                    target: 7,
+                },
+                Op::Goto { target: 2 },
+                Op::Halt,
+            ],
+            vec![Value::from("name")],
+            2,
+            1,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(
+            rows,
+            vec![vec![Value::from("alice")], vec![Value::from("bob")]]
+        );
+    }
+
+    #[test]
+    fn comparison_with_null_yields_null() {
+        let mut db = test_db();
+        let constant = |dest: u32, index: u32| Op::Constant { dest, value: index };
+
+        let and_false = program(
+            vec![
+                Op::Null { dest: 0 },
+                constant(1, 0),
+                Op::Binary {
+                    op: binary_code::AND,
+                    left: 0,
+                    right: 1,
+                    dest: 2,
+                },
+                Op::ResultRow { start: 2, count: 1 },
+                Op::Halt,
+            ],
+            vec![Value::Bool(false)],
+            3,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &and_false).expect("run"),
+            vec![vec![Value::Bool(false)]],
+            "null AND false is false"
+        );
+
+        let eq_true = program(
+            vec![
+                Op::Null { dest: 0 },
+                constant(1, 0),
+                Op::Binary {
+                    op: binary_code::EQ,
+                    left: 0,
+                    right: 1,
+                    dest: 2,
+                },
+                Op::ResultRow { start: 2, count: 1 },
+                Op::Halt,
+            ],
+            vec![Value::Bool(true)],
+            3,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &eq_true).expect("run"),
+            vec![vec![Value::Null]],
+            "null = true is null"
+        );
+    }
+
+    #[test]
+    fn negating_null_yields_null() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::Null { dest: 0 },
+                Op::Unary {
+                    op: unary_code::NEG,
+                    src: 0,
+                    dest: 1,
+                },
+                Op::ResultRow { start: 1, count: 1 },
+                Op::Halt,
+            ],
+            Vec::new(),
+            2,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &program).expect("run"),
+            vec![vec![Value::Null]]
+        );
+    }
+
+    #[test]
+    fn subscript_reads_a_list_element() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::Constant { dest: 2, value: 2 },
+                Op::BuildList {
+                    dest: 3,
+                    items: vec![0, 1, 2],
+                },
+                Op::Constant { dest: 4, value: 3 },
+                Op::Subscript {
+                    base: 3,
+                    index: 4,
+                    dest: 5,
+                },
+                Op::ResultRow { start: 5, count: 1 },
+                Op::Halt,
+            ],
+            vec![
+                Value::Int(10),
+                Value::Int(20),
+                Value::Int(30),
+                Value::Int(1),
+            ],
+            6,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &program).expect("run"),
+            vec![vec![Value::Int(20)]]
+        );
+    }
+
+    #[test]
+    fn subscript_on_a_scalar_is_a_type_error() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::Subscript {
+                    base: 0,
+                    index: 1,
+                    dest: 2,
+                },
+                Op::Halt,
+            ],
+            vec![Value::Int(5), Value::Int(0)],
+            3,
+            0,
+        );
+        let err = run(&mut db, &program).expect_err("type error");
+        assert_eq!(err.code(), ErrorCode::Type);
+    }
+
+    #[test]
+    fn slice_honours_negative_bounds() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::Constant { dest: 2, value: 2 },
+                Op::Constant { dest: 3, value: 3 },
+                Op::Constant { dest: 4, value: 4 },
+                Op::BuildList {
+                    dest: 5,
+                    items: vec![0, 1, 2, 3, 4],
+                },
+                Op::Constant { dest: 6, value: 5 },
+                Op::Constant { dest: 7, value: 6 },
+                Op::Slice {
+                    base: 5,
+                    lower: 6,
+                    upper: 7,
+                    open_lower: false,
+                    open_upper: false,
+                    dest: 8,
+                },
+                Op::ResultRow { start: 8, count: 1 },
+                Op::Halt,
+            ],
+            vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
+                Value::Int(4),
+                Value::Int(5),
+                Value::Int(-3),
+                Value::Int(-1),
+            ],
+            9,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &program).expect("run"),
+            vec![vec![Value::List(vec![Value::Int(3), Value::Int(4)].into())]]
+        );
+    }
+
+    #[test]
+    fn hash_aggregate_groups_and_sums() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::CollectOpen { cursor: 0 },
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::Constant { dest: 0, value: 2 },
+                Op::Constant { dest: 1, value: 3 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::Constant { dest: 0, value: 4 },
+                Op::Constant { dest: 1, value: 5 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::HashAggregate {
+                    cursor: 0,
+                    prefix: 0,
+                    groups: 1,
+                    aggs: vec![AggSpec {
+                        func: AggFn::Sum,
+                        args: 1,
+                        star: false,
+                        distinct: false,
+                    }],
+                },
+                Op::CtxRewind {
+                    cursor: 0,
+                    target: 16,
+                },
+                Op::CtxData {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::ResultRow { start: 0, count: 2 },
+                Op::CtxNext {
+                    cursor: 0,
+                    target: 16,
+                },
+                Op::Goto { target: 12 },
+                Op::Halt,
+            ],
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Int(1),
+                Value::Int(20),
+                Value::Int(2),
+                Value::Int(30),
+            ],
+            2,
+            1,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(30)],
+                vec![Value::Int(2), Value::Int(30)],
+            ]
+        );
+    }
+
+    #[test]
+    fn dedup_rows_keeps_the_first_of_each_key() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::CollectOpen { cursor: 0 },
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::Constant { dest: 0, value: 2 },
+                Op::Constant { dest: 1, value: 3 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::Constant { dest: 0, value: 4 },
+                Op::Constant { dest: 1, value: 5 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::DedupRows {
+                    cursor: 0,
+                    prefix: 0,
+                    keys: 1,
+                },
+                Op::CtxRewind {
+                    cursor: 0,
+                    target: 16,
+                },
+                Op::CtxData {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::ResultRow { start: 0, count: 2 },
+                Op::CtxNext {
+                    cursor: 0,
+                    target: 16,
+                },
+                Op::Goto { target: 12 },
+                Op::Halt,
+            ],
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Int(1),
+                Value::Int(20),
+                Value::Int(2),
+                Value::Int(30),
+            ],
+            2,
+            1,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(10)],
+                vec![Value::Int(2), Value::Int(30)],
+            ]
+        );
+    }
+
+    #[test]
+    fn truncate_rows_rejects_a_float_limit() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::CollectOpen { cursor: 0 },
+                Op::Constant { dest: 0, value: 0 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 1,
+                },
+                Op::Constant { dest: 1, value: 1 },
+                Op::Constant { dest: 2, value: 2 },
+                Op::TruncateRows {
+                    cursor: 0,
+                    skip: 1,
+                    limit: 2,
+                },
+                Op::Halt,
+            ],
+            vec![Value::Int(7), Value::Int(0), Value::Float(1.0)],
+            3,
+            1,
+        );
+        let err = run(&mut db, &program).expect_err("float limit");
+        assert_eq!(err.code(), ErrorCode::Syntax);
+        assert!(err.message().contains("LIMIT"), "{err}");
+    }
+}

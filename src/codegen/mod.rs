@@ -2067,3 +2067,203 @@ fn scalar_function(name: &str) -> Result<u8> {
         ))),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::engine::Database;
+    use crate::planner::plan::AggFn;
+    use crate::planner::plan_query;
+    use crate::vfs::mem::MemVfs;
+
+    fn test_db() -> Database {
+        Database::create(Arc::new(MemVfs::new()), Path::new("codegen.db"), 4096).expect("create db")
+    }
+
+    fn compile_source(db: &mut Database, source: &str) -> Program {
+        let query = crate::cypher::parse(source).expect("parse");
+        let prepared = plan_query(db, &query, &std::collections::HashMap::new()).expect("plan");
+        compile(&prepared).expect("compile")
+    }
+
+    fn has_op(program: &Program, pred: impl Fn(&Op) -> bool) -> bool {
+        program.ops.iter().any(pred)
+    }
+
+    #[test]
+    fn scan_projects_binds_rows_and_halts() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "MATCH (n) RETURN n");
+        assert!(has_op(&program, |op| matches!(
+            op,
+            Op::OpenNodeScan { label: None, .. }
+        )));
+        assert!(has_op(&program, |op| matches!(op, Op::Rewind { .. })));
+        assert!(has_op(&program, |op| matches!(op, Op::Next { .. })));
+        assert!(has_op(&program, |op| matches!(op, Op::Bind { .. })));
+        assert!(has_op(&program, |op| matches!(op, Op::ResultRow { .. })));
+        assert_eq!(program.ops.last(), Some(&Op::Halt));
+        assert_eq!(program.columns, vec!["n".to_owned()]);
+        assert!(!program.mutating);
+    }
+
+    #[test]
+    fn return_literals_compile_to_constants() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "RETURN 1 AS x");
+        assert_eq!(
+            program.ops,
+            vec![
+                Op::Constant { dest: 0, value: 0 },
+                Op::Copy { dest: 1, src: 0 },
+                Op::ResultRow { start: 1, count: 1 },
+                Op::Halt,
+            ]
+        );
+        assert_eq!(program.constants, vec![Value::Int(1)]);
+        assert_eq!(program.columns, vec!["x".to_owned()]);
+    }
+
+    #[test]
+    fn label_scan_carries_the_label_name_constant() {
+        let mut db = test_db();
+        db.write(|db| db.ensure_label("Person")).expect("label");
+        let program = compile_source(&mut db, "MATCH (n:Person) RETURN n");
+        let label = program
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::OpenNodeScan {
+                    label: Some(reg), ..
+                } => Some(program.constants[*reg as usize].clone()),
+                _ => None,
+            })
+            .expect("labeled scan");
+        assert_eq!(label, Value::from("Person"));
+    }
+
+    #[test]
+    fn literal_index_lookup_compiles_to_index_scan() {
+        let mut db = test_db();
+        let index = db
+            .write(|db| db.create_node_index("name", Some("Person"), false))
+            .expect("index");
+        let program = compile_source(&mut db, "MATCH (n:Person {name: 'alice'}) RETURN n");
+        assert!(has_op(&program, |op| matches!(
+            op,
+            Op::OpenIndexScan { index: id, .. } if *id == index
+        )));
+        assert!(!has_op(&program, |op| matches!(
+            op,
+            Op::OpenNodeScan { .. }
+        )));
+        assert!(program.constants.contains(&Value::from("alice")));
+    }
+
+    #[test]
+    fn expansion_compiles_to_open_and_bind_expand() {
+        let mut db = test_db();
+        let edge_type = db
+            .write(|db| {
+                db.ensure_label("A")?;
+                db.ensure_edge_type("T")
+            })
+            .expect("schema");
+        let program = compile_source(&mut db, "MATCH (a:A)-[r:T]->(b) RETURN r");
+        assert!(has_op(&program, |op| matches!(
+            op,
+            Op::OpenExpand { types, .. } if types == &[edge_type]
+        )));
+        assert!(has_op(&program, |op| matches!(op, Op::BindExpand { .. })));
+    }
+
+    #[test]
+    fn variable_length_expansion_compiles_to_cursor_ops() {
+        let mut db = test_db();
+        db.write(|db| db.ensure_label("A")).expect("label");
+        let program = compile_source(&mut db, "MATCH (a:A)-[r*1..2]->(b) RETURN r");
+        assert!(has_op(&program, |op| matches!(
+            op,
+            Op::VarExpandOpen { .. }
+        )));
+        assert!(has_op(&program, |op| matches!(
+            op,
+            Op::VarExpandNext { .. }
+        )));
+    }
+
+    #[test]
+    fn sorting_and_limits_compile_to_row_cursors() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "MATCH (n) RETURN n ORDER BY n SKIP 1 LIMIT 2");
+        assert!(has_op(&program, |op| matches!(op, Op::SortRows { .. })));
+        assert!(has_op(&program, |op| matches!(op, Op::TruncateRows { .. })));
+    }
+
+    #[test]
+    fn aggregations_carry_their_function_specs() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "MATCH (n) RETURN count(*) AS c, sum(n.age) AS s");
+        let aggregate = program
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::HashAggregate { aggs, .. } => Some(aggs),
+                _ => None,
+            })
+            .expect("HashAggregate");
+        assert_eq!(aggregate.len(), 2);
+        assert_eq!(aggregate[0].func, AggFn::Count);
+        assert_eq!(aggregate[1].func, AggFn::Sum);
+    }
+
+    #[test]
+    fn distinct_compiles_to_dedup_rows() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "MATCH (n) RETURN DISTINCT n");
+        assert!(has_op(&program, |op| matches!(op, Op::DedupRows { .. })));
+    }
+
+    #[test]
+    fn pattern_comprehension_uses_a_collect_cursor() {
+        let mut db = test_db();
+        db.write(|db| {
+            db.ensure_label("Person")?;
+            db.ensure_edge_type("K")
+        })
+        .expect("schema");
+        let program = compile_source(&mut db, "MATCH (n:Person) RETURN [(n)-[:K]->(m) | m] AS ms");
+        assert!(has_op(&program, |op| matches!(op, Op::CollectOpen { .. })));
+        assert!(has_op(&program, |op| matches!(op, Op::CollectRow { .. })));
+    }
+
+    #[test]
+    fn create_compiles_to_mutation_ops() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "CREATE (:A {name: 'x'})");
+        assert!(has_op(&program, |op| matches!(op, Op::CreateNode { .. })));
+        assert!(program.mutating);
+    }
+
+    #[test]
+    fn merge_compiles_match_and_create_branches() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "MERGE (n:Person {name: 'x'})");
+        assert!(has_op(&program, |op| matches!(
+            op,
+            Op::CheckMergeProps { .. }
+        )));
+        assert!(has_op(&program, |op| matches!(op, Op::CreateNode { .. })));
+        assert!(program.mutating);
+    }
+
+    #[test]
+    fn delete_compiles_to_delete_any() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "MATCH (n) DELETE n");
+        assert!(has_op(&program, |op| matches!(op, Op::DeleteAny { .. })));
+    }
+}

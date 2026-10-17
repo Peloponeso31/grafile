@@ -2151,4 +2151,85 @@ mod tests {
         })
         .expect("verify");
     }
+
+    #[test]
+    fn label_bitmaps_follow_label_add_and_remove() {
+        let mut db = temp_db();
+        db.write(|db| {
+            let person = db.ensure_label("Person")?;
+            let robot = db.ensure_label("Robot")?;
+            let a = db.create_node(&[person], vec![])?;
+            let b = db.create_node(&[], vec![])?;
+
+            db.add_node_labels(b, &[robot])?;
+            assert_eq!(db.label_nodes(person)?, vec![a]);
+            assert_eq!(db.label_nodes(robot)?, vec![b]);
+
+            db.remove_node_labels(a, &[person])?;
+            assert!(db.label_nodes(person)?.is_empty());
+            assert!(db.node_exists(a)?, "the node survives label removal");
+            assert_eq!(db.get_node(a)?.expect("node").labels, Vec::<u32>::new());
+
+            db.add_node_labels(a, &[person])?;
+            assert_eq!(db.label_nodes(person)?, vec![a]);
+            Ok(())
+        })
+        .expect("write");
+    }
+
+    #[test]
+    fn edge_deletion_removes_its_index_entries() {
+        let mut db = temp_db();
+        db.write(|db| {
+            let person = db.ensure_label("Person")?;
+            let knows = db.ensure_edge_type("KNOWS")?;
+            let weight = db.ensure_property_key("weight")?;
+            let a = db.create_node(&[person], vec![])?;
+            let b = db.create_node(&[person], vec![])?;
+            let e = db.create_edge(knows, a, b, vec![(weight, Value::Int(1))])?;
+            db.create_edge_index("weight", Some("KNOWS"), false)?;
+            assert_eq!(edge_index_entries(db, &Value::Int(1)), vec![e]);
+            assert_eq!(db.node_edges(a, Direction::Out, &[])?.len(), 1);
+
+            assert!(db.delete_edge(e)?);
+            assert!(edge_index_entries(db, &Value::Int(1)).is_empty());
+            assert!(db.edges_of_type(knows)?.is_empty());
+            assert_eq!(db.node_edges(a, Direction::Out, &[])?.len(), 0);
+            assert_eq!(
+                db.node_edges(b, Direction::In, &[])?.len(),
+                0,
+                "the in-side bitmap is cleared too"
+            );
+            Ok(())
+        })
+        .expect("write");
+    }
+
+    #[test]
+    fn node_index_entries_follow_property_changes() {
+        let mut db = temp_db();
+        db.write(|db| {
+            let person = db.ensure_label("Person")?;
+            let age = db.ensure_property_key("age")?;
+            let n = db.create_node(&[person], vec![(age, Value::Int(30))])?;
+            let index = db.create_node_index("age", Some("Person"), false)?;
+            assert_eq!(db.index_lookup(index, &Value::Int(30))?, vec![n]);
+
+            db.set_node_property(n, age, Value::Int(40))?;
+            assert!(db.index_lookup(index, &Value::Int(30))?.is_empty());
+            assert_eq!(db.index_lookup(index, &Value::Int(40))?, vec![n]);
+
+            // Null removes the property and its index entry.
+            db.set_node_property(n, age, Value::Null)?;
+            assert!(db.index_lookup(index, &Value::Int(40))?.is_empty());
+            assert_eq!(db.get_node(n)?.expect("node").get(age), None);
+
+            db.set_node_property(n, age, Value::Int(50))?;
+            assert_eq!(db.index_lookup(index, &Value::Int(50))?, vec![n]);
+            db.replace_node_properties(n, vec![])?;
+            assert!(db.index_lookup(index, &Value::Int(50))?.is_empty());
+            Ok(())
+        })
+        .expect("write");
+    }
 }
