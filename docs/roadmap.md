@@ -48,8 +48,9 @@ of the built-in function library, and temporal/spatial value types.
 
 Known semantic deviations to close:
 
-- `MERGE` on a path with unbound endpoints merges the node(s) first and then
-  the relationship, instead of matching the whole path atomically.
+- A write clause followed by a read clause streams rows instead of
+  buffering: `MATCH (a:A) DELETE a MERGE (a2:A)` can still match a node
+  deleted by an earlier row (Phase 4).
 - `ORDER BY` after aggregation may only reference projected values.
 - Aggregations with multiple arguments are rejected (needed for
   `percentileCont`/`percentileDisc`, Phase 2).
@@ -63,11 +64,11 @@ Status markers: `[done]` implemented and gated, `[partial]` some items
 finished, `[pending]` not started. Items the TCK does not exercise are
 verified by unit and integration tests and must not regress the report.
 
-Current baseline: 2020 of 3897 scenarios passing (51.8%), 1877 allow-listed.
+Current baseline: 2048 of 3897 scenarios passing (52.5%), 1849 allow-listed.
 The remaining list is dominated by temporal types (~1000, Phase 3), the
 error-kind/phase and ordering/comparison sweeps (~690, Phase 4), the function
-library (Phase 2), pattern predicates (~50, Phase 1B), MERGE conformance
-(~21, Phase 1D) and CALL procedure registration (52, unreachable: the TCK
+library (Phase 2), pattern predicates (~50, Phase 1B), eager evaluation after
+writes (Phase 4) and CALL procedure registration (52, unreachable: the TCK
 registers test procedures).
 
 ### Phase 1 — Core language completion (large) [partial]
@@ -97,10 +98,14 @@ registers test procedures).
 - List comprehensions, quantifiers with three-valued logic and `reduce()`
   (556 scenarios).
 
-#### 1D — Write-side completeness [pending]
+#### 1D — Write-side completeness [partial]
 
-- [ ] MERGE conformance: whole-path match-or-create and multiple
-  relationships; removes the documented deviation (~21).
+- [done] MERGE conformance: the whole path matches or is created atomically
+  (including multiple relationships), matching honours the written
+  direction, `p = …` binds the path, bound nodes cannot gain labels,
+  variable-length patterns and relationship re-binding are rejected,
+  null property values are rejected, `n[key]`/`r[key]` dynamic property
+  access works and `SET x = entity` copies properties.
 - [ ] `FOREACH` and `CALL … YIELD` for built-in procedures (`db.labels()`,
   `db.propertyKeys()`, …). TCK-blind: unit tests only.
 
@@ -142,6 +147,9 @@ the remaining documented deviations.
   same rules. TCK-blind: unit and integration tests only.
 - Statically detectable errors (for example `NOT {true: true}`,
   `labels(path)`) are reported at compile time instead of runtime.
+- Eager evaluation between a write clause and a later read clause: rows are
+  buffered so that `MATCH … DELETE a MERGE (a2:A)` cannot match a node
+  deleted by an earlier row, matching Neo4j's eager operators.
 
 ### Phase 5 — Neo4j extensions (medium) [pending]
 
