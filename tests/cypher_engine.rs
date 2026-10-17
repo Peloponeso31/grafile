@@ -981,6 +981,64 @@ fn string_case_and_trimming_helpers() {
     );
 }
 
+// ---- math functions ----
+
+#[test]
+fn math_rounding_and_signs() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN abs(-1) AS a, abs(-2.5) AS b, sign(-3) AS c, sign(0.0) AS d, \
+         ceil(0.1) AS e, floor(-0.1) AS f, round(2.5) AS g, round(-2.5) AS h",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1", "2.5", "-1", "0", "1", "-1", "3", "-3"]]
+    );
+}
+
+#[test]
+fn math_logarithms_and_roots() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN sqrt(12.96) AS a, exp(0.0) AS b, log(1.0) AS c, log10(100.0) AS d, \
+         log(null) AS e",
+    );
+    assert_eq!(rows, vec![vec!["3.6", "1", "0", "2", "null"]]);
+}
+
+#[test]
+fn math_trigonometry_and_constants() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN degrees(pi()) AS a, radians(180.0) AS b, sin(0.0) AS c, cos(0.0) AS d, \
+         atan2(1.0, 1.0) AS e, haversin(pi()) AS f, e() > 2.7 AS g",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "180",
+            "3.141592653589793",
+            "0",
+            "1",
+            "0.7853981633974483",
+            "1",
+            "true"
+        ]]
+    );
+}
+
+#[test]
+fn math_functions_reject_non_numbers() {
+    let mut conn = connection();
+    let err = conn
+        .query("RETURN abs('x')", &Params::new())
+        .expect_err("string argument");
+    assert_eq!(err.code(), grafile::ErrorCode::Type);
+}
+
 #[test]
 fn conversions_reject_incompatible_types() {
     let mut conn = connection();

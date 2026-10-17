@@ -484,10 +484,6 @@
       "[17] Fail when using floating point in LIMIT 2": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      },
-      "[6] LIMIT with an expression that does not depend on variables": {
-        "reason": "not-implemented",
-        "note": "setup failed: Unsupported: function `range` is not supported yet"
       }
     },
     "clauses/return/Return2.feature": {
@@ -1806,12 +1802,6 @@
         "note": "expected SyntaxError at compile time, but the query returned 1 rows"
       }
     },
-    "expressions/list/List11.feature": {
-      "[3] Create an empty list if range direction and step direction are inconsistent": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `sign` is not supported yet"
-      }
-    },
     "expressions/list/List3.feature": {
       "[1] Equality between list and literal should return false": {
         "reason": "not-implemented",
@@ -2066,18 +2056,6 @@
         "note": "expected TypeError at compile time, but the query returned 1 rows"
       }
     },
-    "expressions/mathematical/Mathematical11.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `abs` is not supported yet"
-      }
-    },
-    "expressions/mathematical/Mathematical13.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `sqrt` is not supported yet"
-      }
-    },
     "expressions/path/Path2.feature": {
       "[2] Return relationships by fetching them from the path - starting from the end": {
         "reason": "not-implemented",
@@ -2328,18 +2306,6 @@
       "[8] All quantifier on list containing nodes": {
         "reason": "not-implemented",
         "note": "expected rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident)"
-      }
-    },
-    "expressions/quantifier/Quantifier5.feature": {
-      "[2] None quantifier can nest itself and other quantifiers on the same list (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `abs` is not supported yet"
-      }
-    },
-    "expressions/quantifier/Quantifier8.feature": {
-      "[2] All quantifier can nest itself and other quantifiers on the same list (example 7)": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `abs` is not supported yet"
       }
     },
     "expressions/temporal/Temporal1.feature": {

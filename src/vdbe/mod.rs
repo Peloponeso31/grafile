@@ -600,6 +600,50 @@ pub mod func {
     pub const RIGHT: u8 = 30;
     /// `replace(original, search, replacement)`
     pub const REPLACE: u8 = 31;
+    /// `abs(x)`
+    pub const ABS: u8 = 32;
+    /// `ceil(x)`
+    pub const CEIL: u8 = 33;
+    /// `floor(x)`
+    pub const FLOOR: u8 = 34;
+    /// `round(x)`
+    pub const ROUND: u8 = 35;
+    /// `sign(x)`
+    pub const SIGN: u8 = 36;
+    /// `sqrt(x)`
+    pub const SQRT: u8 = 37;
+    /// `exp(x)`
+    pub const EXP: u8 = 38;
+    /// `log(x)`
+    pub const LOG: u8 = 39;
+    /// `log10(x)`
+    pub const LOG10: u8 = 40;
+    /// `sin(x)`
+    pub const SIN: u8 = 41;
+    /// `cos(x)`
+    pub const COS: u8 = 42;
+    /// `tan(x)`
+    pub const TAN: u8 = 43;
+    /// `cot(x)`
+    pub const COT: u8 = 44;
+    /// `asin(x)`
+    pub const ASIN: u8 = 45;
+    /// `acos(x)`
+    pub const ACOS: u8 = 46;
+    /// `atan(x)`
+    pub const ATAN: u8 = 47;
+    /// `atan2(y, x)`
+    pub const ATAN2: u8 = 48;
+    /// `degrees(x)`
+    pub const DEGREES: u8 = 49;
+    /// `radians(x)`
+    pub const RADIANS: u8 = 50;
+    /// `haversin(x)`
+    pub const HAVERSIN: u8 = 51;
+    /// `pi()`
+    pub const PI: u8 = 52;
+    /// `e()`
+    pub const E: u8 = 53;
 }
 
 /// A compiled VDBE program.
@@ -2013,6 +2057,58 @@ impl<'a> Executor<'a> {
             func::RTRIM => text_map(args, "rtrim", |text| text.trim_end().to_owned()),
             func::LEFT | func::RIGHT => call_left_right(func, args),
             func::REPLACE => call_replace(args),
+            func::ABS => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::Int(value)) => Ok(match value.checked_abs() {
+                    Some(value) => Value::Int(value),
+                    // `abs(i64::MIN)` overflows into float, like Neo4j.
+                    None => Value::Float((*value as f64).abs()),
+                }),
+                Some(Value::Float(value)) => Ok(Value::Float(value.abs())),
+                Some(other) => Err(invalid_argument("abs", other)),
+            },
+            func::SIGN => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::Int(value)) => Ok(Value::Int(value.signum())),
+                Some(Value::Float(value)) => Ok(Value::Int(if value.is_nan() {
+                    0
+                } else if *value > 0.0 {
+                    1
+                } else if *value < 0.0 {
+                    -1
+                } else {
+                    0
+                })),
+                Some(other) => Err(invalid_argument("sign", other)),
+            },
+            func::CEIL => float_map(args, "ceil", f64::ceil),
+            func::FLOOR => float_map(args, "floor", f64::floor),
+            func::ROUND => float_map(args, "round", f64::round),
+            func::SQRT => float_map(args, "sqrt", f64::sqrt),
+            func::EXP => float_map(args, "exp", f64::exp),
+            func::LOG => float_map(args, "log", f64::ln),
+            func::LOG10 => float_map(args, "log10", f64::log10),
+            func::SIN => float_map(args, "sin", f64::sin),
+            func::COS => float_map(args, "cos", f64::cos),
+            func::TAN => float_map(args, "tan", f64::tan),
+            func::COT => float_map(args, "cot", |value| 1.0 / value.tan()),
+            func::ASIN => float_map(args, "asin", f64::asin),
+            func::ACOS => float_map(args, "acos", f64::acos),
+            func::ATAN => float_map(args, "atan", f64::atan),
+            func::ATAN2 => match (args.first(), args.get(1)) {
+                (Some(Value::Null), _) | (_, Some(Value::Null)) | (None, _) => Ok(Value::Null),
+                (Some(first), Some(second)) => {
+                    let y = number_argument("atan2", first)?;
+                    let x = number_argument("atan2", second)?;
+                    Ok(Value::Float(y.atan2(x)))
+                }
+                (Some(other), None) => Err(invalid_argument("atan2", other)),
+            },
+            func::DEGREES => float_map(args, "degrees", f64::to_degrees),
+            func::RADIANS => float_map(args, "radians", f64::to_radians),
+            func::HAVERSIN => float_map(args, "haversin", |value| (1.0 - value.cos()) / 2.0),
+            func::PI => Ok(Value::Float(std::f64::consts::PI)),
+            func::E => Ok(Value::Float(std::f64::consts::E)),
             func::PROPERTIES => match args.first() {
                 Some(Value::Node(id)) => {
                     let Some(record) = self.db.get_node(*id)? else {
@@ -2689,6 +2785,23 @@ fn call_replace(args: &[Value]) -> Result<Value> {
     }
     let [original, search, replacement] = texts;
     Ok(Value::Text(original.replace(search, replacement).into()))
+}
+
+/// Interpret a value as a number for a math function.
+fn number_argument(name: &str, value: &Value) -> Result<f64> {
+    match value {
+        Value::Int(number) => Ok(*number as f64),
+        Value::Float(number) => Ok(*number),
+        other => Err(invalid_argument(name, other)),
+    }
+}
+
+/// Apply a float transformation: null propagates and integers are widened.
+fn float_map(args: &[Value], name: &str, f: impl FnOnce(f64) -> f64) -> Result<Value> {
+    match args.first() {
+        Some(Value::Null) | None => Ok(Value::Null),
+        Some(value) => Ok(Value::Float(f(number_argument(name, value)?))),
+    }
 }
 
 /// Apply a string transformation, propagating nulls and rejecting other
