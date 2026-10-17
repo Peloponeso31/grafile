@@ -981,6 +981,69 @@ fn string_case_and_trimming_helpers() {
     );
 }
 
+// ---- percentile and deviation aggregations ----
+
+#[test]
+fn percentile_aggregations() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "UNWIND [10.0, 20.0, 30.0] AS price \
+         RETURN percentileDisc(price, 0.5) AS d, percentileCont(price, 0.5) AS c, \
+         percentileCont(price, 0.0) AS lo, percentileDisc(price, 1.0) AS hi",
+    );
+    assert_eq!(rows, vec![vec!["20", "20", "10", "30"]]);
+}
+
+#[test]
+fn percentile_disc_preserves_value_types() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "UNWIND [10, 20, 30] AS x \
+         RETURN percentileDisc(x, 0.5) AS d, percentileCont(x, 0.5) AS c",
+    );
+    assert_eq!(rows, vec![vec!["20", "20"]]);
+}
+
+#[test]
+fn percentile_ignores_null_values() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "UNWIND [null, 4.0, null, 8.0] AS x \
+         RETURN percentileDisc(x, 0.5) AS d, percentileCont(x, 1.0) AS c",
+    );
+    assert_eq!(rows, vec![vec!["4", "8"]]);
+}
+
+#[test]
+fn percentile_out_of_range_is_an_error() {
+    let mut conn = connection();
+    for source in [
+        "UNWIND [1.0] AS x RETURN percentileCont(x, 2.0)",
+        "UNWIND [1.0] AS x RETURN percentileDisc(x, -0.5)",
+    ] {
+        let err = conn
+            .query(source, &Params::new())
+            .expect_err("out of range");
+        assert_eq!(err.code(), grafile::ErrorCode::Range, "{source}");
+    }
+}
+
+#[test]
+fn standard_deviations() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "UNWIND [1, 2, 3, 4] AS x RETURN stDev(x) AS s, stDevP(x) AS p, stDev(null) AS n",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1.2909944487358056", "1.118033988749895", "null"]]
+    );
+}
+
 // ---- math functions ----
 
 #[test]

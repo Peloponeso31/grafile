@@ -652,9 +652,12 @@ impl Codegen {
                     for (expr, _) in groups {
                         group_values.push(cg.compile_expr(expr, in_ctx)?);
                     }
-                    let mut agg_values = Vec::with_capacity(aggs.len());
+                    let arg_count: usize = aggs.iter().map(|item| item.arguments.len()).sum();
+                    let mut agg_values = Vec::with_capacity(arg_count);
                     for item in aggs {
-                        agg_values.push(cg.compile_expr(&item.argument, in_ctx)?);
+                        for argument in &item.arguments {
+                            agg_values.push(cg.compile_expr(argument, in_ctx)?);
+                        }
                     }
                     let prefix = cg.next_reg - in_ctx.window_start;
                     let group_base = cg.next_reg;
@@ -676,7 +679,7 @@ impl Codegen {
                     cg.emit(Op::CollectRow {
                         cursor,
                         start: in_ctx.window_start,
-                        count: prefix + (groups.len() + aggs.len()) as u32,
+                        count: prefix + (groups.len() + arg_count) as u32,
                     });
                     Ok(())
                 })?;
@@ -686,6 +689,7 @@ impl Codegen {
                     .iter()
                     .map(|item| AggSpec {
                         func: item.func,
+                        args: item.arguments.len() as u8,
                         star: false,
                         distinct: item.distinct,
                     })

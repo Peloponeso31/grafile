@@ -1632,22 +1632,22 @@ impl<'a> Planner<'a> {
                     "aggregations are not allowed inside list comprehensions",
                 ));
             }
-            if let Some((func, argument, star, distinct)) = aggregate_call(expr)? {
+            if let Some((func, arguments, star, distinct)) = aggregate_call(expr)? {
                 aggs.push(AggItem {
                     func,
-                    argument: aggregate_argument(func, argument, star, &scope)?,
+                    arguments: aggregate_arguments(func, &arguments, star, &scope)?,
                     distinct,
                     name: name.clone(),
                 });
             } else if contains_aggregation(expr) {
                 let mut residual = rewrite_expr(expr, &mut |sub| {
-                    let Some((func, argument, star, distinct)) = aggregate_call(sub)? else {
+                    let Some((func, arguments, star, distinct)) = aggregate_call(sub)? else {
                         return Ok(None);
                     };
                     let hidden = format!("  agg{}", aggs.len());
                     aggs.push(AggItem {
                         func,
-                        argument: aggregate_argument(func, argument, star, &scope)?,
+                        arguments: aggregate_arguments(func, &arguments, star, &scope)?,
                         distinct,
                         name: hidden.clone(),
                     });
@@ -2340,9 +2340,9 @@ fn binary_text(op: BinaryOp) -> &'static str {
 }
 
 /// Whether an expression is exactly an aggregation call, returning the
-/// function, optional argument and star flag.
+/// function, its arguments and the star flag.
 #[allow(clippy::type_complexity)]
-fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool, bool)>> {
+fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Vec<&Expr>, bool, bool)>> {
     let Expr::Function {
         name,
         distinct,
@@ -2359,6 +2359,10 @@ fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool, boo
         "min" => AggFn::Min,
         "max" => AggFn::Max,
         "collect" => AggFn::Collect,
+        "percentilecont" => AggFn::PercentileCont,
+        "percentiledisc" => AggFn::PercentileDisc,
+        "stdev" => AggFn::StDev,
+        "stdevp" => AggFn::StDevP,
         _ => return Ok(None),
     };
     if *star {
@@ -2368,29 +2372,40 @@ fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool, boo
         if *distinct {
             return Err(Error::syntax("count(DISTINCT *) is not valid"));
         }
-        return Ok(Some((func, None, true, false)));
+        return Ok(Some((func, Vec::new(), true, false)));
     }
-    match args.len() {
-        1 => Ok(Some((func, Some(&args[0]), false, *distinct))),
-        0 => Err(Error::syntax(format!("{name} requires an argument"))),
-        _ => Err(Error::unsupported("aggregations with multiple arguments")),
+    let expected = match func {
+        AggFn::PercentileCont | AggFn::PercentileDisc => 2,
+        _ => 1,
+    };
+    if args.len() != expected {
+        return Err(Error::syntax(format!(
+            "{name}() expects {expected} argument(s)"
+        )));
     }
+    Ok(Some((func, args.iter().collect(), false, *distinct)))
 }
 
-/// The argument of an aggregation, with `count(*)` becoming `count(1)`.
-fn aggregate_argument(
+/// The arguments of an aggregation, with `count(*)` becoming `count(1)`.
+fn aggregate_arguments(
     func: AggFn,
-    argument: Option<&Expr>,
+    arguments: &[&Expr],
     star: bool,
     scope: &FastMap<String, VarKind>,
-) -> Result<Expr> {
+) -> Result<Vec<Expr>> {
     if star {
-        return Ok(Expr::Literal(Value::Int(1)));
+        return Ok(vec![Expr::Literal(Value::Int(1))]);
     }
-    let argument =
-        argument.ok_or_else(|| Error::syntax(format!("{func:?} requires an argument")))?;
-    validate_expr(argument, scope)?;
-    Ok(argument.clone())
+    if arguments.is_empty() {
+        return Err(Error::syntax(format!("{func:?} requires an argument")));
+    }
+    for argument in arguments {
+        validate_expr(argument, scope)?;
+    }
+    Ok(arguments
+        .iter()
+        .map(|argument| (*argument).clone())
+        .collect())
 }
 
 /// Rewrite an expression top-down; `f` may replace a subexpression and stop
@@ -3209,7 +3224,16 @@ fn contains_aggregation(expr: &Expr) -> bool {
             let lower = name.to_ascii_lowercase();
             matches!(
                 lower.as_str(),
-                "count" | "sum" | "avg" | "min" | "max" | "collect"
+                "count"
+                    | "sum"
+                    | "avg"
+                    | "min"
+                    | "max"
+                    | "collect"
+                    | "percentilecont"
+                    | "percentiledisc"
+                    | "stdev"
+                    | "stdevp"
             ) || args.iter().any(contains_aggregation)
         }
         Expr::Property { base, .. } | Expr::Unary { expr: base, .. } => contains_aggregation(base),

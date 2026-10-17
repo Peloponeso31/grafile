@@ -65,6 +65,8 @@ impl Eq for Reg {}
 pub struct AggSpec {
     /// Aggregation function.
     pub func: AggFn,
+    /// How many argument values each row feeds this aggregation.
+    pub args: u8,
     /// Whether the argument is `*` (only meaningful for `count`).
     pub star: bool,
     /// Whether only distinct argument values are aggregated.
@@ -1855,9 +1857,11 @@ impl<'a> Executor<'a> {
             let accumulators = table
                 .entry(key)
                 .or_insert_with(|| aggs.iter().map(|spec| AggState::new(*spec)).collect());
+            let mut offset = prefix + group_count;
             for (idx, spec) in aggs.iter().enumerate() {
-                let input = &row[prefix + group_count + idx];
-                accumulators[idx].step(spec, input);
+                let inputs = &row[offset..offset + spec.args as usize];
+                accumulators[idx].step(spec, inputs)?;
+                offset += spec.args as usize;
             }
         }
         if table.is_empty() && group_count == 0 {
@@ -2194,14 +2198,14 @@ impl AggState {
         }
     }
 
-    fn step(&mut self, spec: &AggSpec, input: &Reg) {
+    fn step(&mut self, spec: &AggSpec, inputs: &[Reg]) -> Result<()> {
         if spec.distinct {
-            let value = input.to_value();
+            let value = inputs[0].to_value();
             if value.is_null() || !self.seen.insert(value) {
-                return;
+                return Ok(());
             }
         }
-        self.accumulator.step(spec, input);
+        self.accumulator.step(spec, inputs)
     }
 
     fn finish(self, spec: &AggSpec) -> Value {
@@ -2213,10 +2217,32 @@ impl AggState {
 enum Accumulator {
     Count(i64),
     Sum(SumState),
-    Avg { sum: f64, count: i64 },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
     Min(Option<Value>),
     Max(Option<Value>),
     Collect(Vec<Value>),
+    /// `percentileCont`: interpolated numeric values and the latest
+    /// percentile argument.
+    PercentileCont {
+        values: Vec<f64>,
+        percentile: Option<f64>,
+    },
+    /// `percentileDisc`: original values (types preserved) and the latest
+    /// percentile argument.
+    PercentileDisc {
+        values: Vec<Value>,
+        percentile: Option<f64>,
+    },
+    /// Welford's online variance for `stDev` (sample) and `stDevP`.
+    StDev {
+        count: u64,
+        mean: f64,
+        m2: f64,
+        sample: bool,
+    },
 }
 
 enum SumState {
@@ -2234,11 +2260,62 @@ impl Accumulator {
             AggFn::Min => Self::Min(None),
             AggFn::Max => Self::Max(None),
             AggFn::Collect => Self::Collect(Vec::new()),
+            AggFn::PercentileCont => Self::PercentileCont {
+                values: Vec::new(),
+                percentile: None,
+            },
+            AggFn::PercentileDisc => Self::PercentileDisc {
+                values: Vec::new(),
+                percentile: None,
+            },
+            AggFn::StDev | AggFn::StDevP => Self::StDev {
+                count: 0,
+                mean: 0.0,
+                m2: 0.0,
+                sample: spec.func == AggFn::StDev,
+            },
         }
     }
 
-    fn step(&mut self, spec: &AggSpec, input: &Reg) {
-        let value = input.to_value();
+    /// Feed one row's argument values into the accumulator. Percentile
+    /// arguments are validated here so out-of-range values fail at runtime.
+    fn step(&mut self, spec: &AggSpec, inputs: &[Reg]) -> Result<()> {
+        match self {
+            Self::PercentileCont { values, percentile } => {
+                *percentile = Some(percentile_argument(inputs.get(1))?);
+                if let Some(number) = inputs[0].to_value().as_number() {
+                    values.push(number);
+                }
+                return Ok(());
+            }
+            Self::PercentileDisc { values, percentile } => {
+                *percentile = Some(percentile_argument(inputs.get(1))?);
+                let value = inputs[0].to_value();
+                if !value.is_null() {
+                    values.push(value);
+                }
+                return Ok(());
+            }
+            Self::StDev {
+                count, mean, m2, ..
+            } => {
+                if let Some(number) = inputs[0].to_value().as_number() {
+                    // Welford's online algorithm keeps the running variance
+                    // stable without buffering every value.
+                    *count += 1;
+                    let delta = number - *mean;
+                    *mean += delta / *count as f64;
+                    *m2 += delta * (number - *mean);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        self.step_value(spec, inputs[0].to_value());
+        Ok(())
+    }
+
+    fn step_value(&mut self, spec: &AggSpec, value: Value) {
         match self {
             Self::Count(count) => {
                 if spec.star || !value.is_null() {
@@ -2283,6 +2360,9 @@ impl Accumulator {
                     items.push(value);
                 }
             }
+            // Multi-input accumulators are handled by `step` before this
+            // point.
+            Self::PercentileCont { .. } | Self::PercentileDisc { .. } | Self::StDev { .. } => {}
         }
     }
 
@@ -2303,8 +2383,69 @@ impl Accumulator {
             }
             Self::Min(value) | Self::Max(value) => value.unwrap_or(Value::Null),
             Self::Collect(items) => Value::List(items.into()),
+            Self::PercentileCont {
+                mut values,
+                percentile,
+            } => {
+                let Some(percentile) = percentile.filter(|_| !values.is_empty()) else {
+                    return Value::Null;
+                };
+                values.sort_by(f64::total_cmp);
+                let position = percentile * (values.len() - 1) as f64;
+                let lower = position.floor() as usize;
+                let upper = position.ceil() as usize;
+                let fraction = position - lower as f64;
+                Value::Float(values[lower] + (values[upper] - values[lower]) * fraction)
+            }
+            Self::PercentileDisc {
+                mut values,
+                percentile,
+            } => {
+                let Some(percentile) = percentile.filter(|_| !values.is_empty()) else {
+                    return Value::Null;
+                };
+                values.sort();
+                // Nearest-rank method: the first value at or above the
+                // requested percentile rank.
+                let rank = (percentile * values.len() as f64).ceil().max(1.0);
+                values[rank as usize - 1].clone()
+            }
+            Self::StDev {
+                count, m2, sample, ..
+            } => {
+                if count == 0 {
+                    Value::Null
+                } else if sample && count == 1 {
+                    Value::Float(0.0)
+                } else {
+                    let divisor = if sample {
+                        (count - 1) as f64
+                    } else {
+                        count as f64
+                    };
+                    Value::Float((m2 / divisor).sqrt())
+                }
+            }
         }
     }
+}
+
+/// Interpret the percentile argument of `percentileCont`/`percentileDisc`,
+/// which must be a number between 0 and 1.
+fn percentile_argument(input: Option<&Reg>) -> Result<f64> {
+    let value = input.map(Reg::to_value).unwrap_or(Value::Null);
+    let number = match value {
+        Value::Int(number) => number as f64,
+        Value::Float(number) => number,
+        other => return Err(invalid_argument("percentile", &other)),
+    };
+    if !(0.0..=1.0).contains(&number) {
+        return Err(Error::new(
+            crate::error::ErrorCode::Range,
+            "percentile must be between 0 and 1",
+        ));
+    }
+    Ok(number)
 }
 
 /// Operator codes for [`Op::Unary`].

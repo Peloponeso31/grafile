@@ -1078,12 +1078,6 @@
         "note": "rows differ: expected [1, 2], got 0.2"
       }
     },
-    "expressions/aggregation/Aggregation6.feature": {
-      "*": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: function `percentiledisc` is not supported yet"
-      }
-    },
     "expressions/boolean/Boolean1.feature": {
       "[5] Conjunction is commutative on null": {
         "reason": "not-implemented",
