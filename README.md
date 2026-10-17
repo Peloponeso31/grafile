@@ -197,7 +197,7 @@ The interactive shell remembers a few conveniences:
 | Command | Effect |
 | --- | --- |
 | `.schema` | labels, relationship types and property keys |
-| `.indexes` | index definitions |
+| `.indexes` | index and constraint definitions |
 | `.meta` | database header: page size, UUID, freelist, tree roots |
 | `.mode NAME` | output mode: `table`, `box`, `csv`, `json`, `markdown`, … |
 | `.headers on\|off` | column titles |
@@ -279,10 +279,20 @@ for row in rows.iter() {
 # Ok::<(), grafile::Error>(())
 ```
 
-Property indexes are a DDL extension (openCypher has no DDL, and the shell
-does not expose index creation yet; Cypher `CREATE INDEX` / `CREATE
-CONSTRAINT` statements are scheduled in [docs/roadmap.md](docs/roadmap.md)
-Phase 5):
+Schema DDL is a Neo4j extension (openCypher defines none). It runs as
+regular statements from the shell, scripts or the API:
+
+```console
+grafile> CREATE CONSTRAINT person_email IF NOT EXISTS FOR (n:Person) REQUIRE n.email IS UNIQUE
+grafile> CREATE INDEX person_name FOR (n:Person) ON (n.name)
+grafile> DROP CONSTRAINT person_email IF EXISTS
+```
+
+`IS UNIQUE`, `IS NOT NULL` and `REQUIRE (n.a, n.b) IS NODE KEY` are
+enforced on creation, property removal and whole-map replacement, and
+the edge form `FOR ()-[r:TYPE]-()` covers unique and not-null edge
+constraints. `SHOW INDEXES` / `SHOW CONSTRAINTS` are not supported. The
+Rust API keeps the direct constructors:
 
 ```rust
 conn.create_node_index("name", Some("Person"), true)?; // unique index
@@ -327,7 +337,8 @@ in `ffi/examples/`.
 ## Cypher support
 
 Implemented: `MATCH` (node and relationship patterns, directions, type
-disjunction, inline property filters including non-literal values),
+disjunction and label expressions — `:A|B`, `:A&B`, `:!A` — inline
+property filters including non-literal values),
 `OPTIONAL MATCH`, `WHERE`, `RETURN` and `WITH` (with
 `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`), `UNWIND`, `CREATE`, `MERGE` (with
 `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE` /
@@ -364,12 +375,14 @@ serialization, component accessors (`d.year`, `t.offset`, `du.months`,
 `date.truncate`/`datetime.truncate` and friends (millennium through
 microsecond), plus `distance()` for cartesian and WGS-84 points.
 
-Explicit gaps fail with clear `Unsupported` errors instead of wrong results:
-`REMOVE n = {…}` and map projections (`n{.name}`). The plan to close them,
+Explicit gaps fail with clear `Unsupported` errors instead of wrong
+results: `REMOVE n = {…}`, map projections (`n{.name}`), `SHOW
+INDEXES`/`SHOW CONSTRAINTS`, and negated or conjunctive type expressions
+on variable-length and shortest-path patterns. The plan to close them,
 ordered by TCK scenario share, is in [docs/roadmap.md](docs/roadmap.md).
-Storage-side work tracked alongside it: WAL mode for concurrent readers,
-delete rebalancing and `VACUUM`-style compaction, bulk loading, and
-streaming scans.
+Storage-side work tracked alongside it: WAL mode for concurrent
+readers, delete rebalancing and `VACUUM`-style compaction, bulk loading,
+and streaming scans.
 
 ## Conformance: the openCypher TCK
 

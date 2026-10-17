@@ -17,7 +17,8 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
   `CREATE`, `MERGE` (with `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`,
   `DELETE`, `DETACH DELETE`, `UNION` / `UNION ALL`.
 - Patterns: node and relationship patterns, directions, type disjunction
-  (`:A|B`), inline literal property filters, multiple labels, pre-bound
+  (`:A|B`) and label expressions (`:A|B`, `:A&B`, `:!A`), inline literal
+  property filters, multiple labels, pre-bound
   elements (verified instead of re-bound), variable-length paths (`*`, `*2`,
   `*1..3`, `*0..`) with trail semantics, named paths (`p = …`) with
   `nodes()`, `relationships()` and `length()`.
@@ -46,6 +47,10 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
   `*.truncate` from millennium to microsecond; `distance()` for cartesian
   and WGS-84 points; statement clock functions
   (`date.transaction`/`realtime`/`statement` and friends).
+- Schema DDL: `CREATE INDEX`/`CREATE CONSTRAINT` with `IS UNIQUE`,
+  `IS NOT NULL` and `IS NODE KEY`, `DROP INDEX`/`DROP CONSTRAINT` with
+  `IF [NOT] EXISTS`, and the edge forms; constraints are enforced on every
+  write path (see Phase 5).
 
 Explicit gaps (currently clear `Unsupported` errors):
 
@@ -174,10 +179,9 @@ column names.
 Not delivered: pattern comprehensions nested inside list comprehensions
 (evaluated per element without plan nodes; one scenario stays allow-listed).
 
-### Phase 5 — Neo4j extensions (medium) [pending]
+### Phase 5 — Neo4j extensions (medium) [partial]
 
-- Cypher DDL for indexes and constraints (today they exist only through the
-  Rust API, and the shell cannot create or drop them):
+- [done] Cypher DDL for indexes and constraints:
   - `CREATE [CONSTRAINT|INDEX] name [IF NOT EXISTS] FOR (n:Label) …` and the
     edge form `FOR ()-[r:TYPE]-() …`, plus `DROP … name [IF EXISTS]`.
   - Constraint kinds: `IS UNIQUE`, `IS NOT NULL` (existence, enforced on
@@ -187,16 +191,20 @@ Not delivered: pattern comprehensions nested inside list comprehensions
   - Reject the Neo4j 3.x forms (`CREATE INDEX ON :L(p)`, `… ASSERT …`) with a
     message pointing at the modern syntax; `SHOW INDEXES`/`SHOW CONSTRAINTS`
     remain unsupported.
-  - Storage: index definitions gain a name, key list and kind; the catalog
-    entry encoding changes with a format minor bump and stays readable in
-    both directions. Dropping an index frees its B+tree pages.
+  - Storage: index definitions gained a name, key list and kind. The catalog
+    format minor is 3: named objects use new catalog entry kinds and
+    `IS NOT NULL` constraints take entries of their own, so builds from
+    minor 2 reject files that contain them while minor-3 builds read both
+    encodings. Dropping an index frees its B+tree pages.
   - No TCK coverage (openCypher defines no DDL): verified by unit and
     integration tests, and the conformance gate must not regress.
-- `LOAD CSV [WITH HEADERS] FROM …` for local file paths.
-- Label expressions in patterns: `:A|B`, `:!A` (negation and conjunction are
-  rejected on variable-length and shortest-path patterns).
+- [pending] `LOAD CSV [WITH HEADERS] FROM …` for local file paths.
+- [done] Label expressions in patterns: `:A|B`, `:A&B`, `:!A` (negation and
+  conjunction are rejected on variable-length and shortest-path patterns).
 
-These stay allow-listed as `neo4j-extension` until this phase.
+The vendored TCK has no scenarios for these extensions, so none of them is
+allow-listed; the allow-list only holds the CALL procedure non-goal and one
+nested pattern comprehension.
 
 ### Phase 6 — Performance for the new surface (medium, interleaved) [pending]
 

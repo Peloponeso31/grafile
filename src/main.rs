@@ -1221,7 +1221,7 @@ repl:
   queries end with ';' or an empty line
   .help             this message
   .schema           labels, edge types and property keys
-  .indexes          index definitions
+  .indexes          index and constraint definitions
   .meta [raw|human] database header metadata (default human)
   .mode [NAME]      output mode (.mode --list to see all)
   .headers on|off   show column titles (default on)
@@ -1243,7 +1243,9 @@ cypher (v1): MATCH, OPTIONAL MATCH, WHERE, RETURN, WITH, UNWIND,
              stDev), a built-in function library, temporal values
              (date/time/datetime/duration with IANA zones) and spatial
              points, parameters ($name)
-ddl (extension): CREATE INDEX ON :Label(prop) / :TYPE(prop) via API"
+ddl (extension): CREATE INDEX|CONSTRAINT name [IF NOT EXISTS]
+             FOR (n:Label)|()-[r:TYPE]-() ..., DROP INDEX|CONSTRAINT name
+             [IF EXISTS] (SHOW is not supported)"
     );
 }
 
