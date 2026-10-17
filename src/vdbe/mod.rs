@@ -1795,21 +1795,35 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
-            Op::DeleteAny { target, detach } => match self.reg_value(*target)? {
-                Value::Node(id) => {
-                    self.db.delete_node(id, *detach)?;
+            Op::DeleteAny { target, detach } => {
+                // A `DELETE` target may be a path or a nested list of
+                // entities; every element is deleted.
+                self.delete_any(self.reg_value(*target)?, *detach)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_any(&mut self, value: Value, detach: bool) -> Result<()> {
+        match value {
+            Value::Node(id) => {
+                self.db.delete_node(id, detach)?;
+            }
+            Value::Edge(id) => {
+                self.db.delete_edge(id)?;
+            }
+            Value::List(items) => {
+                for item in items.iter() {
+                    self.delete_any(item.clone(), detach)?;
                 }
-                Value::Edge(id) => {
-                    self.db.delete_edge(id)?;
-                }
-                Value::Null => {}
-                other => {
-                    return Err(Error::type_error(format!(
-                        "DELETE expects a node or relationship, got {}",
-                        other.type_name()
-                    )));
-                }
-            },
+            }
+            Value::Null => {}
+            other => {
+                return Err(Error::type_error(format!(
+                    "DELETE expects a node, relationship or path, got {}",
+                    other.type_name()
+                )));
+            }
         }
         Ok(())
     }
@@ -2064,7 +2078,10 @@ impl<'a> Executor<'a> {
                     }
                     Ok(Value::List(names.into()))
                 }
-                _ => Ok(Value::Null),
+                Some(Value::Null) | None => Ok(Value::Null),
+                _ => Err(Error::type_error(
+                    "InvalidArgumentValue: labels() expects a node",
+                )),
             },
             func::TYPE => match args.first() {
                 Some(Value::Edge(id)) => {
@@ -2078,7 +2095,10 @@ impl<'a> Executor<'a> {
                         .map(|name| Value::Text(std::sync::Arc::from(name)))
                         .unwrap_or(Value::Null))
                 }
-                _ => Ok(Value::Null),
+                Some(Value::Null) | None => Ok(Value::Null),
+                _ => Err(Error::type_error(
+                    "InvalidArgumentValue: type() expects a relationship",
+                )),
             },
             func::START_NODE | func::END_NODE => match args.first() {
                 Some(Value::Edge(id)) => {
@@ -2092,7 +2112,10 @@ impl<'a> Executor<'a> {
                     };
                     Ok(Value::Node(node))
                 }
-                _ => Ok(Value::Null),
+                Some(Value::Null) | None => Ok(Value::Null),
+                _ => Err(Error::type_error(
+                    "InvalidArgumentValue: startNode()/endNode() expects a relationship",
+                )),
             },
             func::COALESCE => Ok(args
                 .iter()

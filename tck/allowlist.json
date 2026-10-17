@@ -42,12 +42,6 @@
         "note": "expected no rows, got a compile time error: compile time: Syntax: RETURN/WITH requires at least one item; expected +10 nodes, got +0"
       }
     },
-    "clauses/delete/Delete3.feature": {
-      "[1] Detach deleting paths": {
-        "reason": "not-implemented",
-        "note": "expected no rows, got a runtime error: runtime: Type: DELETE expects a node or relationship, got list; expected -nodes 4, got 0; expected -relationships 3, got 0; expected -labels 1, got 0"
-      }
-    },
     "clauses/delete/Delete4.feature": {
       "[1] Undirected expand followed by delete and count": {
         "reason": "not-implemented",
@@ -68,34 +62,6 @@
       "[14] Merges should not be able to match on deleted nodes": {
         "reason": "not-implemented",
         "note": "expected column `a2.num`, got `num`; expected -2 nodes, got -1"
-      }
-    },
-    "clauses/return-skip-limit/ReturnSkipLimit1.feature": {
-      "[6] Negative parameter for SKIP should fail": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at runtime, got TypeError at runtime"
-      },
-      "[8] Floating point parameter for SKIP should fail": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at runtime, got TypeError at runtime"
-      }
-    },
-    "clauses/return-skip-limit/ReturnSkipLimit2.feature": {
-      "[10] Negative parameter for LIMIT should fail": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at runtime, got TypeError at runtime"
-      },
-      "[11] Negative parameter for LIMIT with ORDER BY should fail": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at runtime, got TypeError at runtime"
-      },
-      "[14] Floating point parameter for LIMIT should fail": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at runtime, got TypeError at runtime"
-      },
-      "[15] Floating point parameter for LIMIT with ORDER BY should fail": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at runtime, got TypeError at runtime"
       }
     },
     "clauses/return/Return2.feature": {
@@ -148,12 +114,6 @@
         "note": "expected rows, got a compile time error: compile time: Unsupported: expressions mixing aggregation and non-aggregated values are not supported yet"
       }
     },
-    "clauses/set/Set1.feature": {
-      "[10] Failing when setting a list of maps as a property": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, but the query returned 0 rows"
-      }
-    },
     "expressions/existentialSubqueries/ExistentialSubquery1.feature": {
       "*": {
         "reason": "not-implemented",
@@ -176,32 +136,10 @@
         "note": "expected rows, got a compile time error: compile time: Syntax: expected a clause at line 2 column 24 (found LBrace)"
       }
     },
-    "expressions/graph/Graph3.feature": {
-      "[9] `labels()` failing on invalid arguments": {
+    "expressions/graph/Graph5.feature": {
+      "[5] Label expression on null": {
         "reason": "not-implemented",
-        "note": "expected TypeError at runtime, but the query returned 2 rows"
-      }
-    },
-    "expressions/graph/Graph4.feature": {
-      "[6] `type()` failing on invalid arguments (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[6] `type()` failing on invalid arguments (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[6] `type()` failing on invalid arguments (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[6] `type()` failing on invalid arguments (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
-      },
-      "[6] `type()` failing on invalid arguments (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected TypeError at runtime, got SyntaxError at compile time"
+        "note": "expected column `m:TYPE`, got `(m:TYPE)`"
       }
     },
     "expressions/pattern/Pattern1.feature": {

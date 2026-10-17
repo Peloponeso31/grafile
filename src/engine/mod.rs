@@ -403,9 +403,41 @@ impl Database {
         Ok(true)
     }
 
+    /// Reject property values outside the value model: maps and entities,
+    /// lists of lists and lists containing nulls or entities.
+    fn validate_property_value(value: &Value) -> Result<()> {
+        match value {
+            Value::List(items) => {
+                for item in items.iter() {
+                    match item {
+                        Value::Null
+                        | Value::Map(_)
+                        | Value::List(_)
+                        | Value::Node(_)
+                        | Value::Edge(_) => {
+                            return Err(Error::type_error(
+                                "InvalidPropertyType: a property list may only contain \
+                                 primitive values",
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
+            Value::Map(_) | Value::Node(_) | Value::Edge(_) => Err(Error::type_error(
+                "InvalidPropertyType: a property may not be a map or an entity",
+            )),
+            _ => Ok(()),
+        }
+    }
+
     /// Replace a node property (or remove it when `value` is null).
     pub fn set_node_property(&mut self, node_id: u64, key_id: u32, value: Value) -> Result<bool> {
         self.require_write()?;
+        if !value.is_null() {
+            Self::validate_property_value(&value)?;
+        }
         let Some(mut record) = self.get_node(node_id)? else {
             return Err(Error::new(
                 ErrorCode::NotFound,
@@ -429,6 +461,9 @@ impl Database {
     /// Replace an edge property (or remove it when `value` is null).
     pub fn set_edge_property(&mut self, edge_id: u64, key_id: u32, value: Value) -> Result<bool> {
         self.require_write()?;
+        if !value.is_null() {
+            Self::validate_property_value(&value)?;
+        }
         let Some(mut record) = self.get_edge(edge_id)? else {
             return Err(Error::new(
                 ErrorCode::NotFound,

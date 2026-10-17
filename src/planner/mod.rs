@@ -492,6 +492,25 @@ impl<'a> Planner<'a> {
                         "pattern expressions inside list comprehensions are not supported",
                     ));
                 }
+                if let Expr::Pattern(path) = expr
+                    && let Some(var) = &path.start.variable
+                    && path.segments.is_empty()
+                {
+                    // A lone node pattern is a label predicate when it has
+                    // labels; a bare variable pattern has no value.
+                    if path.start.labels.is_empty() && path.start.properties.is_none() {
+                        return Err(Error::syntax(
+                            "InvalidArgumentType: a single node pattern is not a value",
+                        ));
+                    }
+                    if !path.start.labels.is_empty() && path.start.properties.is_none() {
+                        *expr = Expr::LabelCheck {
+                            expr: Box::new(Expr::Variable(var.clone())),
+                            labels: path.start.labels.clone(),
+                        };
+                        return Ok(());
+                    }
+                }
                 if context == PatternContext::Value && matches!(expr, Expr::Pattern(_)) {
                     return Err(Error::syntax(
                         "pattern expressions are only allowed in predicates",
@@ -2811,6 +2830,9 @@ fn default_name(expr: &Expr) -> String {
         }
         Expr::Parameter(name) => format!("${name}"),
         Expr::Literal(value) => literal_text(value),
+        Expr::LabelCheck { expr, labels } => {
+            format!("({}:{})", default_name(expr), labels.join(":"))
+        }
         Expr::Property { base, key } => format!("{}.{}", property_base_name(base), key),
         Expr::Subscript { base, index } => {
             format!("{}[{}]", subscript_base_name(base), default_name(index))
@@ -2888,9 +2910,6 @@ fn default_name(expr: &Expr) -> String {
             default_name(expr),
             if *negated { "NOT " } else { "" }
         ),
-        Expr::LabelCheck { expr, labels } => {
-            format!("{}:{}", default_name(expr), labels.join(":"))
-        }
         Expr::List(items) => format!(
             "[{}]",
             items
@@ -3248,23 +3267,16 @@ fn is_atom_expr(expr: &Expr) -> bool {
     }
 }
 
-/// `SKIP` and `LIMIT` must be constants; literal values are range checked at
-/// compile time so parameter values can be checked at execution time.
+/// `SKIP` and `LIMIT` must not depend on variables; the value itself is
+/// range checked at compile time for literals (in `substitute_items`) and at
+/// execution time for everything else.
 fn validate_projection_limit(expr: &Expr, what: &str) -> Result<()> {
     if has_free_variable(expr, &[], &[]) {
         return Err(Error::syntax(format!(
             "NonConstantExpression: {what} must not depend on variables"
         )));
     }
-    match expr {
-        Expr::Literal(Value::Int(value)) if *value < 0 => Err(Error::syntax(format!(
-            "NegativeIntegerArgument: {what} expects a non-negative integer"
-        ))),
-        Expr::Literal(Value::Float(_)) => Err(Error::syntax(format!(
-            "InvalidArgumentType: {what} expects an integer"
-        ))),
-        _ => Ok(()),
-    }
+    Ok(())
 }
 
 /// Rewrite an expression top-down; `f` may replace a subexpression and stop
@@ -4145,6 +4157,23 @@ fn substitute_items(
     }
     for key in order {
         substitute_expr(&mut key.expr, params)?;
+    }
+    // Bad count literals are compile errors; parameter values that only
+    // become literals here are range checked during execution instead.
+    for (bound, what) in [(skip.as_ref(), "SKIP"), (limit.as_ref(), "LIMIT")] {
+        match bound {
+            Some(Expr::Literal(Value::Int(value))) if *value < 0 => {
+                return Err(Error::syntax(format!(
+                    "NegativeIntegerArgument: {what} expects a non-negative integer"
+                )));
+            }
+            Some(Expr::Literal(Value::Float(_))) => {
+                return Err(Error::syntax(format!(
+                    "InvalidArgumentType: {what} expects an integer"
+                )));
+            }
+            _ => {}
+        }
     }
     if let Some(skip) = skip {
         substitute_expr(skip, params)?;
