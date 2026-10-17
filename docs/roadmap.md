@@ -43,8 +43,8 @@ Explicit gaps (currently clear `Unsupported` errors):
 | Map projections (`n{.name}`) | parser |
 | Unknown functions | codegen |
 
-Silently absent areas: shortest paths, `FOREACH`, `CALL`, most
-of the built-in function library, and temporal/spatial value types.
+Silently absent areas: most of the built-in function library and
+temporal/spatial value types.
 
 Known semantic deviations to close:
 
@@ -70,7 +70,7 @@ error-kind/phase and ordering/comparison sweeps (~690, Phase 4), the function
 library (Phase 2), eager evaluation after writes (Phase 4) and CALL procedure
 registration (52, unreachable: the TCK registers test procedures).
 
-### Phase 1 — Core language completion (large) [partial]
+### Phase 1 — Core language completion (large) [done]
 
 #### 1A — Statement and expression surface [done]
 
@@ -104,7 +104,7 @@ registration (52, unreachable: the TCK registers test procedures).
 - List comprehensions, quantifiers with three-valued logic and `reduce()`
   (556 scenarios).
 
-#### 1D — Write-side completeness [partial]
+#### 1D — Write-side completeness [done]
 
 - [done] MERGE conformance: the whole path matches or is created atomically
   (including multiple relationships), matching honours the written
@@ -112,8 +112,10 @@ registration (52, unreachable: the TCK registers test procedures).
   variable-length patterns and relationship re-binding are rejected,
   null property values are rejected, `n[key]`/`r[key]` dynamic property
   access works and `SET x = entity` copies properties.
-- [ ] `FOREACH` and `CALL … YIELD` for built-in procedures (`db.labels()`,
-  `db.propertyKeys()`, …). TCK-blind: unit tests only.
+- [done] `FOREACH (x IN list | updating clauses)` with nested loops, and
+  `CALL … YIELD` for the built-in procedures `db.labels()`,
+  `db.propertyKeys()` and `db.relationshipTypes()`. TCK-blind: unit and
+  integration tests only.
 
 ### Phase 2 — Function library (medium) [pending]
 
