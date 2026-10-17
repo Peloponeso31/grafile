@@ -2,6 +2,9 @@
 name = "grafile"
 version = "0.1.0"
 edition = "2024"
+description = "Single-file graph database with a Cypher shell"
+license = "MIT"
+repository = "https://github.com/Peloponeso31/grafile"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -30,6 +33,28 @@ criterion = "0.8.2"
 proptest = "1.12.0"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 tempfile = "3.27.0"
+
+[package.metadata.deb]
+maintainer = "Tanil Izquierdo <Peloponeso31@users.noreply.github.com>"
+license-file = ["LICENSE", "0"]
+section = "database"
+priority = "optional"
+extended-description = """\
+grafile is a single-file graph database with an interactive Cypher shell. \
+It stores nodes, relationships, labels and indexes in one portable file, \
+supports transactions and crash recovery, and ships a REPL plus script \
+runner for querying databases from the command line."""
+assets = [
+    ["target/release/grafile", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/grafile/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/grafile", dest = "/usr/bin/grafile", mode = "755" },
+    { source = "README.md", dest = "/usr/share/doc/grafile/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/grafile/LICENSE", mode = "644" },
+]
 
 [[bench]]
 name = "storage"

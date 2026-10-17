@@ -1,0 +1,33 @@
+name: winget
+
+# Opens a PR against microsoft/winget-pkgs for every published release.
+#
+# One-time bootstrap before enabling this job:
+#   1. Fork microsoft/winget-pkgs under Peloponeso31.
+#   2. Create a classic PAT with the public_repo and workflow scopes, and
+#      store it as the WINGET_TOKEN repository secret (fine-grained PATs are
+#      not supported by winget-releaser).
+#   3. Submit the first version manually using the manifests attached to the
+#      release (winget-releaser can only update packages that already exist
+#      in winget-pkgs).
+#   4. Set the WINGET_ENABLED repository variable to true.
+
+on:
+  release:
+    types: [released]
+
+permissions:
+  contents: read
+
+jobs:
+  winget:
+    if: vars.WINGET_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: Peloponeso31.Grafile
+          installers-regex: 'x86_64-windows\.zip$'
+          max-versions-to-keep: 0
+          release-tag: ${{ github.event.release.tag_name }}
+          token: ${{ secrets.WINGET_TOKEN }}

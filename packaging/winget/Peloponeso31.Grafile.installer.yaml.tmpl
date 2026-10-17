@@ -1,0 +1,14 @@
+PackageIdentifier: Peloponeso31.Grafile
+PackageVersion: ${VERSION}
+InstallerLocale: en-US
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: grafile.exe
+    PortableCommandAlias: grafile
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/Peloponeso31/grafile/releases/download/v${VERSION}/grafile-${VERSION}-x86_64-windows.zip
+    InstallerSha256: ${SHA256}
+ManifestType: installer
+ManifestVersion: 1.10.0
