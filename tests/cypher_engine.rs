@@ -1044,6 +1044,130 @@ fn standard_deviations() {
     );
 }
 
+// ---- temporal values ----
+
+#[test]
+fn temporal_constructors_from_maps_and_strings() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN date({year: 1984, month: 10, day: 11}) AS a, \
+         date('2015-W30-2') AS b, \
+         date({year: 1817, week: 1, dayOfWeek: 2}) AS c, \
+         localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876123}) AS d, \
+         time({hour: 21, minute: 40, timezone: '+01:00'}) AS e",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "1984-10-11",
+            "2015-07-21",
+            "1816-12-31",
+            "12:31:14.645876123",
+            "21:40+01:00"
+        ]]
+    );
+}
+
+#[test]
+fn temporal_composition_and_overrides() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH date({year: 1984, month: 10, day: 11}) AS other \
+         RETURN localdatetime({date: other, hour: 10, minute: 10, second: 10}) AS a, \
+         localdatetime({date: other, day: 28, hour: 10, minute: 10, second: 10}) AS b",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1984-10-11T10:10:10", "1984-10-28T10:10:10"]]
+    );
+}
+
+#[test]
+fn temporal_accessors() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH datetime({year: 1984, month: 11, day: 11, hour: 12, minute: 31, second: 14, \
+          nanosecond: 645876123, timezone: 'Europe/Stockholm'}) AS d \
+         RETURN d.year, d.quarter, d.week, d.weekDay, d.dayOfQuarter, d.hour, d.nanosecond, \
+                d.timezone, d.offset, d.offsetSeconds, d.epochSeconds, d.epochMillis",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "1984",
+            "4",
+            "45",
+            "7",
+            "42",
+            "12",
+            "645876123",
+            "Europe/Stockholm",
+            "+01:00",
+            "3600",
+            "469020674",
+            "469020674645"
+        ]]
+    );
+}
+
+#[test]
+fn temporal_serialization_round_trips() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH date({year: 1984, month: 10, day: 11}) AS d, \
+              localtime({hour: 12, minute: 31, second: 14, nanosecond: 645876123}) AS t, \
+              duration({years: 12, months: 5, days: 14, hours: 16, minutes: 12, seconds: 70, nanoseconds: 1}) AS du \
+         RETURN date(toString(d)) = d AS a, localtime(toString(t)) = t AS b, duration(toString(du)) = du AS c, \
+                toString(du) AS text",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "true",
+            "true",
+            "true",
+            "P12Y5M14DT16H13M10.000000001S"
+        ]]
+    );
+}
+
+#[test]
+fn temporal_values_store_and_compare() {
+    let mut conn = connection();
+    conn.execute(
+        "CREATE (:Val {date: date({year: 1984, month: 10, day: 11}), \
+          dates: [date({year: 1984, month: 10, day: 12})]})",
+    )
+    .expect("store temporals");
+    let rows = query(
+        &mut conn,
+        "MATCH (v:Val) \
+         RETURN v.date, v.dates, v.date < date('2000-01-01'), v.date = date('1984-10-11')",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["1984-10-11", "[1984-10-12]", "true", "true"]]
+    );
+}
+
+#[test]
+fn temporal_duration_arithmetic_forms() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH duration({months: 1, days: -14, hours: 16, minutes: -12, seconds: 70}) AS dur \
+         RETURN dur.years, dur.months, dur.days, dur.hours, dur.seconds, dur.minutes, dur.secondsOfMinute",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["0", "1", "-14", "15", "56950", "949", "10"]]
+    );
+}
+
 // ---- math functions ----
 
 #[test]

@@ -127,6 +127,25 @@ pub fn value_json(
             let fields = edge_fields(db, *id)?;
             object_json(db, &fields, options, indent)?
         }
+        // Temporal values render as their ISO 8601 text; points as a small
+        // object so the coordinates stay machine readable.
+        Value::Date(value) => options.string(&escape_json(&value.to_string())),
+        Value::LocalTime(value) => options.string(&escape_json(&value.to_string())),
+        Value::Time(value) => options.string(&escape_json(&value.to_string())),
+        Value::LocalDateTime(value) => options.string(&escape_json(&value.to_string())),
+        Value::DateTime(value) => options.string(&escape_json(&value.to_string())),
+        Value::Duration(value) => options.string(&escape_json(&value.to_string())),
+        Value::Point(value) => {
+            let mut fields = vec![
+                ("srid".to_owned(), Value::Int(value.srid() as i64)),
+                ("x".to_owned(), Value::Float(value.x())),
+                ("y".to_owned(), Value::Float(value.y())),
+            ];
+            if let Some(z) = value.z() {
+                fields.push(("z".to_owned(), Value::Float(z)));
+            }
+            object_json(db, &fields, options, indent)?
+        }
     })
 }
 

@@ -1867,6 +1867,14 @@ fn scalar_function(name: &str) -> Result<u8> {
         "haversin" => Ok(func::HAVERSIN),
         "pi" => Ok(func::PI),
         "e" => Ok(func::E),
+        "date" => Ok(func::DATE),
+        "localtime" => Ok(func::LOCALTIME),
+        "time" => Ok(func::TIME),
+        "localdatetime" => Ok(func::LOCAL_DATETIME),
+        "datetime" => Ok(func::DATETIME),
+        "duration" => Ok(func::DURATION),
+        "point" => Ok(func::POINT),
+        "distance" => Ok(func::DISTANCE),
         other => Err(Error::unsupported(format!(
             "function `{other}` is not supported yet"
         ))),

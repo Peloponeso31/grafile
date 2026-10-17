@@ -336,6 +336,13 @@ impl Duration {
         self.seconds as i128 * 1_000_000_000 + self.nanos as i128
     }
 
+    /// The duration's length in nanoseconds using Neo4j's ordering averages
+    /// (a year is 365.2425 days, a month 2,629,746 seconds). Used to order
+    /// durations, which have no exact total length otherwise.
+    pub const fn normalized_nanos(self) -> i128 {
+        self.months as i128 * NS_PER_MONTH + self.days as i128 * NS_PER_DAY + self.total_nanos()
+    }
+
     /// Scale every field by a factor, cascading fractional results like
     /// Neo4j's `duration * number`.
     pub fn multiplied(self, factor: f64) -> Option<Self> {
@@ -355,6 +362,29 @@ impl Duration {
             return None;
         }
         self.multiplied(1.0 / divisor)
+    }
+}
+
+impl PartialOrd for Duration {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Duration {
+    /// Durations order by their normalized length, then component-wise, so
+    /// the order is total and matches [`Duration::normalized_nanos`].
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.normalized_nanos()
+            .cmp(&other.normalized_nanos())
+            .then_with(|| {
+                (self.months, self.days, self.seconds, self.nanos).cmp(&(
+                    other.months,
+                    other.days,
+                    other.seconds,
+                    other.nanos,
+                ))
+            })
     }
 }
 

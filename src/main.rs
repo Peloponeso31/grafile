@@ -586,6 +586,13 @@ fn quote_literal(value: &Value) -> String {
             format!("{{{}}}", inner.join(", "))
         }
         Value::Node(_) | Value::Edge(_) => compact_entity(value),
+        Value::Date(_)
+        | Value::LocalTime(_)
+        | Value::Time(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime(_)
+        | Value::Duration(_)
+        | Value::Point(_) => format_value(value),
     }
 }
 

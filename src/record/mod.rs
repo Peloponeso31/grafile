@@ -13,6 +13,10 @@
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::temporal::civil::Date;
+use crate::temporal::datetime::{DateTime, LocalDateTime, LocalTime, Time};
+use crate::temporal::duration::Duration;
+use crate::temporal::point::Point;
 
 /// A dynamically typed property or expression value.
 ///
@@ -40,6 +44,20 @@ pub enum Value {
     Node(u64),
     /// Reference to an edge by id (engine-internal; not storable).
     Edge(u64),
+    /// A civil date.
+    Date(Date),
+    /// A wall-clock time.
+    LocalTime(LocalTime),
+    /// A wall-clock time with a fixed UTC offset.
+    Time(Time),
+    /// A civil datetime without a zone.
+    LocalDateTime(LocalDateTime),
+    /// A datetime with an offset and optional IANA zone.
+    DateTime(DateTime),
+    /// A duration of months, days and seconds.
+    Duration(Duration),
+    /// A spatial point.
+    Point(Point),
 }
 
 impl Value {
@@ -56,6 +74,13 @@ impl Value {
             Self::Map(_) => "map",
             Self::Node(_) => "node",
             Self::Edge(_) => "relationship",
+            Self::Date(_) => "date",
+            Self::LocalTime(_) => "local time",
+            Self::Time(_) => "time",
+            Self::LocalDateTime(_) => "local datetime",
+            Self::DateTime(_) => "datetime",
+            Self::Duration(_) => "duration",
+            Self::Point(_) => "point",
         }
     }
 
@@ -114,6 +139,13 @@ impl PartialEq for Value {
             (Self::Map(a), Self::Map(b)) => a == b,
             (Self::Node(a), Self::Node(b)) => a == b,
             (Self::Edge(a), Self::Edge(b)) => a == b,
+            (Self::Date(a), Self::Date(b)) => a == b,
+            (Self::LocalTime(a), Self::LocalTime(b)) => a == b,
+            (Self::Time(a), Self::Time(b)) => a == b,
+            (Self::LocalDateTime(a), Self::LocalDateTime(b)) => a == b,
+            (Self::DateTime(a), Self::DateTime(b)) => a == b,
+            (Self::Duration(a), Self::Duration(b)) => a == b,
+            (Self::Point(a), Self::Point(b)) => a == b,
             _ => false,
         }
     }
@@ -148,6 +180,13 @@ impl Ord for Value {
             (Self::Map(a), Self::Map(b)) => a.cmp(b),
             (Self::Node(a), Self::Node(b)) => a.cmp(b),
             (Self::Edge(a), Self::Edge(b)) => a.cmp(b),
+            (Self::Date(a), Self::Date(b)) => a.cmp(b),
+            (Self::LocalTime(a), Self::LocalTime(b)) => a.cmp(b),
+            (Self::Time(a), Self::Time(b)) => a.cmp(b),
+            (Self::LocalDateTime(a), Self::LocalDateTime(b)) => a.cmp(b),
+            (Self::DateTime(a), Self::DateTime(b)) => a.cmp(b),
+            (Self::Duration(a), Self::Duration(b)) => a.cmp(b),
+            (Self::Point(a), Self::Point(b)) => a.cmp(b),
             _ => rank(self).cmp(&rank(other)),
         }
     }
@@ -172,6 +211,16 @@ fn rank(value: &Value) -> u8 {
         Value::Map(_) => 6,
         Value::Node(_) => 7,
         Value::Edge(_) => 8,
+        // The relative order of the temporal and spatial types is
+        // provisional until the Phase 4 ordering sweep; it only needs to be
+        // total and stable.
+        Value::Date(_) => 9,
+        Value::LocalTime(_) => 10,
+        Value::Time(_) => 11,
+        Value::LocalDateTime(_) => 12,
+        Value::DateTime(_) => 13,
+        Value::Duration(_) => 14,
+        Value::Point(_) => 15,
     }
 }
 
@@ -189,6 +238,34 @@ pub fn value_equals(a: &Value, b: &Value) -> Option<bool> {
         (Value::Bytes(x), Value::Bytes(y)) => Some(x == y),
         (Value::Node(x), Value::Node(y)) => Some(x == y),
         (Value::Edge(x), Value::Edge(y)) => Some(x == y),
+        (Value::Date(x), Value::Date(y)) => Some(x == y),
+        (Value::LocalTime(x), Value::LocalTime(y)) => Some(x == y),
+        (Value::Time(x), Value::Time(y)) => Some(x == y),
+        (Value::LocalDateTime(x), Value::LocalDateTime(y)) => Some(x == y),
+        (Value::DateTime(x), Value::DateTime(y)) => Some(x == y),
+        (Value::Duration(x), Value::Duration(y)) => Some(x == y),
+        (Value::Point(x), Value::Point(y)) => Some(x == y),
+        // Temporal and spatial values never equal values of another type.
+        (
+            Value::Date(_)
+            | Value::LocalTime(_)
+            | Value::Time(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime(_)
+            | Value::Duration(_)
+            | Value::Point(_),
+            _,
+        )
+        | (
+            _,
+            Value::Date(_)
+            | Value::LocalTime(_)
+            | Value::Time(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime(_)
+            | Value::Duration(_)
+            | Value::Point(_),
+        ) => Some(false),
         (Value::List(x), Value::List(y)) => {
             if x.len() != y.len() {
                 return Some(false);
@@ -290,6 +367,13 @@ mod tag {
     pub const TEXT: u8 = 5;
     pub const BYTES: u8 = 6;
     pub const LIST: u8 = 7;
+    pub const DATE: u8 = 8;
+    pub const LOCAL_TIME: u8 = 9;
+    pub const TIME: u8 = 10;
+    pub const LOCAL_DATETIME: u8 = 11;
+    pub const DATETIME: u8 = 12;
+    pub const DURATION: u8 = 13;
+    pub const POINT: u8 = 14;
 }
 
 /// Encode a value into a record buffer.
@@ -322,6 +406,51 @@ pub fn encode_value(out: &mut Vec<u8>, value: &Value) {
             for item in values.iter() {
                 encode_value(out, item);
             }
+        }
+        Value::Date(date) => {
+            out.push(tag::DATE);
+            encode_varint(out, zigzag_encode(date.days()));
+        }
+        Value::LocalTime(time) => {
+            out.push(tag::LOCAL_TIME);
+            encode_varint(out, time.nanos() as u64);
+        }
+        Value::Time(time) => {
+            out.push(tag::TIME);
+            encode_varint(out, time.local().nanos() as u64);
+            encode_varint(out, zigzag_encode(time.offset() as i64));
+        }
+        Value::LocalDateTime(datetime) => {
+            out.push(tag::LOCAL_DATETIME);
+            encode_varint(out, zigzag_encode(datetime.seconds()));
+            encode_varint(out, datetime.nanos() as u64);
+        }
+        Value::DateTime(datetime) => {
+            out.push(tag::DATETIME);
+            encode_varint(out, zigzag_encode(datetime.local().seconds()));
+            encode_varint(out, datetime.local().nanos() as u64);
+            encode_varint(out, zigzag_encode(datetime.offset() as i64));
+            match datetime.zone() {
+                Some(zone) => {
+                    encode_varint(out, zone.len() as u64 + 1);
+                    out.extend_from_slice(zone.as_bytes());
+                }
+                None => encode_varint(out, 0),
+            }
+        }
+        Value::Duration(duration) => {
+            out.push(tag::DURATION);
+            encode_varint(out, zigzag_encode(duration.months()));
+            encode_varint(out, zigzag_encode(duration.days()));
+            encode_varint(out, zigzag_encode(duration.seconds()));
+            encode_varint(out, zigzag_encode(duration.nanos() as i64));
+        }
+        Value::Point(point) => {
+            out.push(tag::POINT);
+            out.extend_from_slice(&point.srid().to_le_bytes());
+            out.extend_from_slice(&point.x().to_bits().to_le_bytes());
+            out.extend_from_slice(&point.y().to_bits().to_le_bytes());
+            out.extend_from_slice(&point.z().unwrap_or(f64::NAN).to_bits().to_le_bytes());
         }
         // Maps and entity references are engine-internal and never stored;
         // the engine validates property values before encoding.
@@ -370,6 +499,76 @@ pub fn decode_value(input: &[u8], pos: &mut usize) -> Result<Value> {
                 values.push(decode_value(input, pos)?);
             }
             Ok(Value::List(Arc::from(values)))
+        }
+        tag::DATE => {
+            let days = zigzag_decode(decode_varint(input, pos)?);
+            Ok(Value::Date(Date::from_days(days)))
+        }
+        tag::LOCAL_TIME => {
+            let nanos = decode_varint(input, pos)? as i64;
+            LocalTime::from_nanos(nanos)
+                .map(Value::LocalTime)
+                .ok_or_else(|| Error::corrupt("invalid local time in record"))
+        }
+        tag::TIME => {
+            let nanos = decode_varint(input, pos)? as i64;
+            let offset = zigzag_decode(decode_varint(input, pos)?) as i32;
+            let local = LocalTime::from_nanos(nanos)
+                .ok_or_else(|| Error::corrupt("invalid time in record"))?;
+            Time::new(local, offset)
+                .map(Value::Time)
+                .ok_or_else(|| Error::corrupt("invalid time offset in record"))
+        }
+        tag::LOCAL_DATETIME => {
+            let seconds = zigzag_decode(decode_varint(input, pos)?);
+            let nanos = decode_varint(input, pos)? as i64;
+            LocalDateTime::from_epoch(seconds, nanos)
+                .map(Value::LocalDateTime)
+                .ok_or_else(|| Error::corrupt("invalid local datetime in record"))
+        }
+        tag::DATETIME => {
+            let seconds = zigzag_decode(decode_varint(input, pos)?);
+            let nanos = decode_varint(input, pos)? as i64;
+            let offset = zigzag_decode(decode_varint(input, pos)?) as i32;
+            let zone_len = decode_varint(input, pos)? as usize;
+            let zone = if zone_len == 0 {
+                None
+            } else {
+                let bytes = take(input, pos, zone_len - 1)?;
+                let name = std::str::from_utf8(bytes)
+                    .map_err(|_| Error::corrupt("invalid UTF-8 in zone name"))?;
+                Some(Arc::<str>::from(name))
+            };
+            let local = LocalDateTime::from_epoch(seconds, nanos)
+                .ok_or_else(|| Error::corrupt("invalid datetime in record"))?;
+            DateTime::new(local, offset, zone)
+                .map(Value::DateTime)
+                .ok_or_else(|| Error::corrupt("invalid datetime offset in record"))
+        }
+        tag::DURATION => {
+            let months = zigzag_decode(decode_varint(input, pos)?);
+            let days = zigzag_decode(decode_varint(input, pos)?);
+            let seconds = zigzag_decode(decode_varint(input, pos)?);
+            let nanos = zigzag_decode(decode_varint(input, pos)?);
+            Duration::new(months, days, seconds, nanos)
+                .map(Value::Duration)
+                .ok_or_else(|| Error::corrupt("invalid duration in record"))
+        }
+        tag::POINT => {
+            let srid = i32::from_le_bytes(take(input, pos, 4)?.try_into().expect("slice length"));
+            let x = f64::from_bits(u64::from_le_bytes(
+                take(input, pos, 8)?.try_into().expect("slice length"),
+            ));
+            let y = f64::from_bits(u64::from_le_bytes(
+                take(input, pos, 8)?.try_into().expect("slice length"),
+            ));
+            let z = f64::from_bits(u64::from_le_bytes(
+                take(input, pos, 8)?.try_into().expect("slice length"),
+            ));
+            let z = (!z.is_nan()).then_some(z);
+            Point::new(srid, x, y, z)
+                .map(Value::Point)
+                .ok_or_else(|| Error::corrupt("invalid point in record"))
         }
         other => Err(Error::corrupt(format!("unknown value tag {other}"))),
     }
@@ -568,6 +767,13 @@ mod index_tag {
     pub const TEXT: u8 = 5;
     pub const BYTES: u8 = 6;
     pub const LIST: u8 = 7;
+    pub const DATE: u8 = 8;
+    pub const LOCAL_TIME: u8 = 9;
+    pub const TIME: u8 = 10;
+    pub const LOCAL_DATETIME: u8 = 11;
+    pub const DATETIME: u8 = 12;
+    pub const DURATION: u8 = 13;
+    pub const POINT: u8 = 14;
 }
 
 /// Encode a value so that byte order equals value order.
@@ -609,11 +815,74 @@ pub fn encode_index_key(out: &mut Vec<u8>, value: &Value) {
             }
             out.extend_from_slice(&[0x00, 0x01]);
         }
+        Value::Date(date) => {
+            out.push(index_tag::DATE);
+            encode_ordered_i128(out, date.days() as i128);
+        }
+        Value::LocalTime(time) => {
+            out.push(index_tag::LOCAL_TIME);
+            encode_ordered_i128(out, time.nanos() as i128);
+        }
+        Value::Time(time) => {
+            out.push(index_tag::TIME);
+            encode_ordered_i128(out, time.utc_nanos() as i128);
+            encode_ordered_i128(out, time.offset() as i128);
+        }
+        Value::LocalDateTime(datetime) => {
+            out.push(index_tag::LOCAL_DATETIME);
+            encode_ordered_i128(out, datetime.epoch_nanos());
+        }
+        Value::DateTime(datetime) => {
+            out.push(index_tag::DATETIME);
+            encode_ordered_i128(out, datetime.instant_nanos());
+            encode_ordered_i128(out, datetime.offset() as i128);
+            encode_escaped(out, datetime.zone().unwrap_or_default().as_bytes());
+        }
+        Value::Duration(duration) => {
+            out.push(index_tag::DURATION);
+            // Durations order by their normalized length; the components
+            // break ties so the encoding stays total and stable.
+            encode_ordered_i128(out, duration.normalized_nanos());
+            encode_ordered_i128(out, duration.months() as i128);
+            encode_ordered_i128(out, duration.days() as i128);
+            encode_ordered_i128(out, duration.seconds() as i128);
+            encode_ordered_i128(out, duration.nanos() as i128);
+        }
+        Value::Point(point) => {
+            out.push(index_tag::POINT);
+            encode_ordered_i128(out, point.srid() as i128);
+            encode_ordered_float(out, point.x());
+            encode_ordered_float(out, point.y());
+            match point.z() {
+                Some(z) => {
+                    out.push(1);
+                    encode_ordered_float(out, z);
+                }
+                None => out.push(0),
+            }
+        }
         Value::Map(_) | Value::Node(_) | Value::Edge(_) => {
             debug_assert!(false, "attempted to index an unstorable value");
             out.push(index_tag::NULL);
         }
     }
+}
+
+/// Encode a signed integer so that byte order matches numeric order.
+fn encode_ordered_i128(out: &mut Vec<u8>, value: i128) {
+    let flipped = (value as u128) ^ (1u128 << 127);
+    out.extend_from_slice(&flipped.to_be_bytes());
+}
+
+/// Encode a float with the usual sign-flipping trick; NaN sorts last.
+fn encode_ordered_float(out: &mut Vec<u8>, value: f64) {
+    let bits = value.to_bits();
+    let flipped = if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits ^ (1u64 << 63)
+    };
+    out.extend_from_slice(&flipped.to_be_bytes());
 }
 
 fn encode_escaped(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -738,7 +1007,14 @@ mod tests {
             Value::Text(_) => 5,
             Value::Bytes(_) => 6,
             Value::List(_) => 7,
-            Value::Map(_) | Value::Node(_) | Value::Edge(_) => 8,
+            Value::Date(_) => 8,
+            Value::LocalTime(_) => 9,
+            Value::Time(_) => 10,
+            Value::LocalDateTime(_) => 11,
+            Value::DateTime(_) => 12,
+            Value::Duration(_) => 13,
+            Value::Point(_) => 14,
+            Value::Map(_) | Value::Node(_) | Value::Edge(_) => 15,
         }
     }
 

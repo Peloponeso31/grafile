@@ -1,6 +1,6 @@
 # grafile on-disk format
 
-Version 0.1 (format major 0, minor 1). All multi-byte integers are
+Version 0.2 (format major 0, minor 2). All multi-byte integers are
 little-endian unless stated otherwise. The database is a single file; a
 transient `-journal` sidecar exists only while a write transaction is in
 flight (see [Transactions](#transactions)).
@@ -172,6 +172,13 @@ Values are encoded with a 1-byte tag followed by payload:
 | 5 | text | varint length + UTF-8 bytes |
 | 6 | bytes | varint length + raw bytes |
 | 7 | list | varint count + encoded elements |
+| 8 | date | zigzag varint days since 1970-01-01 |
+| 9 | local time | varint nanoseconds of day |
+| 10 | time | varint nanoseconds of day + zigzag varint offset seconds |
+| 11 | local datetime | zigzag varint seconds + varint nanoseconds |
+| 12 | datetime | zigzag varint local seconds + varint nanoseconds + zigzag varint offset seconds + varint zone length (+1) and UTF-8 zone name (0 when absent) |
+| 13 | duration | zigzag varint months + days + seconds + nanoseconds |
+| 14 | point | 4-byte LE srid + 8-byte LE `x` + 8-byte LE `y` + 8-byte LE `z` (NaN when the point is 2D) |
 
 Null properties are not stored (Cypher treats them as absent).
 
@@ -182,8 +189,12 @@ Edge record: `[edge type varint][src varint][dst varint][property count varint][
 Index keys are order-preserving: type tag, then for integers the sign-flipped
 big-endian u64, for floats the sign-flipped IEEE bits (negative values
 bitwise-negated), for text the escaped bytes with `0x00` mapped to
-`0x00 0xFF` and terminated by `0x00 0x01`, for null just the tag. Composite
-keys concatenate encoded fields.
+`0x00 0xFF` and terminated by `0x00 0x01`, for null just the tag. Temporal
+values (tags 8-14) are encoded as their comparable components (days since
+epoch, nanoseconds of day, instants as wide sign-flipped integers, the
+normalized duration length, point coordinates as order-preserving floats),
+each field sign-flipped where signed. Composite keys concatenate encoded
+fields.
 
 ## Freelist
 

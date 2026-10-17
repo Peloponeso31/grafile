@@ -17,6 +17,10 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::matrix::Direction;
 use crate::planner::plan::AggFn;
 use crate::record::{Value, value_equals};
+use crate::temporal::civil::Date;
+use crate::temporal::construct::{self, Field};
+use crate::temporal::datetime::{DateTime, LocalDateTime, LocalTime, Time};
+use crate::temporal::point::Point;
 
 /// A register value: a plain value or an entity reference.
 #[derive(Debug, Clone, PartialEq)]
@@ -646,6 +650,22 @@ pub mod func {
     pub const PI: u8 = 52;
     /// `e()`
     pub const E: u8 = 53;
+    /// `date(...)`
+    pub const DATE: u8 = 54;
+    /// `localtime(...)`
+    pub const LOCALTIME: u8 = 55;
+    /// `time(...)`
+    pub const TIME: u8 = 56;
+    /// `localdatetime(...)`
+    pub const LOCAL_DATETIME: u8 = 57;
+    /// `datetime(...)`
+    pub const DATETIME: u8 = 58;
+    /// `duration(...)`
+    pub const DURATION: u8 = 59;
+    /// `point({...})`
+    pub const POINT: u8 = 60;
+    /// `distance(a, b)`
+    pub const DISTANCE: u8 = 61;
 }
 
 /// A compiled VDBE program.
@@ -1101,6 +1121,22 @@ impl<'a> Executor<'a> {
                             .find(|(entry, _)| entry.as_ref() == name.as_ref())
                             .map(|(_, value)| value.clone())
                             .unwrap_or(Value::Null)
+                    }
+                    Reg::Value(
+                        value @ (Value::Date(_)
+                        | Value::LocalTime(_)
+                        | Value::Time(_)
+                        | Value::LocalDateTime(_)
+                        | Value::DateTime(_)
+                        | Value::Duration(_)
+                        | Value::Point(_)),
+                    ) => {
+                        // Temporal and spatial values expose components as
+                        // property-like accessors (`d.year`, `p.x`).
+                        let Value::Text(name) = &self.program.constants[*name as usize] else {
+                            return Err(Error::internal("property name is not a string"));
+                        };
+                        temporal_accessor(&value, name)?
                     }
                     other => {
                         return Err(Error::type_error(format!(
@@ -1953,6 +1989,17 @@ impl<'a> Executor<'a> {
                     Ok(Value::Text(std::sync::Arc::from(buffer.format(*value))))
                 }
                 Some(Value::Text(value)) => Ok(Value::Text(value.clone())),
+                Some(
+                    value @ (Value::Date(_)
+                    | Value::LocalTime(_)
+                    | Value::Time(_)
+                    | Value::LocalDateTime(_)
+                    | Value::DateTime(_)
+                    | Value::Duration(_)
+                    | Value::Point(_)),
+                ) => Ok(Value::Text(std::sync::Arc::from(
+                    format_value(value).as_str(),
+                ))),
                 Some(other) => Err(invalid_argument("toString", other)),
             },
             func::TO_INTEGER => match args.first() {
@@ -2113,6 +2160,14 @@ impl<'a> Executor<'a> {
             func::HAVERSIN => float_map(args, "haversin", |value| (1.0 - value.cos()) / 2.0),
             func::PI => Ok(Value::Float(std::f64::consts::PI)),
             func::E => Ok(Value::Float(std::f64::consts::E)),
+            func::DATE => call_date(args),
+            func::LOCALTIME => call_localtime(args),
+            func::TIME => call_time(args),
+            func::LOCAL_DATETIME => call_localdatetime(args),
+            func::DATETIME => call_datetime(args),
+            func::DURATION => call_duration(args),
+            func::POINT => call_point(args),
+            func::DISTANCE => call_distance(args),
             func::PROPERTIES => match args.first() {
                 Some(Value::Node(id)) => {
                     let Some(record) = self.db.get_node(*id)? else {
@@ -2670,6 +2725,13 @@ fn compare_value(op: u8, a: &Value, b: &Value) -> Value {
         }
         (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::Date(x), Value::Date(y)) => x.cmp(y),
+        (Value::LocalTime(x), Value::LocalTime(y)) => x.cmp(y),
+        (Value::Time(x), Value::Time(y)) => x.cmp(y),
+        (Value::LocalDateTime(x), Value::LocalDateTime(y)) => x.cmp(y),
+        (Value::DateTime(x), Value::DateTime(y)) => x.cmp(y),
+        (Value::Duration(x), Value::Duration(y)) => x.cmp(y),
+        (Value::Point(x), Value::Point(y)) => x.cmp(y),
         _ => return Value::Null,
     };
     let result = match op {
@@ -2757,6 +2819,459 @@ fn normalize_reg(value: Value) -> Reg {
         Value::Edge(id) => Reg::Edge(id),
         other => Reg::Value(other),
     }
+}
+
+/// Read a component from a temporal or spatial value (`d.year`, `t.offset`,
+/// `du.months`, `p.x`).
+fn temporal_accessor(value: &Value, key: &str) -> Result<Value> {
+    let integer = Value::Int;
+    match value {
+        Value::Date(date) => match key {
+            "year" => Ok(integer(date.year())),
+            "quarter" => Ok(integer(date.quarter() as i64)),
+            "month" => Ok(integer(date.month() as i64)),
+            "week" => Ok(integer(date.iso_week().1 as i64)),
+            "weekYear" => Ok(integer(date.iso_week().0)),
+            "day" => Ok(integer(date.day() as i64)),
+            "ordinalDay" => Ok(integer(date.ordinal_day() as i64)),
+            "weekDay" => Ok(integer(date.iso_weekday() as i64)),
+            "dayOfQuarter" => Ok(integer(date.day_of_quarter() as i64)),
+            _ => Err(unknown_field(key, value)),
+        },
+        Value::LocalTime(time) => match key {
+            "hour" => Ok(integer(time.hour())),
+            "minute" => Ok(integer(time.minute())),
+            "second" => Ok(integer(time.second())),
+            "millisecond" => Ok(integer(time.millisecond())),
+            "microsecond" => Ok(integer(time.microsecond())),
+            "nanosecond" => Ok(integer(time.nanosecond())),
+            _ => Err(unknown_field(key, value)),
+        },
+        Value::Time(time) => match key {
+            "hour" => Ok(integer(time.local().hour())),
+            "minute" => Ok(integer(time.local().minute())),
+            "second" => Ok(integer(time.local().second())),
+            "millisecond" => Ok(integer(time.local().millisecond())),
+            "microsecond" => Ok(integer(time.local().microsecond())),
+            "nanosecond" => Ok(integer(time.local().nanosecond())),
+            "timezone" | "offset" => Ok(offset_text(time.offset())),
+            "offsetMinutes" => Ok(integer(time.offset_minutes())),
+            "offsetSeconds" => Ok(integer(time.offset_seconds())),
+            _ => Err(unknown_field(key, value)),
+        },
+        Value::LocalDateTime(datetime) => match key {
+            "year" => Ok(integer(datetime.date().year())),
+            "quarter" => Ok(integer(datetime.date().quarter() as i64)),
+            "month" => Ok(integer(datetime.date().month() as i64)),
+            "week" => Ok(integer(datetime.date().iso_week().1 as i64)),
+            "weekYear" => Ok(integer(datetime.date().iso_week().0)),
+            "day" => Ok(integer(datetime.date().day() as i64)),
+            "ordinalDay" => Ok(integer(datetime.date().ordinal_day() as i64)),
+            "weekDay" => Ok(integer(datetime.date().iso_weekday() as i64)),
+            "dayOfQuarter" => Ok(integer(datetime.date().day_of_quarter() as i64)),
+            "hour" => Ok(integer(datetime.time().hour())),
+            "minute" => Ok(integer(datetime.time().minute())),
+            "second" => Ok(integer(datetime.time().second())),
+            "millisecond" => Ok(integer(datetime.time().millisecond())),
+            "microsecond" => Ok(integer(datetime.time().microsecond())),
+            "nanosecond" => Ok(integer(datetime.time().nanosecond())),
+            _ => Err(unknown_field(key, value)),
+        },
+        Value::DateTime(datetime) => {
+            // The calendar and clock accessors come from the local civil
+            // datetime; the rest are instant or zone related.
+            if let Ok(value) = temporal_accessor(&Value::LocalDateTime(datetime.local()), key) {
+                return Ok(value);
+            }
+            match key {
+                "timezone" => Ok(match datetime.zone() {
+                    Some(zone) => Value::Text(zone.into()),
+                    None => Value::Null,
+                }),
+                "offset" => Ok(offset_text(datetime.offset())),
+                "offsetMinutes" => Ok(integer(datetime.offset() as i64 / 60)),
+                "offsetSeconds" => Ok(integer(datetime.offset() as i64)),
+                "epochSeconds" => Ok(integer(datetime.epoch_seconds())),
+                "epochMillis" => Ok(integer(datetime.epoch_millis())),
+                _ => Err(unknown_field(key, value)),
+            }
+        }
+        Value::Duration(duration) => {
+            let number = match key {
+                "years" => duration.years(),
+                "quarters" => duration.quarters(),
+                "months" => duration.months(),
+                "weeks" => duration.weeks(),
+                "days" => duration.days(),
+                "hours" => duration.hours(),
+                "minutes" => duration.minutes(),
+                "seconds" => duration.seconds(),
+                "milliseconds" => duration.milliseconds(),
+                "microseconds" => duration.microseconds(),
+                "nanoseconds" => duration.nanoseconds(),
+                "quartersOfYear" => duration.quarters_of_year(),
+                "monthsOfQuarter" => duration.months_of_quarter(),
+                "monthsOfYear" => duration.months_of_year(),
+                "daysOfWeek" => duration.days_of_week(),
+                "minutesOfHour" => duration.minutes_of_hour(),
+                "secondsOfMinute" => duration.seconds_of_minute(),
+                "millisecondsOfSecond" => duration.milliseconds_of_second(),
+                "microsecondsOfSecond" => duration.microseconds_of_second(),
+                "nanosecondsOfSecond" => duration.nanoseconds_of_second(),
+                _ => return Err(unknown_field(key, value)),
+            };
+            Ok(integer(number))
+        }
+        Value::Point(point) => match key {
+            "x" => Ok(Value::Float(point.x())),
+            "y" => Ok(Value::Float(point.y())),
+            "z" => Ok(point.z().map(Value::Float).unwrap_or(Value::Null)),
+            "longitude" => Ok(Value::Float(point.longitude())),
+            "latitude" => Ok(Value::Float(point.latitude())),
+            "height" => Ok(point.height().map(Value::Float).unwrap_or(Value::Null)),
+            "srid" => Ok(integer(point.srid() as i64)),
+            "crs" => Ok(Value::Text(point.crs().into())),
+            _ => Err(unknown_field(key, value)),
+        },
+        _ => Err(unknown_field(key, value)),
+    }
+}
+
+fn offset_text(offset: i32) -> Value {
+    let mut text = String::new();
+    if offset == 0 {
+        text.push('Z');
+    } else {
+        let sign = if offset < 0 { '-' } else { '+' };
+        let offset = offset.unsigned_abs();
+        text.push_str(&format!(
+            "{sign}{:02}:{:02}",
+            offset / 3600,
+            (offset % 3600) / 60
+        ));
+    }
+    Value::Text(text.into())
+}
+
+fn unknown_field(key: &str, value: &Value) -> Error {
+    Error::type_error(format!(
+        "unknown field `{key}` on a {} value",
+        value.type_name()
+    ))
+}
+
+/// Convert a field map into constructor fields, or `None` when the value is
+/// not a map at all.
+fn field_map(name: &str, value: &Value) -> Result<Option<Vec<(String, Field)>>> {
+    let Value::Map(entries) = value else {
+        return Ok(None);
+    };
+    let mut fields = Vec::with_capacity(entries.len());
+    for (key, value) in entries.iter() {
+        let field = match value {
+            Value::Int(number) => Field::Number(*number as f64),
+            Value::Float(number) => Field::Number(*number),
+            Value::Text(text) => Field::Text(text.to_string()),
+            Value::Date(date) => Field::Date(*date),
+            Value::LocalTime(time) => Field::LocalTime(*time),
+            Value::Time(time) => Field::Time(*time),
+            Value::LocalDateTime(datetime) => Field::LocalDateTime(*datetime),
+            Value::DateTime(datetime) => Field::DateTime(datetime.clone()),
+            other => {
+                return Err(Error::type_error(format!(
+                    "{name}() map key `{key}` has unsupported type {}",
+                    other.type_name()
+                )));
+            }
+        };
+        fields.push((key.to_string(), field));
+    }
+    Ok(Some(fields))
+}
+
+/// Construct a date: from a map, a string, a date or another temporal value.
+fn call_date(args: &[Value]) -> Result<Value> {
+    let Some(value) = args.first() else {
+        let now = system_local_datetime();
+        return Ok(Value::Date(now.date()));
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(fields) = field_map("date", value)? {
+        return construct::date_from_fields(&fields)
+            .map(Value::Date)
+            .map_err(|message| Error::type_error(format!("date(): {message}")));
+    }
+    Ok(match value {
+        Value::Date(date) => Value::Date(*date),
+        Value::DateTime(datetime) => Value::Date(datetime.local().date()),
+        Value::LocalDateTime(datetime) => Value::Date(datetime.date()),
+        Value::Text(text) => Value::Date(
+            text.parse()
+                .map_err(|message| Error::type_error(format!("date(): {message}")))?,
+        ),
+        other => return Err(invalid_argument("date", other)),
+    })
+}
+
+/// Construct a local time.
+fn call_localtime(args: &[Value]) -> Result<Value> {
+    let Some(value) = args.first() else {
+        return Ok(Value::LocalTime(system_local_datetime().time()));
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(fields) = field_map("localtime", value)? {
+        return construct::localtime_from_fields(&fields)
+            .map(Value::LocalTime)
+            .map_err(|message| Error::type_error(format!("localtime(): {message}")));
+    }
+    Ok(match value {
+        Value::LocalTime(time) => Value::LocalTime(*time),
+        Value::Time(time) => Value::LocalTime(time.local()),
+        Value::DateTime(datetime) => Value::LocalTime(datetime.local().time()),
+        Value::LocalDateTime(datetime) => Value::LocalTime(datetime.time()),
+        Value::Text(text) => Value::LocalTime(
+            text.parse()
+                .map_err(|message| Error::type_error(format!("localtime(): {message}")))?,
+        ),
+        other => return Err(invalid_argument("localtime", other)),
+    })
+}
+
+/// Construct a time with offset.
+fn call_time(args: &[Value]) -> Result<Value> {
+    let Some(value) = args.first() else {
+        let now = system_local_datetime();
+        return Ok(Value::Time(Time::new(now.time(), 0).expect("zero offset")));
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(fields) = field_map("time", value)? {
+        return construct::time_from_fields(&fields)
+            .map(Value::Time)
+            .map_err(|message| Error::type_error(format!("time(): {message}")));
+    }
+    Ok(match value {
+        Value::Time(time) => Value::Time(*time),
+        Value::LocalTime(time) => Value::Time(Time::new(*time, 0).expect("zero offset")),
+        Value::DateTime(datetime) => Value::Time(
+            Time::new(datetime.local().time(), datetime.offset()).expect("valid offset"),
+        ),
+        Value::LocalDateTime(datetime) => {
+            Value::Time(Time::new(datetime.time(), 0).expect("zero offset"))
+        }
+        Value::Text(text) => Value::Time(
+            text.parse()
+                .map_err(|message| Error::type_error(format!("time(): {message}")))?,
+        ),
+        other => return Err(invalid_argument("time", other)),
+    })
+}
+
+/// Construct a zone-less datetime.
+fn call_localdatetime(args: &[Value]) -> Result<Value> {
+    let Some(value) = args.first() else {
+        return Ok(Value::LocalDateTime(system_local_datetime()));
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(fields) = field_map("localdatetime", value)? {
+        return construct::localdatetime_from_fields(&fields)
+            .map(Value::LocalDateTime)
+            .map_err(|message| Error::type_error(format!("localdatetime(): {message}")));
+    }
+    Ok(match value {
+        Value::LocalDateTime(datetime) => Value::LocalDateTime(*datetime),
+        Value::DateTime(datetime) => Value::LocalDateTime(datetime.local()),
+        Value::Date(date) => Value::LocalDateTime(LocalDateTime::new(
+            *date,
+            LocalTime::new(0, 0, 0, 0).expect("midnight"),
+        )),
+        Value::LocalTime(time) => Value::LocalDateTime(LocalDateTime::new(
+            Date::new(1970, 1, 1).expect("epoch"),
+            *time,
+        )),
+        Value::Time(time) => Value::LocalDateTime(LocalDateTime::new(
+            Date::new(1970, 1, 1).expect("epoch"),
+            time.local(),
+        )),
+        Value::Text(text) => Value::LocalDateTime(
+            text.parse()
+                .map_err(|message| Error::type_error(format!("localdatetime(): {message}")))?,
+        ),
+        other => return Err(invalid_argument("localdatetime", other)),
+    })
+}
+
+/// Construct a datetime with an offset and optional zone.
+fn call_datetime(args: &[Value]) -> Result<Value> {
+    let Some(value) = args.first() else {
+        return Ok(Value::DateTime(
+            DateTime::new(system_local_datetime(), 0, None).expect("zero offset"),
+        ));
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(fields) = field_map("datetime", value)? {
+        return construct::datetime_from_fields(&fields)
+            .map(Value::DateTime)
+            .map_err(|message| Error::type_error(format!("datetime(): {message}")));
+    }
+    Ok(match value {
+        Value::DateTime(datetime) => Value::DateTime(datetime.clone()),
+        Value::LocalDateTime(datetime) => {
+            Value::DateTime(DateTime::new(*datetime, 0, None).expect("zero offset"))
+        }
+        Value::Date(date) => Value::DateTime(
+            DateTime::new(
+                LocalDateTime::new(*date, LocalTime::new(0, 0, 0, 0).expect("midnight")),
+                0,
+                None,
+            )
+            .expect("zero offset"),
+        ),
+        Value::LocalTime(time) => Value::DateTime(
+            DateTime::new(
+                LocalDateTime::new(Date::new(1970, 1, 1).expect("epoch"), *time),
+                0,
+                None,
+            )
+            .expect("zero offset"),
+        ),
+        Value::Time(time) => Value::DateTime(
+            DateTime::new(
+                LocalDateTime::new(Date::new(1970, 1, 1).expect("epoch"), time.local()),
+                time.offset(),
+                None,
+            )
+            .expect("valid offset"),
+        ),
+        Value::Text(text) => Value::DateTime(
+            text.parse()
+                .map_err(|message| Error::type_error(format!("datetime(): {message}")))?,
+        ),
+        other => return Err(invalid_argument("datetime", other)),
+    })
+}
+
+/// Construct a duration.
+fn call_duration(args: &[Value]) -> Result<Value> {
+    let Some(value) = args.first() else {
+        return Err(Error::type_error("duration() requires a map or string"));
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(fields) = field_map("duration", value)? {
+        return construct::duration_from_fields(&fields)
+            .map(Value::Duration)
+            .map_err(|message| Error::type_error(format!("duration(): {message}")));
+    }
+    Ok(match value {
+        Value::Duration(duration) => Value::Duration(*duration),
+        Value::Text(text) => Value::Duration(
+            text.parse()
+                .map_err(|message| Error::type_error(format!("duration(): {message}")))?,
+        ),
+        other => return Err(invalid_argument("duration", other)),
+    })
+}
+
+/// Construct a point from `{x, y, z?, srid?}` or
+/// `{longitude, latitude, height?, srid?}`.
+fn call_point(args: &[Value]) -> Result<Value> {
+    let Some(Value::Map(entries)) = args.first() else {
+        match args.first() {
+            Some(Value::Null) => return Ok(Value::Null),
+            Some(other) => return Err(invalid_argument("point", other)),
+            None => return Err(Error::type_error("point() requires a map")),
+        }
+    };
+    let number = |key: &str| -> Option<f64> {
+        entries
+            .iter()
+            .find(|(name, _)| name.as_ref() == key)
+            .and_then(|(_, value)| match value {
+                Value::Int(number) => Some(*number as f64),
+                Value::Float(number) => Some(*number),
+                _ => None,
+            })
+    };
+    let srid = entries
+        .iter()
+        .find(|(name, _)| name.as_ref() == "srid")
+        .map(|(_, value)| match value {
+            Value::Int(number) => Ok(*number as i32),
+            other => Err(Error::type_error(format!(
+                "point(): `srid` must be an integer, got {}",
+                other.type_name()
+            ))),
+        })
+        .transpose()?;
+    let (x, y, z, default_srid) = match (number("x"), number("y")) {
+        (Some(x), Some(y)) => {
+            let z = number("z");
+            let srid = if z.is_some() {
+                crate::temporal::point::CARTESIAN_3D
+            } else {
+                crate::temporal::point::CARTESIAN_2D
+            };
+            (x, y, z, srid)
+        }
+        _ => match (number("longitude"), number("latitude")) {
+            (Some(x), Some(y)) => {
+                let z = number("height");
+                let srid = if z.is_some() {
+                    crate::temporal::point::WGS84_3D
+                } else {
+                    crate::temporal::point::WGS84_2D
+                };
+                (x, y, z, srid)
+            }
+            _ => {
+                return Err(Error::type_error(
+                    "point() requires x/y or longitude/latitude",
+                ));
+            }
+        },
+    };
+    let srid = srid.unwrap_or(default_srid);
+    Point::new(srid, x, y, z)
+        .map(Value::Point)
+        .ok_or_else(|| Error::type_error("point(): invalid srid or coordinates"))
+}
+
+/// `distance(a, b)` between two points.
+fn call_distance(args: &[Value]) -> Result<Value> {
+    match (args.first(), args.get(1)) {
+        (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
+        (Some(Value::Point(a)), Some(Value::Point(b))) => {
+            a.distance(*b).map(Value::Float).map_err(Error::type_error)
+        }
+        (Some(other), _) => Err(invalid_argument("distance", other)),
+        (_, Some(other)) => Err(invalid_argument("distance", other)),
+        (None, _) => Err(Error::type_error("distance() requires two points")),
+    }
+}
+
+/// The current UTC local datetime.
+fn system_local_datetime() -> LocalDateTime {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    LocalDateTime::new(
+        Date::from_days((now.as_secs() / 86_400) as i64),
+        LocalTime::from_nanos(
+            (now.subsec_nanos() as i64) + (now.as_secs() % 86_400) as i64 * 1_000_000_000,
+        )
+        .expect("valid time of day"),
+    )
 }
 
 /// Largest list `range()` will materialize; guards against runaway queries
@@ -3013,5 +3528,12 @@ pub fn format_value(value: &Value) -> String {
         }
         Value::Node(id) => format!("(node {id})"),
         Value::Edge(id) => format!("[edge {id}]"),
+        Value::Date(value) => value.to_string(),
+        Value::LocalTime(value) => value.to_string(),
+        Value::Time(value) => value.to_string(),
+        Value::LocalDateTime(value) => value.to_string(),
+        Value::DateTime(value) => value.to_string(),
+        Value::Duration(value) => value.to_string(),
+        Value::Point(value) => value.to_string(),
     }
 }
