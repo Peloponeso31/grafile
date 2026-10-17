@@ -1108,25 +1108,39 @@ fn print_schema(conn: &Connection) {
 
 fn print_indexes(conn: &Connection) {
     let schema = conn.schema();
-    if schema.node_indexes.is_empty() && schema.edge_indexes.is_empty() {
+    if schema.node_indexes.is_empty()
+        && schema.edge_indexes.is_empty()
+        && schema.node_constraints.is_empty()
+        && schema.edge_constraints.is_empty()
+    {
         println!("(no indexes)");
         return;
     }
     for index in &schema.node_indexes {
-        let key = schema.property_key_name(index.key_id).unwrap_or("?");
+        let keys = index
+            .key_ids
+            .iter()
+            .map(|key_id| schema.property_key_name(*key_id).unwrap_or("?"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let label = if index.label_id == 0 {
             "*".to_owned()
         } else {
             schema.label_name(index.label_id).unwrap_or("?").to_owned()
         };
         println!(
-            "node index {} on {label}({key}){}",
-            index.id,
-            if index.unique { " unique" } else { "" }
+            "node {:<8} {} on {label}({keys})",
+            index.kind_name(),
+            index.name.as_deref().unwrap_or("-"),
         );
     }
     for index in &schema.edge_indexes {
-        let key = schema.property_key_name(index.key_id).unwrap_or("?");
+        let keys = index
+            .key_ids
+            .iter()
+            .map(|key_id| schema.property_key_name(*key_id).unwrap_or("?"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let edge_type = if index.type_id == 0 {
             "*".to_owned()
         } else {
@@ -1136,9 +1150,39 @@ fn print_indexes(conn: &Connection) {
                 .to_owned()
         };
         println!(
-            "edge index {} on {edge_type}({key}){}",
-            index.id,
-            if index.unique { " unique" } else { "" }
+            "edge {:<8} {} on {edge_type}({keys})",
+            index.kind_name(),
+            index.name.as_deref().unwrap_or("-"),
+        );
+    }
+    for constraint in &schema.node_constraints {
+        let key = schema.property_key_name(constraint.key_id).unwrap_or("?");
+        let label = if constraint.label_id == 0 {
+            "*".to_owned()
+        } else {
+            schema
+                .label_name(constraint.label_id)
+                .unwrap_or("?")
+                .to_owned()
+        };
+        println!(
+            "node constraint {} on {label}({key}) not null",
+            constraint.name
+        );
+    }
+    for constraint in &schema.edge_constraints {
+        let key = schema.property_key_name(constraint.key_id).unwrap_or("?");
+        let edge_type = if constraint.type_id == 0 {
+            "*".to_owned()
+        } else {
+            schema
+                .edge_type_name(constraint.type_id)
+                .unwrap_or("?")
+                .to_owned()
+        };
+        println!(
+            "edge constraint {} on {edge_type}({key}) not null",
+            constraint.name
         );
     }
 }

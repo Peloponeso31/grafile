@@ -1342,7 +1342,8 @@ impl<'a> Planner<'a> {
         let schema = self.db.schema();
         node.props.iter().any(|(_, key_id, _)| {
             schema.node_indexes.iter().any(|index| {
-                index.key_id == *key_id
+                index.seekable()
+                    && index.key_id() == *key_id
                     && (index.label_id == 0 || node.label_ids.contains(&index.label_id))
             })
         })
@@ -1357,7 +1358,8 @@ impl<'a> Planner<'a> {
         // Prefer an index seek on a literal property.
         for (_, key_id, value) in &node.props {
             let index = schema.node_indexes.iter().find(|index| {
-                index.key_id == *key_id
+                index.seekable()
+                    && index.key_id() == *key_id
                     && (index.label_id == 0 || node.label_ids.contains(&index.label_id))
             });
             if let Some(index) = index {

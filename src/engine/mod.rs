@@ -960,7 +960,8 @@ impl Database {
                 .node_indexes
                 .iter()
                 .find(|index| {
-                    index.key_id == *key_id
+                    index.seekable()
+                        && index.key_id() == *key_id
                         && (index.label_id == 0 || labels.contains(&index.label_id))
                 })
                 .cloned();
@@ -1114,7 +1115,7 @@ impl Database {
     fn unindex_node(&mut self, record: &NodeRecord, node_id: u64) -> Result<()> {
         let indexes: Vec<_> = self.schema().node_indexes.clone();
         for index in indexes {
-            self.delete_index_entry(&index, record.get(index.key_id), node_id)?;
+            self.delete_index_entry(&index, record.get(index.key_id()), node_id)?;
         }
         Ok(())
     }
@@ -1171,12 +1172,12 @@ impl Database {
         let Some(def) = def else {
             return Ok(());
         };
-        let Some(value) = record.get(def.key_id) else {
+        let Some(value) = record.get(def.key_id()) else {
             return Ok(());
         };
         let mut tree = Btree::from_root(def.root, TreeKind::Index);
         let key = node_index_key(value, node_id);
-        if def.unique {
+        if def.unique() {
             // Index keys embed the entity id, so key uniqueness cannot
             // enforce value uniqueness: probe the value prefix instead.
             let prefix = index_value_prefix(value);
@@ -1189,7 +1190,7 @@ impl Database {
                 if u64::from_be_bytes(existing) != node_id || !backfill {
                     return Err(Error::constraint(format!(
                         "unique index on property {} violated by node {node_id}",
-                        def.key_id
+                        def.key_id()
                     )));
                 }
             }
@@ -1259,7 +1260,7 @@ impl Database {
     fn unindex_edge(&mut self, record: &EdgeRecord, edge_id: u64) -> Result<()> {
         let indexes: Vec<_> = self.schema().edge_indexes.clone();
         for index in indexes {
-            self.delete_edge_index_entry(&index, record.get(index.key_id), edge_id)?;
+            self.delete_edge_index_entry(&index, record.get(index.key_id()), edge_id)?;
         }
         Ok(())
     }
@@ -1316,12 +1317,12 @@ impl Database {
         let Some(def) = def else {
             return Ok(());
         };
-        let Some(value) = record.get(def.key_id) else {
+        let Some(value) = record.get(def.key_id()) else {
             return Ok(());
         };
         let mut tree = Btree::from_root(def.root, TreeKind::Index);
         let key = edge_index_key(value, edge_id);
-        if def.unique {
+        if def.unique() {
             let prefix = index_value_prefix(value);
             let mut cursor = tree.cursor();
             if cursor.seek_ge(&mut self.pager, &prefix)? && cursor.key().starts_with(&prefix) {
@@ -1331,7 +1332,7 @@ impl Database {
                 if u64::from_be_bytes(existing) != edge_id || !backfill {
                     return Err(Error::constraint(format!(
                         "unique index on property {} violated by edge {edge_id}",
-                        def.key_id
+                        def.key_id()
                     )));
                 }
             }

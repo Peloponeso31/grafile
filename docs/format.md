@@ -1,6 +1,6 @@
 # grafile on-disk format
 
-Version 0.2 (format major 0, minor 2). All multi-byte integers are
+Version 0.3 (format major 0, minor 3). All multi-byte integers are
 little-endian unless stated otherwise. The database is a single file; a
 transient `-journal` sidecar exists only while a write transaction is in
 flight (see [Transactions](#transactions)).
@@ -128,6 +128,44 @@ payload uses the same length/overflow encoding as table leaves.
 | 24 | * | data |
 
 Usable data per overflow page = `page_size - 24`.
+
+## Catalog entries
+
+The catalog B+tree (a table tree) maps 8-byte keys to per-kind payloads.
+Keys pack `(kind u8, id u32)` big-endian into a `u64`. Kinds:
+
+| Kind | Entries |
+|-----:|---------|
+| 1 | label name (UTF-8) |
+| 2 | edge type name (UTF-8) |
+| 3 | property key name (UTF-8) |
+| 4 | anonymous node index (format minor 2) |
+| 5 | anonymous edge index (format minor 2) |
+| 6 | named node index (format minor 3) |
+| 7 | named edge index (format minor 3) |
+| 8 | node `IS NOT NULL` constraint |
+| 9 | edge `IS NOT NULL` constraint |
+
+Anonymous index payloads (kinds 4 and 5) are the format-minor-2 layout:
+varint key id, varint label (node) or type (edge) id, one byte `unique`,
+4-byte little-endian B+tree root.
+
+Named index payloads (kinds 6 and 7):
+
+| Field | Encoding |
+|-------|----------|
+| key count | varint (at least 1) |
+| key ids | varint each, in key order |
+| label (node) or type (edge) id | varint, 0 = any |
+| kind | 1 byte: 0 plain, 1 unique, 2 node key (nodes only) |
+| name | varint `length + 1` (0 = anonymous) + UTF-8 bytes |
+| B+tree root | 4-byte little-endian page number |
+
+Constraint payloads (kinds 8 and 9): varint label/type id, varint property
+key id, varint name length, name bytes. Constraints have no B+tree.
+
+A build that predates format minor 3 reads kinds 1-5 and rejects any file
+containing the newer kinds; builds from minor 3 read both index encodings.
 
 ## Fragment store
 

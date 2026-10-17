@@ -7,8 +7,11 @@ pub const MAGIC: [u8; 8] = *b"GRAFILE\0";
 /// Format version written by this build.
 pub const FORMAT_MAJOR: u16 = 0;
 /// Format minor version written by this build. Minor 2 adds the temporal
-/// and point record tags; files written by minor 1 builds load unchanged.
-pub const FORMAT_MINOR: u16 = 2;
+/// and point record tags; minor 3 adds named catalog objects (indexes with
+/// names, key lists and kinds, plus NOT NULL constraints). Older minors load
+/// unchanged; builds from before minor 3 reject files that contain the new
+/// catalog entry kinds.
+pub const FORMAT_MINOR: u16 = 3;
 
 /// Size of the common page header in bytes.
 pub const PAGE_HEADER_SIZE: usize = 20;
