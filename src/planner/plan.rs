@@ -120,8 +120,8 @@ pub enum Plan {
         dst: String,
         /// Pattern direction.
         direction: RelDirection,
-        /// Restricting edge type names (empty = any).
-        types: Vec<String>,
+        /// Restricting edge type names; `None` means any type.
+        types: Option<Vec<String>>,
         /// Literal property filters applied at every hop, by key name.
         props: Vec<(String, crate::record::Value)>,
         /// Minimum hops.
@@ -147,8 +147,8 @@ pub enum Plan {
         dst: String,
         /// Pattern direction.
         direction: RelDirection,
-        /// Restricting edge type names (empty = any).
-        types: Vec<String>,
+        /// Restricting edge type names; `None` means any type.
+        types: Option<Vec<String>>,
         /// Literal property filters on the edge, by key name.
         props: Vec<(String, crate::record::Value)>,
     },
@@ -209,8 +209,8 @@ pub enum Plan {
         edge: Option<String>,
         /// Direction.
         direction: crate::cypher::RelDirection,
-        /// Restricting edge type names.
-        types: Vec<String>,
+        /// Restricting edge type names; `None` means any type.
+        types: Option<Vec<String>>,
         /// Literal property filters applied at every hop.
         props: Vec<(String, crate::record::Value)>,
         /// Minimum hops.
@@ -396,6 +396,15 @@ impl CreateItem {
     }
 }
 
+/// Render an edge type filter for `EXPLAIN`: `any`, `none`, or `A|B`.
+fn types_text(types: &Option<Vec<String>>) -> String {
+    match types {
+        None => "any".to_owned(),
+        Some(names) if names.is_empty() => "none".to_owned(),
+        Some(names) => names.join("|"),
+    }
+}
+
 /// Render a plan tree for `EXPLAIN` output.
 pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
     let pad = "  ".repeat(indent);
@@ -444,7 +453,8 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
             nodes: _,
         } => {
             out.push_str(&format!(
-                "{pad}VarExpand {src}-[{edge:?}:{types:?} {direction:?} {min}..{max:?}]->{dst} props={} reverse={reverse}\n",
+                "{pad}VarExpand {src}-[{edge:?}:{} {direction:?} {min}..{max:?}]->{dst} props={} reverse={reverse}\n",
+                types_text(types),
                 props.len()
             ));
             explain(input, indent + 1, out);
@@ -459,7 +469,8 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
             props,
         } => {
             out.push_str(&format!(
-                "{pad}Expand {src}-[{edge:?}:{types:?} {direction:?}]->{dst} props={}\n",
+                "{pad}Expand {src}-[{edge:?}:{} {direction:?}]->{dst} props={}\n",
+                types_text(types),
                 props.len()
             ));
             explain(input, indent + 1, out);

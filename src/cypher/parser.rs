@@ -551,14 +551,54 @@ impl<'a> Parser<'a> {
         if matches!(self.peek(), Some(Token::Ident) | Some(Token::EscapedIdent)) {
             pattern.variable = Some(self.parse_name()?);
         }
-        while self.eat(Token::Colon) {
-            pattern.labels.push(self.parse_symbol_name()?);
+        if self.eat(Token::Colon) {
+            pattern.labels = self.parse_label_expr()?;
         }
         if self.peek() == Some(Token::LBrace) {
             pattern.properties = Some(self.parse_map_literal()?);
         }
         self.expect(Token::RParen, "')' to close a node pattern")?;
         Ok(pattern)
+    }
+
+    /// Label/type expression: `|` has the lowest precedence, then `&` and the
+    /// `:` chain shorthand, then `!` and parentheses.
+    fn parse_label_expr(&mut self) -> Result<LabelExpr> {
+        let mut parts = vec![self.parse_label_and()?];
+        while self.eat(Token::Pipe) {
+            parts.push(self.parse_label_and()?);
+        }
+        Ok(if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            LabelExpr::Or(parts)
+        })
+    }
+
+    fn parse_label_and(&mut self) -> Result<LabelExpr> {
+        let mut parts = vec![self.parse_label_unary()?];
+        while self.eat(Token::Amp) || self.eat(Token::Colon) {
+            parts.push(self.parse_label_unary()?);
+        }
+        Ok(if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            LabelExpr::And(parts)
+        })
+    }
+
+    fn parse_label_unary(&mut self) -> Result<LabelExpr> {
+        // `:T|:U` spells the second alternative with its own colon.
+        self.eat(Token::Colon);
+        if self.eat(Token::Bang) {
+            return Ok(LabelExpr::Not(Box::new(self.parse_label_unary()?)));
+        }
+        if self.eat(Token::LParen) {
+            let expr = self.parse_label_expr()?;
+            self.expect(Token::RParen, "')' to close a label expression")?;
+            return Ok(expr);
+        }
+        Ok(LabelExpr::Label(self.parse_symbol_name()?))
     }
 
     fn parse_relationship(&mut self) -> Result<RelationshipPattern> {
@@ -569,7 +609,7 @@ impl<'a> Parser<'a> {
         };
         let mut pattern = RelationshipPattern {
             variable: None,
-            types: Vec::new(),
+            types: LabelExpr::default(),
             direction: RelDirection::Undirected,
             var_length: None,
             properties: None,
@@ -579,18 +619,7 @@ impl<'a> Parser<'a> {
                 pattern.variable = Some(self.parse_name()?);
             }
             if self.eat(Token::Colon) {
-                pattern.types.push(self.parse_symbol_name()?);
-                while self.eat(Token::Pipe) {
-                    // `:T|:U` and `:T|U` are both accepted.
-                    self.eat(Token::Colon);
-                    let name = self.parse_symbol_name()?;
-                    // `:T|:T` is the same filter twice.
-                    if !pattern.types.contains(&name) {
-                        pattern.types.push(name);
-                    }
-                    // Repeated types are impossible, so the loop only needs
-                    // to skip them at the end.
-                }
+                pattern.types = self.parse_label_expr()?;
             }
             if self.eat(Token::Star) {
                 pattern.var_length = Some(self.parse_var_length()?);
@@ -1519,7 +1548,7 @@ mod tests {
         assert_eq!(matched.patterns.len(), 1);
         let path = &matched.patterns[0];
         assert_eq!(path.start.variable.as_deref(), Some("n"));
-        assert_eq!(path.start.labels, vec!["Person"]);
+        assert_eq!(path.start.labels, LabelExpr::Label("Person".to_owned()));
         assert!(path.start.properties.is_some());
         assert_eq!(path.segments.len(), 1);
         assert_eq!(
@@ -1527,6 +1556,43 @@ mod tests {
             RelDirection::Outgoing
         );
         assert!(matched.where_clause.is_some());
+    }
+
+    #[test]
+    fn parses_label_expressions() {
+        let query = parse("MATCH (n:A|B:C), (m:!D), (o:(A|B)&C) RETURN n, m, o").expect("parse");
+        let Clause::Match(matched) = &query.parts[0].clauses[0] else {
+            panic!("expected MATCH");
+        };
+        let label = |name: &str| LabelExpr::Label(name.to_owned());
+        assert_eq!(
+            matched.patterns[0].start.labels,
+            LabelExpr::Or(vec![
+                label("A"),
+                LabelExpr::And(vec![label("B"), label("C")])
+            ])
+        );
+        assert_eq!(
+            matched.patterns[1].start.labels,
+            LabelExpr::Not(Box::new(label("D")))
+        );
+        assert_eq!(
+            matched.patterns[2].start.labels,
+            LabelExpr::And(vec![
+                LabelExpr::Or(vec![label("A"), label("B")]),
+                label("C"),
+            ])
+        );
+        // Relationship type expressions share the grammar, including the
+        // `:T|:U` spelling of the second alternative.
+        let query = parse("MATCH ()-[:X|:!Y]-() RETURN 1").expect("parse");
+        let Clause::Match(matched) = &query.parts[0].clauses[0] else {
+            panic!("expected MATCH");
+        };
+        assert_eq!(
+            matched.patterns[0].segments[0].relationship.types,
+            LabelExpr::Or(vec![label("X"), LabelExpr::Not(Box::new(label("Y")))])
+        );
     }
 
     #[test]

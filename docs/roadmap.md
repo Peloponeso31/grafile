@@ -193,7 +193,8 @@ Not delivered: pattern comprehensions nested inside list comprehensions
   - No TCK coverage (openCypher defines no DDL): verified by unit and
     integration tests, and the conformance gate must not regress.
 - `LOAD CSV [WITH HEADERS] FROM …` for local file paths.
-- Label expressions in patterns: `:A|B`, `:!A`.
+- Label expressions in patterns: `:A|B`, `:!A` (negation and conjunction are
+  rejected on variable-length and shortest-path patterns).
 
 These stay allow-listed as `neo4j-extension` until this phase.
 

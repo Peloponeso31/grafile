@@ -109,6 +109,18 @@ impl Codegen {
         index
     }
 
+    /// Compile an edge type filter: constant pool indices for the names and
+    /// whether the pattern accepted any type (`None`).
+    fn edge_types(&mut self, types: &Option<Vec<String>>) -> (Vec<u32>, bool) {
+        let regs = types
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|name| self.const_index(Value::from(name.as_str())))
+            .collect();
+        (regs, types.is_none())
+    }
+
     fn const_reg(&mut self, value: Value) -> u32 {
         let index = self.constants.len() as u32;
         self.constants.push(value);
@@ -254,16 +266,13 @@ impl Codegen {
                     crate::cypher::RelDirection::Incoming => 1u8,
                     crate::cypher::RelDirection::Undirected => 2u8,
                 };
-                let type_regs: Vec<u32> = types
-                    .iter()
-                    .map(|name| cg.const_index(Value::from(name.as_str())))
-                    .collect();
+                let (type_regs, any_type) = cg.edge_types(types);
                 cg.emit(Op::VarExpandOpen {
                     cursor,
                     src: src_reg,
                     direction: direction_code,
                     types: type_regs,
-                    any_type: types.is_empty(),
+                    any_type,
                     props: props.clone(),
                     min: *min,
                     max: *max,
@@ -310,16 +319,13 @@ impl Codegen {
                     crate::cypher::RelDirection::Incoming => 1u8,
                     crate::cypher::RelDirection::Undirected => 2u8,
                 };
-                let type_regs: Vec<u32> = types
-                    .iter()
-                    .map(|name| cg.const_index(Value::from(name.as_str())))
-                    .collect();
+                let (type_regs, any_type) = cg.edge_types(types);
                 cg.emit(Op::OpenExpand {
                     cursor,
                     src: src_reg,
                     direction: direction_code,
                     types: type_regs,
-                    any_type: types.is_empty(),
+                    any_type,
                 });
                 let rewind = cg.emit(Op::Rewind { cursor, target: 0 });
                 let loop_start = cg.ops.len() as u32;
@@ -484,17 +490,14 @@ impl Codegen {
                     crate::cypher::RelDirection::Incoming => 1u8,
                     crate::cypher::RelDirection::Undirected => 2u8,
                 };
-                let type_regs: Vec<u32> = types
-                    .iter()
-                    .map(|name| cg.const_index(Value::from(name.as_str())))
-                    .collect();
+                let (type_regs, any_type) = cg.edge_types(types);
                 cg.emit(Op::ShortestOpen {
                     cursor,
                     src: src_reg,
                     dst: dst_reg,
                     direction: direction_code,
                     types: type_regs,
-                    any_type: types.is_empty(),
+                    any_type,
                     props: props.clone(),
                     min: *min,
                     max: *max,

@@ -240,6 +240,12 @@ pub enum Token {
     /// `|`
     #[token("|")]
     Pipe,
+    /// `!` (label expression negation)
+    #[token("!")]
+    Bang,
+    /// `&` (label expression conjunction)
+    #[token("&")]
+    Amp,
     /// `(`
     #[token("(")]
     LParen,
@@ -453,7 +459,7 @@ fn classify(token: Token, tokens: &[(usize, usize, Token)], index: usize) -> Tok
             TokenClass::Operator
         }
         LParen | RParen | LBracket | RBracket | LBrace | RBrace | Comma | Semicolon | Colon
-        | Pipe | Dot => TokenClass::Punctuation,
+        | Pipe | Bang | Amp | Dot => TokenClass::Punctuation,
         other => {
             debug_assert!(other.is_keyword());
             TokenClass::Keyword
@@ -467,7 +473,7 @@ fn context_class(tokens: &[(usize, usize, Token)], index: usize) -> TokenClass {
         .and_then(|previous| tokens.get(previous))
         .map(|entry| entry.2)
     {
-        Some(Token::Colon) | Some(Token::Pipe) => TokenClass::Label,
+        Some(Token::Colon) | Some(Token::Pipe) | Some(Token::Bang) => TokenClass::Label,
         Some(Token::Dot) => TokenClass::Property,
         _ => TokenClass::Variable,
     }

@@ -238,13 +238,68 @@ pub struct VarLength {
     pub max: Option<u32>,
 }
 
+/// A label (or relationship type) expression: names combined with `&`, `|`
+/// and `!`, as introduced by Neo4j 5. `:` chains are conjunctions too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelExpr {
+    /// A single label or type name.
+    Label(String),
+    /// Every sub-expression must match (empty means no label was written).
+    And(Vec<LabelExpr>),
+    /// At least one sub-expression must match.
+    Or(Vec<LabelExpr>),
+    /// The sub-expression must not match.
+    Not(Box<LabelExpr>),
+}
+
+impl Default for LabelExpr {
+    fn default() -> Self {
+        Self::And(Vec::new())
+    }
+}
+
+impl LabelExpr {
+    /// Whether no label was written at all.
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::And(parts) if parts.is_empty())
+    }
+
+    /// The label names when the expression is a conjunction of plain labels,
+    /// which is the only form write clauses accept.
+    pub fn plain_labels(&self) -> Option<Vec<String>> {
+        let mut labels = Vec::new();
+        self.collect_plain(&mut labels).then_some(labels)
+    }
+
+    /// Every label a matching node must carry. Disjunctions and negations
+    /// guarantee nothing even when they mention labels.
+    pub fn guaranteed_labels(&self) -> Vec<String> {
+        match self {
+            Self::Label(label) => vec![label.clone()],
+            Self::And(parts) => parts.iter().flat_map(Self::guaranteed_labels).collect(),
+            Self::Or(_) | Self::Not(_) => Vec::new(),
+        }
+    }
+
+    fn collect_plain(&self, labels: &mut Vec<String>) -> bool {
+        match self {
+            Self::Label(label) => {
+                labels.push(label.clone());
+                true
+            }
+            Self::And(parts) => parts.iter().all(|part| part.collect_plain(labels)),
+            Self::Or(_) | Self::Not(_) => false,
+        }
+    }
+}
+
 /// Node pattern `(var:Label {props})`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct NodePattern {
     /// Optional variable.
     pub variable: Option<String>,
-    /// Label names.
-    pub labels: Vec<String>,
+    /// Label expression.
+    pub labels: LabelExpr,
     /// Optional inline property map.
     pub properties: Option<Expr>,
 }
@@ -254,8 +309,8 @@ pub struct NodePattern {
 pub struct RelationshipPattern {
     /// Optional variable.
     pub variable: Option<String>,
-    /// Edge type names.
-    pub types: Vec<String>,
+    /// Relationship type expression.
+    pub types: LabelExpr,
     /// Direction.
     pub direction: RelDirection,
     /// Optional variable-length bounds.

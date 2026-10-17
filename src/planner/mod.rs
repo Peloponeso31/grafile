@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use hashlink::LinkedHashMap as FastMap;
 
 use crate::cypher::{
-    BinaryOp, Clause, Expr, MatchClause, NodePattern, PatternPath, QuantifierKind, Query,
-    RelDirection, ReturnItem, SetItem, Shortest, SortItem, UnaryOp,
+    BinaryOp, Clause, Expr, LabelExpr, MatchClause, NodePattern, PatternPath, QuantifierKind,
+    Query, RelDirection, RelationshipPattern, ReturnItem, SetItem, Shortest, SortItem, UnaryOp,
 };
 use crate::engine::Database;
 use crate::error::{Error, ErrorCode, Result};
@@ -552,10 +552,7 @@ impl<'a> Planner<'a> {
                         ));
                     }
                     if !path.start.labels.is_empty() && path.start.properties.is_none() {
-                        *expr = Expr::LabelCheck {
-                            expr: Box::new(Expr::Variable(var.clone())),
-                            labels: path.start.labels.clone(),
-                        };
+                        *expr = label_expr_filter(var, &path.start.labels);
                         return Ok(());
                     }
                 }
@@ -796,6 +793,19 @@ impl<'a> Planner<'a> {
                 "shortestPath requires a variable-length relationship pattern",
             ));
         };
+        let types = if rel.types.is_empty() {
+            None
+        } else {
+            match positive_type_names(&rel.types) {
+                Some(names) => Some(names),
+                None => {
+                    return Err(Error::unsupported(
+                        "type expressions with negation or conjunction are not \
+                         supported in shortest paths",
+                    ));
+                }
+            }
+        };
         let (props, prop_exprs) =
             self.pattern_props(rel.properties.as_ref(), "relationship", scope)?;
         if !prop_exprs.is_empty() {
@@ -866,7 +876,7 @@ impl<'a> Planner<'a> {
             dst: dst_node.var.clone(),
             edge: Some(edge_var.clone()),
             direction,
-            types: rel.types.clone(),
+            types,
             props: props
                 .into_iter()
                 .map(|(name, _, value)| (name, value))
@@ -923,7 +933,8 @@ impl<'a> Planner<'a> {
         struct RelInfo {
             index: usize,
             var: String,
-            types: Vec<String>,
+            types: Option<Vec<String>>,
+            type_filter: Option<LabelExpr>,
             direction: RelDirection,
             props: Vec<(String, Value)>,
             prop_exprs: Vec<(String, Expr)>,
@@ -941,7 +952,7 @@ impl<'a> Planner<'a> {
                 Some(var) => var.clone(),
                 None => self.anon_name("rel"),
             };
-            let types = rel.types.clone();
+            let (types, type_filter) = self.plan_rel_types(rel, rel.var_length.is_some())?;
             let (literals, prop_exprs) =
                 self.pattern_props(rel.properties.as_ref(), "relationship", scope)?;
             if rel.var_length.is_some() && !prop_exprs.is_empty() {
@@ -953,6 +964,7 @@ impl<'a> Planner<'a> {
                 index: nodes.len() - 2,
                 var,
                 types,
+                type_filter,
                 direction: rel.direction,
                 props: literals
                     .into_iter()
@@ -1044,6 +1056,7 @@ impl<'a> Planner<'a> {
                 };
                 constrain_edge(plan, &edge_var, &rel.var, edge_bound);
                 constrain_edge_props(plan, &edge_var, &rel.prop_exprs);
+                constrain_edge_types(plan, &edge_var, &rel.type_filter);
                 scope.insert(nodes[to_idx].var.clone(), VarKind::Node);
                 if rel.var_length.is_none() {
                     distinct_edges.push(edge_var.clone());
@@ -1126,6 +1139,7 @@ impl<'a> Planner<'a> {
                 };
                 constrain_edge(plan, &edge_var, &rel.var, edge_bound);
                 constrain_edge_props(plan, &edge_var, &rel.prop_exprs);
+                constrain_edge_types(plan, &edge_var, &rel.type_filter);
                 if rel.var_length.is_none() {
                     distinct_edges.push(edge_var.clone());
                 } else {
@@ -1354,7 +1368,7 @@ impl<'a> Planner<'a> {
                     .map(|(name, _, value)| (name.clone(), value.clone()))
                     .collect();
                 return Ok((
-                    node.label_names.first().cloned(),
+                    node.anchor.clone(),
                     Some(IndexSeek {
                         index_id: index.id,
                         key_id: *key_id,
@@ -1365,13 +1379,37 @@ impl<'a> Planner<'a> {
             }
         }
         Ok((
-            node.label_names.first().cloned(),
+            node.anchor.clone(),
             None,
             node.props
                 .iter()
                 .map(|(name, _, value)| (name.clone(), value.clone()))
                 .collect(),
         ))
+    }
+
+    /// Lower a type expression for an expansion: positive disjunctions keep
+    /// their names (resolved against the catalog at execution time, so types
+    /// created later in the same query still match); anything with a
+    /// negation or conjunction needs a runtime filter and no restriction.
+    fn plan_rel_types(
+        &self,
+        rel: &RelationshipPattern,
+        var_length: bool,
+    ) -> Result<(Option<Vec<String>>, Option<LabelExpr>)> {
+        if rel.types.is_empty() {
+            return Ok((None, None));
+        }
+        if let Some(names) = positive_type_names(&rel.types) {
+            return Ok((Some(names), None));
+        }
+        if var_length {
+            return Err(Error::unsupported(
+                "type expressions with negation or conjunction are not supported \
+                 in variable-length relationships",
+            ));
+        }
+        Ok((None, Some(rel.types.clone())))
     }
 
     fn planned_node(
@@ -1403,16 +1441,21 @@ impl<'a> Planner<'a> {
             None => self.anon_name("node"),
         };
         let mut label_ids = Vec::new();
-        for label in &pattern.labels {
-            // A missing label yields an impossible id so the scan is empty
-            // but the variable is still bound.
-            label_ids.push(self.db.label_id(label).unwrap_or(u32::MAX));
+        let mut anchor = None;
+        if !pattern.labels.is_empty() {
+            for label in pattern.labels.guaranteed_labels() {
+                // A missing label yields an impossible id so the scan is empty
+                // but the variable is still bound.
+                label_ids.push(self.db.label_id(&label).unwrap_or(u32::MAX));
+            }
+            anchor = pattern.labels.guaranteed_labels().into_iter().next();
         }
         let (props, prop_exprs) = self.pattern_props(pattern.properties.as_ref(), "node", scope)?;
         Ok(PlannedNode {
             var,
             label_ids,
-            label_names: pattern.labels.clone(),
+            labels: pattern.labels.clone(),
+            anchor,
             props,
             prop_exprs,
         })
@@ -1502,11 +1545,14 @@ impl<'a> Planner<'a> {
                 if rel.direction == RelDirection::Undirected {
                     return Err(Error::syntax("CREATE requires a directed relationship"));
                 }
-                if rel.types.len() != 1 {
-                    return Err(Error::syntax(
-                        "relationships in CREATE must have exactly one type",
-                    ));
-                }
+                let edge_type = match rel.types.plain_labels() {
+                    Some(types) if types.len() == 1 => types[0].clone(),
+                    _ => {
+                        return Err(Error::syntax(
+                            "relationships in CREATE must have exactly one type",
+                        ));
+                    }
+                };
                 if rel.var_length.is_some() {
                     return Err(Error::syntax(
                         "CreatingVarLength: variable-length relationships cannot be created",
@@ -1529,7 +1575,7 @@ impl<'a> Planner<'a> {
                 };
                 items.push(CreateItem::Edge {
                     var,
-                    edge_type: rel.types[0].clone(),
+                    edge_type,
                     src,
                     dst,
                     props,
@@ -1563,9 +1609,12 @@ impl<'a> Planner<'a> {
             None => self.anon_name("node"),
         };
         let (props, prop_exprs) = self.create_props(pattern.properties.as_ref(), scope)?;
+        let labels = pattern.labels.plain_labels().ok_or_else(|| {
+            Error::syntax("label expressions cannot be created; use plain `:Label` names")
+        })?;
         Ok(Some(CreateItem::Node {
             var,
-            labels: pattern.labels.clone(),
+            labels,
             props,
             prop_exprs,
         }))
@@ -1630,7 +1679,11 @@ impl<'a> Planner<'a> {
         }
         for segment in &path.segments {
             let rel = &segment.relationship;
-            if rel.types.len() != 1 {
+            if rel
+                .types
+                .plain_labels()
+                .is_none_or(|types| types.len() != 1)
+            {
                 return Err(Error::syntax(
                     "relationships in MERGE must have exactly one type",
                 ));
@@ -1698,9 +1751,17 @@ impl<'a> Planner<'a> {
                 RelDirection::Outgoing | RelDirection::Undirected => (src, node_var.clone()),
             };
             let (props, prop_exprs) = self.create_props(rel.properties.as_ref(), scope)?;
+            let edge_type = match rel.types.plain_labels() {
+                Some(types) if types.len() == 1 => types[0].clone(),
+                _ => {
+                    return Err(Error::syntax(
+                        "relationships in MERGE must have exactly one type",
+                    ));
+                }
+            };
             items.push(CreateItem::Edge {
                 var: var.clone(),
-                edge_type: rel.types[0].clone(),
+                edge_type,
                 src: from,
                 dst: to,
                 props,
@@ -2171,8 +2232,13 @@ impl<'a> Planner<'a> {
 /// A node pattern with resolved names.
 struct PlannedNode {
     var: String,
+    /// Ids of the labels every match is guaranteed to carry (used for index
+    /// selection); disjunctions and negations contribute nothing.
     label_ids: Vec<u32>,
-    label_names: Vec<String>,
+    /// The pattern's label expression.
+    labels: LabelExpr,
+    /// Label the scan can anchor on, if the expression guarantees one.
+    anchor: Option<String>,
     /// Literal properties as `(name, key id, value)`.
     props: Vec<(String, u32, Value)>,
     prop_exprs: Vec<(String, Expr)>,
@@ -2205,6 +2271,40 @@ fn constrain_edge_props(plan: &mut Plan, edge_var: &str, props: &[(String, Expr)
     }
 }
 
+/// Apply a relationship type expression at runtime; only expressions with
+/// negation or conjunction need this, plain disjunctions restrict the
+/// traversal itself.
+fn constrain_edge_types(plan: &mut Plan, edge_var: &str, filter: &Option<LabelExpr>) {
+    if let Some(filter) = filter {
+        *plan = Plan::Filter {
+            input: Box::new(plan.clone()),
+            predicate: label_expr_filter(edge_var, filter),
+        };
+    }
+}
+
+/// Type names of a positive disjunction of plain types, or `None` when the
+/// expression uses negation or conjunction. Names are resolved against the
+/// catalog at execution time, so types created earlier in the same query
+/// still match.
+fn positive_type_names(expr: &LabelExpr) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    collect_positive_types(expr, &mut names).then_some(names)
+}
+
+fn collect_positive_types(expr: &LabelExpr, names: &mut Vec<String>) -> bool {
+    match expr {
+        LabelExpr::Label(label) => {
+            if !names.contains(label) {
+                names.push(label.clone());
+            }
+            true
+        }
+        LabelExpr::Or(parts) => parts.iter().all(|part| collect_positive_types(part, names)),
+        LabelExpr::And(_) | LabelExpr::Not(_) => false,
+    }
+}
+
 fn constrain_edge(plan: &mut Plan, edge_var: &str, rel_var: &str, edge_bound: bool) {
     if !edge_bound {
         return;
@@ -2218,21 +2318,18 @@ fn constrain_edge(plan: &mut Plan, edge_var: &str, rel_var: &str, edge_bound: bo
     };
 }
 
-/// Predicates for node constraints a scan did not apply. Scans enforce the
-/// first label and all literal properties, so only the remaining labels are
-/// left; nodes bound by the scope or an expansion need everything.
+/// Predicates for node constraints a scan did not apply. A scan enforces the
+/// anchor label alone, so only that exact single-label pattern is skipped;
+/// everything else is checked (cheap and always correct). Bound nodes need
+/// their label expression and literal properties checked as well.
 fn node_constraints(node: &PlannedNode, scanned: bool) -> Option<Expr> {
     let mut predicates: Vec<Expr> = Vec::new();
-    let labels: &[String] = if scanned {
-        node.label_names.get(1..).unwrap_or(&[])
-    } else {
-        &node.label_names
-    };
-    if !labels.is_empty() {
-        predicates.push(Expr::LabelCheck {
-            expr: Box::new(Expr::Variable(node.var.clone())),
-            labels: labels.to_vec(),
-        });
+    if !node.labels.is_empty() {
+        let enforced_by_scan = scanned
+            && matches!(&node.labels, LabelExpr::Label(label) if node.anchor.as_deref() == Some(label));
+        if !enforced_by_scan {
+            predicates.push(label_expr_filter(&node.var, &node.labels));
+        }
     }
     if !scanned {
         // Scans apply literal properties themselves; bound nodes need them
@@ -2264,6 +2361,41 @@ fn node_constraints(node: &PlannedNode, scanned: bool) -> Option<Expr> {
         left: Box::new(left),
         right: Box::new(right),
     })
+}
+
+/// Lower a label expression over a variable to a boolean expression built
+/// from single-label checks; `Op::HasLabel` tests node labels as well as
+/// relationship types.
+fn label_expr_filter(var: &str, expr: &LabelExpr) -> Expr {
+    let check = |label: &String| Expr::LabelCheck {
+        expr: Box::new(Expr::Variable(var.to_owned())),
+        labels: vec![label.clone()],
+    };
+    match expr {
+        LabelExpr::Label(label) => check(label),
+        LabelExpr::And(parts) => parts
+            .iter()
+            .map(|part| label_expr_filter(var, part))
+            .reduce(|left, right| Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+            .expect("non-empty conjunction"),
+        LabelExpr::Or(parts) => parts
+            .iter()
+            .map(|part| label_expr_filter(var, part))
+            .reduce(|left, right| Expr::Binary {
+                op: BinaryOp::Or,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+            .expect("non-empty disjunction"),
+        LabelExpr::Not(inner) => Expr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(label_expr_filter(var, inner)),
+        },
+    }
 }
 
 fn flip(direction: RelDirection) -> RelDirection {

@@ -536,6 +536,78 @@ fn pattern_checks_every_label_on_scanned_nodes() {
     assert_eq!(rows, vec![vec!["1"]]);
 }
 
+#[test]
+fn label_expressions_match_nodes() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A), (:B), (:C), (:A:B), (:D)")
+        .expect("create");
+    let rows = query(&mut conn, "MATCH (n:A|B) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["3"]]);
+    let rows = query(&mut conn, "MATCH (n:A&B) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["1"]]);
+    let rows = query(&mut conn, "MATCH (n:!A) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["3"]]);
+    let rows = query(&mut conn, "MATCH (n:(A|B)&!D) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["3"]]);
+    // A lone node pattern in a predicate evaluates its label expression.
+    let rows = query(&mut conn, "MATCH (n) WHERE (n:A|B) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["3"]]);
+}
+
+#[test]
+fn label_expressions_on_relationships() {
+    let mut conn = connection();
+    conn.execute("CREATE (a:N)-[:X]->(b:N), (a)-[:Y]->(b), (a)-[:Z]->(b)")
+        .expect("create");
+    let rows = query(&mut conn, "MATCH ()-[r:!X]->() RETURN count(*)");
+    assert_eq!(rows, vec![vec!["2"]]);
+    let rows = query(&mut conn, "MATCH ()-[r:X|:Y]->() RETURN count(*)");
+    assert_eq!(rows, vec![vec!["2"]]);
+    // Variable-length traversals accept plain disjunctions...
+    let rows = query(&mut conn, "MATCH (a:N)-[:Y|:Z*1..1]->(b) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["2"]]);
+    // ...but negation and conjunction need the single-hop form.
+    let err = conn
+        .query(
+            "MATCH (a:N)-[:!X*1..2]->(b) RETURN count(*)",
+            &Params::new(),
+        )
+        .expect_err("variable-length negation");
+    assert_eq!(err.code(), grafile::ErrorCode::Unsupported);
+}
+
+#[test]
+fn label_expressions_are_rejected_in_writes() {
+    let mut conn = connection();
+    let err = conn.execute("CREATE (n:A|B)").expect_err("create");
+    assert_eq!(err.code(), grafile::ErrorCode::Syntax);
+    let err = conn
+        .execute("CREATE ()-[:X|Y]->()")
+        .expect_err("create edge");
+    assert_eq!(err.code(), grafile::ErrorCode::Syntax);
+    let err = conn.execute("MERGE (n:A|B)").expect_err("merge");
+    assert_eq!(err.code(), grafile::ErrorCode::Syntax);
+}
+
+#[test]
+fn label_expressions_do_not_seek_indexes() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A {name: 'x'}), (:B {name: 'x'})")
+        .expect("create");
+    conn.create_node_index("name", Some("A"), false)
+        .expect("index");
+    // No label is guaranteed, so the literal property cannot use the index.
+    let plan = conn
+        .explain("MATCH (n:A|B {name: 'x'}) RETURN n")
+        .expect("explain");
+    assert!(plan.contains("seek=-"), "{plan}");
+    // A conjunction guarantees both labels, so the index still applies.
+    let plan = conn
+        .explain("MATCH (n:A&:B {name: 'x'}) RETURN n")
+        .expect("explain");
+    assert!(!plan.contains("seek=-"), "{plan}");
+}
+
 // ---- column naming ----
 
 #[test]
