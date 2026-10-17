@@ -46,6 +46,9 @@ enum VarKind {
     EdgeList,
     /// A named path; usable neither as a node nor as a relationship.
     Path,
+    /// A variable known to hold a scalar (or list or map) of this kind,
+    /// which rules it out as a node or relationship binding.
+    Scalar(Kind),
 }
 
 /// Where a pattern expression appears, which decides whether plan-level
@@ -302,6 +305,14 @@ impl<'a> Planner<'a> {
             Clause::Delete { detach, exprs } => {
                 for expr in exprs {
                     validate_expr(expr, scope)?;
+                    if let Some(kind) = static_kind(expr, scope)
+                        && !matches!(
+                            kind,
+                            Kind::Node | Kind::Edge | Kind::Path | Kind::List | Kind::Null
+                        )
+                    {
+                        return Err(Error::syntax("DELETE expects a node, relationship or path"));
+                    }
                 }
                 *plan = Plan::Delete {
                     input: Box::new(std::mem::replace(plan, Plan::Empty)),
@@ -1198,13 +1209,15 @@ impl<'a> Planner<'a> {
             // segment (as a list of relationships).
             VarKind::EdgeList if var_length => {}
             VarKind::Edge => {}
-            VarKind::EdgeList | VarKind::Node | VarKind::Path => {
+            VarKind::EdgeList | VarKind::Node | VarKind::Path | VarKind::Scalar(_) => {
                 return Err(Error::syntax(format!(
                     "variable `{var}` is already bound to a {}",
                     if *kind == VarKind::Node {
                         "node"
                     } else if *kind == VarKind::Path {
                         "path"
+                    } else if matches!(kind, VarKind::Scalar(_)) {
+                        "value"
                     } else {
                         "relationship"
                     }
@@ -1299,12 +1312,17 @@ impl<'a> Planner<'a> {
         let var = match &pattern.variable {
             Some(var) => {
                 if let Some(kind) = scope.get(var)
-                    && matches!(kind, VarKind::Edge | VarKind::EdgeList | VarKind::Path)
+                    && matches!(
+                        kind,
+                        VarKind::Edge | VarKind::EdgeList | VarKind::Path | VarKind::Scalar(_)
+                    )
                 {
                     return Err(Error::syntax(format!(
                         "variable `{var}` is already bound to a {}",
                         if *kind == VarKind::Path {
                             "path"
+                        } else if matches!(kind, VarKind::Scalar(_)) {
+                            "value"
                         } else {
                             "relationship"
                         }
@@ -1382,7 +1400,8 @@ impl<'a> Planner<'a> {
         let mut items = Vec::new();
         let mut local_scope: FastMap<String, VarKind> = scope.clone();
         for path in patterns {
-            let start = self.create_node_item(&path.start, &local_scope)?;
+            let start =
+                self.create_node_item(&path.start, &local_scope, !path.segments.is_empty())?;
             if let Some(item) = &start {
                 local_scope.insert(item.var().to_owned(), VarKind::Node);
                 items.push(item.clone());
@@ -1396,7 +1415,7 @@ impl<'a> Planner<'a> {
                     .ok_or_else(|| Error::internal("anonymous bound node"))?,
             };
             for segment in &path.segments {
-                let node_item = self.create_node_item(&segment.node, &local_scope)?;
+                let node_item = self.create_node_item(&segment.node, &local_scope, true)?;
                 if let Some(item) = &node_item {
                     local_scope.insert(item.var().to_owned(), VarKind::Node);
                     items.push(item.clone());
@@ -1456,9 +1475,20 @@ impl<'a> Planner<'a> {
         &mut self,
         pattern: &NodePattern,
         scope: &FastMap<String, VarKind>,
+        attached: bool,
     ) -> Result<Option<CreateItem>> {
         let var = match &pattern.variable {
-            Some(var) if scope.contains_key(var) => return Ok(None),
+            Some(var) if scope.contains_key(var) => {
+                // An already-bound variable may anchor a relationship, but
+                // cannot gain labels or properties, nor stand alone.
+                if !pattern.labels.is_empty() || pattern.properties.is_some() {
+                    return Err(Error::syntax(format!("variable `{var}` is already bound")));
+                }
+                if !attached {
+                    return Err(Error::syntax(format!("variable `{var}` is already bound")));
+                }
+                return Ok(None);
+            }
             Some(var) => var.clone(),
             None => self.anon_name("node"),
         };
@@ -1549,7 +1579,7 @@ impl<'a> Planner<'a> {
         let mut items: Vec<CreateItem> = Vec::new();
         let mut path_vars: Vec<String> = Vec::new();
         let mut local = scope.clone();
-        let start_item = self.create_node_item(&path.start, &local)?;
+        let start_item = self.create_node_item(&path.start, &local, true)?;
         if path.segments.is_empty() && start_item.is_none() {
             let name = path.start.variable.as_deref().unwrap_or("?");
             return Err(Error::syntax(format!(
@@ -1574,7 +1604,7 @@ impl<'a> Planner<'a> {
         let mut src = start_var;
         for segment in &path.segments {
             let rel = &segment.relationship;
-            let node_item = self.create_node_item(&segment.node, &local)?;
+            let node_item = self.create_node_item(&segment.node, &local, true)?;
             let node_var = match &node_item {
                 Some(item) => {
                     local.insert(item.var().to_owned(), VarKind::Node);
@@ -1864,7 +1894,7 @@ impl<'a> Planner<'a> {
                 items: projection_items.clone(),
             };
             for (expr, name) in &projection_items {
-                new_scope.insert(name.clone(), expr_kind(expr, &scope));
+                new_scope.insert(name.clone(), alias_kind(expr, &scope));
             }
         } else {
             plan = Plan::Aggregate {
@@ -1962,7 +1992,7 @@ impl<'a> Planner<'a> {
         // Output scope maps names to output registers; nodes keep their kind.
         let mut output_scope = FastMap::new();
         for (expr, name) in &expanded {
-            output_scope.insert(name.clone(), expr_kind(expr, &scope));
+            output_scope.insert(name.clone(), alias_kind(expr, &scope));
         }
         let _ = std::mem::replace(&mut new_scope, output_scope);
         Ok((plan, new_scope, columns))
@@ -2297,6 +2327,7 @@ fn static_kind_with(
                 Some(VarKind::Edge) => Some(Kind::Edge),
                 Some(VarKind::EdgeList) => Some(Kind::List),
                 Some(VarKind::Path) => Some(Kind::Path),
+                Some(VarKind::Scalar(kind)) => Some(*kind),
                 Some(VarKind::Value) | None => None,
             },
         },
@@ -2384,8 +2415,8 @@ fn static_function_kind(
         | "sign" | "ceil" | "floor" | "round" | "sqrt" | "exp" | "log" | "log10" | "sin"
         | "cos" | "tan" | "cot" | "asin" | "acos" | "atan" | "atan2" | "degrees" | "radians"
         | "haversin" | "pi" | "e" | "rand" => Kind::Number,
-        "labels" | "keys" | "nodes" | "relationships" | "collect" | "range" | "head" | "last"
-        | "tail" | "reverse" | "split" => Kind::List,
+        "labels" | "keys" | "nodes" | "relationships" | "collect" | "range" | "tail"
+        | "reverse" | "split" => Kind::List,
         "properties" => Kind::Map,
         "type" | "tostring" | "substring" | "toupper" | "tolower" | "trim" | "ltrim" | "rtrim"
         | "left" | "right" | "replace" => Kind::Text,
@@ -2499,7 +2530,7 @@ fn check_expr_kinds_with(
         }
         Expr::Function { name, args, .. } => {
             let first = args.first();
-            let argument = first.and_then(|arg| kind(arg));
+            let argument = first.and_then(&kind);
             match name.to_ascii_lowercase().as_str() {
                 "labels" | "properties" | "keys" => require(
                     argument,
@@ -2606,6 +2637,29 @@ fn expr_kind(expr: &Expr, scope: &FastMap<String, VarKind>) -> VarKind {
     match expr {
         Expr::Variable(name) => scope.get(name).copied().unwrap_or(VarKind::Value),
         _ => VarKind::Value,
+    }
+}
+
+/// The scope kind to record for a projection alias. Carrying through a
+/// variable keeps its kind; a statically known non-entity expression
+/// becomes a scalar binding so patterns cannot reuse it as an entity.
+fn alias_kind(expr: &Expr, scope: &FastMap<String, VarKind>) -> VarKind {
+    let kind = expr_kind(expr, scope);
+    if kind != VarKind::Value {
+        return kind;
+    }
+    // A list literal of relationships stays usable as a variable-length
+    // relationship binding.
+    if let Some(Kind::Edge) = list_element_kind(expr, scope, None) {
+        return VarKind::EdgeList;
+    }
+    match static_kind(expr, scope) {
+        Some(Kind::Node) => VarKind::Node,
+        Some(Kind::Edge) => VarKind::Edge,
+        Some(Kind::Path) => VarKind::Path,
+        // Null is compatible with every kind, so it stays unconstrained.
+        Some(Kind::Null) | None => VarKind::Value,
+        Some(other) => VarKind::Scalar(other),
     }
 }
 

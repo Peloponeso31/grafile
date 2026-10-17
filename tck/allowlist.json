@@ -36,36 +36,6 @@
         "note": "procedures are not supported: `there exists a procedure test.labels() :: (label :: STRING?):`"
       }
     },
-    "clauses/create/Create1.feature": {
-      "[13] Fail when creating a node that is already bound": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 0 rows"
-      },
-      "[14] Fail when creating a node with properties that is already bound": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 13 rows"
-      },
-      "[15] Fail when adding a new label predicate on a node that is already bound 1": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 0 rows"
-      },
-      "[16] Fail when adding new label predicate on a node that is already bound 2": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 0 rows"
-      },
-      "[17] Fail when adding new label predicate on a node that is already bound 3": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 0 rows"
-      },
-      "[18] Fail when adding new label predicate on a node that is already bound 4": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 0 rows"
-      },
-      "[19] Fail when adding new label predicate on a node that is already bound 5": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 0 rows"
-      }
-    },
     "clauses/create/Create2.feature": {
       "[22] Fail when creating a variable-length relationship": {
         "reason": "not-implemented",
@@ -88,18 +58,6 @@
         "note": "expected column `a`, got `r2`"
       }
     },
-    "clauses/delete/Delete1.feature": {
-      "[8] Failing when deleting a label": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      }
-    },
-    "clauses/delete/Delete2.feature": {
-      "[5] Failing when deleting a relationship type": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
-      }
-    },
     "clauses/delete/Delete3.feature": {
       "[1] Detach deleting paths": {
         "reason": "not-implemented",
@@ -120,10 +78,6 @@
       "[7] Delete paths from nested map/list": {
         "reason": "not-implemented",
         "note": "expected no rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident); expected -2 nodes, got +0; expected -2 relationships, got +0; e..."
-      },
-      "[9] Failing when deleting an integer expression": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
       }
     },
     "clauses/match-where/MatchWhere1.feature": {
@@ -133,38 +87,6 @@
       }
     },
     "clauses/match/Match1.feature": {
-      "[11] Fail when matching a node variable bound to a value (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1 rows"
-      },
-      "[11] Fail when matching a node variable bound to a value (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1 rows"
-      },
-      "[11] Fail when matching a node variable bound to a value (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1 rows"
-      },
-      "[11] Fail when matching a node variable bound to a value (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1 rows"
-      },
-      "[11] Fail when matching a node variable bound to a value (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1 rows"
-      },
-      "[11] Fail when matching a node variable bound to a value (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1 rows"
-      },
-      "[11] Fail when matching a node variable bound to a value (example 7)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1 rows"
-      },
-      "[11] Fail when matching a node variable bound to a value (example 8)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 1 rows"
-      },
       "[9] Fail when a relationship has the same variable in the same pattern (example 1)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, but the query returned 32 rows"
@@ -184,46 +106,6 @@
       "[9] Fail when a relationship has the same variable in the same pattern (example 5)": {
         "reason": "not-implemented",
         "note": "expected SyntaxError at compile time, got SemanticError at compile time"
-      }
-    },
-    "clauses/match/Match2.feature": {
-      "[13] Fail when matching a relationship variable bound to a value (example 1)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      },
-      "[13] Fail when matching a relationship variable bound to a value (example 2)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      },
-      "[13] Fail when matching a relationship variable bound to a value (example 3)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      },
-      "[13] Fail when matching a relationship variable bound to a value (example 4)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      },
-      "[13] Fail when matching a relationship variable bound to a value (example 5)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      },
-      "[13] Fail when matching a relationship variable bound to a value (example 6)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      },
-      "[13] Fail when matching a relationship variable bound to a value (example 7)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      },
-      "[13] Fail when matching a relationship variable bound to a value (example 8)": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, but the query returned 32 rows"
-      }
-    },
-    "clauses/match/Match3.feature": {
-      "[30] Fail when using a list or nodes as a node": {
-        "reason": "not-implemented",
-        "note": "expected SyntaxError at compile time, got TypeError at runtime"
       }
     },
     "clauses/match/Match5.feature": {
