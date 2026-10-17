@@ -9,6 +9,7 @@
 //! Values in registers are [`Reg`]: plain [`Value`]s plus node/edge
 //! references bound by cursors.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -2166,27 +2167,11 @@ impl<'a> Executor<'a> {
                 .unwrap_or(Value::Null)),
             func::TO_STRING => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
-                Some(Value::Int(value)) => Ok(Value::Text(std::sync::Arc::from(value.to_string()))),
-                Some(Value::Bool(value)) => {
-                    Ok(Value::Text(std::sync::Arc::from(value.to_string())))
-                }
-                Some(Value::Float(value)) => {
-                    let mut buffer = ryu::Buffer::new();
-                    Ok(Value::Text(std::sync::Arc::from(buffer.format(*value))))
-                }
                 Some(Value::Text(value)) => Ok(Value::Text(value.clone())),
-                Some(
-                    value @ (Value::Date(_)
-                    | Value::LocalTime(_)
-                    | Value::Time(_)
-                    | Value::LocalDateTime(_)
-                    | Value::DateTime(_)
-                    | Value::Duration(_)
-                    | Value::Point(_)),
-                ) => Ok(Value::Text(std::sync::Arc::from(
-                    format_value(value).as_str(),
-                ))),
-                Some(other) => Err(invalid_argument("toString", other)),
+                Some(value) => match scalar_text(value) {
+                    Some(text) => Ok(Value::Text(Arc::from(text.into_owned()))),
+                    None => Err(invalid_argument("toString", value)),
+                },
             },
             func::TO_INTEGER => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
@@ -2987,7 +2972,7 @@ fn binary_op(op: u8, a: &Value, b: &Value) -> Result<Value> {
         },
         code::EQ => Ok(bool_value(value_equals(a, b))),
         code::NE => Ok(bool_value(value_equals(a, b).map(|equal| !equal))),
-        code::LT | code::LE | code::GT | code::GE => Ok(compare_value(op, a, b)),
+        code::LT | code::LE | code::GT | code::GE => compare_value(op, a, b),
         code::AND => Ok(kleene_and(a, b)),
         code::OR => Ok(kleene_or(a, b)),
         code::XOR => Ok(kleene_xor(a, b)),
@@ -3027,8 +3012,23 @@ fn numeric_or_concat(
     float_op: impl Fn(f64, f64) -> f64,
     int_op: impl Fn(i64, i64) -> i64,
 ) -> Result<Value> {
-    if let (Value::Text(x), Value::Text(y)) = (a, b) {
-        return Ok(Value::Text(format!("{x}{y}").into()));
+    // A string concatenates any scalar on either side, coercing the scalar
+    // through its text form. Lists keep their append/prepend semantics.
+    match (a, b) {
+        (Value::Text(x), Value::Text(y)) => {
+            return Ok(Value::Text(format!("{x}{y}").into()));
+        }
+        (Value::Text(x), other) => {
+            if let Some(y) = scalar_text(other) {
+                return Ok(Value::Text(format!("{x}{y}").into()));
+            }
+        }
+        (other, Value::Text(y)) => {
+            if let Some(x) = scalar_text(other) {
+                return Ok(Value::Text(format!("{x}{y}").into()));
+            }
+        }
+        _ => {}
     }
     match (a, b) {
         (Value::List(x), Value::List(y)) => {
@@ -3050,6 +3050,29 @@ fn numeric_or_concat(
         _ => {}
     }
     numeric(a, b, float_op, int_op)
+}
+
+/// Text form of a scalar for `toString()` and string concatenation. Returns
+/// `None` for values without a text form (null, collections, entities); the
+/// caller decides between an error, a null result or another operator branch.
+fn scalar_text(value: &Value) -> Option<Cow<'_, str>> {
+    match value {
+        Value::Int(value) => Some(Cow::Owned(value.to_string())),
+        Value::Bool(value) => Some(Cow::Owned(value.to_string())),
+        Value::Float(value) => {
+            let mut buffer = ryu::Buffer::new();
+            Some(Cow::Owned(buffer.format(*value).to_owned()))
+        }
+        Value::Text(value) => Some(Cow::Borrowed(value)),
+        Value::Date(_)
+        | Value::LocalTime(_)
+        | Value::Time(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime(_)
+        | Value::Duration(_)
+        | Value::Point(_) => Some(Cow::Owned(format_value(value))),
+        _ => None,
+    }
 }
 
 /// Resolve a slice bound against the list length: negative bounds count from
@@ -3118,10 +3141,10 @@ fn value_order(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
     }
 }
 
-fn compare_value(op: u8, a: &Value, b: &Value) -> Value {
+fn compare_value(op: u8, a: &Value, b: &Value) -> Result<Value> {
     use binary_code as code;
     let ordering = match (a, b) {
-        (Value::Null, _) | (_, Value::Null) => return Value::Null,
+        (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
         (Value::Int(_), Value::Int(_))
         | (Value::Float(_), Value::Float(_))
         | (Value::Int(_), Value::Float(_))
@@ -3130,10 +3153,10 @@ fn compare_value(op: u8, a: &Value, b: &Value) -> Value {
             if matches!(a, Value::Float(value) if value.is_nan())
                 || matches!(b, Value::Float(value) if value.is_nan())
             {
-                return Value::Bool(false);
+                return Ok(Value::Bool(false));
             }
             let (Some(x), Some(y)) = (a.as_number(), b.as_number()) else {
-                return Value::Null;
+                return Ok(Value::Null);
             };
             x.total_cmp(&y)
         }
@@ -3143,11 +3166,11 @@ fn compare_value(op: u8, a: &Value, b: &Value) -> Value {
             // Lists and paths are distinct types: comparing one with the
             // other yields null, like any other cross-type ordering.
             if crate::record::is_path_shaped(x) != crate::record::is_path_shaped(y) {
-                return Value::Null;
+                return Ok(Value::Null);
             }
             match list_order(x, y) {
                 Some(ordering) => ordering,
-                None => return Value::Null,
+                None => return Ok(Value::Null),
             }
         }
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
@@ -3157,7 +3180,27 @@ fn compare_value(op: u8, a: &Value, b: &Value) -> Value {
         (Value::DateTime(x), Value::DateTime(y)) => x.cmp(y),
         (Value::Duration(x), Value::Duration(y)) => x.cmp(y),
         (Value::Point(x), Value::Point(y)) => x.cmp(y),
-        _ => return Value::Null,
+        (
+            Value::Date(_)
+            | Value::LocalTime(_)
+            | Value::Time(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime(_)
+            | Value::Duration(_),
+            Value::Date(_)
+            | Value::LocalTime(_)
+            | Value::Time(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime(_)
+            | Value::Duration(_),
+        ) => {
+            return Err(Error::type_error(format!(
+                "Cannot compare {} with {}",
+                a.type_name(),
+                b.type_name()
+            )));
+        }
+        _ => return Ok(Value::Null),
     };
     let result = match op {
         code::LT => ordering.is_lt(),
@@ -3165,7 +3208,7 @@ fn compare_value(op: u8, a: &Value, b: &Value) -> Value {
         code::GT => ordering.is_gt(),
         _ => ordering.is_ge(),
     };
-    Value::Bool(result)
+    Ok(Value::Bool(result))
 }
 
 fn kleene_and(a: &Value, b: &Value) -> Value {

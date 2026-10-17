@@ -1083,12 +1083,13 @@ impl Database {
                 format!("edge {edge_id} does not exist"),
             ));
         };
+        self.unindex_edge(&record, edge_id)?;
+        record.props = normalize_props(props)?;
         let key_bytes = edge_id.to_be_bytes();
         self.edges.delete(&mut self.pager, &key_bytes)?;
-        record.props = normalize_props(props)?;
         self.edges
             .insert(&mut self.pager, &key_bytes, &record.encode())?;
-        Ok(())
+        self.index_edge(&record, edge_id)
     }
 
     fn require_write(&self) -> Result<()> {
@@ -1670,5 +1671,66 @@ mod tests {
             Ok(())
         })
         .expect("write");
+    }
+
+    /// Entity ids recorded in the single edge index of the test schema for a
+    /// property value.
+    fn edge_index_entries(db: &mut Database, value: &Value) -> Vec<u64> {
+        let def = db
+            .schema()
+            .edge_indexes
+            .first()
+            .cloned()
+            .expect("edge index");
+        let tree = Btree::from_root(def.root, TreeKind::Index);
+        let mut cursor = tree.cursor();
+        let prefix = index_value_prefix(value);
+        let mut found = Vec::new();
+        let mut ok = cursor.seek_ge(&mut db.pager, &prefix).expect("seek");
+        while ok && cursor.key().starts_with(&prefix) {
+            let key = cursor.key();
+            found.push(u64::from_be_bytes(
+                key[key.len() - 8..].try_into().expect("id"),
+            ));
+            ok = cursor.next(&mut db.pager).expect("next");
+        }
+        found
+    }
+
+    #[test]
+    fn replace_edge_properties_maintains_indexes() {
+        let mut db = temp_db();
+        let (e2, weight) = db
+            .write(|db| {
+                let person = db.ensure_label("Person")?;
+                let knows = db.ensure_edge_type("KNOWS")?;
+                let weight = db.ensure_property_key("weight")?;
+                let a = db.create_node(&[person], vec![])?;
+                let b = db.create_node(&[person], vec![])?;
+                let e1 = db.create_edge(knows, a, b, vec![(weight, Value::Int(1))])?;
+                let e2 = db.create_edge(knows, a, b, vec![(weight, Value::Int(2))])?;
+                db.create_edge_index("weight", Some("KNOWS"), true)?;
+                assert_eq!(edge_index_entries(db, &Value::Int(1)), vec![e1]);
+                assert_eq!(edge_index_entries(db, &Value::Int(2)), vec![e2]);
+                // Whole-map replacement rewrites the index entries in place.
+                db.replace_edge_properties(e1, vec![(weight, Value::Int(3))])?;
+                assert!(edge_index_entries(db, &Value::Int(1)).is_empty());
+                assert_eq!(edge_index_entries(db, &Value::Int(3)), vec![e1]);
+                Ok((e2, weight))
+            })
+            .expect("write");
+        // Uniqueness is enforced on whole-map replacement too, and the
+        // failure rolls the transaction back.
+        let err = db
+            .write(|db| db.replace_edge_properties(e2, vec![(weight, Value::Int(3))]))
+            .expect_err("duplicate");
+        assert_eq!(err.code(), ErrorCode::Constraint);
+        db.write(|db| {
+            assert_eq!(edge_index_entries(db, &Value::Int(2)), vec![e2]);
+            let record = db.get_edge(e2)?.expect("edge");
+            assert_eq!(record.get(weight), Some(&Value::Int(2)));
+            Ok(())
+        })
+        .expect("verify");
     }
 }

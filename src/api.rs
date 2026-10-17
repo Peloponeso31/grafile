@@ -415,7 +415,10 @@ mod tests {
     fn execution_failure_is_runtime() {
         let mut conn = connection();
         let err = conn
-            .query_with_phase("RETURN 1 + 'x'", &Params::new())
+            .query_with_phase(
+                "RETURN date('2020-01-01') < datetime('2020-01-01T00:00:00')",
+                &Params::new(),
+            )
             .expect_err("type error");
         assert_eq!(err.phase(), Phase::Runtime);
         assert_eq!(err.error().code(), ErrorCode::Type);

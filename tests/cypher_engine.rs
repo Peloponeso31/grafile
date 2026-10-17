@@ -271,6 +271,28 @@ fn unique_constraint_via_cypher() {
 }
 
 #[test]
+fn edge_unique_constraint_survives_map_replacement() {
+    let mut conn = connection();
+    conn.execute("CREATE (:Person)-[:KNOWS {weight: 1}]->(:Person)")
+        .expect("first edge");
+    conn.execute("CREATE (:Person)-[:KNOWS {weight: 2}]->(:Person)")
+        .expect("second edge");
+    conn.create_edge_index("weight", Some("KNOWS"), true)
+        .expect("index");
+    conn.execute("MATCH ()-[r:KNOWS {weight: 2}]->() SET r = {weight: 3}")
+        .expect("replace");
+    let rows = query(
+        &mut conn,
+        "MATCH ()-[r:KNOWS]->() RETURN r.weight ORDER BY r.weight",
+    );
+    assert_eq!(rows, vec![vec!["1"], vec!["3"]]);
+    let err = conn
+        .execute("MATCH ()-[r:KNOWS {weight: 3}]->() SET r = {weight: 1}")
+        .expect_err("duplicate");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+}
+
+#[test]
 fn undefined_variable_is_rejected() {
     let mut conn = connection();
     let err = conn
@@ -884,6 +906,32 @@ fn to_string_renders_scalars() {
     assert_eq!(rows, vec![vec!["[42, 2.3, true, apa, null]"]]);
 }
 
+#[test]
+fn plus_coerces_the_non_string_operand() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN 'p-' + 1 AS a, 1 + 'p' AS b, 'v' + true AS c, 'x' + 2.5 AS d, \
+                'a' + null AS e, 'a' + [1, 2] AS f, 'd:' + date('2020-01-01') AS g",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "p-1",
+            "1p",
+            "vtrue",
+            "x2.5",
+            "null",
+            "[a, 1, 2]",
+            "d:2020-01-01"
+        ]]
+    );
+    let err = conn
+        .query("RETURN {a: 1} + 'x'", &Params::new())
+        .expect_err("map plus string");
+    assert_eq!(err.code(), grafile::ErrorCode::Type);
+}
+
 // ---- list and string functions ----
 
 #[test]
@@ -1381,6 +1429,36 @@ fn temporal_duration_arithmetic_forms() {
         rows,
         vec![vec!["0", "1", "-14", "15", "56950", "949", "10"]]
     );
+}
+
+#[test]
+fn cross_temporal_ordering_is_an_error() {
+    let mut conn = connection();
+    let err = conn
+        .query(
+            "RETURN date('2020-01-01') < datetime('2020-01-01T00:00:00Z')",
+            &Params::new(),
+        )
+        .expect_err("cross temporal");
+    assert_eq!(err.code(), grafile::ErrorCode::Type);
+    assert!(
+        err.message().contains("Cannot compare date with datetime"),
+        "{err}"
+    );
+    // Equality between different temporal types is false, not an error.
+    let rows = query(
+        &mut conn,
+        "RETURN date('2020-01-01') = datetime('2020-01-01T00:00:00Z') AS eq, \
+                localtime('12:00:00') = time('12:00:00Z') AS eq2",
+    );
+    assert_eq!(rows, vec![vec!["false", "false"]]);
+    // ORDER BY ranks temporal types without comparing across them.
+    let rows = query(
+        &mut conn,
+        "UNWIND [datetime('2020-01-02T00:00:00Z'), date('2020-01-01')] AS t \
+         RETURN toString(t) ORDER BY t",
+    );
+    assert_eq!(rows.len(), 2);
 }
 
 // ---- math functions ----
