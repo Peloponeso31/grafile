@@ -1178,6 +1178,34 @@ fn temporal_values_store_and_compare() {
 }
 
 #[test]
+fn spatial_points_and_distance() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN point({x: 1.5, y: 2.5}) AS p, \
+         point({latitude: 12.0, longitude: 14.0}) AS g, \
+         distance(point({x: 0, y: 0}), point({x: 3, y: 4})) AS d, \
+         point({x: 1.5, y: 2.5, z: 3.0}) AS p3",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "point({x: 1.5, y: 2.5})",
+            "point({srid: 4326, x: 14.0, y: 12.0})",
+            "5",
+            "point({srid: 9157, x: 1.5, y: 2.5, z: 3.0})"
+        ]]
+    );
+    let rows = query(
+        &mut conn,
+        "WITH point({latitude: 12.0, longitude: 12.0}) AS p \
+         RETURN p.latitude, p.longitude, p.srid, p.crs, \
+                distance(p, point({latitude: 13.0, longitude: 12.0})) > 110000.0",
+    );
+    assert_eq!(rows, vec![vec!["12", "12", "4326", "wgs-84", "true"]]);
+}
+
+#[test]
 fn temporal_duration_arithmetic_forms() {
     let mut conn = connection();
     let rows = query(

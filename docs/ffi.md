@@ -157,7 +157,12 @@ classes overlap.
 
 `GRAFILE_NULL`, `GRAFILE_INT`, `GRAFILE_FLOAT`, `GRAFILE_TEXT`,
 `GRAFILE_BLOB`, `GRAFILE_BOOL`, `GRAFILE_LIST`, `GRAFILE_MAP`,
-`GRAFILE_NODE`, `GRAFILE_EDGE`.
+`GRAFILE_NODE`, `GRAFILE_EDGE`, plus the temporal and spatial kinds
+`GRAFILE_DATE` (10), `GRAFILE_LOCALTIME` (11), `GRAFILE_TIME` (12),
+`GRAFILE_LOCALDATETIME` (13), `GRAFILE_DATETIME` (14),
+`GRAFILE_DURATION` (15) and `GRAFILE_POINT` (16). Temporal values render
+as ISO 8601 text in both the text and JSON accessors; points render as
+`{"srid", "x", "y"[, "z"]}` objects in JSON.
 
 ### JSON conventions
 
