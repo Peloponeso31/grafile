@@ -13,17 +13,27 @@ use crate::record::Value;
 
 /// Parse a full Cypher query.
 pub fn parse(source: &str) -> Result<Query> {
+    let mut parser = parser_for(source)?;
+    let query = parser.parse_query()?;
+    Ok(query)
+}
+
+/// Parse a statement: a DDL command or a query.
+pub fn parse_statement(source: &str) -> Result<Statement> {
+    let mut parser = parser_for(source)?;
+    parser.parse_statement()
+}
+
+fn parser_for(source: &str) -> Result<Parser<'_>> {
     let tokens = lex(source).map_err(|(start, _)| {
         let (line, column) = line_column(source, start);
         Error::syntax(format!("invalid character at line {line} column {column}"))
     })?;
-    let mut parser = Parser {
+    Ok(Parser {
         source,
         tokens,
         pos: 0,
-    };
-    let query = parser.parse_query()?;
-    Ok(query)
+    })
 }
 
 struct Parser<'a> {
@@ -57,6 +67,36 @@ impl<'a> Parser<'a> {
             Ok(())
         } else {
             self.fail(format!("expected {what}"))
+        }
+    }
+
+    /// Source text of the next token when it is a plain identifier.
+    fn peek_ident_text(&self) -> Option<&'a str> {
+        let spanned = self.tokens.get(self.pos)?;
+        (spanned.token == Token::Ident).then(|| {
+            self.source
+                .get(spanned.start..spanned.end)
+                .expect("token span is valid")
+        })
+    }
+
+    fn eat_ident_text(&mut self, text: &str) -> bool {
+        if self
+            .peek_ident_text()
+            .is_some_and(|token| token.eq_ignore_ascii_case(text))
+        {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_ident_text(&mut self, text: &str) -> Result<()> {
+        if self.eat_ident_text(text) {
+            Ok(())
+        } else {
+            self.fail(format!("expected {text}"))
         }
     }
 
@@ -103,6 +143,237 @@ impl<'a> Parser<'a> {
             return self.fail("unexpected input after end of query");
         }
         Ok(Query { parts })
+    }
+
+    /// Parse a statement: a DDL command or a query.
+    fn parse_statement(&mut self) -> Result<Statement> {
+        if let Some(text) = self.peek_ident_text() {
+            if text.eq_ignore_ascii_case("show") {
+                return Err(Error::unsupported(
+                    "SHOW statements are not supported (only CREATE/DROP INDEX and CONSTRAINT)",
+                ));
+            }
+            if text.eq_ignore_ascii_case("drop") {
+                return self.parse_drop();
+            }
+        }
+        if self.peek() == Some(Token::Create)
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .and_then(|spanned| self.source.get(spanned.start..spanned.end))
+                .is_some_and(|text| {
+                    text.eq_ignore_ascii_case("index") || text.eq_ignore_ascii_case("constraint")
+                })
+        {
+            let ddl = self.parse_create_ddl()?;
+            self.eat(Token::Semicolon);
+            if self.peek().is_some() {
+                return self.fail("unexpected input after the DDL statement");
+            }
+            return Ok(ddl);
+        }
+        let query = self.parse_query()?;
+        Ok(Statement::Query(query))
+    }
+
+    fn parse_create_ddl(&mut self) -> Result<Statement> {
+        self.expect(Token::Create, "CREATE")?;
+        if self.eat_ident_text("index") {
+            self.parse_create_index()
+        } else if self.eat_ident_text("constraint") {
+            self.parse_create_constraint()
+        } else {
+            self.fail("expected INDEX or CONSTRAINT after CREATE")
+        }
+    }
+
+    fn parse_create_index(&mut self) -> Result<Statement> {
+        if self.peek() == Some(Token::On) {
+            return Err(Error::syntax(
+                "the `CREATE INDEX ON :Label(property)` form was removed in Neo4j 4; \
+                 use `CREATE INDEX name FOR (n:Label) ON (n.property)`",
+            ));
+        }
+        self.reject_missing_name("an index")?;
+        let name = self.parse_name()?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let (entity, var) = self.parse_ddl_entity()?;
+        self.expect(Token::On, "ON after the pattern")?;
+        let keys = self.parse_ddl_keys(&var)?;
+        Ok(Statement::Ddl(DdlStatement::CreateIndex(DdlIndex {
+            name,
+            if_not_exists,
+            entity,
+            keys,
+        })))
+    }
+
+    fn parse_create_constraint(&mut self) -> Result<Statement> {
+        if self.peek() == Some(Token::On) {
+            return Err(Error::syntax(
+                "the `CREATE CONSTRAINT ON ... ASSERT ...` form was removed in Neo4j 4; \
+                 use `CREATE CONSTRAINT name FOR (n:Label) REQUIRE n.property IS UNIQUE`",
+            ));
+        }
+        self.reject_missing_name("a constraint")?;
+        let name = self.parse_name()?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let (entity, var) = self.parse_ddl_entity()?;
+        if self.peek_ident_text() == Some("assert") {
+            return Err(Error::syntax(
+                "ASSERT was replaced by REQUIRE in Neo4j 4; \
+                 use `CREATE CONSTRAINT name FOR (n:Label) REQUIRE n.property IS UNIQUE`",
+            ));
+        }
+        self.expect_ident_text("require")?;
+        let keys = if self.eat(Token::LParen) {
+            let mut keys = Vec::new();
+            loop {
+                keys.push(self.parse_ddl_property(&var)?);
+                if !self.eat(Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(Token::RParen, "')' to close the property list")?;
+            keys
+        } else {
+            vec![self.parse_ddl_property(&var)?]
+        };
+        self.expect(Token::Is, "IS")?;
+        let kind = if self.eat_ident_text("unique") {
+            DdlConstraintKind::Unique
+        } else if self.eat(Token::Not) {
+            self.expect(Token::Null, "NULL")?;
+            DdlConstraintKind::NotNull
+        } else if self.eat_ident_text("node") {
+            self.expect_ident_text("key")?;
+            DdlConstraintKind::NodeKey
+        } else {
+            return self.fail("expected UNIQUE, NOT NULL or NODE KEY after IS");
+        };
+        self.validate_constraint(&kind, &entity, keys.len())?;
+        Ok(Statement::Ddl(DdlStatement::CreateConstraint(
+            DdlConstraint {
+                name,
+                if_not_exists,
+                entity,
+                kind,
+                keys,
+            },
+        )))
+    }
+
+    fn validate_constraint(
+        &self,
+        kind: &DdlConstraintKind,
+        entity: &DdlEntity,
+        key_count: usize,
+    ) -> Result<()> {
+        match kind {
+            DdlConstraintKind::Unique | DdlConstraintKind::NotNull if key_count != 1 => Err(
+                Error::syntax("UNIQUE and NOT NULL constraints cover exactly one property"),
+            ),
+            DdlConstraintKind::NodeKey if matches!(entity, DdlEntity::Edge { .. }) => Err(
+                Error::syntax("NODE KEY constraints apply to nodes, not relationships"),
+            ),
+            DdlConstraintKind::Unique | DdlConstraintKind::NotNull | DdlConstraintKind::NodeKey => {
+                Ok(())
+            }
+        }
+    }
+
+    fn parse_drop(&mut self) -> Result<Statement> {
+        self.advance();
+        let index = if self.eat_ident_text("index") {
+            true
+        } else if self.eat_ident_text("constraint") {
+            false
+        } else {
+            return self.fail("expected INDEX or CONSTRAINT after DROP");
+        };
+        let name = self.parse_name()?;
+        let if_exists = if self.eat_ident_text("if") {
+            self.expect_ident_text("exists")?;
+            true
+        } else {
+            false
+        };
+        self.eat(Token::Semicolon);
+        if self.peek().is_some() {
+            return self.fail("unexpected input after the DDL statement");
+        }
+        Ok(Statement::Ddl(if index {
+            DdlStatement::DropIndex { name, if_exists }
+        } else {
+            DdlStatement::DropConstraint { name, if_exists }
+        }))
+    }
+
+    fn parse_if_not_exists(&mut self) -> Result<bool> {
+        if !self.eat_ident_text("if") {
+            return Ok(false);
+        }
+        self.expect(Token::Not, "NOT")?;
+        self.expect_ident_text("exists")?;
+        Ok(true)
+    }
+
+    fn reject_missing_name(&self, what: &str) -> Result<()> {
+        if self
+            .peek_ident_text()
+            .is_some_and(|text| text.eq_ignore_ascii_case("for"))
+        {
+            return Err(Error::syntax(format!("a {what} name is required")));
+        }
+        Ok(())
+    }
+
+    /// Parse `FOR (n:Label)` or `FOR ()-[r:TYPE]-()`; returns the entity and
+    /// the variable the property expressions must use.
+    fn parse_ddl_entity(&mut self) -> Result<(DdlEntity, String)> {
+        self.expect_ident_text("for")?;
+        self.expect(Token::LParen, "'(' after FOR")?;
+        if self.eat(Token::RParen) {
+            self.expect(Token::Minus, "'-' before the relationship pattern")?;
+            self.expect(Token::LBracket, "'[' to open the relationship pattern")?;
+            let var = self.parse_name()?;
+            self.expect(Token::Colon, "':' before the relationship type")?;
+            let edge_type = self.parse_symbol_name()?;
+            self.expect(Token::RBracket, "']' to close the relationship pattern")?;
+            self.expect(Token::Minus, "'-' after the relationship pattern")?;
+            self.expect(Token::LParen, "'(' after the relationship pattern")?;
+            self.expect(Token::RParen, "')' after the relationship pattern")?;
+            return Ok((DdlEntity::Edge { edge_type }, var));
+        }
+        let var = self.parse_name()?;
+        self.expect(Token::Colon, "':' before the label")?;
+        let label = self.parse_symbol_name()?;
+        self.expect(Token::RParen, "')' after the label")?;
+        Ok((DdlEntity::Node { label }, var))
+    }
+
+    fn parse_ddl_keys(&mut self, var: &str) -> Result<Vec<String>> {
+        self.expect(Token::LParen, "'(' to open the property list")?;
+        let mut keys = Vec::new();
+        loop {
+            keys.push(self.parse_ddl_property(var)?);
+            if !self.eat(Token::Comma) {
+                break;
+            }
+        }
+        self.expect(Token::RParen, "')' to close the property list")?;
+        Ok(keys)
+    }
+
+    /// A property expression `var.key`; the variable must be the pattern's.
+    fn parse_ddl_property(&mut self, var: &str) -> Result<String> {
+        let base = self.parse_name()?;
+        if base != var {
+            return self.fail(format!("the property expression must use `{var}`"));
+        }
+        self.expect(Token::Dot, "'.' in the property expression")?;
+        self.parse_symbol_name()
     }
 
     /// Parse the clauses of one query part, up to `UNION` or the end.
@@ -1593,6 +1864,106 @@ mod tests {
             matched.patterns[0].segments[0].relationship.types,
             LabelExpr::Or(vec![label("X"), LabelExpr::Not(Box::new(label("Y")))])
         );
+    }
+
+    #[test]
+    fn parses_ddl_statements() {
+        let statement = parse_statement(
+            "CREATE INDEX person_name IF NOT EXISTS FOR (n:Person) ON (n.name, n.age)",
+        )
+        .expect("parse");
+        let Statement::Ddl(DdlStatement::CreateIndex(index)) = statement else {
+            panic!("expected CREATE INDEX");
+        };
+        assert_eq!(index.name, "person_name");
+        assert!(index.if_not_exists);
+        assert_eq!(
+            index.entity,
+            DdlEntity::Node {
+                label: "Person".to_owned()
+            }
+        );
+        assert_eq!(index.keys, vec!["name", "age"]);
+
+        let statement =
+            parse_statement("CREATE INDEX knows_weight FOR ()-[r:KNOWS]-() ON (r.weight)")
+                .expect("parse");
+        let Statement::Ddl(DdlStatement::CreateIndex(index)) = statement else {
+            panic!("expected CREATE INDEX");
+        };
+        assert_eq!(
+            index.entity,
+            DdlEntity::Edge {
+                edge_type: "KNOWS".to_owned()
+            }
+        );
+        assert!(!index.if_not_exists);
+        assert_eq!(index.keys, vec!["weight"]);
+
+        let statement = parse_statement(
+            "CREATE CONSTRAINT person_key FOR (n:Person) REQUIRE (n.name, n.surname) IS NODE KEY",
+        )
+        .expect("parse");
+        let Statement::Ddl(DdlStatement::CreateConstraint(constraint)) = statement else {
+            panic!("expected CREATE CONSTRAINT");
+        };
+        assert_eq!(constraint.kind, DdlConstraintKind::NodeKey);
+        assert_eq!(constraint.keys, vec!["name", "surname"]);
+
+        let statement = parse_statement(
+            "CREATE CONSTRAINT knows_weight FOR ()-[r:KNOWS]-() REQUIRE r.weight IS NOT NULL",
+        )
+        .expect("parse");
+        let Statement::Ddl(DdlStatement::CreateConstraint(constraint)) = statement else {
+            panic!("expected CREATE CONSTRAINT");
+        };
+        assert_eq!(constraint.kind, DdlConstraintKind::NotNull);
+
+        let statement = parse_statement("DROP CONSTRAINT person_key IF EXISTS").expect("parse");
+        assert_eq!(
+            statement,
+            Statement::Ddl(DdlStatement::DropConstraint {
+                name: "person_key".to_owned(),
+                if_exists: true,
+            })
+        );
+        let statement = parse_statement("DROP INDEX person_name").expect("parse");
+        assert_eq!(
+            statement,
+            Statement::Ddl(DdlStatement::DropIndex {
+                name: "person_name".to_owned(),
+                if_exists: false,
+            })
+        );
+    }
+
+    #[test]
+    fn ddl_errors_point_at_the_replacement() {
+        let err = parse_statement("CREATE INDEX ON :Person(name)").expect_err("old form");
+        assert!(err.message().contains("CREATE INDEX name FOR"), "{err}");
+        let err = parse_statement("CREATE CONSTRAINT ON (n:Person) ASSERT n.name IS UNIQUE")
+            .expect_err("old form");
+        assert!(err.message().contains("REQUIRE"), "{err}");
+        let err = parse_statement("SHOW INDEXES").expect_err("show");
+        assert_eq!(err.code(), crate::error::ErrorCode::Unsupported);
+        let err = parse_statement("CREATE INDEX FOR (n:Person) ON (n.name)").expect_err("name");
+        assert!(err.message().contains("name is required"), "{err}");
+        let err = parse_statement("CREATE CONSTRAINT c FOR ()-[r:T]-() REQUIRE r.p IS NODE KEY")
+            .expect_err("edge node key");
+        assert!(err.message().contains("NODE KEY"), "{err}");
+        let err = parse_statement("CREATE CONSTRAINT c FOR (n:N) REQUIRE (n.a, n.b) IS UNIQUE")
+            .expect_err("two keys");
+        assert!(err.message().contains("exactly one property"), "{err}");
+    }
+
+    #[test]
+    fn create_patterns_are_not_ddl() {
+        // `CREATE` followed by a pattern stays a query; identifiers named
+        // `index` and `drop` still work as variables.
+        let statement = parse_statement("CREATE (n:Index) RETURN n").expect("parse");
+        assert!(matches!(statement, Statement::Query(_)));
+        let statement = parse_statement("MATCH (index) RETURN index").expect("parse");
+        assert!(matches!(statement, Statement::Query(_)));
     }
 
     #[test]
