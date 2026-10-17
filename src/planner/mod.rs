@@ -143,23 +143,7 @@ impl<'a> Planner<'a> {
                     on_create,
                     on_match,
                 } => {
-                    let items = self.plan_merge(pattern, &scope)?;
-                    for item in &items {
-                        let kind = match item {
-                            CreateItem::Node { .. } => VarKind::Node,
-                            CreateItem::Edge { .. } => VarKind::Edge,
-                        };
-                        scope.insert(item.var().to_owned(), kind);
-                    }
-                    for set_item in on_create.iter().chain(on_match) {
-                        self.validate_set_item(set_item, &scope)?;
-                    }
-                    plan = Plan::Merge {
-                        input: Box::new(plan),
-                        items,
-                        on_create: on_create.clone(),
-                        on_match: on_match.clone(),
-                    };
+                    self.plan_merge(pattern, on_create, on_match, &mut plan, &mut scope)?;
                     mutating = true;
                     columns.clear();
                 }
@@ -319,9 +303,9 @@ impl<'a> Planner<'a> {
         struct RelInfo {
             index: usize,
             var: String,
-            types: Vec<u32>,
+            types: Vec<String>,
             direction: RelDirection,
-            props: Vec<(u32, Value)>,
+            props: Vec<(String, Value)>,
             prop_exprs: Vec<(String, Expr)>,
             var_length: Option<crate::cypher::VarLength>,
         }
@@ -334,7 +318,7 @@ impl<'a> Planner<'a> {
                 Some(var) => var.clone(),
                 None => self.anon_name("rel"),
             };
-            let types = self.resolve_types(&rel.types);
+            let types = rel.types.clone();
             let (literals, prop_exprs) =
                 self.pattern_props(rel.properties.as_ref(), "relationship", scope)?;
             if rel.var_length.is_some() && !prop_exprs.is_empty() {
@@ -349,7 +333,7 @@ impl<'a> Planner<'a> {
                 direction: rel.direction,
                 props: literals
                     .into_iter()
-                    .map(|(_, key_id, value)| (key_id, value))
+                    .map(|(name, _, value)| (name, value))
                     .collect(),
                 prop_exprs,
                 var_length: rel.var_length,
@@ -594,7 +578,7 @@ impl<'a> Planner<'a> {
     /// Whether a literal property of this node can be served by an index.
     fn has_usable_index(&self, node: &PlannedNode) -> bool {
         let schema = self.db.schema();
-        node.props.iter().any(|(key_id, _)| {
+        node.props.iter().any(|(_, key_id, _)| {
             schema.node_indexes.iter().any(|index| {
                 index.key_id == *key_id
                     && (index.label_id == 0 || node.label_ids.contains(&index.label_id))
@@ -606,23 +590,23 @@ impl<'a> Planner<'a> {
     fn anchor_plan(
         &self,
         node: &PlannedNode,
-    ) -> Result<(Option<u32>, Option<IndexSeek>, Vec<(u32, Value)>)> {
+    ) -> Result<(Option<String>, Option<IndexSeek>, Vec<(String, Value)>)> {
         let schema = self.db.schema();
         // Prefer an index seek on a literal property.
-        for (key_id, value) in &node.props {
+        for (_, key_id, value) in &node.props {
             let index = schema.node_indexes.iter().find(|index| {
                 index.key_id == *key_id
                     && (index.label_id == 0 || node.label_ids.contains(&index.label_id))
             });
             if let Some(index) = index {
-                let remaining: Vec<(u32, Value)> = node
+                let remaining: Vec<(String, Value)> = node
                     .props
                     .iter()
-                    .filter(|(key, _)| *key != *key_id)
-                    .cloned()
+                    .filter(|(_, key, _)| *key != *key_id)
+                    .map(|(name, _, value)| (name.clone(), value.clone()))
                     .collect();
                 return Ok((
-                    node.label_ids.first().copied(),
+                    node.label_names.first().cloned(),
                     Some(IndexSeek {
                         index_id: index.id,
                         key_id: *key_id,
@@ -632,7 +616,14 @@ impl<'a> Planner<'a> {
                 ));
             }
         }
-        Ok((node.label_ids.first().copied(), None, node.props.clone()))
+        Ok((
+            node.label_names.first().cloned(),
+            None,
+            node.props
+                .iter()
+                .map(|(name, _, value)| (name.clone(), value.clone()))
+                .collect(),
+        ))
     }
 
     fn planned_node(
@@ -664,20 +655,12 @@ impl<'a> Planner<'a> {
             // but the variable is still bound.
             label_ids.push(self.db.label_id(label).unwrap_or(u32::MAX));
         }
-        let (literals, prop_exprs) =
-            self.pattern_props(pattern.properties.as_ref(), "node", scope)?;
+        let (props, prop_exprs) = self.pattern_props(pattern.properties.as_ref(), "node", scope)?;
         Ok(PlannedNode {
             var,
             label_ids,
             label_names: pattern.labels.clone(),
-            props: literals
-                .iter()
-                .map(|(_, key_id, value)| (*key_id, value.clone()))
-                .collect(),
-            prop_literals: literals
-                .into_iter()
-                .map(|(name, _, value)| (name, value))
-                .collect(),
+            props,
             prop_exprs,
         })
     }
@@ -717,22 +700,6 @@ impl<'a> Planner<'a> {
             }
         }
         Ok((literals, exprs))
-    }
-
-    fn resolve_types(&self, types: &[String]) -> Vec<u32> {
-        if types.is_empty() {
-            return Vec::new();
-        }
-        let mut ids: Vec<u32> = types
-            .iter()
-            .filter_map(|name| self.db.edge_type_id(name))
-            .collect();
-        if ids.is_empty() {
-            // No such type: an impossible id keeps the variable bound while
-            // yielding no rows.
-            ids.push(u32::MAX);
-        }
-        ids
     }
 
     fn anon_name(&mut self, prefix: &str) -> String {
@@ -844,9 +811,9 @@ impl<'a> Planner<'a> {
         let mut exprs = Vec::new();
         for (key, value) in entries {
             if let Expr::Literal(value) = value {
-                if !value.is_null() {
-                    literals.push((key.clone(), value.clone()));
-                }
+                // Null literals are kept so MERGE can reject them; creating
+                // simply drops them.
+                literals.push((key.clone(), value.clone()));
             } else {
                 validate_expr(value, scope)?;
                 exprs.push((key.clone(), value.clone()));
@@ -855,31 +822,65 @@ impl<'a> Planner<'a> {
         Ok((literals, exprs))
     }
 
+    /// Plan `MERGE`: the whole pattern is matched first (one row per match);
+    /// when nothing matches, the unbound elements are created and the
+    /// `ON CREATE` items apply.
     fn plan_merge(
         &mut self,
         path: &PatternPath,
-        scope: &FastMap<String, VarKind>,
-    ) -> Result<Vec<CreateItem>> {
-        if path.segments.is_empty() {
-            let Some(item) = self.create_node_item(&path.start, scope)? else {
-                let name = path.start.variable.as_deref().unwrap_or("?");
-                return Err(Error::syntax(format!(
-                    "variable `{name}` is already bound and cannot be merged"
-                )));
-            };
-            return Ok(vec![item]);
-        }
-        if path.segments.len() > 1 {
-            return Err(Error::unsupported(
-                "MERGE with multiple relationships is not supported yet",
+        on_create: &[SetItem],
+        on_match: &[SetItem],
+        plan: &mut Plan,
+        scope: &mut FastMap<String, VarKind>,
+    ) -> Result<()> {
+        if path
+            .segments
+            .iter()
+            .any(|segment| segment.relationship.var_length.is_some())
+        {
+            return Err(Error::syntax(
+                "variable-length relationships cannot be merged",
             ));
         }
-        let segment = &path.segments[0];
-        let mut items = Vec::new();
+        for node in std::iter::once(&path.start).chain(path.segments.iter().map(|s| &s.node)) {
+            if let Some(var) = &node.variable
+                && scope.contains_key(var)
+                && !node.labels.is_empty()
+            {
+                return Err(Error::syntax(format!(
+                    "MERGE cannot add labels to the bound variable `{var}`"
+                )));
+            }
+        }
+        for segment in &path.segments {
+            let rel = &segment.relationship;
+            if rel.types.len() != 1 {
+                return Err(Error::syntax(
+                    "relationships in MERGE must have exactly one type",
+                ));
+            }
+            if let Some(var) = &rel.variable
+                && scope.contains_key(var)
+            {
+                return Err(Error::syntax(format!(
+                    "MERGE cannot re-bind the relationship variable `{var}`"
+                )));
+            }
+        }
+
+        // Create items for the unbound elements, in creation order, while
+        // recording the variable each path element uses.
+        let mut items: Vec<CreateItem> = Vec::new();
+        let mut path_vars: Vec<String> = Vec::new();
         let mut local = scope.clone();
-        // Unbound endpoints are merged as nodes first.
         let start_item = self.create_node_item(&path.start, &local)?;
-        let src = match &start_item {
+        if path.segments.is_empty() && start_item.is_none() {
+            let name = path.start.variable.as_deref().unwrap_or("?");
+            return Err(Error::syntax(format!(
+                "variable `{name}` is already bound and cannot be merged"
+            )));
+        }
+        let start_var = match &start_item {
             Some(item) => {
                 local.insert(item.var().to_owned(), VarKind::Node);
                 item.var().to_owned()
@@ -888,56 +889,99 @@ impl<'a> Planner<'a> {
                 .start
                 .variable
                 .clone()
-                .ok_or_else(|| Error::unsupported("MERGE requires a variable or new node"))?,
+                .ok_or_else(|| Error::syntax("MERGE requires a variable or a new node"))?,
         };
+        path_vars.push(start_var.clone());
         if let Some(item) = start_item {
             items.push(item);
         }
-        let node_item = self.create_node_item(&segment.node, &local)?;
-        let dst = match &node_item {
-            Some(item) => {
-                local.insert(item.var().to_owned(), VarKind::Node);
-                item.var().to_owned()
+        let mut src = start_var;
+        for segment in &path.segments {
+            let rel = &segment.relationship;
+            let node_item = self.create_node_item(&segment.node, &local)?;
+            let node_var = match &node_item {
+                Some(item) => {
+                    local.insert(item.var().to_owned(), VarKind::Node);
+                    item.var().to_owned()
+                }
+                None => segment
+                    .node
+                    .variable
+                    .clone()
+                    .ok_or_else(|| Error::syntax("MERGE requires a variable or a new node"))?,
+            };
+            if let Some(item) = node_item {
+                items.push(item);
             }
-            None => segment
-                .node
-                .variable
-                .clone()
-                .ok_or_else(|| Error::unsupported("MERGE requires a variable or new node"))?,
-        };
-        if let Some(item) = node_item {
-            items.push(item);
+            let var = match &rel.variable {
+                Some(var) => var.clone(),
+                None => self.anon_name("rel"),
+            };
+            let (from, to) = match rel.direction {
+                RelDirection::Incoming => (node_var.clone(), src),
+                RelDirection::Outgoing | RelDirection::Undirected => (src, node_var.clone()),
+            };
+            let (props, prop_exprs) = self.create_props(rel.properties.as_ref(), scope)?;
+            items.push(CreateItem::Edge {
+                var: var.clone(),
+                edge_type: rel.types[0].clone(),
+                src: from,
+                dst: to,
+                props,
+                prop_exprs,
+            });
+            path_vars.push(var);
+            path_vars.push(node_var.clone());
+            src = node_var;
         }
-        let rel = &segment.relationship;
-        if rel.types.len() != 1 {
-            return Err(Error::syntax(
-                "relationships in MERGE must have exactly one type",
-            ));
+
+        // The match plan uses the same variable names, with the pattern's
+        // unbound elements still unbound.
+        let mut match_pattern = path.clone();
+        match_pattern.start.variable = Some(path_vars[0].clone());
+        let mut index = 1;
+        for segment in &mut match_pattern.segments {
+            segment.relationship.variable = Some(path_vars[index].clone());
+            segment.node.variable = Some(path_vars[index + 1].clone());
+            index += 2;
         }
-        if rel.var_length.is_some() {
-            return Err(Error::unsupported(
-                "variable-length relationships cannot be merged",
-            ));
+        let mut match_plan = Plan::Empty;
+        let mut match_scope = scope.clone();
+        self.plan_path(&match_pattern, &mut match_plan, &mut match_scope)?;
+
+        // Created elements are bound from here on.
+        for item in &items {
+            let kind = match item {
+                CreateItem::Node { .. } => VarKind::Node,
+                CreateItem::Edge { .. } => VarKind::Edge,
+            };
+            scope.insert(item.var().to_owned(), kind);
         }
-        let (src, dst) = match rel.direction {
-            RelDirection::Outgoing => (src, dst),
-            RelDirection::Incoming => (dst, src),
-            RelDirection::Undirected => (src, dst),
-        };
-        let var = match &rel.variable {
-            Some(var) => var.clone(),
-            None => self.anon_name("rel"),
-        };
-        let (props, prop_exprs) = self.create_props(rel.properties.as_ref(), scope)?;
-        items.push(CreateItem::Edge {
-            var,
-            edge_type: rel.types[0].clone(),
-            src,
-            dst,
-            props,
-            prop_exprs,
+        for set_item in on_create.iter().chain(on_match) {
+            self.validate_set_item(set_item, scope)?;
+        }
+
+        let path_binding = path.variable.as_ref().map(|var| {
+            let mut elements = Vec::with_capacity(path_vars.len());
+            for element in &path_vars {
+                elements.push((element.clone(), false));
+            }
+            (var.clone(), elements)
         });
-        Ok(items)
+        if let Some(var) = &path.variable {
+            path_vars.push(var.clone());
+            scope.insert(var.clone(), VarKind::Path);
+        }
+        *plan = Plan::Merge {
+            input: Box::new(plan.clone()),
+            match_plan: Box::new(match_plan),
+            items,
+            path: path_binding,
+            path_vars,
+            on_create: on_create.to_vec(),
+            on_match: on_match.to_vec(),
+        };
+        Ok(())
     }
 
     fn validate_set_item(&self, item: &SetItem, scope: &FastMap<String, VarKind>) -> Result<()> {
@@ -1256,8 +1300,8 @@ struct PlannedNode {
     var: String,
     label_ids: Vec<u32>,
     label_names: Vec<String>,
-    props: Vec<(u32, Value)>,
-    prop_literals: Vec<(String, Value)>,
+    /// Literal properties as `(name, key id, value)`.
+    props: Vec<(String, u32, Value)>,
     prop_exprs: Vec<(String, Expr)>,
 }
 
@@ -1320,7 +1364,7 @@ fn node_constraints(node: &PlannedNode, scanned: bool) -> Option<Expr> {
     if !scanned {
         // Scans apply literal properties themselves; bound nodes need them
         // re-checked.
-        for (key, value) in &node.prop_literals {
+        for (key, _, value) in &node.props {
             predicates.push(Expr::Binary {
                 op: BinaryOp::Eq,
                 left: Box::new(Expr::Property {

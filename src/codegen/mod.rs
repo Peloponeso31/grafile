@@ -10,7 +10,6 @@
 use hashbrown::HashMap;
 
 use crate::cypher::{Expr, QuantifierKind, SetItem};
-use crate::engine::Database;
 use crate::error::{Error, Result};
 use crate::planner::Prepared;
 use crate::planner::plan::{CreateItem, Plan};
@@ -26,8 +25,7 @@ struct Ctx {
 }
 
 /// Code generator state.
-struct Codegen<'a> {
-    db: &'a Database,
+struct Codegen {
     ops: Vec<Op>,
     constants: Vec<Value>,
     next_reg: u32,
@@ -35,9 +33,8 @@ struct Codegen<'a> {
 }
 
 /// Compile a prepared query into a VDBE program.
-pub fn compile(db: &Database, prepared: &Prepared) -> Result<Program> {
+pub fn compile(prepared: &Prepared) -> Result<Program> {
     let mut cg = Codegen {
-        db,
         ops: Vec::new(),
         constants: Vec::new(),
         next_reg: 0,
@@ -69,7 +66,7 @@ pub fn compile(db: &Database, prepared: &Prepared) -> Result<Program> {
     })
 }
 
-impl<'a> Codegen<'a> {
+impl Codegen {
     fn emit(&mut self, op: Op) -> u32 {
         self.ops.push(op);
         (self.ops.len() - 1) as u32
@@ -158,9 +155,12 @@ impl<'a> Codegen<'a> {
                         });
                         rewind = cg.emit(Op::Rewind { cursor, target: 0 });
                     } else {
+                        let label_reg = label
+                            .as_ref()
+                            .map(|name| cg.const_index(Value::from(name.as_str())));
                         cg.emit(Op::OpenNodeScan {
                             cursor,
-                            label: *label,
+                            label: label_reg,
                         });
                         rewind = cg.emit(Op::Rewind { cursor, target: 0 });
                     }
@@ -173,12 +173,12 @@ impl<'a> Codegen<'a> {
                     // Index scans must re-check the label.
                     if seek.is_some()
                         && let Some(label) = label
-                        && *label != u32::MAX
                     {
                         let check = cg.alloc_reg();
+                        let label_reg = cg.const_index(Value::from(label.as_str()));
                         cg.emit(Op::HasLabel {
                             node: dest,
-                            label: *label,
+                            label: label_reg,
                             dest: check,
                         });
                         skip_jumps.push(cg.emit(Op::IfNot {
@@ -252,11 +252,16 @@ impl<'a> Codegen<'a> {
                     crate::cypher::RelDirection::Incoming => 1u8,
                     crate::cypher::RelDirection::Undirected => 2u8,
                 };
+                let type_regs: Vec<u32> = types
+                    .iter()
+                    .map(|name| cg.const_index(Value::from(name.as_str())))
+                    .collect();
                 cg.emit(Op::VarExpandOpen {
                     cursor,
                     src: src_reg,
                     direction: direction_code,
-                    types: types.clone(),
+                    types: type_regs,
+                    any_type: types.is_empty(),
                     props: props.clone(),
                     min: *min,
                     max: *max,
@@ -297,11 +302,16 @@ impl<'a> Codegen<'a> {
                     crate::cypher::RelDirection::Incoming => 1u8,
                     crate::cypher::RelDirection::Undirected => 2u8,
                 };
+                let type_regs: Vec<u32> = types
+                    .iter()
+                    .map(|name| cg.const_index(Value::from(name.as_str())))
+                    .collect();
                 cg.emit(Op::OpenExpand {
                     cursor,
                     src: src_reg,
                     direction: direction_code,
-                    types: types.clone(),
+                    types: type_regs,
+                    any_type: types.is_empty(),
                 });
                 let rewind = cg.emit(Op::Rewind { cursor, target: 0 });
                 let loop_start = cg.ops.len() as u32;
@@ -656,80 +666,115 @@ impl<'a> Codegen<'a> {
             }),
             Plan::Create { input, items } => self.compile(input, ctx, &mut |cg, ctx| {
                 for item in items {
-                    cg.compile_create_item(item, ctx)?;
+                    cg.compile_create_item(item, ctx, None)?;
                 }
                 out(cg, ctx)
             }),
             Plan::Merge {
                 input,
+                match_plan,
                 items,
+                path,
+                path_vars,
                 on_create,
                 on_match,
-            } => {
-                self.compile(input, ctx, &mut |cg, ctx| {
-                    let mut created_flags = Vec::with_capacity(items.len());
-                    for item in items {
-                        let flag = cg.alloc_reg();
-                        cg.compile_merge_item(item, ctx, flag)?;
-                        created_flags.push(flag);
+            } => self.compile(input, ctx, &mut |cg, outer_ctx| {
+                let columns = path_vars.len() as u32 + 1;
+                // Property maps are compiled up front so MERGE can reject
+                // null values before matching, as Neo4j does.
+                let mut item_props = Vec::with_capacity(items.len());
+                for item in items {
+                    let props = cg.compile_item_props(item, outer_ctx)?;
+                    cg.emit(Op::CheckMergeProps { props });
+                    item_props.push(props);
+                }
+                let cursor = cg.alloc_cursor();
+                cg.emit(Op::CollectOpen { cursor });
+                // Match phase: one row per existing match.
+                let mut match_base: Option<u32> = None;
+                cg.compile(match_plan, outer_ctx, &mut |cg, match_ctx| {
+                    let base = cg.reorder_window(match_ctx, path_vars)?;
+                    match_base = Some(base);
+                    cg.const_reg(Value::Bool(false));
+                    cg.emit(Op::CollectRow {
+                        cursor,
+                        start: base,
+                        count: columns,
+                    });
+                    Ok(())
+                })?;
+                // Create phase: the pattern did not match, so create the
+                // unbound elements and collect the created row.
+                let empty_jump = cg.emit(Op::CtxRewind { cursor, target: 0 });
+                let skip_create = cg.emit(Op::Goto { target: 0 });
+                let create_start = cg.ops.len() as u32;
+                for (item, props) in items.iter().zip(&item_props) {
+                    cg.compile_create_item(item, outer_ctx, Some(*props))?;
+                }
+                if let Some((var, elements)) = path {
+                    let mut regs = Vec::with_capacity(elements.len());
+                    for (name, splice) in elements {
+                        regs.push((cg.var_reg(outer_ctx, name)?, *splice));
                     }
-                    let created = if created_flags.is_empty() {
-                        // Unreachable through the planner; keep the compiler
-                        // panic-free if a plan ever carries an empty merge.
-                        cg.const_reg(Value::Bool(false))
-                    } else if created_flags.len() == 1 {
-                        created_flags[0]
-                    } else {
-                        let combined = cg.alloc_reg();
-                        cg.emit(Op::Copy {
-                            dest: combined,
-                            src: created_flags[0],
-                        });
-                        for flag in &created_flags[1..] {
-                            let next = cg.alloc_reg();
-                            cg.emit(Op::Binary {
-                                op: binary_code::OR,
-                                left: combined,
-                                right: *flag,
-                                dest: next,
-                            });
-                            // Rebind for the next iteration.
-                            let temp = next;
-                            let target = combined;
-                            cg.emit(Op::Copy {
-                                dest: target,
-                                src: temp,
-                            });
-                        }
-                        combined
-                    };
-                    for set_item in on_create {
-                        let skip = cg.emit(Op::IfNot {
-                            reg: created,
-                            target: 0,
-                        });
-                        cg.compile_set_item(set_item, ctx)?;
-                        let end = cg.ops.len() as u32;
-                        cg.patch(skip, end)?;
-                    }
-                    for set_item in on_match {
-                        let not_created = cg.alloc_reg();
-                        cg.emit(Op::Unary {
-                            op: unary_code::NOT,
-                            src: created,
-                            dest: not_created,
-                        });
-                        let skip = cg.emit(Op::IfNot {
-                            reg: not_created,
-                            target: 0,
-                        });
-                        cg.compile_set_item(set_item, ctx)?;
-                        let end = cg.ops.len() as u32;
-                        cg.patch(skip, end)?;
-                    }
-                    out(cg, ctx)
-                })
-            }
+                    let dest = cg.alloc_reg();
+                    cg.emit(Op::BuildPath {
+                        dest,
+                        elements: regs,
+                    });
+                    outer_ctx.vars.insert(var.clone(), dest);
+                    outer_ctx.window_len = cg.next_reg - outer_ctx.window_start;
+                }
+                let base = cg.reorder_window(outer_ctx, path_vars)?;
+                cg.const_reg(Value::Bool(true));
+                cg.emit(Op::CollectRow {
+                    cursor,
+                    start: base,
+                    count: columns,
+                });
+                let replay_start = cg.ops.len() as u32;
+                cg.patch(empty_jump, create_start)?;
+                cg.patch(skip_create, replay_start)?;
+                // Replay: ON CREATE for created rows, ON MATCH otherwise.
+                let replay_base = match_base.unwrap_or(base);
+                // Keep the outer variables; the merge variables come from
+                // the collected row.
+                let mut replay_ctx = outer_ctx.clone();
+                replay_ctx.window_start = replay_base;
+                replay_ctx.window_len = path_vars.len() as u32;
+                for (index, var) in path_vars.iter().enumerate() {
+                    replay_ctx
+                        .vars
+                        .insert(var.clone(), replay_base + index as u32);
+                }
+                let loop_start = cg.ops.len() as u32;
+                cg.emit(Op::CtxData {
+                    cursor,
+                    start: replay_base,
+                    count: columns,
+                });
+                let created_flag = replay_base + path_vars.len() as u32;
+                let not_created = cg.emit(Op::IfNot {
+                    reg: created_flag,
+                    target: 0,
+                });
+                for set_item in on_create {
+                    cg.compile_set_item(set_item, &replay_ctx)?;
+                }
+                let after_create = cg.emit(Op::Goto { target: 0 });
+                let match_start = cg.ops.len() as u32;
+                cg.patch(not_created, match_start)?;
+                for set_item in on_match {
+                    cg.compile_set_item(set_item, &replay_ctx)?;
+                }
+                let after_match = cg.ops.len() as u32;
+                cg.patch(after_create, after_match)?;
+                out(cg, &mut replay_ctx)?;
+                let next = cg.emit(Op::CtxNext { cursor, target: 0 });
+                cg.emit(Op::Goto { target: loop_start });
+                let end = cg.ops.len() as u32;
+                cg.patch(next, end)?;
+                Ok(())
+            }),
             Plan::SetItems { input, items } => self.compile(input, ctx, &mut |cg, ctx| {
                 for item in items {
                     cg.compile_set_item(item, ctx)?;
@@ -838,14 +883,15 @@ impl<'a> Codegen<'a> {
     fn emit_property_filters(
         &mut self,
         entity_reg: u32,
-        props: &[(u32, Value)],
+        props: &[(String, Value)],
         skip_jumps: &mut Vec<u32>,
     ) -> Result<()> {
         for (key, value) in props {
             let column = self.alloc_reg();
-            self.emit(Op::Column {
+            let name = self.const_index(Value::from(key.as_str()));
+            self.emit(Op::Property {
                 target: entity_reg,
-                key: *key,
+                name,
                 dest: column,
             });
             let constant = self.const_reg(value.clone());
@@ -864,7 +910,39 @@ impl<'a> Codegen<'a> {
         Ok(())
     }
 
-    fn compile_create_item(&mut self, item: &CreateItem, ctx: &mut Ctx) -> Result<()> {
+    /// Copy the given variables into a fresh contiguous window in that order
+    /// and return its base, so both MERGE paths collect rows alike.
+    fn reorder_window(&mut self, ctx: &Ctx, vars: &[String]) -> Result<u32> {
+        let mut sources = Vec::with_capacity(vars.len());
+        for var in vars {
+            sources.push(*ctx.vars.get(var).ok_or_else(|| undefined(var))?);
+        }
+        let base = self.next_reg;
+        for src in sources {
+            let dest = self.alloc_reg();
+            self.emit(Op::Copy { dest, src });
+        }
+        Ok(base)
+    }
+
+    /// Compile the property map of a create item.
+    fn compile_item_props(&mut self, item: &CreateItem, ctx: &Ctx) -> Result<u32> {
+        match item {
+            CreateItem::Node {
+                props, prop_exprs, ..
+            }
+            | CreateItem::Edge {
+                props, prop_exprs, ..
+            } => self.compile_map(props, prop_exprs, ctx),
+        }
+    }
+
+    fn compile_create_item(
+        &mut self,
+        item: &CreateItem,
+        ctx: &mut Ctx,
+        prebuilt_props: Option<u32>,
+    ) -> Result<()> {
         match item {
             CreateItem::Node {
                 var,
@@ -873,7 +951,10 @@ impl<'a> Codegen<'a> {
                 prop_exprs,
             } => {
                 let labels_reg = self.label_list_reg(labels);
-                let props_reg = self.compile_map(props, prop_exprs, ctx)?;
+                let props_reg = match prebuilt_props {
+                    Some(reg) => reg,
+                    None => self.compile_map(props, prop_exprs, ctx)?,
+                };
                 let dest = self.alloc_reg();
                 self.emit(Op::CreateNode {
                     labels: labels_reg,
@@ -894,7 +975,10 @@ impl<'a> Codegen<'a> {
                 let src_reg = self.var_reg(ctx, src)?;
                 let dst_reg = self.var_reg(ctx, dst)?;
                 let type_reg = self.const_reg(Value::from(edge_type.as_str()));
-                let props_reg = self.compile_map(props, prop_exprs, ctx)?;
+                let props_reg = match prebuilt_props {
+                    Some(reg) => reg,
+                    None => self.compile_map(props, prop_exprs, ctx)?,
+                };
                 let dest = self.alloc_reg();
                 self.emit(Op::CreateEdge {
                     edge_type: type_reg,
@@ -902,53 +986,6 @@ impl<'a> Codegen<'a> {
                     dst: dst_reg,
                     props: props_reg,
                     dest,
-                });
-                ctx.vars.insert(var.clone(), dest);
-                Ok(())
-            }
-        }
-    }
-
-    fn compile_merge_item(&mut self, item: &CreateItem, ctx: &mut Ctx, created: u32) -> Result<()> {
-        match item {
-            CreateItem::Node {
-                var,
-                labels,
-                props,
-                prop_exprs,
-            } => {
-                let labels_reg = self.label_list_reg(labels);
-                let props_reg = self.compile_map(props, prop_exprs, ctx)?;
-                let dest = self.alloc_reg();
-                self.emit(Op::MergeNode {
-                    labels: labels_reg,
-                    props: props_reg,
-                    dest,
-                    created,
-                });
-                ctx.vars.insert(var.clone(), dest);
-                Ok(())
-            }
-            CreateItem::Edge {
-                var,
-                edge_type,
-                src,
-                dst,
-                props,
-                prop_exprs,
-            } => {
-                let src_reg = self.var_reg(ctx, src)?;
-                let dst_reg = self.var_reg(ctx, dst)?;
-                let type_reg = self.const_reg(Value::from(edge_type.as_str()));
-                let props_reg = self.compile_map(props, prop_exprs, ctx)?;
-                let dest = self.alloc_reg();
-                self.emit(Op::MergeEdge {
-                    edge_type: type_reg,
-                    src: src_reg,
-                    dst: dst_reg,
-                    props: props_reg,
-                    dest,
-                    created,
                 });
                 ctx.vars.insert(var.clone(), dest);
                 Ok(())
@@ -1555,11 +1592,11 @@ impl<'a> Codegen<'a> {
                 let node_reg = self.compile_expr(expr, ctx)?;
                 let mut checks = Vec::new();
                 for label in labels {
-                    let label_id = self.db.label_id(label).unwrap_or(u32::MAX);
+                    let label_reg = self.const_index(Value::from(label.as_str()));
                     let check = self.alloc_reg();
                     self.emit(Op::HasLabel {
                         node: node_reg,
-                        label: label_id,
+                        label: label_reg,
                         dest: check,
                     });
                     checks.push(check);

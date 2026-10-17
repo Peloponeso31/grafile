@@ -955,3 +955,139 @@ fn literal_pattern_properties_still_seek_indexes() {
         .expect("explain");
     assert!(plan.contains("seek=-"), "{plan}");
 }
+
+#[test]
+fn merge_matches_whole_path_atomically() {
+    let mut conn = connection();
+    conn.execute("CREATE (:Person {name: 'gina'})-[:KNOWS]->(:Person {name: 'hank'})")
+        .expect("seed");
+    conn.execute("MERGE (:Person {name: 'gina'})-[:KNOWS]->(:Person {name: 'hank'})")
+        .expect("merge path");
+    // The whole path exists, so the MERGE matches it without creating.
+    let rows = query(&mut conn, "MATCH (n:Person) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["2"]]);
+    let rows = query(&mut conn, "MATCH ()-[r:KNOWS]->() RETURN count(r)");
+    assert_eq!(rows, vec![vec!["1"]]);
+}
+
+#[test]
+fn merge_creates_fresh_endpoints_when_path_is_absent() {
+    let mut conn = connection();
+    conn.execute("CREATE (:Person {name: 'iris'})")
+        .expect("seed");
+    conn.execute("MERGE (:Person {name: 'iris'})-[:KNOWS]->(:Person {name: 'jack'})")
+        .expect("merge path");
+    // The whole path is absent, so the existing `iris` node is not reused.
+    let rows = query(&mut conn, "MATCH (n:Person) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["3"]]);
+}
+
+#[test]
+fn merge_respects_relationship_direction_when_matching() {
+    let mut conn = connection();
+    conn.execute("CREATE (:Person {name: 'kim'})-[:KNOWS]->(:Person {name: 'lena'})")
+        .expect("seed");
+    conn.execute("MERGE (:Person {name: 'lena'})-[:KNOWS]->(:Person {name: 'kim'})")
+        .expect("merge path");
+    // The reverse edge is created; the existing edge is not reused.
+    let rows = query(&mut conn, "MATCH ()-[r:KNOWS]->() RETURN count(r)");
+    assert_eq!(rows, vec![vec!["2"]]);
+    // An undirected pattern matches edges in both directions.
+    conn.execute("MERGE (:Person {name: 'lena'})-[:KNOWS]-(:Person {name: 'kim'})")
+        .expect("merge undirected");
+    let rows = query(&mut conn, "MATCH ()-[r:KNOWS]->() RETURN count(r)");
+    assert_eq!(rows, vec![vec!["2"]]);
+}
+
+#[test]
+fn merge_binds_matched_path() {
+    let mut conn = connection();
+    conn.execute("CREATE (:Person {name: 'mia'})-[:KNOWS]->(:Person {name: 'nate'})")
+        .expect("seed");
+    let rows = query(
+        &mut conn,
+        "MERGE p = (:Person {name: 'mia'})-[:KNOWS]->(:Person {name: 'nate'}) RETURN length(p)",
+    );
+    assert_eq!(rows, vec![vec!["1"]]);
+}
+
+#[test]
+fn merge_emits_one_row_per_match() {
+    let mut conn = connection();
+    conn.execute("CREATE (:Person {name: 'olga'})")
+        .expect("seed");
+    conn.execute("MATCH (a:Person) MERGE (a)-[:KNOWS]->(:Person {name: 'pete'})")
+        .expect("merge edge");
+    conn.execute("MATCH (a:Person) MERGE (a)-[:KNOWS]->(:Person {name: 'pete'})")
+        .expect("merge edge again");
+    let rows = query(
+        &mut conn,
+        "MATCH (:Person {name: 'olga'})-[r:KNOWS]->(:Person {name: 'pete'}) RETURN count(r)",
+    );
+    assert_eq!(rows, vec![vec!["1"]]);
+}
+
+#[test]
+fn merge_rejects_null_property_values() {
+    let mut conn = connection();
+    let err = conn
+        .query("MERGE (n:Person {name: null})", &Params::new())
+        .expect_err("null property must be rejected");
+    assert!(err.to_string().contains("null"), "{err}");
+}
+
+#[test]
+fn merge_rejects_bound_node_with_labels() {
+    let mut conn = connection();
+    seed(&mut conn);
+    let err = conn
+        .query(
+            "MATCH (n:Person {name: 'alice'}) MERGE (n:Robot)",
+            &Params::new(),
+        )
+        .expect_err("labels on a bound node must be rejected");
+    assert!(err.to_string().contains("labels"), "{err}");
+}
+
+#[test]
+fn merge_rejects_variable_length_pattern() {
+    let mut conn = connection();
+    let err = conn
+        .query(
+            "MERGE (:Person {name: 'quinn'})-[:KNOWS*1..2]->()",
+            &Params::new(),
+        )
+        .expect_err("variable-length MERGE must be rejected");
+    assert!(err.to_string().contains("variable-length"), "{err}");
+}
+
+#[test]
+fn set_entity_copies_properties() {
+    let mut conn = connection();
+    conn.execute("CREATE (:Person {name: 'ravi', age: 40, city: 'oslo'})")
+        .expect("seed");
+    conn.execute("CREATE (:Person {name: 'sara'})")
+        .expect("seed");
+    conn.execute("MATCH (a:Person {name: 'ravi'}), (b:Person {name: 'sara'}) SET b = a")
+        .expect("copy properties");
+    // The copy replaces every property, including the name.
+    let rows = query(
+        &mut conn,
+        "MATCH (n:Person {name: 'ravi'}) RETURN count(*), max(n.age)",
+    );
+    assert_eq!(rows, vec![vec!["2", "40"]]);
+}
+
+#[test]
+fn dynamic_property_access_on_entities() {
+    let mut conn = connection();
+    conn.execute(
+        "CREATE (:Person {name: 'tara'})-[:KNOWS {since: 2019}]->(:Person {name: 'umar'})",
+    )
+    .expect("seed");
+    let rows = query(
+        &mut conn,
+        "MATCH (n:Person {name: 'tara'})-[r:KNOWS]->() RETURN n['name'], r['since'], n['missing']",
+    );
+    assert_eq!(rows, vec![vec!["tara", "2019", "null"]]);
+}

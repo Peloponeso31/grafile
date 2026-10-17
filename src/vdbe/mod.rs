@@ -78,7 +78,7 @@ pub enum Op {
     OpenNodeScan {
         /// Cursor slot.
         cursor: u32,
-        /// Label id filter.
+        /// Constant index of the label name to filter by.
         label: Option<u32>,
     },
     /// Open an edge scan (all edges, or a type bitmap).
@@ -105,8 +105,10 @@ pub enum Op {
         src: u32,
         /// Direction code (0 out, 1 in, 2 undirected).
         direction: u8,
-        /// Restricting edge type ids.
+        /// Constant indices of restricting edge type names.
         types: Vec<u32>,
+        /// Whether the pattern had no type filter (empty `types` means any).
+        any_type: bool,
     },
     /// Position a cursor on its first row; jump when empty.
     Rewind {
@@ -213,7 +215,7 @@ pub enum Op {
     HasLabel {
         /// Node register.
         node: u32,
-        /// Label id.
+        /// Constant index of the label name.
         label: u32,
         /// Destination register.
         dest: u32,
@@ -379,10 +381,12 @@ pub enum Op {
         src: u32,
         /// Direction code: 0 out, 1 in, 2 both.
         direction: u8,
-        /// Restricting edge type ids (empty = any).
+        /// Constant indices of restricting edge type names.
         types: Vec<u32>,
-        /// Literal property filters applied at every hop.
-        props: Vec<(u32, Value)>,
+        /// Whether the pattern had no type filter.
+        any_type: bool,
+        /// Literal property filters applied at every hop, by key name.
+        props: Vec<(String, Value)>,
         /// Minimum hops.
         min: u32,
         /// Maximum hops; `None` is unbounded.
@@ -437,31 +441,10 @@ pub enum Op {
         /// Destination register.
         dest: u32,
     },
-    /// Match or create a node; writes `true` to `created` on creation.
-    MergeNode {
-        /// Register holding a list of label names.
-        labels: u32,
+    /// Reject null property values, which MERGE does not allow.
+    CheckMergeProps {
         /// Register holding a property map.
         props: u32,
-        /// Destination register.
-        dest: u32,
-        /// Register receiving whether the node was created.
-        created: u32,
-    },
-    /// Match or create an edge.
-    MergeEdge {
-        /// Register holding the edge type name.
-        edge_type: u32,
-        /// Source node register.
-        src: u32,
-        /// Destination node register.
-        dst: u32,
-        /// Register holding a property map.
-        props: u32,
-        /// Destination register.
-        dest: u32,
-        /// Register receiving whether the edge was created.
-        created: u32,
     },
     /// Set a property on a node or edge.
     SetProperty {
@@ -567,6 +550,7 @@ pub fn execute(db: &mut Database, program: &Program) -> Result<Vec<Vec<Value>>> 
         cursors: (0..program.cursor_count).map(|_| Cursor::Empty).collect(),
         results: Vec::new(),
         key_ids: vec![None; program.constants.len()],
+        label_ids: vec![None; program.constants.len()],
         pc: 0,
         steps: 0,
     };
@@ -609,6 +593,7 @@ struct Executor<'a> {
     cursors: Vec<Cursor>,
     results: Vec<Vec<Value>>,
     key_ids: Vec<Option<u32>>,
+    label_ids: Vec<Option<u32>>,
     pc: usize,
     steps: u64,
 }
@@ -634,7 +619,10 @@ impl<'a> Executor<'a> {
         match op {
             Op::OpenNodeScan { cursor, label } => {
                 let ids = match label {
-                    Some(label) => self.db.label_nodes(*label)?,
+                    Some(label) => match self.resolve_label(*label)? {
+                        Some(label) => self.db.label_nodes(label)?,
+                        None => Vec::new(),
+                    },
                     None => self.db.all_node_ids()?,
                 };
                 self.cursors[*cursor as usize] = Cursor::Ids {
@@ -672,22 +660,40 @@ impl<'a> Executor<'a> {
                 src,
                 direction,
                 types,
+                any_type,
             } => {
+                let types = self.resolve_types(types, *any_type)?;
                 // Expanding from a null binding (an optional match that
                 // missed) matches nothing instead of failing.
-                let items = if matches!(self.regs[*src as usize], Reg::Value(Value::Null)) {
-                    Vec::new()
-                } else {
-                    let node = self.reg_node(*src)?;
-                    match direction {
-                        0 => self.db.expand(node, Direction::Out, types)?,
-                        1 => self.db.expand(node, Direction::In, types)?,
-                        _ => {
-                            let mut both = self.db.expand(node, Direction::Out, types)?;
-                            both.extend(self.db.expand(node, Direction::In, types)?);
-                            both.sort_unstable();
-                            both.dedup();
-                            both
+                let items = match (&types, &self.regs[*src as usize]) {
+                    (Some(types), _) if types.is_empty() => Vec::new(),
+                    (_, Reg::Value(Value::Null)) => Vec::new(),
+                    (None, _) => {
+                        let node = self.reg_node(*src)?;
+                        match direction {
+                            0 => self.db.expand(node, Direction::Out, &[])?,
+                            1 => self.db.expand(node, Direction::In, &[])?,
+                            _ => {
+                                let mut both = self.db.expand(node, Direction::Out, &[])?;
+                                both.extend(self.db.expand(node, Direction::In, &[])?);
+                                both.sort_unstable();
+                                both.dedup();
+                                both
+                            }
+                        }
+                    }
+                    (Some(types), _) => {
+                        let node = self.reg_node(*src)?;
+                        match direction {
+                            0 => self.db.expand(node, Direction::Out, types)?,
+                            1 => self.db.expand(node, Direction::In, types)?,
+                            _ => {
+                                let mut both = self.db.expand(node, Direction::Out, types)?;
+                                both.extend(self.db.expand(node, Direction::In, types)?);
+                                both.sort_unstable();
+                                both.dedup();
+                                both
+                            }
                         }
                     }
                 };
@@ -830,6 +836,31 @@ impl<'a> Executor<'a> {
                         .find(|(entry, _)| entry.as_ref() == key.as_ref())
                         .map(|(_, value)| value.clone())
                         .unwrap_or(Value::Null),
+                    // Dynamic property access: `n[key]` / `r[key]`.
+                    (Value::Node(id), Value::Text(key)) => {
+                        let key_id = self.db.property_key_id(&key);
+                        key_id
+                            .and_then(|key_id| {
+                                self.db
+                                    .get_node(id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|record| record.get(key_id).cloned())
+                            })
+                            .unwrap_or(Value::Null)
+                    }
+                    (Value::Edge(id), Value::Text(key)) => {
+                        let key_id = self.db.property_key_id(&key);
+                        key_id
+                            .and_then(|key_id| {
+                                self.db
+                                    .get_edge(id)
+                                    .ok()
+                                    .flatten()
+                                    .and_then(|record| record.get(key_id).cloned())
+                            })
+                            .unwrap_or(Value::Null)
+                    }
                     (Value::List(_), other) => {
                         return Err(Error::type_error(format!(
                             "list index must be an integer, got {}",
@@ -961,11 +992,12 @@ impl<'a> Executor<'a> {
                 self.regs[*dest as usize] = Reg::Value(Value::Bool(value.is_null()));
             }
             Op::HasLabel { node, label, dest } => {
-                let result = match self.regs[*node as usize].clone() {
-                    Reg::Node(id) => self
+                let label_id = self.resolve_label(*label)?;
+                let result = match (self.regs[*node as usize].clone(), label_id) {
+                    (Reg::Node(id), Some(label)) => self
                         .db
                         .get_node(id)?
-                        .map(|record| record.labels.contains(label))
+                        .map(|record| record.labels.contains(&label))
                         .unwrap_or(false),
                     _ => false,
                 };
@@ -1162,22 +1194,27 @@ impl<'a> Executor<'a> {
                 src,
                 direction,
                 types,
+                any_type,
                 props,
                 min,
                 max,
             } => {
+                let types = self.resolve_types(types, *any_type)?;
                 // Expanding from a null binding matches nothing.
-                let items = if matches!(self.regs[*src as usize], Reg::Value(Value::Null)) {
-                    Vec::new()
-                } else {
-                    let node = self.reg_node(*src)?;
-                    let directions: Vec<Direction> = match direction {
-                        0 => vec![Direction::Out],
-                        1 => vec![Direction::In],
-                        _ => vec![Direction::Out, Direction::In],
-                    };
-                    self.db
-                        .var_expand(node, &directions, types, props, *min, *max)?
+                let items = match (&types, &self.regs[*src as usize]) {
+                    (Some(types), _) if types.is_empty() => Vec::new(),
+                    (_, Reg::Value(Value::Null)) => Vec::new(),
+                    _ => {
+                        let node = self.reg_node(*src)?;
+                        let directions: Vec<Direction> = match direction {
+                            0 => vec![Direction::Out],
+                            1 => vec![Direction::In],
+                            _ => vec![Direction::Out, Direction::In],
+                        };
+                        let filter: &[u32] = types.as_deref().unwrap_or(&[]);
+                        self.db
+                            .var_expand(node, &directions, filter, props, *min, *max)?
+                    }
                 };
                 self.cursors[*cursor as usize] = Cursor::Trails { items, pos: 0 };
             }
@@ -1295,35 +1332,13 @@ impl<'a> Executor<'a> {
                     .create_edge_unchecked(type_id, src_id, dst_id, props)?;
                 self.regs[*dest as usize] = Reg::Edge(id);
             }
-            Op::MergeNode {
-                labels,
-                props,
-                dest,
-                created,
-            } => {
-                let label_ids = self.resolve_labels(*labels)?;
+            Op::CheckMergeProps { props } => {
                 let props = self.resolve_props(*props)?;
-                let (id, was_created) = self.db.match_or_create_node(&label_ids, props)?;
-                self.regs[*dest as usize] = Reg::Node(id);
-                self.regs[*created as usize] = Reg::Value(Value::Bool(was_created));
-            }
-            Op::MergeEdge {
-                edge_type,
-                src,
-                dst,
-                props,
-                dest,
-                created,
-            } => {
-                let type_id = self.resolve_edge_type(*edge_type)?;
-                let src_id = self.reg_node(*src)?;
-                let dst_id = self.reg_node(*dst)?;
-                let props = self.resolve_props(*props)?;
-                let (id, was_created) = self
-                    .db
-                    .match_or_create_edge(type_id, src_id, dst_id, props)?;
-                self.regs[*dest as usize] = Reg::Edge(id);
-                self.regs[*created as usize] = Reg::Value(Value::Bool(was_created));
+                if props.iter().any(|(_, value)| value.is_null()) {
+                    return Err(Error::unsupported(
+                        "MERGE does not allow null property values",
+                    ));
+                }
             }
             Op::SetProperty { target, key, value } => {
                 let key_name = self.reg_text(*key)?;
@@ -1363,11 +1378,43 @@ impl<'a> Executor<'a> {
                 }
             }
             Op::ReplaceProperties { target, props } => {
+                // `SET x = y` copies y's properties when y is an entity.
+                let value = self.reg_value(*props)?;
+                let entries = match value {
+                    Value::Map(_) => self.resolve_props(*props)?,
+                    Value::Node(id) => self
+                        .db
+                        .get_node(id)?
+                        .map(|record| record.props)
+                        .unwrap_or_default(),
+                    Value::Edge(id) => self
+                        .db
+                        .get_edge(id)?
+                        .map(|record| record.props)
+                        .unwrap_or_default(),
+                    Value::Null => Vec::new(),
+                    other => {
+                        return Err(Error::type_error(format!(
+                            "SET expects a map, node or relationship, got {}",
+                            other.type_name()
+                        )));
+                    }
+                };
                 // Replacing properties on a null binding is a no-op.
-                if !matches!(self.regs[*target as usize], Reg::Value(Value::Null)) {
-                    let id = self.reg_node(*target)?;
-                    let props = self.resolve_props(*props)?;
-                    self.db.replace_node_properties(id, props)?;
+                match self.regs[*target as usize].clone() {
+                    Reg::Value(Value::Null) => {}
+                    Reg::Node(id) => {
+                        self.db.replace_node_properties(id, entries)?;
+                    }
+                    Reg::Edge(id) => {
+                        self.db.replace_edge_properties(id, entries)?;
+                    }
+                    other => {
+                        return Err(Error::type_error(format!(
+                            "SET expects a node or relationship, got {}",
+                            other.to_value().type_name()
+                        )));
+                    }
                 }
             }
             Op::MergeProperties { target, props } => {
@@ -1496,6 +1543,44 @@ impl<'a> Executor<'a> {
     fn resolve_edge_type(&mut self, reg: u32) -> Result<u32> {
         let name = self.reg_text(reg)?;
         self.db.ensure_edge_type(&name)
+    }
+
+    /// Resolve a label name constant to its id, caching successes only so
+    /// labels created by the same statement are still found.
+    fn resolve_label(&mut self, name: u32) -> Result<Option<u32>> {
+        match self.label_ids.get(name as usize).copied() {
+            Some(Some(id)) => Ok(Some(id)),
+            Some(None) => {
+                let Value::Text(label) = &self.program.constants[name as usize] else {
+                    return Err(Error::internal("label name is not a string"));
+                };
+                let resolved = self.db.label_id(label);
+                if resolved.is_some() {
+                    self.label_ids[name as usize] = resolved;
+                }
+                Ok(resolved)
+            }
+            None => Err(Error::internal("constant index out of range")),
+        }
+    }
+
+    /// Resolve edge type name constants to ids. `None` means the pattern had
+    /// no type filter (any type); `Some` with an empty list means no listed
+    /// type exists, so nothing can match.
+    fn resolve_types(&mut self, names: &[u32], any_type: bool) -> Result<Option<Vec<u32>>> {
+        if any_type {
+            return Ok(None);
+        }
+        let mut types = Vec::with_capacity(names.len());
+        for name in names {
+            let Value::Text(ty) = &self.program.constants[*name as usize] else {
+                return Err(Error::internal("edge type name is not a string"));
+            };
+            if let Some(id) = self.db.edge_type_id(ty) {
+                types.push(id);
+            }
+        }
+        Ok(Some(types))
     }
 
     fn resolve_props(&mut self, reg: u32) -> Result<Vec<(u32, Value)>> {

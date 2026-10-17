@@ -62,12 +62,12 @@ pub enum Plan {
         input: Box<Plan>,
         /// Variable to bind.
         var: String,
-        /// Label id, or `None` for any label.
-        label: Option<u32>,
+        /// Label name, or `None` for any label.
+        label: Option<String>,
         /// Index seek when a usable index exists.
         seek: Option<IndexSeek>,
-        /// Residual literal property filters.
-        props: Vec<(u32, crate::record::Value)>,
+        /// Residual literal property filters, by key name.
+        props: Vec<(String, crate::record::Value)>,
     },
     /// Scan every node.
     AllNodesScan {
@@ -97,10 +97,10 @@ pub enum Plan {
         dst: String,
         /// Pattern direction.
         direction: RelDirection,
-        /// Restricting edge type ids (empty = any).
-        types: Vec<u32>,
-        /// Literal property filters applied at every hop.
-        props: Vec<(u32, crate::record::Value)>,
+        /// Restricting edge type names (empty = any).
+        types: Vec<String>,
+        /// Literal property filters applied at every hop, by key name.
+        props: Vec<(String, crate::record::Value)>,
         /// Minimum hops.
         min: u32,
         /// Maximum hops; `None` is unbounded.
@@ -118,10 +118,10 @@ pub enum Plan {
         dst: String,
         /// Pattern direction.
         direction: RelDirection,
-        /// Restricting edge type ids (empty = any).
-        types: Vec<u32>,
-        /// Literal property filters on the edge.
-        props: Vec<(u32, crate::record::Value)>,
+        /// Restricting edge type names (empty = any).
+        types: Vec<String>,
+        /// Literal property filters on the edge, by key name.
+        props: Vec<(String, crate::record::Value)>,
     },
     /// Filter rows by a predicate.
     Filter {
@@ -215,15 +215,25 @@ pub enum Plan {
         /// Elements in creation order.
         items: Vec<CreateItem>,
     },
-    /// Match or create elements (a node, or a node plus a relationship).
+    /// Match a whole pattern, creating its unbound elements when nothing
+    /// matches.
     Merge {
         /// Input plan.
         input: Box<Plan>,
-        /// Elements to merge, in order.
+        /// Pattern plan rooted at `Empty`, using the same variable names as
+        /// the create items.
+        match_plan: Box<Plan>,
+        /// Elements created when the pattern does not match.
         items: Vec<CreateItem>,
-        /// Applied when any element was created.
+        /// Path variable and its `(variable, splice)` elements, in path
+        /// order.
+        path: Option<(String, Vec<(String, bool)>)>,
+        /// Every pattern variable in path order, then the path variable;
+        /// both merge paths collect rows in this order.
+        path_vars: Vec<String>,
+        /// Applied to created rows.
         on_create: Vec<SetItem>,
-        /// Applied when every element already existed.
+        /// Applied to matched rows.
         on_match: Vec<SetItem>,
     },
     /// `SET` properties and labels.
@@ -436,7 +446,12 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
             ));
             explain(input, indent + 1, out);
         }
-        Plan::Merge { input, items, .. } => {
+        Plan::Merge {
+            input,
+            match_plan,
+            items,
+            ..
+        } => {
             out.push_str(&format!(
                 "{pad}Merge {}\n",
                 items
@@ -445,6 +460,7 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
+            explain(match_plan, indent + 1, out);
             explain(input, indent + 1, out);
         }
         Plan::SetItems { input, items } => {

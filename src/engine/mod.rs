@@ -445,17 +445,26 @@ impl Database {
         src: u64,
         directions: &[Direction],
         types: &[u32],
-        props: &[(u32, Value)],
+        props: &[(String, Value)],
         min: u32,
         max: Option<u32>,
     ) -> Result<Vec<(Vec<u64>, u64)>> {
+        // Property key names are resolved per call, so keys created by the
+        // same statement are seen. An unknown key matches nothing.
+        let mut keyed = Vec::with_capacity(props.len());
+        for (name, value) in props {
+            match self.property_key_id(name) {
+                Some(key_id) => keyed.push((key_id, value.clone())),
+                None => return Ok(Vec::new()),
+            }
+        }
         let mut out = Vec::new();
         if min == 0 {
             out.push((Vec::new(), src));
         }
         let mut trail = Vec::new();
         self.var_expand_rec(
-            src, directions, types, props, min, max, &mut trail, &mut out,
+            src, directions, types, &keyed, min, max, &mut trail, &mut out,
         )?;
         Ok(out)
     }
@@ -867,6 +876,31 @@ impl Database {
         self.nodes
             .insert(&mut self.pager, &key_bytes, &record.encode())?;
         self.index_node(&record, node_id)
+    }
+
+    /// Replace every property of an edge.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` when the edge does not exist.
+    pub fn replace_edge_properties(
+        &mut self,
+        edge_id: u64,
+        props: Vec<(u32, Value)>,
+    ) -> Result<()> {
+        self.require_write()?;
+        let Some(mut record) = self.get_edge(edge_id)? else {
+            return Err(Error::new(
+                ErrorCode::NotFound,
+                format!("edge {edge_id} does not exist"),
+            ));
+        };
+        let key_bytes = edge_id.to_be_bytes();
+        self.edges.delete(&mut self.pager, &key_bytes)?;
+        record.props = normalize_props(props)?;
+        self.edges
+            .insert(&mut self.pager, &key_bytes, &record.encode())?;
+        Ok(())
     }
 
     fn require_write(&self) -> Result<()> {

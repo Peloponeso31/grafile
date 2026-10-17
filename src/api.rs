@@ -264,7 +264,7 @@ impl Connection {
         let parsed = cypher::parse(source).map_err(compile)?;
         let prepared =
             planner::plan_query(&mut self.db, &parsed, params.values()).map_err(compile)?;
-        let program = codegen::compile(&self.db, &prepared).map_err(compile)?;
+        let program = codegen::compile(&prepared).map_err(compile)?;
         let started = self.db.in_write_txn();
         let read_lock = !program.mutating && !started;
         if read_lock {
@@ -315,7 +315,7 @@ impl Connection {
     pub fn explain_program(&mut self, source: &str) -> Result<String> {
         let parsed = cypher::parse(source)?;
         let prepared = planner::plan_query(&mut self.db, &parsed, &HashMap::new())?;
-        let program = codegen::compile(&self.db, &prepared)?;
+        let program = codegen::compile(&prepared)?;
         let mut out = String::new();
         for (pc, op) in program.ops.iter().enumerate() {
             out.push_str(&format!("{pc:4} {op:?}\n"));
