@@ -43,7 +43,7 @@ Explicit gaps (currently clear `Unsupported` errors):
 | Map projections (`n{.name}`) | parser |
 | Unknown functions | codegen |
 
-Silently absent areas: shortest paths, `exists()`, `FOREACH`, `CALL`, most
+Silently absent areas: shortest paths, `FOREACH`, `CALL`, most
 of the built-in function library, and temporal/spatial value types.
 
 Known semantic deviations to close:
@@ -64,12 +64,11 @@ Status markers: `[done]` implemented and gated, `[partial]` some items
 finished, `[pending]` not started. Items the TCK does not exercise are
 verified by unit and integration tests and must not regress the report.
 
-Current baseline: 2048 of 3897 scenarios passing (52.5%), 1849 allow-listed.
+Current baseline: 2084 of 3897 scenarios passing (53.5%), 1813 allow-listed.
 The remaining list is dominated by temporal types (~1000, Phase 3), the
 error-kind/phase and ordering/comparison sweeps (~690, Phase 4), the function
-library (Phase 2), pattern predicates (~50, Phase 1B), eager evaluation after
-writes (Phase 4) and CALL procedure registration (52, unreachable: the TCK
-registers test procedures).
+library (Phase 2), eager evaluation after writes (Phase 4) and CALL procedure
+registration (52, unreachable: the TCK registers test procedures).
 
 ### Phase 1 — Core language completion (large) [partial]
 
@@ -87,8 +86,12 @@ registers test procedures).
 - [done] Named paths and path values: `p = …`, `nodes(p)`,
   `relationships(p)`, `length(p)`, plus the variable re-binding validations
   (93 scenarios).
-- [ ] Pattern predicates in `WHERE`, `exists()`, and `shortestPath()` /
-  `allShortestPaths()`; pattern comprehensions depend on them (~50).
+- [done] Pattern predicates in `WHERE` (including `NOT`, `AND`, `OR`) and
+  `exists()`, plus pattern comprehensions (`[p = (a)-->(b) WHERE … | …]`)
+  anywhere an expression is allowed (36 scenarios). Nested pattern
+  expressions inside list comprehensions are rejected: their bodies are
+  evaluated per element without plan nodes (one scenario, Phase 4).
+- [ ] `shortestPath()` / `allShortestPaths()`; TCK-blind: unit tests only.
 - [done] Non-literal property values in `MATCH` patterns (`{key: expr}`)
   compile to runtime filters while literals keep index seeks; `MERGE` already
   supports expressions. TCK-blind: unit and integration tests only.
