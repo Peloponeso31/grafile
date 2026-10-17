@@ -56,6 +56,21 @@ pub struct IndexSeek {
     pub value: crate::record::Value,
 }
 
+/// One element of a [`Plan::BindPath`] sequence.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PathElement {
+    /// A single bound value (a node, or a fixed relationship).
+    Value(String),
+    /// A variable-length segment: the relationship list and the node list
+    /// (one more node than relationships), interleaved into the path.
+    Segment {
+        /// Variable bound to the relationship list.
+        edges: String,
+        /// Variable bound to the node list.
+        nodes: String,
+    },
+}
+
 /// An operator in the logical plan.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Plan {
@@ -113,6 +128,12 @@ pub enum Plan {
         min: u32,
         /// Maximum hops; `None` is unbounded.
         max: Option<u32>,
+        /// Whether the trail runs against the pattern direction (the plan
+        /// expands from the pattern's end), so the bound edge list has to
+        /// be reversed to read from the pattern's start.
+        reverse: bool,
+        /// Optional variable bound to the traversal's node list.
+        nodes: Option<String>,
     },
     /// Expand from a bound node to its neighbors.
     Expand {
@@ -151,9 +172,8 @@ pub enum Plan {
         input: Box<Plan>,
         /// Variable to bind.
         var: String,
-        /// `(variable, splice)` elements in path order; splice extends
-        /// variable-length relationship lists into individual edges.
-        elements: Vec<(String, bool)>,
+        /// Elements in path order.
+        elements: Vec<PathElement>,
     },
     /// Run updating clauses once per element of a list.
     Foreach {
@@ -199,6 +219,8 @@ pub enum Plan {
         max: Option<u32>,
         /// Whether every path of minimal length is produced.
         all: bool,
+        /// Optional variable bound to the path's node list.
+        nodes: Option<String>,
     },
     /// Pattern predicate: binds `var` to whether the inner plan matches.
     PatternPredicate {
@@ -418,9 +440,11 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
             props,
             min,
             max,
+            reverse,
+            nodes: _,
         } => {
             out.push_str(&format!(
-                "{pad}VarExpand {src}-[{edge:?}:{types:?} {direction:?} {min}..{max:?}]->{dst} props={}\n",
+                "{pad}VarExpand {src}-[{edge:?}:{types:?} {direction:?} {min}..{max:?}]->{dst} props={} reverse={reverse}\n",
                 props.len()
             ));
             explain(input, indent + 1, out);

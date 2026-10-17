@@ -26,6 +26,24 @@ pub struct Database {
     fragments: FragmentStore,
 }
 
+/// One variable-length expansion: the relationships in traversal order and
+/// the nodes they connect (one more node than edges).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trail {
+    /// Relationships in traversal order.
+    pub edges: Vec<u64>,
+    /// Nodes in traversal order; `nodes[i]` and `nodes[i + 1]` are the
+    /// endpoints of `edges[i]`.
+    pub nodes: Vec<u64>,
+}
+
+impl Trail {
+    /// The final node of the trail.
+    pub fn end(&self) -> u64 {
+        *self.nodes.last().expect("a trail always has a start node")
+    }
+}
+
 impl Database {
     /// Create a new database file.
     pub fn create(vfs: Arc<dyn Vfs>, path: &Path, page_size: u32) -> Result<Self> {
@@ -448,7 +466,7 @@ impl Database {
         props: &[(String, Value)],
         min: u32,
         max: Option<u32>,
-    ) -> Result<Vec<(Vec<u64>, u64)>> {
+    ) -> Result<Vec<Trail>> {
         // Property key names are resolved per call, so keys created by the
         // same statement are seen. An unknown key matches nothing.
         let mut keyed = Vec::with_capacity(props.len());
@@ -460,11 +478,15 @@ impl Database {
         }
         let mut out = Vec::new();
         if min == 0 {
-            out.push((Vec::new(), src));
+            out.push(Trail {
+                edges: Vec::new(),
+                nodes: vec![src],
+            });
         }
         let mut trail = Vec::new();
+        let mut nodes = vec![src];
         self.var_expand_rec(
-            src, directions, types, &keyed, min, max, &mut trail, &mut out,
+            src, directions, types, &keyed, min, max, &mut trail, &mut nodes, &mut out,
         )?;
         Ok(out)
     }
@@ -484,7 +506,7 @@ impl Database {
         min: u32,
         max: Option<u32>,
         all: bool,
-    ) -> Result<Vec<(Vec<u64>, u64)>> {
+    ) -> Result<Vec<Trail>> {
         // Property key names are resolved per call, so keys created by the
         // same statement are seen. An unknown key matches nothing.
         let mut keyed = Vec::with_capacity(props.len());
@@ -496,7 +518,7 @@ impl Database {
         }
         // Shortest paths are simple: a node may not repeat. Each frontier
         // entry carries its edge list and visited nodes.
-        let mut out: Vec<(Vec<u64>, u64)> = Vec::new();
+        let mut out: Vec<Trail> = Vec::new();
         let mut frontier: Vec<(u64, Vec<u64>, Vec<u64>)> = vec![(src, Vec::new(), vec![src])];
         let mut length = 0u32;
         let mut emitted: Vec<u64> = Vec::new();
@@ -504,10 +526,13 @@ impl Database {
             if length >= min {
                 match dst {
                     Some(target) => {
-                        let mut found: Vec<(Vec<u64>, u64)> = frontier
+                        let mut found: Vec<Trail> = frontier
                             .iter()
                             .filter(|(node, _, _)| *node == target)
-                            .map(|(node, trail, _)| (trail.clone(), *node))
+                            .map(|(_, trail, nodes)| Trail {
+                                edges: trail.clone(),
+                                nodes: nodes.clone(),
+                            })
                             .collect();
                         if !found.is_empty() {
                             if !all {
@@ -517,17 +542,20 @@ impl Database {
                         }
                     }
                     None => {
-                        let mut found: Vec<(Vec<u64>, u64)> = frontier
+                        let mut found: Vec<Trail> = frontier
                             .iter()
                             .filter(|(node, _, _)| !emitted.contains(node))
-                            .map(|(node, trail, _)| (trail.clone(), *node))
+                            .map(|(_, trail, nodes)| Trail {
+                                edges: trail.clone(),
+                                nodes: nodes.clone(),
+                            })
                             .collect();
                         if !found.is_empty() {
-                            found.sort_unstable_by_key(|(_, node)| *node);
+                            found.sort_unstable_by_key(Trail::end);
                             if !all {
-                                found.dedup_by_key(|(_, node)| *node);
+                                found.dedup_by_key(|trail| trail.end());
                             }
-                            emitted.extend(found.iter().map(|(_, node)| *node));
+                            emitted.extend(found.iter().map(Trail::end));
                             out.extend(found);
                         }
                     }
@@ -569,7 +597,8 @@ impl Database {
         min: u32,
         max: Option<u32>,
         trail: &mut Vec<u64>,
-        out: &mut Vec<(Vec<u64>, u64)>,
+        nodes: &mut Vec<u64>,
+        out: &mut Vec<Trail>,
     ) -> Result<()> {
         if let Some(max) = max
             && trail.len() as u32 >= max
@@ -587,11 +616,16 @@ impl Database {
                 continue;
             }
             trail.push(edge);
+            nodes.push(next);
             if trail.len() as u32 >= min {
-                out.push((trail.clone(), next));
+                out.push(Trail {
+                    edges: trail.clone(),
+                    nodes: nodes.clone(),
+                });
             }
-            self.var_expand_rec(next, directions, types, props, min, max, trail, out)?;
+            self.var_expand_rec(next, directions, types, props, min, max, trail, nodes, out)?;
             trail.pop();
+            nodes.pop();
         }
         Ok(())
     }

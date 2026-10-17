@@ -1044,6 +1044,57 @@ fn standard_deviations() {
     );
 }
 
+// ---- matching semantics ----
+
+#[test]
+fn relationships_are_distinct_within_a_pattern() {
+    let mut conn = connection();
+    conn.execute("CREATE (:A)-[:T1]->(l:Looper), (l)-[:LOOP]->(l), (l)-[:T2]->(:B)")
+        .expect("seed");
+    let rows = query(
+        &mut conn,
+        "MATCH (x:A)-[r1]->(y)-[r2]-(z) RETURN type(r2), labels(z) ORDER BY type(r2)",
+    );
+    assert_eq!(rows, vec![vec!["LOOP", "[Looper]"], vec!["T2", "[B]"]]);
+    // A self-loop matches once.
+    let rows = query(&mut conn, "MATCH (n)-[r:LOOP]->(n) RETURN count(r)");
+    assert_eq!(rows, vec![vec!["1"]]);
+}
+
+#[test]
+fn named_variable_length_paths_include_intermediate_nodes() {
+    let mut conn = connection();
+    conn.execute("CREATE (a {n: 'a'})-[:K]->(b {n: 'b'})-[:K]->(c {n: 'c'})")
+        .expect("seed");
+    let rows = query(
+        &mut conn,
+        "MATCH p = (a {n: 'a'})-[:K*2..2]->(c) RETURN size(nodes(p)), size(relationships(p))",
+    );
+    assert_eq!(rows, vec![vec!["3", "2"]]);
+}
+
+#[test]
+fn keywords_and_repeated_types_in_patterns() {
+    let mut conn = connection();
+    conn.execute("CREATE (a:A)-[:CONTAINS]->(b:B)")
+        .expect("seed");
+    let rows = query(
+        &mut conn,
+        "MATCH (a)-[:CONTAINS|:CONTAINS]->(b) RETURN count(b)",
+    );
+    assert_eq!(rows, vec![vec!["1"]]);
+}
+
+#[test]
+fn bidirectional_arrow_is_undirected() {
+    let mut conn = connection();
+    conn.execute("CREATE (a:A)-[:T]->(b:B)").expect("seed");
+    let rows = query(&mut conn, "MATCH (a:A)<-->(b:B) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["1"]]);
+    let rows = query(&mut conn, "MATCH (b:B)<-->(a:A) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["1"]]);
+}
+
 // ---- comparison and ordering semantics ----
 
 #[test]
@@ -1483,17 +1534,18 @@ fn rebinding_a_path_variable_is_rejected() {
 }
 
 #[test]
-fn rebinding_a_relationship_in_the_same_section_is_rejected() {
+fn rebinding_a_relationship_in_the_same_pattern_is_rejected() {
     let mut conn = connection();
+    // The same relationship variable cannot appear twice in one pattern.
     let err = conn
-        .query("MATCH ()-[r]->() MATCH ()-[r]->() RETURN r", &Params::new())
+        .query("MATCH (a)-[r]->(b)-[r]->(c) RETURN r", &Params::new())
         .expect_err("relationship rebound");
     assert_eq!(err.code(), grafile::ErrorCode::Syntax);
-    // Through WITH it constrains the pattern instead.
+    // Across MATCH clauses (or through WITH) it constrains the pattern.
     conn.execute("CREATE (:A)-[:T]->(:B)").expect("create");
     let rows = query(
         &mut conn,
-        "MATCH ()-[r]->() WITH r LIMIT 1 MATCH (a)-[r]->(b) RETURN a IS NOT NULL AS ok",
+        "MATCH ()-[r]->() WITH r MATCH (a)-[r]->(b) RETURN a IS NOT NULL AS ok",
     );
     assert_eq!(rows, vec![vec!["true"]]);
 }

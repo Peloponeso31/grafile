@@ -386,8 +386,8 @@ pub enum Op {
     BuildPath {
         /// Destination register.
         dest: u32,
-        /// `(register, splice)` elements in path order.
-        elements: Vec<(u32, bool)>,
+        /// Elements in path order.
+        elements: Vec<BuildPathPart>,
     },
     /// Append a value to a list register (rebuilding the list).
     ListPush {
@@ -451,8 +451,13 @@ pub enum Op {
         cursor: u32,
         /// Destination register for the edge list.
         edges: u32,
+        /// Destination register for the node list.
+        nodes: u32,
         /// Destination register for the end node.
         node: u32,
+        /// Whether the trail runs against the pattern direction, so the
+        /// bound lists read from the pattern's start.
+        reverse: bool,
         /// Jump target when exhausted.
         target: u32,
     },
@@ -542,6 +547,21 @@ pub enum Op {
 
 /// Sentinel property key id meaning "no such property".
 pub const NO_KEY: u32 = u32::MAX;
+
+/// One element of an [`Op::BuildPath`] sequence.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BuildPathPart {
+    /// A single value from a register.
+    Value(u32),
+    /// A variable-length segment: its relationship and node registers are
+    /// interleaved into the path (nodes first, then relationships).
+    Segment {
+        /// Register holding the relationship list.
+        edges: u32,
+        /// Register holding the node list.
+        nodes: u32,
+    },
+}
 
 /// Function codes for [`Op::Function`].
 pub mod func {
@@ -743,7 +763,7 @@ enum Cursor {
         pos: usize,
     },
     Trails {
-        items: Vec<(Vec<u64>, u64)>,
+        items: Vec<crate::engine::Trail>,
         pos: usize,
     },
     Rows {
@@ -1487,7 +1507,9 @@ impl<'a> Executor<'a> {
             Op::VarExpandNext {
                 cursor,
                 edges,
+                nodes,
                 node,
+                reverse,
                 target,
             } => {
                 let next = match &mut self.cursors[*cursor as usize] {
@@ -1501,10 +1523,20 @@ impl<'a> Executor<'a> {
                     _ => return Err(Error::internal("VarExpandNext on a non-trail cursor")),
                 };
                 match next {
-                    Some((edge_ids, end)) => {
-                        let values: Vec<Value> =
-                            edge_ids.iter().map(|id| Value::Edge(*id)).collect();
+                    Some(trail) => {
+                        // The end node stays the traversal's last node even
+                        // when the lists are read from the pattern's start.
+                        let end = trail.end();
+                        let mut values: Vec<Value> =
+                            trail.edges.iter().map(|id| Value::Edge(*id)).collect();
+                        let mut node_values: Vec<Value> =
+                            trail.nodes.iter().map(|id| Value::Node(*id)).collect();
+                        if *reverse {
+                            values.reverse();
+                            node_values.reverse();
+                        }
                         self.regs[*edges as usize] = Reg::Value(Value::List(values.into()));
+                        self.regs[*nodes as usize] = Reg::Value(Value::List(node_values.into()));
                         self.regs[*node as usize] = Reg::Node(end);
                     }
                     None => self.pc = *target as usize,
@@ -1512,11 +1544,35 @@ impl<'a> Executor<'a> {
             }
             Op::BuildPath { dest, elements } => {
                 let mut items: Vec<Value> = Vec::new();
-                for (reg, splice) in elements {
-                    let value = self.reg_value(*reg)?;
-                    match (splice, value) {
-                        (true, Value::List(inner)) => items.extend(inner.iter().cloned()),
-                        (_, value) => items.push(value),
+                for element in elements {
+                    match element {
+                        BuildPathPart::Value(reg) => items.push(self.reg_value(*reg)?),
+                        BuildPathPart::Segment { edges, nodes } => {
+                            // Interleave the segment's nodes and
+                            // relationships; a zero-length segment contains
+                            // only its start node, which is already on the
+                            // path.
+                            let edges = self.reg_value(*edges)?;
+                            let nodes = self.reg_value(*nodes)?;
+                            let (Value::List(edges), Value::List(nodes)) = (edges, nodes) else {
+                                return Err(Error::internal(
+                                    "variable-length path parts must be lists",
+                                ));
+                            };
+                            for (index, edge) in edges.iter().enumerate() {
+                                if let Some(node) = nodes.get(index)
+                                    && items.last() != Some(node)
+                                {
+                                    items.push(node.clone());
+                                }
+                                items.push(edge.clone());
+                            }
+                            if let Some(last) = nodes.last()
+                                && items.last() != Some(last)
+                            {
+                                items.push(last.clone());
+                            }
+                        }
                     }
                 }
                 self.regs[*dest as usize] = Reg::Value(Value::List(items.into()));

@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::planner::Prepared;
 use crate::planner::plan::{CreateItem, Plan};
 use crate::record::Value;
-use crate::vdbe::{AggSpec, Op, Program, binary_code, func, unary_code};
+use crate::vdbe::{AggSpec, BuildPathPart, Op, Program, binary_code, func, unary_code};
 
 /// Register/variable context for the row currently being compiled.
 #[derive(Clone)]
@@ -244,6 +244,8 @@ impl Codegen {
                 props,
                 min,
                 max,
+                reverse,
+                nodes,
             } => self.compile(input, ctx, &mut |cg, ctx| {
                 let src_reg = *ctx.vars.get(src).ok_or_else(|| undefined(src))?;
                 let cursor = cg.alloc_cursor();
@@ -268,15 +270,21 @@ impl Codegen {
                 });
                 let loop_start = cg.ops.len() as u32;
                 let edge_reg = cg.alloc_reg();
+                let nodes_reg = cg.alloc_reg();
                 let node_reg = cg.alloc_reg();
                 let jump = cg.emit(Op::VarExpandNext {
                     cursor,
                     edges: edge_reg,
+                    nodes: nodes_reg,
                     node: node_reg,
+                    reverse: *reverse,
                     target: 0,
                 });
                 if let Some(edge_var) = edge {
                     ctx.vars.insert(edge_var.clone(), edge_reg);
+                }
+                if let Some(nodes_var) = nodes {
+                    ctx.vars.insert(nodes_var.clone(), nodes_reg);
                 }
                 ctx.vars.insert(dst.clone(), node_reg);
                 ctx.window_len = cg.next_reg - ctx.window_start;
@@ -366,9 +374,18 @@ impl Codegen {
                 elements,
             } => self.compile(input, ctx, &mut |cg, ctx| {
                 let mut regs = Vec::with_capacity(elements.len());
-                for (name, splice) in elements {
-                    let reg = *ctx.vars.get(name).ok_or_else(|| undefined(name))?;
-                    regs.push((reg, *splice));
+                for element in elements {
+                    regs.push(match element {
+                        crate::planner::plan::PathElement::Value(name) => BuildPathPart::Value(
+                            *ctx.vars.get(name).ok_or_else(|| undefined(name))?,
+                        ),
+                        crate::planner::plan::PathElement::Segment { edges, nodes } => {
+                            BuildPathPart::Segment {
+                                edges: *ctx.vars.get(edges).ok_or_else(|| undefined(edges))?,
+                                nodes: *ctx.vars.get(nodes).ok_or_else(|| undefined(nodes))?,
+                            }
+                        }
+                    });
                 }
                 let dest = cg.alloc_reg();
                 cg.emit(Op::BuildPath {
@@ -455,6 +472,7 @@ impl Codegen {
                 min,
                 max,
                 all,
+                nodes,
             } => self.compile(input, ctx, &mut |cg, ctx| {
                 let src_reg = *ctx.vars.get(src).ok_or_else(|| undefined(src))?;
                 // An unbound target searches for the shortest path to every
@@ -484,15 +502,21 @@ impl Codegen {
                 });
                 let loop_start = cg.ops.len() as u32;
                 let edge_reg = cg.alloc_reg();
+                let nodes_reg = cg.alloc_reg();
                 let node_reg = cg.alloc_reg();
                 let jump = cg.emit(Op::VarExpandNext {
                     cursor,
                     edges: edge_reg,
+                    nodes: nodes_reg,
                     node: node_reg,
+                    reverse: false,
                     target: 0,
                 });
                 if let Some(edge_var) = edge {
                     ctx.vars.insert(edge_var.clone(), edge_reg);
+                }
+                if let Some(nodes_var) = nodes {
+                    ctx.vars.insert(nodes_var.clone(), nodes_reg);
                 }
                 // A bound target keeps its register; only an unbound target
                 // is bound by the search.
@@ -893,7 +917,13 @@ impl Codegen {
                 if let Some((var, elements)) = path {
                     let mut regs = Vec::with_capacity(elements.len());
                     for (name, splice) in elements {
-                        regs.push((cg.var_reg(outer_ctx, name)?, *splice));
+                        let reg = cg.var_reg(outer_ctx, name)?;
+                        if *splice {
+                            return Err(crate::error::Error::internal(
+                                "MERGE paths cannot splice variable-length segments",
+                            ));
+                        }
+                        regs.push(BuildPathPart::Value(reg));
                     }
                     let dest = cg.alloc_reg();
                     cg.emit(Op::BuildPath {

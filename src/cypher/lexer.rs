@@ -170,8 +170,8 @@ pub enum Token {
     /// Double-quoted string.
     #[regex(r#""([^"\\]|\\.)*""#)]
     StringDouble,
-    /// `$parameter`.
-    #[regex(r"\$[A-Za-z_][A-Za-z0-9_]*")]
+    /// `$parameter` (numeric names such as `$1` occur in the TCK).
+    #[regex(r"\$[A-Za-z0-9_]+")]
     Param,
 
     /// `=~`

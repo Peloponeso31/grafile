@@ -14,14 +14,14 @@ use std::collections::HashMap;
 use hashlink::LinkedHashMap as FastMap;
 
 use crate::cypher::{
-    BinaryOp, Clause, Expr, MatchClause, NodePattern, PatternPath, Query, RelDirection, ReturnItem,
-    SetItem, Shortest, SortItem, UnaryOp,
+    BinaryOp, Clause, Expr, MatchClause, NodePattern, PatternPath, QuantifierKind, Query,
+    RelDirection, ReturnItem, SetItem, Shortest, SortItem, UnaryOp,
 };
 use crate::engine::Database;
 use crate::error::{Error, ErrorCode, Result};
 use crate::record::Value;
 use crate::vdbe::NO_KEY;
-use plan::{AggFn, AggItem, CreateItem, IndexSeek, Plan};
+use plan::{AggFn, AggItem, CreateItem, IndexSeek, PathElement, Plan};
 
 pub use plan::explain;
 
@@ -134,6 +134,9 @@ impl<'a> Planner<'a> {
         for clause in clauses {
             match clause {
                 Clause::Match(matched) => {
+                    // Relationship-variable reuse errors apply within one
+                    // MATCH clause; later clauses may rebind the variable.
+                    self.pattern_rels.clear();
                     self.plan_match(matched, &mut plan, &mut scope)?;
                 }
                 clause @ (Clause::Create(_)
@@ -774,6 +777,7 @@ impl<'a> Planner<'a> {
             }
             None => self.anon_name("rel"),
         };
+        let shortest_nodes_var = bind_path.as_ref().map(|_| self.anon_name("nodes"));
         *plan = Plan::ShortestPath {
             input: Box::new(plan.clone()),
             src: src_node.var.clone(),
@@ -788,6 +792,7 @@ impl<'a> Planner<'a> {
             min: bounds.min,
             max: bounds.max,
             all,
+            nodes: shortest_nodes_var.clone(),
         };
         // The search binds the target; labels and properties it does not
         // enforce become a post-filter.
@@ -804,9 +809,11 @@ impl<'a> Planner<'a> {
                 )));
             }
             let elements = vec![
-                (start.var.clone(), false),
-                (edge_var.clone(), true),
-                (end.var.clone(), false),
+                PathElement::Value(start.var.clone()),
+                PathElement::Segment {
+                    edges: edge_var.clone(),
+                    nodes: shortest_nodes_var.clone().expect("shortest path node list"),
+                },
             ];
             scope.insert(path_var.clone(), VarKind::Path);
             *plan = Plan::BindPath {
@@ -838,6 +845,9 @@ impl<'a> Planner<'a> {
             props: Vec<(String, Value)>,
             prop_exprs: Vec<(String, Expr)>,
             var_length: Option<crate::cypher::VarLength>,
+            /// Hidden variable for the traversal's node list, when a named
+            /// path needs the intermediate nodes.
+            nodes_var: Option<String>,
         }
         let mut rels: Vec<RelInfo> = Vec::new();
         for segment in &path.segments {
@@ -867,6 +877,11 @@ impl<'a> Planner<'a> {
                     .collect(),
                 prop_exprs,
                 var_length: rel.var_length,
+                nodes_var: if rel.var_length.is_some() && path.variable.is_some() {
+                    Some(self.anon_name("nodes"))
+                } else {
+                    None
+                },
             });
         }
 
@@ -876,6 +891,12 @@ impl<'a> Planner<'a> {
             .collect();
         let mut scanned = vec![false; nodes.len()];
         let mut handled = vec![false; rels.len()];
+        // Relationship variables bound by this pattern; openCypher requires
+        // every relationship in a pattern to be distinct.
+        let mut distinct_edges: Vec<String> = Vec::new();
+        // Variable-length segments: their edge lists must not overlap with
+        // any other relationship of the pattern either.
+        let mut segments: Vec<String> = Vec::new();
         loop {
             if bound.iter().all(|b| *b) && handled.iter().all(|h| *h) {
                 break;
@@ -887,12 +908,12 @@ impl<'a> Planner<'a> {
                     continue;
                 }
                 let (from, to) = (rel.index, rel.index + 1);
-                let direction = if bound[from] && !bound[to] {
-                    Some((from, to, rel.direction))
+                let (direction, reverse) = if bound[from] && !bound[to] {
+                    (Some((from, to, rel.direction)), false)
                 } else if bound[to] && !bound[from] {
-                    Some((to, from, flip(rel.direction)))
+                    (Some((to, from, flip(rel.direction))), true)
                 } else {
-                    None
+                    (None, false)
                 };
                 let Some((from_idx, to_idx, direction)) = direction else {
                     continue;
@@ -917,6 +938,8 @@ impl<'a> Planner<'a> {
                         props: rel.props.clone(),
                         min: bounds.min,
                         max: bounds.max,
+                        reverse,
+                        nodes: rel.nodes_var.clone(),
                     },
                     None => Plan::Expand {
                         input: Box::new(plan.clone()),
@@ -931,7 +954,18 @@ impl<'a> Planner<'a> {
                 constrain_edge(plan, &edge_var, &rel.var, edge_bound);
                 constrain_edge_props(plan, &edge_var, &rel.prop_exprs);
                 scope.insert(nodes[to_idx].var.clone(), VarKind::Node);
-                bound[to_idx] = true;
+                if rel.var_length.is_none() {
+                    distinct_edges.push(edge_var.clone());
+                } else {
+                    segments.push(edge_var.clone());
+                }
+                // Binding the endpoint may bind a repeated variable used by
+                // other pattern elements as well.
+                for (index, node) in nodes.iter().enumerate() {
+                    if scope.contains_key(&node.var) {
+                        bound[index] = true;
+                    }
+                }
                 handled[idx] = true;
                 progressed = true;
                 break;
@@ -970,6 +1004,8 @@ impl<'a> Planner<'a> {
                         props: rel.props.clone(),
                         min: bounds.min,
                         max: bounds.max,
+                        reverse: false,
+                        nodes: rel.nodes_var.clone(),
                     },
                     None => Plan::Expand {
                         input: Box::new(plan.clone()),
@@ -991,6 +1027,11 @@ impl<'a> Planner<'a> {
                 };
                 constrain_edge(plan, &edge_var, &rel.var, edge_bound);
                 constrain_edge_props(plan, &edge_var, &rel.prop_exprs);
+                if rel.var_length.is_none() {
+                    distinct_edges.push(edge_var.clone());
+                } else {
+                    segments.push(edge_var.clone());
+                }
                 handled[idx] = true;
                 progressed = true;
                 break;
@@ -1014,6 +1055,65 @@ impl<'a> Planner<'a> {
             };
             bound[idx] = true;
             scanned[idx] = true;
+            // The scan may bind a variable that other pattern elements
+            // mention; they are bound now too.
+            for (index, node) in nodes.iter().enumerate() {
+                if scope.contains_key(&node.var) {
+                    bound[index] = true;
+                }
+            }
+        }
+        // Every relationship in one pattern binds a distinct edge. A
+        // variable-length segment is a list, so its relationships must not
+        // contain any fixed relationship of the pattern nor overlap another
+        // segment's list.
+        for left in 0..distinct_edges.len() {
+            for right in (left + 1)..distinct_edges.len() {
+                *plan = Plan::Filter {
+                    input: Box::new(plan.clone()),
+                    predicate: Expr::Binary {
+                        op: BinaryOp::Ne,
+                        left: Box::new(Expr::Variable(distinct_edges[left].clone())),
+                        right: Box::new(Expr::Variable(distinct_edges[right].clone())),
+                    },
+                };
+            }
+        }
+        for segment in &segments {
+            for fixed in &distinct_edges {
+                *plan = Plan::Filter {
+                    input: Box::new(plan.clone()),
+                    predicate: Expr::Unary {
+                        op: UnaryOp::Not,
+                        expr: Box::new(Expr::Binary {
+                            op: BinaryOp::In,
+                            left: Box::new(Expr::Variable(fixed.clone())),
+                            right: Box::new(Expr::Variable(segment.clone())),
+                        }),
+                    },
+                };
+            }
+        }
+        for left in 0..segments.len() {
+            for right in (left + 1)..segments.len() {
+                let element = self.anon_name("element");
+                *plan = Plan::Filter {
+                    input: Box::new(plan.clone()),
+                    predicate: Expr::Unary {
+                        op: UnaryOp::Not,
+                        expr: Box::new(Expr::Quantifier {
+                            kind: QuantifierKind::Any,
+                            var: element.clone(),
+                            list: Box::new(Expr::Variable(segments[left].clone())),
+                            predicate: Box::new(Expr::Binary {
+                                op: BinaryOp::In,
+                                left: Box::new(Expr::Variable(element)),
+                                right: Box::new(Expr::Variable(segments[right].clone())),
+                            }),
+                        }),
+                    },
+                };
+            }
         }
         // Constraints a scan did not enforce: every label beyond the first on
         // scanned nodes, and all labels and literal properties on nodes that
@@ -1033,10 +1133,22 @@ impl<'a> Planner<'a> {
                     "variable `{path_var}` is already bound"
                 )));
             }
-            let mut elements = vec![(nodes[0].var.clone(), false)];
+            let mut elements = vec![PathElement::Value(nodes[0].var.clone())];
             for (idx, rel) in rels.iter().enumerate() {
-                elements.push((rel.var.clone(), rel.var_length.is_some()));
-                elements.push((nodes[idx + 1].var.clone(), false));
+                match (&rel.var_length, &rel.nodes_var) {
+                    (Some(_), Some(nodes_var)) => {
+                        // A variable-length segment carries its own node
+                        // list; the end node is its last element.
+                        elements.push(PathElement::Segment {
+                            edges: rel.var.clone(),
+                            nodes: nodes_var.clone(),
+                        });
+                    }
+                    _ => {
+                        elements.push(PathElement::Value(rel.var.clone()));
+                        elements.push(PathElement::Value(nodes[idx + 1].var.clone()));
+                    }
+                }
             }
             scope.insert(path_var.clone(), VarKind::Path);
             *plan = Plan::BindPath {
@@ -1275,6 +1387,9 @@ impl<'a> Planner<'a> {
                         .ok_or_else(|| Error::internal("anonymous bound node"))?,
                 };
                 let rel = &segment.relationship;
+                if rel.direction == RelDirection::Undirected {
+                    return Err(Error::syntax("CREATE requires a directed relationship"));
+                }
                 if rel.types.len() != 1 {
                     return Err(Error::syntax(
                         "relationships in CREATE must have exactly one type",

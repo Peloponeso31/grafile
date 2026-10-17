@@ -348,9 +348,9 @@ impl<'a> Parser<'a> {
                     value,
                 });
             } else if self.eat(Token::Colon) {
-                let mut labels = vec![self.parse_name()?];
+                let mut labels = vec![self.parse_symbol_name()?];
                 while self.eat(Token::Colon) {
-                    labels.push(self.parse_name()?);
+                    labels.push(self.parse_symbol_name()?);
                 }
                 items.push(SetItem::Label { variable, labels });
             } else if !remove && self.eat(Token::PlusEquals) {
@@ -538,7 +538,7 @@ impl<'a> Parser<'a> {
             pattern.variable = Some(self.parse_name()?);
         }
         while self.eat(Token::Colon) {
-            pattern.labels.push(self.parse_name()?);
+            pattern.labels.push(self.parse_symbol_name()?);
         }
         if self.peek() == Some(Token::LBrace) {
             pattern.properties = Some(self.parse_map_literal()?);
@@ -560,14 +560,24 @@ impl<'a> Parser<'a> {
             var_length: None,
             properties: None,
         };
+        let mut bracketed = false;
         if self.eat(Token::LBracket) {
+            bracketed = true;
             if matches!(self.peek(), Some(Token::Ident) | Some(Token::EscapedIdent)) {
                 pattern.variable = Some(self.parse_name()?);
             }
             if self.eat(Token::Colon) {
-                pattern.types.push(self.parse_name()?);
+                pattern.types.push(self.parse_symbol_name()?);
                 while self.eat(Token::Pipe) {
-                    pattern.types.push(self.parse_name()?);
+                    // `:T|:U` and `:T|U` are both accepted.
+                    self.eat(Token::Colon);
+                    let name = self.parse_symbol_name()?;
+                    // `:T|:T` is the same filter twice.
+                    if !pattern.types.contains(&name) {
+                        pattern.types.push(name);
+                    }
+                    // Repeated types are impossible, so the loop only needs
+                    // to skip them at the end.
                 }
             }
             if self.eat(Token::Star) {
@@ -587,6 +597,10 @@ impl<'a> Parser<'a> {
             (Token::Minus, Token::Minus) => RelDirection::Undirected,
             (Token::Minus, Token::ArrowRight) => RelDirection::Outgoing,
             (Token::ArrowLeft, Token::Minus) => RelDirection::Incoming,
+            // `(a)<-->(b)` is Neo4j's bidirectional spelling of an
+            // undirected relationship; `<-[:T]->` with both arrows and
+            // brackets is rejected.
+            (Token::ArrowLeft, Token::ArrowRight) if !bracketed => RelDirection::Undirected,
             _ => return self.fail("invalid relationship direction"),
         };
         Ok(pattern)
@@ -639,6 +653,22 @@ impl<'a> Parser<'a> {
                 Ok(self.source[spanned.start..spanned.end].to_owned())
             }
             _ => self.fail("expected a map key"),
+        }
+    }
+
+    /// A label or relationship type name: identifiers and keywords are
+    /// both accepted (`:CONTAINS` is a valid type).
+    fn parse_symbol_name(&mut self) -> Result<String> {
+        if matches!(self.peek(), Some(Token::Ident) | Some(Token::EscapedIdent)) {
+            return self.parse_name();
+        }
+        match self.peek() {
+            Some(token) if token.is_keyword() => {
+                self.advance();
+                let spanned = self.tokens[self.pos - 1];
+                Ok(self.source[spanned.start..spanned.end].to_owned())
+            }
+            _ => self.fail("expected a label or type name"),
         }
     }
 
@@ -928,9 +958,9 @@ impl<'a> Parser<'a> {
                 }
                 Some(Token::Colon) => {
                     self.advance();
-                    let mut labels = vec![self.parse_name()?];
+                    let mut labels = vec![self.parse_symbol_name()?];
                     while self.eat(Token::Colon) {
-                        labels.push(self.parse_name()?);
+                        labels.push(self.parse_symbol_name()?);
                     }
                     expr = Expr::LabelCheck {
                         expr: Box::new(expr),
