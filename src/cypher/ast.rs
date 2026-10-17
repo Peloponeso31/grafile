@@ -423,6 +423,24 @@ pub enum Clause {
         /// Alias for each element.
         alias: String,
     },
+    /// `FOREACH (var IN list | updating clauses)`.
+    Foreach {
+        /// Loop variable.
+        var: String,
+        /// List expression.
+        list: Expr,
+        /// Updating clauses run once per element.
+        clauses: Vec<Clause>,
+    },
+    /// `CALL procedure(args) YIELD column [AS alias]`.
+    Call {
+        /// Dotted procedure name.
+        procedure: String,
+        /// Argument expressions.
+        args: Vec<Expr>,
+        /// Yielded columns with optional aliases.
+        yields: Vec<(String, Option<String>)>,
+    },
 }
 
 /// A parsed query: one or more union parts.

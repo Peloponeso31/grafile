@@ -147,6 +147,28 @@ pub enum Plan {
         /// variable-length relationship lists into individual edges.
         elements: Vec<(String, bool)>,
     },
+    /// Run updating clauses once per element of a list.
+    Foreach {
+        /// Input plan.
+        input: Box<Plan>,
+        /// Loop variable.
+        var: String,
+        /// List expression.
+        list: Expr,
+        /// Body, evaluated per element.
+        plan: Box<Plan>,
+    },
+    /// Call a built-in procedure and bind its outputs.
+    ProcedureCall {
+        /// Input plan.
+        input: Box<Plan>,
+        /// Dotted procedure name.
+        procedure: String,
+        /// Output columns in order.
+        columns: Vec<String>,
+        /// `(column, alias)` pairs to bind.
+        yields: Vec<(String, String)>,
+    },
     /// Shortest-path search from one endpoint to the other.
     ShortestPath {
         /// Input plan.
@@ -444,6 +466,29 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
             out.push_str(&format!(
                 "{pad}ShortestPath {src} -> {dst}{}\n",
                 if *all { " (all)" } else { "" }
+            ));
+            explain(input, indent + 1, out);
+        }
+        Plan::Foreach {
+            input, plan, var, ..
+        } => {
+            out.push_str(&format!("{pad}Foreach {var}\n"));
+            explain(plan, indent + 1, out);
+            explain(input, indent + 1, out);
+        }
+        Plan::ProcedureCall {
+            input,
+            procedure,
+            yields,
+            ..
+        } => {
+            out.push_str(&format!(
+                "{pad}ProcedureCall {procedure} {}\n",
+                yields
+                    .iter()
+                    .map(|(column, alias)| format!("{column} AS {alias}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
             explain(input, indent + 1, out);
         }

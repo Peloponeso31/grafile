@@ -177,6 +177,8 @@ impl<'a> Parser<'a> {
                     exprs: self.parse_expr_list()?,
                 })
             }
+            Some(Token::Foreach) => self.parse_foreach_clause(),
+            Some(Token::Call) => self.parse_call_clause(),
             _ => self.fail("expected a clause"),
         }
     }
@@ -467,6 +469,59 @@ impl<'a> Parser<'a> {
             predicate,
             projection: Box::new(projection),
         }))
+    }
+
+    fn parse_foreach_clause(&mut self) -> Result<Clause> {
+        self.advance();
+        self.expect(Token::LParen, "'(' after FOREACH")?;
+        let var = self.parse_name()?;
+        self.expect(Token::In, "IN after the FOREACH variable")?;
+        let list = self.parse_expr()?;
+        self.expect(Token::Pipe, "'|' before the FOREACH body")?;
+        let mut clauses = Vec::new();
+        while self.peek() != Some(Token::RParen) {
+            clauses.push(self.parse_clause()?);
+        }
+        self.expect(Token::RParen, "')' to close FOREACH")?;
+        if clauses.is_empty() {
+            return self.fail("FOREACH requires at least one updating clause");
+        }
+        Ok(Clause::Foreach { var, list, clauses })
+    }
+
+    fn parse_call_clause(&mut self) -> Result<Clause> {
+        self.advance();
+        let mut procedure = self.parse_name()?;
+        while self.eat(Token::Dot) {
+            procedure.push('.');
+            procedure.push_str(&self.parse_name()?);
+        }
+        self.expect(Token::LParen, "'(' after the procedure name")?;
+        let mut args = Vec::new();
+        if self.peek() != Some(Token::RParen) {
+            args = self.parse_expr_list()?;
+        }
+        self.expect(Token::RParen, "')' to close the procedure call")?;
+        let mut yields = Vec::new();
+        if self.eat(Token::Yield) {
+            loop {
+                let column = self.parse_name()?;
+                let alias = if self.eat(Token::As) {
+                    Some(self.parse_name()?)
+                } else {
+                    None
+                };
+                yields.push((column, alias));
+                if !self.eat(Token::Comma) {
+                    break;
+                }
+            }
+        }
+        Ok(Clause::Call {
+            procedure,
+            args,
+            yields,
+        })
     }
 
     fn parse_node_pattern(&mut self) -> Result<NodePattern> {

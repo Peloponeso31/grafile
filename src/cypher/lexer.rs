@@ -28,6 +28,15 @@ pub enum Token {
     /// `UNWIND`
     #[token("UNWIND", ignore(case))]
     Unwind,
+    /// `FOREACH`
+    #[token("FOREACH", ignore(case))]
+    Foreach,
+    /// `CALL`
+    #[token("CALL", ignore(case))]
+    Call,
+    /// `YIELD`
+    #[token("YIELD", ignore(case))]
+    Yield,
     /// `CREATE`
     #[token("CREATE", ignore(case))]
     Create,
@@ -322,6 +331,9 @@ impl Token {
                 | Return
                 | With
                 | Unwind
+                | Foreach
+                | Call
+                | Yield
                 | Create
                 | Merge
                 | Set

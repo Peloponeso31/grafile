@@ -406,6 +406,13 @@ pub enum Op {
         /// Maximum hops; `None` is unbounded.
         max: Option<u32>,
     },
+    /// Open a built-in procedure, filling a row cursor with its output.
+    ProcedureCallOpen {
+        /// Cursor slot.
+        cursor: u32,
+        /// Constant index of the procedure name.
+        name: u32,
+    },
     /// Open a shortest-path search from a node to a target node.
     ShortestOpen {
         /// Cursor slot.
@@ -1276,6 +1283,14 @@ impl<'a> Executor<'a> {
                 };
                 self.cursors[*cursor as usize] = Cursor::Trails { items, pos: 0 };
             }
+            Op::ProcedureCallOpen { cursor, name } => {
+                let name = match &self.program.constants[*name as usize] {
+                    Value::Text(name) => name.clone(),
+                    _ => return Err(Error::internal("procedure name is not text")),
+                };
+                let rows = self.procedure_rows(&name)?;
+                self.cursors[*cursor as usize] = Cursor::Rows { rows, pos: 0 };
+            }
             Op::ShortestOpen {
                 cursor,
                 src,
@@ -1706,6 +1721,33 @@ impl<'a> Executor<'a> {
             props.push((key_id, value.clone()));
         }
         Ok(props)
+    }
+
+    /// Output rows of a supported built-in procedure.
+    fn procedure_rows(&self, name: &str) -> Result<Vec<Vec<Reg>>> {
+        let schema = self.db.schema();
+        let mut values = Vec::new();
+        let mut id = 1u32;
+        loop {
+            let next = match name {
+                "db.labels" => schema.label_name(id),
+                "db.propertyKeys" => schema.property_key_name(id),
+                "db.relationshipTypes" => schema.edge_type_name(id),
+                other => {
+                    return Err(Error::unsupported(format!(
+                        "procedure `{other}` is not supported"
+                    )));
+                }
+            };
+            match next {
+                Some(entry) => {
+                    values.push(Reg::Value(Value::Text(entry.into())));
+                    id += 1;
+                }
+                None => break,
+            }
+        }
+        Ok(values.into_iter().map(|value| vec![value]).collect())
     }
 
     fn rows_mut(&mut self, cursor: u32) -> Result<(&mut Vec<Vec<Reg>>, usize)> {

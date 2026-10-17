@@ -379,6 +379,71 @@ impl Codegen {
                 ctx.window_len = cg.next_reg - ctx.window_start;
                 out(cg, ctx)
             }),
+            Plan::Foreach {
+                input,
+                var,
+                list,
+                plan,
+            } => self.compile(input, ctx, &mut |cg, ctx| {
+                let list_reg = cg.compile_expr(list, ctx)?;
+                let cursor = cg.alloc_cursor();
+                cg.emit(Op::UnwindInit {
+                    cursor,
+                    list: list_reg,
+                });
+                let loop_start = cg.ops.len() as u32;
+                let element = cg.alloc_reg();
+                let jump = cg.emit(Op::UnwindNext {
+                    cursor,
+                    dest: element,
+                    target: 0,
+                });
+                let mut inner_ctx = ctx.clone();
+                inner_ctx.vars.insert(var.clone(), element);
+                // The body's rows are discarded; the input row passes through.
+                cg.compile(plan, &mut inner_ctx, &mut |_cg, _ctx| Ok(()))?;
+                cg.emit(Op::Goto { target: loop_start });
+                let end = cg.ops.len() as u32;
+                cg.patch(jump, end)?;
+                out(cg, ctx)
+            }),
+            Plan::ProcedureCall {
+                input,
+                procedure,
+                columns,
+                yields,
+            } => self.compile(input, ctx, &mut |cg, ctx| {
+                let cursor = cg.alloc_cursor();
+                let name = cg.const_index(Value::from(procedure.as_str()));
+                cg.emit(Op::ProcedureCallOpen { cursor, name });
+                let base = cg.next_reg;
+                for _ in columns {
+                    cg.alloc_reg();
+                }
+                let mut inner_ctx = ctx.clone();
+                for (column, alias) in yields {
+                    let Some(index) = columns.iter().position(|name| name == column) else {
+                        return Err(Error::internal("procedure yield column is missing"));
+                    };
+                    inner_ctx.vars.insert(alias.clone(), base + index as u32);
+                }
+                inner_ctx.window_start = base;
+                inner_ctx.window_len = columns.len() as u32;
+                let empty = cg.emit(Op::CtxRewind { cursor, target: 0 });
+                let loop_start = cg.ops.len() as u32;
+                cg.emit(Op::CtxData {
+                    cursor,
+                    start: base,
+                    count: columns.len() as u32,
+                });
+                out(cg, &mut inner_ctx)?;
+                let next = cg.emit(Op::CtxNext { cursor, target: 0 });
+                cg.emit(Op::Goto { target: loop_start });
+                let end = cg.ops.len() as u32;
+                cg.patch(empty, end)?;
+                cg.patch(next, end)?;
+                Ok(())
+            }),
             Plan::ShortestPath {
                 input,
                 src,

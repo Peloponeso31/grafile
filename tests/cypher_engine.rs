@@ -1330,3 +1330,91 @@ fn shortest_path_requires_variable_length_single_segment() {
         .expect_err("multi-segment shortestPath must be rejected");
     assert!(err.to_string().contains("exactly one"), "{err}");
 }
+
+#[test]
+fn call_builtin_procedures() {
+    let mut conn = connection();
+    seed(&mut conn);
+    let rows = query(
+        &mut conn,
+        "CALL db.labels() YIELD label RETURN label ORDER BY label",
+    );
+    assert_eq!(rows, vec![vec!["Person"]]);
+    let rows = query(
+        &mut conn,
+        "CALL db.relationshipTypes() YIELD relationshipType RETURN relationshipType ORDER BY relationshipType",
+    );
+    assert_eq!(rows, vec![vec!["KNOWS"], vec!["LIKES"]]);
+    let rows = query(
+        &mut conn,
+        "CALL db.propertyKeys() YIELD propertyKey RETURN propertyKey ORDER BY propertyKey",
+    );
+    assert_eq!(rows, vec![vec!["age"], vec!["name"], vec!["since"]]);
+}
+
+#[test]
+fn call_yields_aliases_and_aggregates() {
+    let mut conn = connection();
+    seed(&mut conn);
+    let rows = query(
+        &mut conn,
+        "CALL db.labels() YIELD label AS l RETURN count(l) AS c",
+    );
+    assert_eq!(rows, vec![vec!["1"]]);
+}
+
+#[test]
+fn call_rejects_unknown_procedures() {
+    let mut conn = connection();
+    let err = conn
+        .query("CALL db.nope() YIELD x RETURN x", &Params::new())
+        .expect_err("unknown procedure must be rejected");
+    assert!(err.to_string().contains("not supported"), "{err}");
+    let err = conn
+        .query(
+            "CALL db.labels() YIELD missing RETURN missing",
+            &Params::new(),
+        )
+        .expect_err("unknown yield column must be rejected");
+    assert!(err.to_string().contains("no column"), "{err}");
+}
+
+#[test]
+fn foreach_creates_per_element() {
+    let mut conn = connection();
+    seed(&mut conn);
+    conn.execute(
+        "MATCH (n:Person {name: 'alice'}) FOREACH (x IN [1, 2, 3] | CREATE (:Tag {v: x}))",
+    )
+    .expect("foreach create");
+    let rows = query(&mut conn, "MATCH (t:Tag) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["3"]]);
+    let rows = query(&mut conn, "MATCH (t:Tag) RETURN count(*) ORDER BY count(*)");
+    assert_eq!(rows, vec![vec!["3"]]);
+}
+
+#[test]
+fn foreach_updates_and_nests() {
+    let mut conn = connection();
+    seed(&mut conn);
+    conn.execute("MATCH (n:Person {name: 'alice'}) FOREACH (x IN [1, 2] | SET n.step = x)")
+        .expect("foreach set");
+    let rows = query(&mut conn, "MATCH (n:Person {name: 'alice'}) RETURN n.step");
+    assert_eq!(rows, vec![vec!["2"]]);
+    conn.execute(
+        "FOREACH (x IN [1, 2] | FOREACH (y IN [10, 20] | CREATE (:Pair {v: x * 100 + y})))",
+    )
+    .expect("nested foreach");
+    let rows = query(&mut conn, "MATCH (p:Pair) RETURN count(*)");
+    assert_eq!(rows, vec![vec!["4"]]);
+}
+
+#[test]
+fn foreach_rejects_non_updating_clauses() {
+    let mut conn = connection();
+    seed(&mut conn);
+    let err = conn
+        .query("FOREACH (x IN [1] | MATCH (n) RETURN n)", &Params::new())
+        .expect_err("non-updating clause must be rejected");
+    assert!(err.to_string().contains("updating clauses"), "{err}");
+}

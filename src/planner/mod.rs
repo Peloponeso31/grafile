@@ -136,64 +136,59 @@ impl<'a> Planner<'a> {
                 Clause::Match(matched) => {
                     self.plan_match(matched, &mut plan, &mut scope)?;
                 }
-                Clause::Create(patterns) => {
-                    let items = self.plan_create(patterns, &scope)?;
-                    for item in &items {
-                        let kind = match item {
-                            CreateItem::Node { .. } => VarKind::Node,
-                            CreateItem::Edge { .. } => VarKind::Edge,
-                        };
-                        scope.insert(item.var().to_owned(), kind);
+                clause @ (Clause::Create(_)
+                | Clause::Merge { .. }
+                | Clause::Set(_)
+                | Clause::Remove(_)
+                | Clause::Delete { .. }
+                | Clause::Foreach { .. }) => {
+                    if self.plan_updating_clause(clause, &mut plan, &mut scope)? {
+                        mutating = true;
+                        columns.clear();
                     }
-                    plan = Plan::Create {
-                        input: Box::new(plan),
-                        items,
-                    };
-                    mutating = true;
-                    columns.clear();
                 }
-                Clause::Merge {
-                    pattern,
-                    on_create,
-                    on_match,
+                Clause::Call {
+                    procedure,
+                    args,
+                    yields,
                 } => {
-                    self.plan_merge(pattern, on_create, on_match, &mut plan, &mut scope)?;
-                    mutating = true;
-                    columns.clear();
-                }
-                Clause::Set(items) => {
-                    for item in items {
-                        self.validate_set_item(item, &scope)?;
+                    if !args.is_empty() {
+                        return Err(Error::unsupported(
+                            "procedures with arguments are not supported",
+                        ));
                     }
-                    plan = Plan::SetItems {
-                        input: Box::new(plan),
-                        items: items.clone(),
+                    let outputs = procedure_columns(procedure)?;
+                    let yields: Vec<(String, String)> = if yields.is_empty() {
+                        outputs
+                            .iter()
+                            .map(|name| (name.clone(), name.clone()))
+                            .collect()
+                    } else {
+                        let mut out = Vec::with_capacity(yields.len());
+                        for (column, alias) in yields {
+                            if !outputs.contains(column) {
+                                return Err(Error::syntax(format!(
+                                    "procedure `{procedure}` has no column `{column}`"
+                                )));
+                            }
+                            out.push((
+                                column.clone(),
+                                alias.clone().unwrap_or_else(|| column.clone()),
+                            ));
+                        }
+                        out
                     };
-                    mutating = true;
-                    columns.clear();
-                }
-                Clause::Remove(items) => {
-                    for item in items {
-                        self.validate_set_item(item, &scope)?;
+                    for (_, alias) in &yields {
+                        scope.insert(alias.clone(), VarKind::Value);
                     }
-                    plan = Plan::RemoveItems {
+                    plan = Plan::ProcedureCall {
                         input: Box::new(plan),
-                        items: items.clone(),
+                        procedure: procedure.clone(),
+                        columns: outputs,
+                        yields: yields.clone(),
                     };
-                    mutating = true;
                     columns.clear();
-                }
-                Clause::Delete { detach, exprs } => {
-                    for expr in exprs {
-                        validate_expr(expr, &scope)?;
-                    }
-                    plan = Plan::Delete {
-                        input: Box::new(plan),
-                        exprs: exprs.clone(),
-                        detach: *detach,
-                    };
-                    mutating = true;
-                    columns.clear();
+                    columns.extend(yields.iter().map(|(_, alias)| alias.clone()));
                 }
                 Clause::Unwind { expr, alias } => {
                     validate_expr(expr, &scope)?;
@@ -245,6 +240,91 @@ impl<'a> Planner<'a> {
             }
         }
         Ok((plan, columns, mutating))
+    }
+
+    /// Plan one updating clause (`CREATE`, `MERGE`, `SET`, `REMOVE`,
+    /// `DELETE`, `FOREACH`). Returns whether it writes to the database.
+    fn plan_updating_clause(
+        &mut self,
+        clause: &Clause,
+        plan: &mut Plan,
+        scope: &mut FastMap<String, VarKind>,
+    ) -> Result<bool> {
+        match clause {
+            Clause::Create(patterns) => {
+                let items = self.plan_create(patterns, scope)?;
+                for item in &items {
+                    let kind = match item {
+                        CreateItem::Node { .. } => VarKind::Node,
+                        CreateItem::Edge { .. } => VarKind::Edge,
+                    };
+                    scope.insert(item.var().to_owned(), kind);
+                }
+                *plan = Plan::Create {
+                    input: Box::new(std::mem::replace(plan, Plan::Empty)),
+                    items,
+                };
+                Ok(true)
+            }
+            Clause::Merge {
+                pattern,
+                on_create,
+                on_match,
+            } => {
+                self.plan_merge(pattern, on_create, on_match, plan, scope)?;
+                Ok(true)
+            }
+            Clause::Set(items) => {
+                for item in items {
+                    self.validate_set_item(item, scope)?;
+                }
+                *plan = Plan::SetItems {
+                    input: Box::new(std::mem::replace(plan, Plan::Empty)),
+                    items: items.clone(),
+                };
+                Ok(true)
+            }
+            Clause::Remove(items) => {
+                for item in items {
+                    self.validate_set_item(item, scope)?;
+                }
+                *plan = Plan::RemoveItems {
+                    input: Box::new(std::mem::replace(plan, Plan::Empty)),
+                    items: items.clone(),
+                };
+                Ok(true)
+            }
+            Clause::Delete { detach, exprs } => {
+                for expr in exprs {
+                    validate_expr(expr, scope)?;
+                }
+                *plan = Plan::Delete {
+                    input: Box::new(std::mem::replace(plan, Plan::Empty)),
+                    exprs: exprs.clone(),
+                    detach: *detach,
+                };
+                Ok(true)
+            }
+            Clause::Foreach { var, list, clauses } => {
+                validate_expr(list, scope)?;
+                let mut inner = Plan::Empty;
+                let mut inner_scope = scope.clone();
+                inner_scope.insert(var.clone(), VarKind::Value);
+                for clause in clauses {
+                    self.plan_updating_clause(clause, &mut inner, &mut inner_scope)?;
+                }
+                *plan = Plan::Foreach {
+                    input: Box::new(std::mem::replace(plan, Plan::Empty)),
+                    var: var.clone(),
+                    list: list.clone(),
+                    plan: Box::new(inner),
+                };
+                Ok(true)
+            }
+            _ => Err(Error::syntax(
+                "only updating clauses are allowed in FOREACH",
+            )),
+        }
     }
 
     // ---- MATCH ----
@@ -1862,6 +1942,18 @@ fn flip(direction: RelDirection) -> RelDirection {
     }
 }
 
+/// Output columns of a supported built-in procedure.
+fn procedure_columns(name: &str) -> Result<Vec<String>> {
+    match name {
+        "db.labels" => Ok(vec!["label".to_owned()]),
+        "db.propertyKeys" => Ok(vec!["propertyKey".to_owned()]),
+        "db.relationshipTypes" => Ok(vec!["relationshipType".to_owned()]),
+        _ => Err(Error::unsupported(format!(
+            "procedure `{name}` is not supported"
+        ))),
+    }
+}
+
 fn undefined_variable(name: &str) -> Error {
     Error::new(
         ErrorCode::NotFound,
@@ -2696,6 +2788,19 @@ fn substitute_clause(clause: &mut Clause, params: &HashMap<String, Value>) -> Re
         Clause::Create(patterns) => {
             for path in &mut patterns.iter_mut() {
                 substitute_path(path, params)?;
+            }
+            Ok(())
+        }
+        Clause::Foreach { list, clauses, .. } => {
+            substitute_expr(list, params)?;
+            for clause in clauses.iter_mut() {
+                substitute_clause(clause, params)?;
+            }
+            Ok(())
+        }
+        Clause::Call { args, .. } => {
+            for arg in args.iter_mut() {
+                substitute_expr(arg, params)?;
             }
             Ok(())
         }
