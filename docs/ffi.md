@@ -10,6 +10,22 @@ The API follows SQLite's shape: `open`/`close`, `prepare`/`step`/`column`,
 JSON helpers, SQLite-compatible numeric result codes, and `grafile_free` for
 library-allocated strings.
 
+## Install
+
+Release tarballs carry the shared and static libraries, the header and a
+pkg-config file; `install.sh` places them under a prefix (default
+`~/.local`):
+
+```console
+$ curl -LsSf https://github.com/Peloponeso31/grafile/releases/latest/download/install.sh | sh
+$ export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig:$PKG_CONFIG_PATH"
+$ cc app.c $(pkg-config --cflags --libs grafile)        # dynamic
+$ cc app.c $(pkg-config --cflags --libs --static grafile)  # static
+```
+
+Linux tarballs ship glibc-linked libraries, so musl-based distros (Alpine)
+get the CLI but should build the library from source for FFI use.
+
 ## Build
 
 ```console

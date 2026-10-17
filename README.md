@@ -119,8 +119,17 @@ verifies its SHA-256, and installs to `~/.local/bin` without sudo:
 $ curl -LsSf https://github.com/Peloponeso31/grafile/releases/latest/download/install.sh | sh
 ```
 
-Set `GRAFILE_INSTALL_DIR` to install elsewhere, or `GRAFILE_VERSION` to pin a
-release.
+Set `GRAFILE_PREFIX` to install elsewhere, or `GRAFILE_VERSION` to pin a
+release. Alongside the binary the script installs the FFI library
+(`lib/libgrafile.*`), the C header (`include/grafile.h`) and pkg-config
+metadata (`lib/pkgconfig/grafile.pc`), so programs can link with:
+
+```console
+$ export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig:$PKG_CONFIG_PATH"
+$ cc app.c $(pkg-config --cflags --libs grafile)
+```
+
+See [docs/ffi.md](docs/ffi.md) for the C ABI.
 
 Debian/Ubuntu users can install the `.deb`; Fedora/RHEL users the `.rpm`
 (x86_64 and aarch64 packages are released):
