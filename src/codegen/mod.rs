@@ -1925,8 +1925,8 @@ fn scalar_function(name: &str) -> Result<u8> {
             Ok(func::LOCAL_DATETIME)
         }
         "datetime.transaction" | "datetime.statement" | "datetime.realtime" => Ok(func::DATETIME),
-        other => Err(Error::unsupported(format!(
-            "function `{other}` is not supported yet"
+        other => Err(Error::syntax(format!(
+            "UnknownFunction: `{other}` is not a known function"
         ))),
     }
 }

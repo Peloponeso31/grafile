@@ -1338,9 +1338,15 @@ impl<'a> Executor<'a> {
                 let limit = match self.reg_value(*limit)? {
                     Value::Null => None,
                     Value::Int(value) if value >= 0 => Some(value as usize),
+                    Value::Float(_) => {
+                        return Err(Error::syntax(format!(
+                            "InvalidArgumentType: LIMIT expects an integer, got {}",
+                            self.reg_value(*limit)?.type_name()
+                        )));
+                    }
                     other => {
-                        return Err(Error::type_error(format!(
-                            "LIMIT expects a non-negative integer, got {}",
+                        return Err(Error::syntax(format!(
+                            "NegativeIntegerArgument: LIMIT expects a non-negative integer, got {}",
                             other.type_name()
                         )));
                     }
@@ -1815,8 +1821,12 @@ impl<'a> Executor<'a> {
         match self.reg_value(reg)? {
             Value::Null => Ok(0),
             Value::Int(value) if value >= 0 => Ok(value as usize),
-            other => Err(Error::type_error(format!(
-                "expected a non-negative integer, got {}",
+            Value::Float(_) => Err(Error::syntax(format!(
+                "InvalidArgumentType: SKIP expects an integer, got {}",
+                self.reg_value(reg)?.type_name()
+            ))),
+            other => Err(Error::syntax(format!(
+                "NegativeIntegerArgument: SKIP expects a non-negative integer, got {}",
                 other.type_name()
             ))),
         }

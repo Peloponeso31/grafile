@@ -224,6 +224,7 @@ impl<'a> Planner<'a> {
                         limit,
                         where_clause.as_ref(),
                         &scope,
+                        true,
                     )?;
                     plan = new_plan;
                     scope = new_scope;
@@ -238,7 +239,7 @@ impl<'a> Planner<'a> {
                     limit,
                 } => {
                     let (new_plan, _, new_columns) = self.plan_projection(
-                        plan, items, *distinct, order, skip, limit, None, &scope,
+                        plan, items, *distinct, order, skip, limit, None, &scope, false,
                     )?;
                     plan = new_plan;
                     columns = new_columns;
@@ -713,6 +714,7 @@ impl<'a> Planner<'a> {
         plan: &mut Plan,
         scope: &mut FastMap<String, VarKind>,
     ) -> Result<()> {
+        check_path_conflicts(path)?;
         let segment = match path.segments.as_slice() {
             [segment] => segment,
             _ => {
@@ -844,6 +846,7 @@ impl<'a> Planner<'a> {
         plan: &mut Plan,
         scope: &mut FastMap<String, VarKind>,
     ) -> Result<()> {
+        check_path_conflicts(path)?;
         if path.shortest != Shortest::Plain {
             let all = path.shortest == Shortest::AllShortest;
             return self.plan_shortest(path, all, path.variable.clone(), false, plan, scope);
@@ -1727,6 +1730,7 @@ impl<'a> Planner<'a> {
 
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn plan_projection(
         &mut self,
         input: Plan,
@@ -1737,6 +1741,7 @@ impl<'a> Planner<'a> {
         limit: &Option<Expr>,
         where_clause: Option<&Expr>,
         scope: &FastMap<String, VarKind>,
+        require_aliases: bool,
     ) -> Result<(Plan, FastMap<String, VarKind>, Vec<String>)> {
         // Expand `*` items.
         let mut expanded: Vec<(Expr, String)> = Vec::new();
@@ -1749,6 +1754,14 @@ impl<'a> Planner<'a> {
                     expanded.push((Expr::Variable(var.clone()), var.clone()));
                 }
             } else {
+                if require_aliases
+                    && item.alias.is_none()
+                    && !matches!(item.expr, Expr::Variable(_))
+                {
+                    return Err(Error::syntax(
+                        "unaliased expression in WITH; use AS to name it",
+                    ));
+                }
                 let name = match &item.alias {
                     Some(alias) => alias.clone(),
                     None => default_name(&item.expr),
@@ -1758,6 +1771,14 @@ impl<'a> Planner<'a> {
         }
         if expanded.is_empty() {
             return Err(Error::syntax("RETURN/WITH requires at least one item"));
+        }
+        let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (_, name) in &expanded {
+            if !seen_names.insert(name.as_str()) {
+                return Err(Error::syntax(format!(
+                    "MultipleResultsWithSameName: `{name}` is projected more than once"
+                )));
+            }
         }
         let mut input = input;
         let mut scope = scope.clone();
@@ -1809,6 +1830,7 @@ impl<'a> Planner<'a> {
                 ));
             }
             if let Some((func, arguments, star, distinct)) = aggregate_call(expr)? {
+                check_aggregate_arguments(&arguments)?;
                 aggs.push(AggItem {
                     func,
                     arguments: aggregate_arguments(func, &arguments, star, &scope)?,
@@ -1820,6 +1842,7 @@ impl<'a> Planner<'a> {
                     let Some((func, arguments, star, distinct)) = aggregate_call(sub)? else {
                         return Ok(None);
                     };
+                    check_aggregate_arguments(&arguments)?;
                     let hidden = format!("  agg{}", aggs.len());
                     aggs.push(AggItem {
                         func,
@@ -1859,26 +1882,53 @@ impl<'a> Planner<'a> {
                 .iter()
                 .map(|(expr, name)| (name.clone(), expr_kind(expr, &scope)))
                 .collect();
+            let mut agg_scope: FastMap<String, VarKind> = FastMap::new();
+            if !aggs.is_empty() {
+                for (_, group) in &groups {
+                    agg_scope.insert(group.clone(), VarKind::Value);
+                }
+                for item in &aggs {
+                    agg_scope.insert(item.name.clone(), VarKind::Value);
+                }
+                for (_, name) in &post {
+                    agg_scope.insert(name.clone(), VarKind::Value);
+                }
+            }
             for key in order {
-                let expr =
-                    if let Some((_, alias)) = expanded.iter().find(|(expr, _)| expr == &key.expr) {
-                        Expr::Variable(alias.clone())
-                    } else if validate_expr(&key.expr, &visible_names).is_ok() {
+                let named = match &key.expr {
+                    Expr::Variable(name) if expanded.iter().any(|(_, item)| item == name) => {
+                        Some(key.expr.clone())
+                    }
+                    _ => None,
+                };
+                let expr = if let Some(expr) = named {
+                    expr
+                } else if let Some((_, alias)) = expanded.iter().find(|(expr, _)| expr == &key.expr)
+                {
+                    Expr::Variable(alias.clone())
+                } else if aggs.is_empty() {
+                    if contains_aggregation(&key.expr) {
+                        return Err(Error::syntax(
+                            "InvalidAggregation: ORDER BY cannot aggregate when RETURN/WITH does not",
+                        ));
+                    }
+                    if validate_expr(&key.expr, &visible_names).is_ok() {
                         key.expr.clone()
-                    } else if aggs.is_empty() && !distinct {
+                    } else if !distinct {
                         validate_expr(&key.expr, &scope)?;
                         let hidden = format!("  sort{}", hidden_keys.len());
                         hidden_keys.push((key.expr.clone(), hidden.clone()));
                         Expr::Variable(hidden)
-                    } else if aggs.is_empty() {
-                        return Err(Error::unsupported(
-                            "ORDER BY on non-projected values cannot be combined with DISTINCT",
-                        ));
                     } else {
-                        return Err(Error::unsupported(
-                            "ORDER BY after aggregation must reference projected values",
+                        return Err(Error::syntax(
+                            "ORDER BY cannot sort on values removed by DISTINCT",
                         ));
-                    };
+                    }
+                } else {
+                    let rewritten = rewrite_sort_key(&key.expr, &groups, &aggs)?;
+                    validate_expr(&rewritten, &agg_scope)?;
+                    rewritten
+                };
                 sort_keys.push((expr, key.ascending));
             }
         }
@@ -1957,14 +2007,14 @@ impl<'a> Planner<'a> {
             };
         }
         if let Some(skip) = skip {
-            validate_expr(skip, &new_scope)?;
+            validate_projection_limit(skip, "SKIP")?;
             plan = Plan::Skip {
                 input: Box::new(plan),
                 count: skip.clone(),
             };
         }
         if let Some(limit) = limit {
-            validate_expr(limit, &new_scope)?;
+            validate_projection_limit(limit, "LIMIT")?;
             plan = Plan::Limit {
                 input: Box::new(plan),
                 count: limit.clone(),
@@ -3000,6 +3050,132 @@ fn aggregate_arguments(
         .collect())
 }
 
+/// Reject aggregations of aggregations and non-deterministic arguments.
+fn check_aggregate_arguments(arguments: &[&Expr]) -> Result<()> {
+    for argument in arguments {
+        if contains_aggregation(argument) {
+            return Err(Error::syntax(
+                "NestedAggregation: an aggregation cannot contain another aggregation",
+            ));
+        }
+        if contains_function(argument, &["rand"]) {
+            return Err(Error::syntax(
+                "NonConstantExpression: an aggregation cannot use non-deterministic functions",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite an ORDER BY key of an aggregating projection: aggregation calls
+/// become references to their projected columns, and simple projected
+/// expressions become references to their grouping keys.
+///
+/// # Errors
+///
+/// Returns `Error::syntax` when an aggregation is not projected or a complex
+/// expression is combined with an aggregation (ambiguous semantics).
+fn rewrite_sort_key(expr: &Expr, groups: &[(Expr, String)], aggs: &[AggItem]) -> Result<Expr> {
+    rewrite_expr(expr, &mut |sub| {
+        if let Some((func, args, star, distinct)) = aggregate_call(sub)? {
+            for item in aggs {
+                let same_args = if star {
+                    matches!(&item.arguments[..], [Expr::Literal(Value::Int(1))])
+                } else {
+                    item.arguments.len() == args.len()
+                        && item.arguments.iter().zip(args.iter()).all(|(a, b)| a == *b)
+                };
+                if item.func == func && item.distinct == distinct && same_args {
+                    return Ok(Some(Expr::Variable(item.name.clone())));
+                }
+            }
+            return Err(Error::syntax(
+                "UndefinedVariable: ORDER BY cannot use an aggregation that is not projected",
+            ));
+        }
+        if let Some((_, group)) = groups.iter().find(|(group, _)| group == sub) {
+            if is_property_chain(sub) {
+                return Ok(Some(Expr::Variable(group.clone())));
+            }
+            return Err(Error::syntax(
+                "AmbiguousAggregationExpression: an ORDER BY item with an aggregation may only \
+                 combine projected variables and aggregations",
+            ));
+        }
+        Ok(None)
+    })
+}
+
+/// A relationship and a node of the same pattern may not share a variable.
+///
+/// # Errors
+///
+/// Returns `Error::syntax` when a variable names both a node and a
+/// relationship within one path.
+fn check_path_conflicts(path: &PatternPath) -> Result<()> {
+    let mut rel_vars: Vec<&str> = Vec::new();
+    for segment in &path.segments {
+        if let Some(var) = &segment.relationship.variable {
+            rel_vars.push(var);
+        }
+    }
+    if rel_vars.is_empty() {
+        return Ok(());
+    }
+    let mut node_vars: Vec<&str> = Vec::new();
+    if let Some(var) = &path.start.variable {
+        node_vars.push(var);
+    }
+    for segment in &path.segments {
+        if let Some(var) = &segment.node.variable {
+            node_vars.push(var);
+        }
+    }
+    if let Some(var) = path
+        .variable
+        .as_deref()
+        .filter(|var| rel_vars.contains(var) || node_vars.contains(var))
+    {
+        return Err(Error::syntax(format!(
+            "VariableTypeConflict: path variable `{var}` is also bound in the pattern"
+        )));
+    }
+    if let Some(var) = rel_vars.iter().find(|var| node_vars.contains(*var)) {
+        return Err(Error::syntax(format!(
+            "VariableTypeConflict: variable `{var}` is bound both as a node and as a relationship"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether an expression is a variable or a chain of property accesses on one.
+fn is_property_chain(expr: &Expr) -> bool {
+    match expr {
+        Expr::Variable(_) => true,
+        Expr::Property { base, .. } => is_property_chain(base),
+        _ => false,
+    }
+}
+
+/// `SKIP` and `LIMIT` must be constants; literal values are range checked at
+/// compile time so parameter values can be checked at execution time.
+fn validate_projection_limit(expr: &Expr, what: &str) -> Result<()> {
+    if free_refs(expr, &[], &[], &[]).unresolved {
+        return Err(Error::syntax(format!(
+            "NonConstantExpression: {what} must not depend on variables"
+        )));
+    }
+    match expr {
+        Expr::Literal(Value::Int(value)) if *value < 0 => Err(Error::syntax(format!(
+            "NegativeIntegerArgument: {what} expects a non-negative integer"
+        ))),
+        Expr::Literal(Value::Float(_)) => Err(Error::syntax(format!(
+            "InvalidArgumentType: {what} expects an integer"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Rewrite an expression top-down; `f` may replace a subexpression and stop
 /// the descent by returning `Some`.
 fn rewrite_expr(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>) -> Result<Expr> {
@@ -3810,32 +3986,19 @@ fn has_aggregation_inside_comprehension(expr: &Expr) -> bool {
     }
 }
 
-fn contains_aggregation(expr: &Expr) -> bool {
+/// Whether any subexpression satisfies `pred` (including `expr` itself).
+fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
+    if pred(expr) {
+        return true;
+    }
     match expr {
-        Expr::Function { name, args, .. } => {
-            let lower = name.to_ascii_lowercase();
-            matches!(
-                lower.as_str(),
-                "count"
-                    | "sum"
-                    | "avg"
-                    | "min"
-                    | "max"
-                    | "collect"
-                    | "percentilecont"
-                    | "percentiledisc"
-                    | "stdev"
-                    | "stdevp"
-            ) || args.iter().any(contains_aggregation)
-        }
-        Expr::Property { base, .. } | Expr::Unary { expr: base, .. } => contains_aggregation(base),
-        Expr::Subscript { base, index } => {
-            contains_aggregation(base) || contains_aggregation(index)
-        }
+        Expr::Function { args, .. } => args.iter().any(|arg| any_subexpr(arg, pred)),
+        Expr::Property { base, .. } | Expr::Unary { expr: base, .. } => any_subexpr(base, pred),
+        Expr::Subscript { base, index } => any_subexpr(base, pred) || any_subexpr(index, pred),
         Expr::Slice { base, lower, upper } => {
-            contains_aggregation(base)
-                || lower.as_deref().is_some_and(contains_aggregation)
-                || upper.as_deref().is_some_and(contains_aggregation)
+            any_subexpr(base, pred)
+                || lower.as_deref().is_some_and(|e| any_subexpr(e, pred))
+                || upper.as_deref().is_some_and(|e| any_subexpr(e, pred))
         }
         Expr::ListComprehension {
             list,
@@ -3843,52 +4006,96 @@ fn contains_aggregation(expr: &Expr) -> bool {
             projection,
             ..
         } => {
-            contains_aggregation(list)
-                || predicate.as_deref().is_some_and(contains_aggregation)
-                || projection.as_deref().is_some_and(contains_aggregation)
+            any_subexpr(list, pred)
+                || predicate.as_deref().is_some_and(|e| any_subexpr(e, pred))
+                || projection.as_deref().is_some_and(|e| any_subexpr(e, pred))
         }
         Expr::Quantifier {
             list, predicate, ..
-        } => contains_aggregation(list) || contains_aggregation(predicate),
+        } => any_subexpr(list, pred) || any_subexpr(predicate, pred),
         Expr::Reduce {
             init,
             list,
             expression,
             ..
-        } => {
-            contains_aggregation(init)
-                || contains_aggregation(list)
-                || contains_aggregation(expression)
-        }
-        Expr::Binary { left, right, .. } => {
-            contains_aggregation(left) || contains_aggregation(right)
-        }
-        Expr::List(items) => items.iter().any(contains_aggregation),
-        Expr::Map(entries) => entries.iter().any(|(_, value)| contains_aggregation(value)),
+        } => any_subexpr(init, pred) || any_subexpr(list, pred) || any_subexpr(expression, pred),
+        Expr::Binary { left, right, .. } => any_subexpr(left, pred) || any_subexpr(right, pred),
+        Expr::List(items) => items.iter().any(|item| any_subexpr(item, pred)),
+        Expr::Map(entries) => entries.iter().any(|(_, value)| any_subexpr(value, pred)),
         Expr::Case {
             subject,
             alternatives,
             default,
         } => {
-            subject.as_ref().is_some_and(|s| contains_aggregation(s))
+            subject.as_ref().is_some_and(|e| any_subexpr(e, pred))
                 || alternatives
                     .iter()
-                    .any(|(a, b)| contains_aggregation(a) || contains_aggregation(b))
-                || default.as_ref().is_some_and(|d| contains_aggregation(d))
+                    .any(|(a, b)| any_subexpr(a, pred) || any_subexpr(b, pred))
+                || default.as_ref().is_some_and(|e| any_subexpr(e, pred))
         }
-        Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => contains_aggregation(expr),
-        Expr::Pattern(path) => pattern_has_aggregation(path),
+        Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => any_subexpr(expr, pred),
+        Expr::Pattern(path) => pattern_properties(path)
+            .iter()
+            .any(|expr| any_subexpr(expr, pred)),
         Expr::PatternComprehension {
             path,
             predicate,
             projection,
         } => {
-            pattern_has_aggregation(path)
-                || predicate.as_deref().is_some_and(contains_aggregation)
-                || contains_aggregation(projection)
+            pattern_properties(path)
+                .iter()
+                .any(|expr| any_subexpr(expr, pred))
+                || predicate.as_deref().is_some_and(|e| any_subexpr(e, pred))
+                || any_subexpr(projection, pred)
         }
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => false,
     }
+}
+
+/// The inline property expressions of every node and relationship of a path.
+fn pattern_properties(path: &PatternPath) -> Vec<&Expr> {
+    let mut out = Vec::new();
+    if let Some(expr) = &path.start.properties {
+        out.push(expr);
+    }
+    for segment in &path.segments {
+        if let Some(expr) = &segment.node.properties {
+            out.push(expr);
+        }
+        if let Some(expr) = &segment.relationship.properties {
+            out.push(expr);
+        }
+    }
+    out
+}
+
+/// The aggregate function names of the Cypher aggregation family.
+const AGGREGATE_NAMES: [&str; 10] = [
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "collect",
+    "percentilecont",
+    "percentiledisc",
+    "stdev",
+    "stdevp",
+];
+
+fn contains_aggregation(expr: &Expr) -> bool {
+    any_subexpr(expr, &mut |sub| {
+        matches!(sub, Expr::Function { name, .. }
+            if AGGREGATE_NAMES.contains(&name.to_ascii_lowercase().as_str()))
+    })
+}
+
+/// Whether `expr` calls one of the named functions.
+fn contains_function(expr: &Expr, names: &[&str]) -> bool {
+    any_subexpr(expr, &mut |sub| {
+        matches!(sub, Expr::Function { name, .. }
+            if names.contains(&name.to_ascii_lowercase().as_str()))
+    })
 }
 
 // ---- parameter substitution ----
