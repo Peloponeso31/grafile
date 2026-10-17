@@ -568,6 +568,38 @@ pub mod func {
     pub const LENGTH: u8 = 14;
     /// `toBoolean(x)`
     pub const TO_BOOLEAN: u8 = 15;
+    /// `range(start, end [, step])`
+    pub const RANGE: u8 = 16;
+    /// `head(list)`
+    pub const HEAD: u8 = 17;
+    /// `last(list)`
+    pub const LAST: u8 = 18;
+    /// `tail(list)`
+    pub const TAIL: u8 = 19;
+    /// `reverse(list|string)`
+    pub const REVERSE: u8 = 20;
+    /// `split(original, delimiter)`
+    pub const SPLIT: u8 = 21;
+    /// `substring(original, start [, length])`
+    pub const SUBSTRING: u8 = 22;
+    /// `rand()`
+    pub const RAND: u8 = 23;
+    /// `toUpper(string)`
+    pub const TO_UPPER: u8 = 24;
+    /// `toLower(string)`
+    pub const TO_LOWER: u8 = 25;
+    /// `trim(string)`
+    pub const TRIM: u8 = 26;
+    /// `ltrim(string)`
+    pub const LTRIM: u8 = 27;
+    /// `rtrim(string)`
+    pub const RTRIM: u8 = 28;
+    /// `left(string, length)`
+    pub const LEFT: u8 = 29;
+    /// `right(string, length)`
+    pub const RIGHT: u8 = 30;
+    /// `replace(original, search, replacement)`
+    pub const REPLACE: u8 = 31;
 }
 
 /// A compiled VDBE program.
@@ -1873,7 +1905,7 @@ impl<'a> Executor<'a> {
                     Ok(Value::Text(std::sync::Arc::from(buffer.format(*value))))
                 }
                 Some(Value::Text(value)) => Ok(Value::Text(value.clone())),
-                Some(other) => Err(conversion_error("toString", other)),
+                Some(other) => Err(invalid_argument("toString", other)),
             },
             func::TO_INTEGER => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
@@ -1885,7 +1917,7 @@ impl<'a> Executor<'a> {
                 Some(Value::Text(text)) => {
                     Ok(text_to_integer(text).map(Value::Int).unwrap_or(Value::Null))
                 }
-                Some(other) => Err(conversion_error("toInteger", other)),
+                Some(other) => Err(invalid_argument("toInteger", other)),
             },
             func::TO_FLOAT => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
@@ -1896,7 +1928,7 @@ impl<'a> Executor<'a> {
                     .parse::<f64>()
                     .map(Value::Float)
                     .unwrap_or(Value::Null)),
-                Some(other) => Err(conversion_error("toFloat", other)),
+                Some(other) => Err(invalid_argument("toFloat", other)),
             },
             func::TO_BOOLEAN => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
@@ -1906,7 +1938,7 @@ impl<'a> Executor<'a> {
                     "false" => Value::Bool(false),
                     _ => Value::Null,
                 }),
-                Some(other) => Err(conversion_error("toBoolean", other)),
+                Some(other) => Err(invalid_argument("toBoolean", other)),
             },
             func::SIZE => Ok(match args.first() {
                 Some(Value::List(items)) => Value::Int(items.len() as i64),
@@ -1944,6 +1976,43 @@ impl<'a> Executor<'a> {
                 ),
                 _ => Value::Null,
             }),
+            func::RANGE => call_range(args),
+            func::HEAD | func::LAST => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::List(items)) => Ok(match func {
+                    func::HEAD => items.first().cloned().unwrap_or(Value::Null),
+                    _ => items.last().cloned().unwrap_or(Value::Null),
+                }),
+                Some(other) => Err(invalid_argument(
+                    if func == func::HEAD { "head" } else { "last" },
+                    other,
+                )),
+            },
+            func::TAIL => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::List(items)) => {
+                    Ok(Value::List(items.iter().skip(1).cloned().collect()))
+                }
+                Some(other) => Err(invalid_argument("tail", other)),
+            },
+            func::REVERSE => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::Text(text)) => {
+                    Ok(Value::Text(text.chars().rev().collect::<String>().into()))
+                }
+                Some(Value::List(items)) => Ok(Value::List(items.iter().rev().cloned().collect())),
+                Some(other) => Err(invalid_argument("reverse", other)),
+            },
+            func::SPLIT => call_split(args),
+            func::SUBSTRING => call_substring(args),
+            func::RAND => Ok(Value::Float(fastrand::f64())),
+            func::TO_UPPER => text_map(args, "toUpper", |text| text.to_uppercase()),
+            func::TO_LOWER => text_map(args, "toLower", |text| text.to_lowercase()),
+            func::TRIM => text_map(args, "trim", |text| text.trim().to_owned()),
+            func::LTRIM => text_map(args, "ltrim", |text| text.trim_start().to_owned()),
+            func::RTRIM => text_map(args, "rtrim", |text| text.trim_end().to_owned()),
+            func::LEFT | func::RIGHT => call_left_right(func, args),
+            func::REPLACE => call_replace(args),
             func::PROPERTIES => match args.first() {
                 Some(Value::Node(id)) => {
                     let Some(record) = self.db.get_node(*id)? else {
@@ -2453,7 +2522,194 @@ fn normalize_reg(value: Value) -> Reg {
     }
 }
 
-/// Format a value the way Cypher's `toString` does.
+/// Largest list `range()` will materialize; guards against runaway queries
+/// like `range(0, 9223372036854775807)`.
+const MAX_RANGE_ELEMENTS: i64 = 10_000_000;
+
+/// `range(start, end [, step])`: an inclusive arithmetic sequence of
+/// integers. A step of zero raises a range error, non-integer arguments a
+/// type error, and an inconsistent direction yields the empty list.
+fn call_range(args: &[Value]) -> Result<Value> {
+    let mut numbers = [0_i64; 3];
+    let mut count = 0;
+    for (index, number) in numbers.iter_mut().enumerate() {
+        match args.get(index) {
+            Some(Value::Int(value)) => {
+                *number = *value;
+                count += 1;
+            }
+            Some(Value::Null) => return Ok(Value::Null),
+            // A missing step defaults to 1; a missing end cannot form one.
+            None if index == 2 => break,
+            None => return Ok(Value::Null),
+            // The TCK classifies non-integer bounds as an argument error,
+            // not a type error.
+            Some(other) => {
+                return Err(Error::new(
+                    crate::error::ErrorCode::Misuse,
+                    format!("range() does not accept {} values", other.type_name()),
+                ));
+            }
+        }
+    }
+    if count < 2 {
+        return Ok(Value::Null);
+    }
+    let [start, end, step] = if count == 2 {
+        [numbers[0], numbers[1], 1]
+    } else {
+        numbers
+    };
+    if step == 0 {
+        return Err(Error::new(
+            crate::error::ErrorCode::Range,
+            "range() step must not be zero",
+        ));
+    }
+    let mut values = Vec::new();
+    let mut value = start;
+    while if step > 0 { value <= end } else { value >= end } {
+        if values.len() as i64 >= MAX_RANGE_ELEMENTS {
+            return Err(Error::new(
+                crate::error::ErrorCode::Range,
+                format!("range() produces more than {MAX_RANGE_ELEMENTS} elements"),
+            ));
+        }
+        values.push(Value::Int(value));
+        match value.checked_add(step) {
+            Some(next) => value = next,
+            None => break,
+        }
+    }
+    Ok(Value::List(values.into()))
+}
+
+/// `split(original, delimiter)`: an empty delimiter splits into characters.
+fn call_split(args: &[Value]) -> Result<Value> {
+    let original = match args.first() {
+        Some(Value::Null) | None => return Ok(Value::Null),
+        Some(Value::Text(text)) => text,
+        Some(other) => return Err(invalid_argument("split", other)),
+    };
+    let delimiter = match args.get(1) {
+        Some(Value::Null) | None => return Ok(Value::Null),
+        Some(Value::Text(text)) => text,
+        Some(other) => return Err(invalid_argument("split", other)),
+    };
+    let parts: Vec<Value> = if delimiter.is_empty() {
+        original
+            .chars()
+            .map(|c| Value::Text(c.to_string().into()))
+            .collect()
+    } else {
+        original
+            .split(delimiter.as_ref())
+            .map(|part| Value::Text(part.into()))
+            .collect()
+    };
+    Ok(Value::List(parts.into()))
+}
+
+/// `substring(original, start [, length])`, counted in characters. Negative
+/// start or length raise a type error; a start past the end yields the empty
+/// string.
+fn call_substring(args: &[Value]) -> Result<Value> {
+    let text = match args.first() {
+        Some(Value::Null) | None => return Ok(Value::Null),
+        Some(Value::Text(text)) => text,
+        Some(other) => return Err(invalid_argument("substring", other)),
+    };
+    let start = match args.get(1) {
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Int(start)) if *start >= 0 => *start as usize,
+        Some(Value::Int(_)) => {
+            return Err(Error::type_error("substring() start must not be negative"));
+        }
+        Some(other) => return Err(invalid_argument("substring", other)),
+        None => 0,
+    };
+    let length = match args.get(2) {
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Int(length)) if *length >= 0 => Some(*length as usize),
+        Some(Value::Int(_)) => {
+            return Err(Error::type_error("substring() length must not be negative"));
+        }
+        Some(other) => return Err(invalid_argument("substring", other)),
+        None => None,
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let start = start.min(chars.len());
+    let end = match length {
+        Some(length) => start.saturating_add(length).min(chars.len()),
+        None => chars.len(),
+    };
+    let slice: String = chars[start..end].iter().collect();
+    Ok(Value::Text(slice.into()))
+}
+
+/// `left(original, length)` and `right(original, length)`, counted in
+/// characters; lengths past the end clamp.
+fn call_left_right(func: u8, args: &[Value]) -> Result<Value> {
+    let name = if func == func::LEFT { "left" } else { "right" };
+    let text = match args.first() {
+        Some(Value::Null) | None => return Ok(Value::Null),
+        Some(Value::Text(text)) => text,
+        Some(other) => return Err(invalid_argument(name, other)),
+    };
+    let length = match args.get(1) {
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Int(length)) if *length >= 0 => *length as usize,
+        Some(Value::Int(_)) => {
+            return Err(Error::type_error(format!(
+                "{name}() length must not be negative"
+            )));
+        }
+        Some(other) => return Err(invalid_argument(name, other)),
+        None => 0,
+    };
+    let chars = text.chars();
+    let slice: String = if func == func::LEFT {
+        chars.take(length).collect()
+    } else {
+        let total = text.chars().count();
+        chars.skip(total.saturating_sub(length)).collect()
+    };
+    Ok(Value::Text(slice.into()))
+}
+
+/// `replace(original, search, replacement)`.
+fn call_replace(args: &[Value]) -> Result<Value> {
+    let mut texts = [""; 3];
+    for (slot, index) in texts.iter_mut().zip(0..3) {
+        match args.get(index) {
+            Some(Value::Null) | None => return Ok(Value::Null),
+            Some(Value::Text(text)) => *slot = text,
+            Some(other) => return Err(invalid_argument("replace", other)),
+        }
+    }
+    let [original, search, replacement] = texts;
+    Ok(Value::Text(original.replace(search, replacement).into()))
+}
+
+/// Apply a string transformation, propagating nulls and rejecting other
+/// types.
+fn text_map(args: &[Value], name: &str, f: impl FnOnce(&str) -> String) -> Result<Value> {
+    match args.first() {
+        Some(Value::Null) | None => Ok(Value::Null),
+        Some(Value::Text(text)) => Ok(Value::Text(f(text).into())),
+        Some(other) => Err(invalid_argument(name, other)),
+    }
+}
+
+/// Invalid argument for a scalar function, reported as a runtime `TypeError`
+/// like openCypher's `InvalidArgumentValue`.
+fn invalid_argument(name: &str, value: &Value) -> Error {
+    Error::type_error(format!(
+        "{name}() does not accept {} values",
+        value.type_name()
+    ))
+}
+
 /// Truncate a float toward zero like `toInteger`; NaN and infinities have no
 /// integer value and yield `None`, as does anything outside the `i64` range.
 fn truncate_to_int(value: f64) -> Option<i64> {
@@ -2477,15 +2733,6 @@ fn text_to_integer(text: &str) -> Option<i64> {
         return Some(value);
     }
     truncate_to_int(text.parse::<f64>().ok()?)
-}
-
-/// Invalid argument for a conversion function, reported as a runtime
-/// `TypeError` like openCypher's `InvalidArgumentValue`.
-fn conversion_error(name: &str, value: &Value) -> Error {
-    Error::type_error(format!(
-        "{name}() does not accept {} values",
-        value.type_name()
-    ))
 }
 
 pub fn format_value(value: &Value) -> String {

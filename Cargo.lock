@@ -470,6 +470,7 @@ dependencies = [
  "anyhow",
  "crc32c",
  "criterion",
+ "fastrand",
  "fs4",
  "hashbrown 0.17.1",
  "hashlink",

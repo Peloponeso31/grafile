@@ -884,6 +884,103 @@ fn to_string_renders_scalars() {
     assert_eq!(rows, vec![vec!["[42, 2.3, true, apa, null]"]]);
 }
 
+// ---- list and string functions ----
+
+#[test]
+fn range_builds_inclusive_sequences() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN range(0, 5) AS a, range(5, 0, -2) AS b, range(0, -3) AS c, range(0, 0, -7) AS d",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["[0, 1, 2, 3, 4, 5]", "[5, 3, 1]", "[]", "[0]"]]
+    );
+}
+
+#[test]
+fn range_rejects_zero_step_and_fractional_bounds() {
+    let mut conn = connection();
+    let err = conn
+        .query("RETURN range(2, 8, 0)", &Params::new())
+        .expect_err("zero step");
+    assert_eq!(err.code(), grafile::ErrorCode::Range);
+    let err = conn
+        .query("RETURN range(1.1, 8, 1)", &Params::new())
+        .expect_err("float bound");
+    assert_eq!(err.code(), grafile::ErrorCode::Misuse);
+}
+
+#[test]
+fn head_last_and_tail() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN head([1, 2, 3]) AS h, last([1, 2, 3]) AS l, tail([1, 2, 3]) AS t, \
+         head([]) AS eh, tail([]) AS et, head(null) AS nh",
+    );
+    assert_eq!(rows, vec![vec!["1", "3", "[2, 3]", "null", "[]", "null"]]);
+}
+
+#[test]
+fn reverse_strings_and_lists() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN reverse('raksO') AS s, reverse([1, 2, 3]) AS l, reverse(null) AS n",
+    );
+    assert_eq!(rows, vec![vec!["Oskar", "[3, 2, 1]", "null"]]);
+}
+
+#[test]
+fn split_and_substring() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN split('one1two', '1') AS a, split('abc', '') AS b, split('', ',') AS c, \
+         substring('0123456789', 1) AS d, substring('hello', 1, 3) AS e, substring('hi', 9) AS f",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "[one, two]",
+            "[a, b, c]",
+            "[]",
+            "123456789",
+            "ell",
+            ""
+        ]]
+    );
+}
+
+#[test]
+fn split_empty_input_keeps_one_empty_part() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN size(split('', ',')) AS a, substring('hello', null) AS b",
+    );
+    assert_eq!(rows, vec![vec!["1", "null"]]);
+}
+
+#[test]
+fn string_case_and_trimming_helpers() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN toUpper('aBc') AS u, toLower('AbC') AS l, trim('  x  ') AS t, \
+         ltrim('  x  ') AS lt, rtrim('  x  ') AS rt, left('hello', 2) AS le, \
+         right('hello', 2) AS ri, left('hi', 9) AS lc, replace('hello', 'l', 'L') AS rp",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "ABC", "abc", "x", "x  ", "  x", "he", "lo", "hi", "heLLo"
+        ]]
+    );
+}
+
 #[test]
 fn conversions_reject_incompatible_types() {
     let mut conn = connection();
