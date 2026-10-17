@@ -867,12 +867,15 @@ impl Codegen {
                 cg.patch(jump, end)?;
                 Ok(())
             }),
-            Plan::Create { input, items } => self.compile(input, ctx, &mut |cg, ctx| {
-                for item in items {
-                    cg.compile_create_item(item, ctx, None)?;
-                }
-                out(cg, ctx)
-            }),
+            Plan::Create { input, items } => {
+                let mut apply = |cg: &mut Codegen, ctx: &mut Ctx| -> Result<()> {
+                    for item in items {
+                        cg.compile_create_item(item, ctx, None)?;
+                    }
+                    Ok(())
+                };
+                self.compile_updating(input, ctx, &mut apply, out)
+            }
             Plan::Merge {
                 input,
                 match_plan,
@@ -984,58 +987,140 @@ impl Codegen {
                 cg.patch(next, end)?;
                 Ok(())
             }),
-            Plan::SetItems { input, items } => self.compile(input, ctx, &mut |cg, ctx| {
-                for item in items {
-                    cg.compile_set_item(item, ctx)?;
-                }
-                out(cg, ctx)
-            }),
-            Plan::RemoveItems { input, items } => self.compile(input, ctx, &mut |cg, ctx| {
-                for item in items {
-                    match item {
-                        SetItem::Property { variable, key, .. } => {
-                            let target = cg.var_reg(ctx, variable)?;
-                            let key_reg = cg.const_reg(Value::from(key.as_str()));
-                            let null = cg.null_reg();
-                            cg.emit(Op::SetProperty {
-                                target,
-                                key: key_reg,
-                                value: null,
-                            });
-                        }
-                        SetItem::Label { variable, labels } => {
-                            let target = cg.var_reg(ctx, variable)?;
-                            let labels_reg = cg.label_list_reg(labels);
-                            cg.emit(Op::SetLabels {
-                                target,
-                                labels: labels_reg,
-                                add: false,
-                            });
-                        }
-                        SetItem::Replace { .. } | SetItem::Append { .. } => {
-                            return Err(Error::unsupported(
-                                "REMOVE with whole-property replacement is not supported",
-                            ));
+            Plan::SetItems { input, items } => {
+                let mut apply = |cg: &mut Codegen, ctx: &mut Ctx| -> Result<()> {
+                    for item in items {
+                        cg.compile_set_item(item, ctx)?;
+                    }
+                    Ok(())
+                };
+                self.compile_updating(input, ctx, &mut apply, out)
+            }
+            Plan::RemoveItems { input, items } => {
+                let mut apply = |cg: &mut Codegen, ctx: &mut Ctx| -> Result<()> {
+                    for item in items {
+                        match item {
+                            SetItem::Property { variable, key, .. } => {
+                                let target = cg.var_reg(ctx, variable)?;
+                                let key_reg = cg.const_reg(Value::from(key.as_str()));
+                                let null = cg.null_reg();
+                                cg.emit(Op::SetProperty {
+                                    target,
+                                    key: key_reg,
+                                    value: null,
+                                });
+                            }
+                            SetItem::Label { variable, labels } => {
+                                let target = cg.var_reg(ctx, variable)?;
+                                let labels_reg = cg.label_list_reg(labels);
+                                cg.emit(Op::SetLabels {
+                                    target,
+                                    labels: labels_reg,
+                                    add: false,
+                                });
+                            }
+                            SetItem::Replace { .. } | SetItem::Append { .. } => {
+                                return Err(Error::unsupported(
+                                    "REMOVE with whole-property replacement is not supported",
+                                ));
+                            }
                         }
                     }
-                }
-                out(cg, ctx)
-            }),
+                    Ok(())
+                };
+                self.compile_updating(input, ctx, &mut apply, out)
+            }
             Plan::Delete {
                 input,
                 exprs,
                 detach,
-            } => self.compile(input, ctx, &mut |cg, ctx| {
-                for expr in exprs {
-                    let target = cg.compile_expr(expr, ctx)?;
-                    cg.emit(Op::DeleteAny {
-                        target,
-                        detach: *detach,
-                    });
-                }
-                out(cg, ctx)
-            }),
+            } => {
+                let mut apply = |cg: &mut Codegen, ctx: &mut Ctx| -> Result<()> {
+                    for expr in exprs {
+                        let target = cg.compile_expr(expr, ctx)?;
+                        cg.emit(Op::DeleteAny {
+                            target,
+                            detach: *detach,
+                        });
+                    }
+                    Ok(())
+                };
+                self.compile_updating(input, ctx, &mut apply, out)
+            }
         }
+    }
+
+    /// Compile an updating clause eagerly: materialize every input row,
+    /// apply `apply` to all of them, then hand the same rows to `out`. A
+    /// clause observes its entire input before the next clause can see its
+    /// writes.
+    fn compile_updating(
+        &mut self,
+        input: &Plan,
+        ctx: &mut Ctx,
+        apply: &mut dyn FnMut(&mut Codegen, &mut Ctx) -> Result<()>,
+        out: &mut dyn FnMut(&mut Codegen, &mut Ctx) -> Result<()>,
+    ) -> Result<()> {
+        let frame_start = ctx.window_start;
+        let cursor = self.alloc_cursor();
+        self.emit(Op::CollectOpen { cursor });
+        let mut produced: Option<Ctx> = None;
+        let mut collect_len = 0;
+        self.compile(input, ctx, &mut |cg, in_ctx| {
+            // Collect from the enclosing frame so outer variables (an
+            // UNWIND binding, say) survive into the apply and output loops.
+            collect_len = cg.next_reg - frame_start;
+            produced = Some(in_ctx.clone());
+            cg.emit(Op::CollectRow {
+                cursor,
+                start: frame_start,
+                count: collect_len,
+            });
+            Ok(())
+        })?;
+        let mut row_ctx = produced.ok_or_else(|| Error::internal("empty updating input"))?;
+        row_ctx.window_start = frame_start;
+        row_ctx.window_len = collect_len;
+        let mut apply_wrapper = |cg: &mut Codegen, ctx: &mut Ctx| -> Result<()> {
+            apply(cg, ctx)?;
+            // The apply step may bind new variables (CREATE does); store the
+            // widened window back into the row so `out` sees the values.
+            let count = cg.next_reg - ctx.window_start;
+            cg.emit(Op::CtxStore {
+                cursor,
+                start: ctx.window_start,
+                count,
+            });
+            ctx.window_len = count;
+            Ok(())
+        };
+        self.emit_ctx_loop(cursor, &mut row_ctx, &mut apply_wrapper)?;
+        self.emit_ctx_loop(cursor, &mut row_ctx, out)?;
+        Ok(())
+    }
+
+    /// Emit a loop over a collected cursor: copy every row into the context
+    /// window and run `body` for it.
+    fn emit_ctx_loop(
+        &mut self,
+        cursor: u32,
+        row_ctx: &mut Ctx,
+        body: &mut dyn FnMut(&mut Codegen, &mut Ctx) -> Result<()>,
+    ) -> Result<()> {
+        let rewind = self.emit(Op::CtxRewind { cursor, target: 0 });
+        let loop_start = self.ops.len() as u32;
+        self.emit(Op::CtxData {
+            cursor,
+            start: row_ctx.window_start,
+            count: row_ctx.window_len,
+        });
+        body(self, row_ctx)?;
+        let next = self.emit(Op::CtxNext { cursor, target: 0 });
+        self.emit(Op::Goto { target: loop_start });
+        let end = self.ops.len() as u32;
+        self.patch(rewind, end)?;
+        self.patch(next, end)?;
+        Ok(())
     }
 
     /// Compile `input`, truncate collected rows, then iterate the result.

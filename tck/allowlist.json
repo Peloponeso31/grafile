@@ -36,32 +36,10 @@
         "note": "procedures are not supported: `there exists a procedure test.labels() :: (label :: STRING?):`"
       }
     },
-    "clauses/create/Create3.feature": {
-      "[3] MATCH-CREATE-WITH-CREATE": {
-        "reason": "not-implemented",
-        "note": "expected no rows, got a compile time error: compile time: Syntax: RETURN/WITH requires at least one item; expected +10 nodes, got +0"
-      }
-    },
-    "clauses/delete/Delete4.feature": {
-      "[1] Undirected expand followed by delete and count": {
-        "reason": "not-implemented",
-        "note": "rows differ: expected 2, got 1"
-      },
-      "[2] Undirected variable length expand followed by delete and count": {
-        "reason": "not-implemented",
-        "note": "expected rows, got a compile time error: compile time: Unsupported: variable-length relationship patterns are not supported yet; expected -3 nodes, got +0; expected -2 relationships, got +0"
-      }
-    },
     "clauses/delete/Delete5.feature": {
       "[7] Delete paths from nested map/list": {
         "reason": "not-implemented",
         "note": "expected no rows, got a compile time error: compile time: Syntax: expected '(' to start a node pattern at line 2 column 7 (found Ident); expected -2 nodes, got +0; expected -2 relationships, got +0; e..."
-      }
-    },
-    "clauses/merge/Merge1.feature": {
-      "[14] Merges should not be able to match on deleted nodes": {
-        "reason": "not-implemented",
-        "note": "expected column `a2.num`, got `num`; expected -2 nodes, got -1"
       }
     },
     "clauses/return/Return2.feature": {

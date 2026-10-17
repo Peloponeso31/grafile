@@ -357,6 +357,15 @@ pub enum Op {
         /// Number of registers.
         count: u32,
     },
+    /// Write the register window back into the current row of a row cursor.
+    CtxStore {
+        /// Cursor slot.
+        cursor: u32,
+        /// First register.
+        start: u32,
+        /// Number of registers.
+        count: u32,
+    },
     /// Read a property by name from a node, relationship or map.
     Property {
         /// Entity or map register.
@@ -1449,6 +1458,24 @@ impl<'a> Executor<'a> {
                         .ok_or_else(|| Error::internal("row shorter than window"))?
                         .clone();
                     self.regs[(*start as usize) + idx] = value;
+                }
+            }
+            Op::CtxStore {
+                cursor,
+                start,
+                count,
+            } => {
+                let row: Vec<Reg> = (0..*count)
+                    .map(|idx| self.regs[(*start + idx) as usize].clone())
+                    .collect();
+                match &mut self.cursors[*cursor as usize] {
+                    Cursor::Rows { rows, pos } => match rows.get_mut(*pos) {
+                        Some(slot) => *slot = row,
+                        None => {
+                            return Err(Error::internal("CtxStore on exhausted cursor"));
+                        }
+                    },
+                    _ => return Err(Error::internal("CtxStore on a non-row cursor")),
                 }
             }
             Op::VarExpandOpen {
