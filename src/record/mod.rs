@@ -193,11 +193,22 @@ impl Ord for Value {
 }
 
 fn float_cmp(a: f64, b: f64) -> std::cmp::Ordering {
-    if a == b {
-        // Treat -0.0 and 0.0 as equal, matching `PartialEq`.
-        return std::cmp::Ordering::Equal;
+    use std::cmp::Ordering;
+    // `0.0 / 0.0` produces a negative NaN on x86 and a positive one on
+    // aarch64; `total_cmp` would order the two differently. NaN is the
+    // greatest number in every environment instead.
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => {
+            if a == b {
+                // Treat -0.0 and 0.0 as equal, matching `PartialEq`.
+                return Ordering::Equal;
+            }
+            a.total_cmp(&b)
+        }
     }
-    a.total_cmp(&b)
 }
 
 /// Cross-type orderability, matching Neo4j: maps first, then nodes,
@@ -842,13 +853,7 @@ pub fn encode_index_key(out: &mut Vec<u8>, value: &Value) {
         }
         Value::Float(value) => {
             out.push(index_tag::FLOAT);
-            let bits = value.to_bits();
-            let flipped = if bits >> 63 == 1 {
-                !bits
-            } else {
-                bits ^ (1u64 << 63)
-            };
-            out.extend_from_slice(&flipped.to_be_bytes());
+            encode_ordered_float(out, *value);
         }
         Value::Text(value) => {
             out.push(index_tag::TEXT);
@@ -925,8 +930,16 @@ fn encode_ordered_i128(out: &mut Vec<u8>, value: i128) {
 }
 
 /// Encode a float with the usual sign-flipping trick; NaN sorts last.
+///
+/// NaNs are canonicalized to the positive quiet NaN first: the sign bit of
+/// an arithmetic NaN is platform-dependent (`0.0 / 0.0` is negative on x86),
+/// and without canonicalization a negative NaN would encode smallest.
 fn encode_ordered_float(out: &mut Vec<u8>, value: f64) {
-    let bits = value.to_bits();
+    let bits = if value.is_nan() {
+        f64::NAN.to_bits()
+    } else {
+        value.to_bits()
+    };
     let flipped = if bits >> 63 == 1 {
         !bits
     } else {
@@ -1032,13 +1045,19 @@ mod tests {
 
     /// Total order used by the index encoding, for test comparison.
     ///
-    /// Within a type, values compare naturally (floats by `total_cmp`, which
-    /// matches the bit transform). Across types, tag order decides.
+    /// Within a type, values compare naturally; floats by `total_cmp` with
+    /// NaN canonicalized last (matching the bit transform). Across types,
+    /// tag order decides.
     fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => x.cmp(y),
-            (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
+            (Value::Float(x), Value::Float(y)) => match (x.is_nan(), y.is_nan()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => x.total_cmp(y),
+            },
             (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
@@ -1086,6 +1105,35 @@ mod tests {
         encode_index_key(&mut neg, &Value::Float(-1.5));
         encode_index_key(&mut pos, &Value::Float(1.5));
         assert!(neg < pos);
+    }
+
+    #[test]
+    fn nan_orders_last_regardless_of_its_sign_bit() {
+        use std::cmp::Ordering;
+        // x86_64's SSE produces a negative NaN for `0.0 / 0.0`; aarch64 a
+        // positive one. Both must order like the greatest number and must
+        // encode to the same index key.
+        let negative_nan = Value::Float(f64::from_bits(0xFFF8_0000_0000_0000));
+        let positive_nan = Value::Float(f64::NAN);
+        for nan in [&negative_nan, &positive_nan] {
+            assert_eq!(nan.cmp(&Value::Float(1.5)), Ordering::Greater);
+            assert_eq!(nan.cmp(&Value::Float(f64::INFINITY)), Ordering::Greater);
+            assert_eq!(Value::Float(1.5).cmp(nan), Ordering::Less);
+        }
+        assert_eq!(
+            negative_nan.cmp(&positive_nan),
+            Ordering::Equal,
+            "all NaNs are one group"
+        );
+
+        let mut negative_key = Vec::new();
+        let mut positive_key = Vec::new();
+        encode_index_key(&mut negative_key, &negative_nan);
+        encode_index_key(&mut positive_key, &positive_nan);
+        assert_eq!(negative_key, positive_key);
+        let mut one_and_a_half = Vec::new();
+        encode_index_key(&mut one_and_a_half, &Value::Float(1.5));
+        assert!(one_and_a_half < negative_key, "NaN keys sort last");
     }
 
     #[test]
