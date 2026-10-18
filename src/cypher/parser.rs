@@ -13,17 +13,27 @@ use crate::record::Value;
 
 /// Parse a full Cypher query.
 pub fn parse(source: &str) -> Result<Query> {
+    let mut parser = parser_for(source)?;
+    let query = parser.parse_query()?;
+    Ok(query)
+}
+
+/// Parse a statement: a DDL command or a query.
+pub fn parse_statement(source: &str) -> Result<Statement> {
+    let mut parser = parser_for(source)?;
+    parser.parse_statement()
+}
+
+fn parser_for(source: &str) -> Result<Parser<'_>> {
     let tokens = lex(source).map_err(|(start, _)| {
         let (line, column) = line_column(source, start);
         Error::syntax(format!("invalid character at line {line} column {column}"))
     })?;
-    let mut parser = Parser {
+    Ok(Parser {
         source,
         tokens,
         pos: 0,
-    };
-    let query = parser.parse_query()?;
-    Ok(query)
+    })
 }
 
 struct Parser<'a> {
@@ -57,6 +67,36 @@ impl<'a> Parser<'a> {
             Ok(())
         } else {
             self.fail(format!("expected {what}"))
+        }
+    }
+
+    /// Source text of the next token when it is a plain identifier.
+    fn peek_ident_text(&self) -> Option<&'a str> {
+        let spanned = self.tokens.get(self.pos)?;
+        (spanned.token == Token::Ident).then(|| {
+            self.source
+                .get(spanned.start..spanned.end)
+                .expect("token span is valid")
+        })
+    }
+
+    fn eat_ident_text(&mut self, text: &str) -> bool {
+        if self
+            .peek_ident_text()
+            .is_some_and(|token| token.eq_ignore_ascii_case(text))
+        {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect_ident_text(&mut self, text: &str) -> Result<()> {
+        if self.eat_ident_text(text) {
+            Ok(())
+        } else {
+            self.fail(format!("expected {text}"))
         }
     }
 
@@ -105,12 +145,244 @@ impl<'a> Parser<'a> {
         Ok(Query { parts })
     }
 
+    /// Parse a statement: a DDL command or a query.
+    fn parse_statement(&mut self) -> Result<Statement> {
+        if let Some(text) = self.peek_ident_text() {
+            if text.eq_ignore_ascii_case("show") {
+                return Err(Error::unsupported(
+                    "SHOW statements are not supported (only CREATE/DROP INDEX and CONSTRAINT)",
+                ));
+            }
+            if text.eq_ignore_ascii_case("drop") {
+                return self.parse_drop();
+            }
+        }
+        if self.peek() == Some(Token::Create)
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .and_then(|spanned| self.source.get(spanned.start..spanned.end))
+                .is_some_and(|text| {
+                    text.eq_ignore_ascii_case("index") || text.eq_ignore_ascii_case("constraint")
+                })
+        {
+            let ddl = self.parse_create_ddl()?;
+            self.eat(Token::Semicolon);
+            if self.peek().is_some() {
+                return self.fail("unexpected input after the DDL statement");
+            }
+            return Ok(ddl);
+        }
+        let query = self.parse_query()?;
+        Ok(Statement::Query(query))
+    }
+
+    fn parse_create_ddl(&mut self) -> Result<Statement> {
+        self.expect(Token::Create, "CREATE")?;
+        if self.eat_ident_text("index") {
+            self.parse_create_index()
+        } else if self.eat_ident_text("constraint") {
+            self.parse_create_constraint()
+        } else {
+            self.fail("expected INDEX or CONSTRAINT after CREATE")
+        }
+    }
+
+    fn parse_create_index(&mut self) -> Result<Statement> {
+        if self.peek() == Some(Token::On) {
+            return Err(Error::syntax(
+                "the `CREATE INDEX ON :Label(property)` form was removed in Neo4j 4; \
+                 use `CREATE INDEX name FOR (n:Label) ON (n.property)`",
+            ));
+        }
+        self.reject_missing_name("an index")?;
+        let name = self.parse_name()?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let (entity, var) = self.parse_ddl_entity()?;
+        self.expect(Token::On, "ON after the pattern")?;
+        let keys = self.parse_ddl_keys(&var)?;
+        Ok(Statement::Ddl(DdlStatement::CreateIndex(DdlIndex {
+            name,
+            if_not_exists,
+            entity,
+            keys,
+        })))
+    }
+
+    fn parse_create_constraint(&mut self) -> Result<Statement> {
+        if self.peek() == Some(Token::On) {
+            return Err(Error::syntax(
+                "the `CREATE CONSTRAINT ON ... ASSERT ...` form was removed in Neo4j 4; \
+                 use `CREATE CONSTRAINT name FOR (n:Label) REQUIRE n.property IS UNIQUE`",
+            ));
+        }
+        self.reject_missing_name("a constraint")?;
+        let name = self.parse_name()?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let (entity, var) = self.parse_ddl_entity()?;
+        if self.peek_ident_text() == Some("assert") {
+            return Err(Error::syntax(
+                "ASSERT was replaced by REQUIRE in Neo4j 4; \
+                 use `CREATE CONSTRAINT name FOR (n:Label) REQUIRE n.property IS UNIQUE`",
+            ));
+        }
+        self.expect_ident_text("require")?;
+        let keys = if self.eat(Token::LParen) {
+            let mut keys = Vec::new();
+            loop {
+                keys.push(self.parse_ddl_property(&var)?);
+                if !self.eat(Token::Comma) {
+                    break;
+                }
+            }
+            self.expect(Token::RParen, "')' to close the property list")?;
+            keys
+        } else {
+            vec![self.parse_ddl_property(&var)?]
+        };
+        self.expect(Token::Is, "IS")?;
+        let kind = if self.eat_ident_text("unique") {
+            DdlConstraintKind::Unique
+        } else if self.eat(Token::Not) {
+            self.expect(Token::Null, "NULL")?;
+            DdlConstraintKind::NotNull
+        } else if self.eat_ident_text("node") {
+            self.expect_ident_text("key")?;
+            DdlConstraintKind::NodeKey
+        } else {
+            return self.fail("expected UNIQUE, NOT NULL or NODE KEY after IS");
+        };
+        self.validate_constraint(&kind, &entity, keys.len())?;
+        Ok(Statement::Ddl(DdlStatement::CreateConstraint(
+            DdlConstraint {
+                name,
+                if_not_exists,
+                entity,
+                kind,
+                keys,
+            },
+        )))
+    }
+
+    fn validate_constraint(
+        &self,
+        kind: &DdlConstraintKind,
+        entity: &DdlEntity,
+        key_count: usize,
+    ) -> Result<()> {
+        match kind {
+            DdlConstraintKind::Unique | DdlConstraintKind::NotNull if key_count != 1 => Err(
+                Error::syntax("UNIQUE and NOT NULL constraints cover exactly one property"),
+            ),
+            DdlConstraintKind::NodeKey if matches!(entity, DdlEntity::Edge { .. }) => Err(
+                Error::syntax("NODE KEY constraints apply to nodes, not relationships"),
+            ),
+            DdlConstraintKind::Unique | DdlConstraintKind::NotNull | DdlConstraintKind::NodeKey => {
+                Ok(())
+            }
+        }
+    }
+
+    fn parse_drop(&mut self) -> Result<Statement> {
+        self.advance();
+        let index = if self.eat_ident_text("index") {
+            true
+        } else if self.eat_ident_text("constraint") {
+            false
+        } else {
+            return self.fail("expected INDEX or CONSTRAINT after DROP");
+        };
+        let name = self.parse_name()?;
+        let if_exists = if self.eat_ident_text("if") {
+            self.expect_ident_text("exists")?;
+            true
+        } else {
+            false
+        };
+        self.eat(Token::Semicolon);
+        if self.peek().is_some() {
+            return self.fail("unexpected input after the DDL statement");
+        }
+        Ok(Statement::Ddl(if index {
+            DdlStatement::DropIndex { name, if_exists }
+        } else {
+            DdlStatement::DropConstraint { name, if_exists }
+        }))
+    }
+
+    fn parse_if_not_exists(&mut self) -> Result<bool> {
+        if !self.eat_ident_text("if") {
+            return Ok(false);
+        }
+        self.expect(Token::Not, "NOT")?;
+        self.expect_ident_text("exists")?;
+        Ok(true)
+    }
+
+    fn reject_missing_name(&self, what: &str) -> Result<()> {
+        if self
+            .peek_ident_text()
+            .is_some_and(|text| text.eq_ignore_ascii_case("for"))
+        {
+            return Err(Error::syntax(format!("a {what} name is required")));
+        }
+        Ok(())
+    }
+
+    /// Parse `FOR (n:Label)` or `FOR ()-[r:TYPE]-()`; returns the entity and
+    /// the variable the property expressions must use.
+    fn parse_ddl_entity(&mut self) -> Result<(DdlEntity, String)> {
+        self.expect_ident_text("for")?;
+        self.expect(Token::LParen, "'(' after FOR")?;
+        if self.eat(Token::RParen) {
+            self.expect(Token::Minus, "'-' before the relationship pattern")?;
+            self.expect(Token::LBracket, "'[' to open the relationship pattern")?;
+            let var = self.parse_name()?;
+            self.expect(Token::Colon, "':' before the relationship type")?;
+            let edge_type = self.parse_symbol_name()?;
+            self.expect(Token::RBracket, "']' to close the relationship pattern")?;
+            self.expect(Token::Minus, "'-' after the relationship pattern")?;
+            self.expect(Token::LParen, "'(' after the relationship pattern")?;
+            self.expect(Token::RParen, "')' after the relationship pattern")?;
+            return Ok((DdlEntity::Edge { edge_type }, var));
+        }
+        let var = self.parse_name()?;
+        self.expect(Token::Colon, "':' before the label")?;
+        let label = self.parse_symbol_name()?;
+        self.expect(Token::RParen, "')' after the label")?;
+        Ok((DdlEntity::Node { label }, var))
+    }
+
+    fn parse_ddl_keys(&mut self, var: &str) -> Result<Vec<String>> {
+        self.expect(Token::LParen, "'(' to open the property list")?;
+        let mut keys = Vec::new();
+        loop {
+            keys.push(self.parse_ddl_property(var)?);
+            if !self.eat(Token::Comma) {
+                break;
+            }
+        }
+        self.expect(Token::RParen, "')' to close the property list")?;
+        Ok(keys)
+    }
+
+    /// A property expression `var.key`; the variable must be the pattern's.
+    fn parse_ddl_property(&mut self, var: &str) -> Result<String> {
+        let base = self.parse_name()?;
+        if base != var {
+            return self.fail(format!("the property expression must use `{var}`"));
+        }
+        self.expect(Token::Dot, "'.' in the property expression")?;
+        self.parse_symbol_name()
+    }
+
     /// Parse the clauses of one query part, up to `UNION` or the end.
     fn parse_clauses(&mut self) -> Result<Vec<Clause>> {
         let mut clauses = Vec::new();
         while self.peek().is_some()
             && self.peek() != Some(Token::Semicolon)
             && self.peek() != Some(Token::Union)
+            && self.peek() != Some(Token::RBrace)
         {
             clauses.push(self.parse_clause()?);
         }
@@ -179,8 +451,50 @@ impl<'a> Parser<'a> {
             }
             Some(Token::Foreach) => self.parse_foreach_clause(),
             Some(Token::Call) => self.parse_call_clause(),
+            Some(Token::Ident)
+                if self
+                    .peek_ident_text()
+                    .is_some_and(|text| text.eq_ignore_ascii_case("load")) =>
+            {
+                self.parse_load_csv_clause()
+            }
             _ => self.fail("expected a clause"),
         }
+    }
+
+    fn parse_load_csv_clause(&mut self) -> Result<Clause> {
+        self.advance(); // LOAD
+        self.expect_ident_text("csv")?;
+        let with_headers = if self.eat(Token::With) {
+            self.expect_ident_text("headers")?;
+            true
+        } else {
+            false
+        };
+        self.expect_ident_text("from")?;
+        let source = self.parse_expr()?;
+        self.expect(Token::As, "AS after the CSV source")?;
+        let alias = self.parse_name()?;
+        let field_terminator = if self.eat_ident_text("fieldterminator") {
+            match self.parse_expr()? {
+                Expr::Literal(Value::Text(text)) if text.chars().count() == 1 => {
+                    let ch = text.chars().next().expect("one character");
+                    if !ch.is_ascii() {
+                        return self.fail("FIELDTERMINATOR must be a single-byte character");
+                    }
+                    Some(ch)
+                }
+                _ => return self.fail("FIELDTERMINATOR expects a single-character string"),
+            }
+        } else {
+            None
+        };
+        Ok(Clause::LoadCsv {
+            with_headers,
+            source,
+            alias,
+            field_terminator,
+        })
     }
 
     fn parse_match_clause(&mut self, optional: bool) -> Result<MatchClause> {
@@ -270,9 +584,21 @@ impl<'a> Parser<'a> {
                     star: true,
                     expr: Expr::Literal(Value::Null),
                     alias: None,
+                    text: None,
                 });
             } else {
+                let start = self.tokens.get(self.pos).map(|spanned| spanned.start);
                 let expr = self.parse_expr()?;
+                let end = self
+                    .tokens
+                    .get(self.pos.wrapping_sub(1))
+                    .map(|spanned| spanned.end);
+                let text = match (start, end) {
+                    (Some(start), Some(end)) if start <= end => {
+                        Some(self.source[start..end].to_owned())
+                    }
+                    _ => None,
+                };
                 let alias = if self.eat(Token::As) {
                     Some(self.parse_name()?)
                 } else {
@@ -282,6 +608,7 @@ impl<'a> Parser<'a> {
                     star: false,
                     expr,
                     alias,
+                    text,
                 });
             }
             if !self.eat(Token::Comma) {
@@ -326,7 +653,14 @@ impl<'a> Parser<'a> {
     fn parse_set_items(&mut self, remove: bool) -> Result<Vec<SetItem>> {
         let mut items = Vec::new();
         loop {
-            let variable = self.parse_name()?;
+            // The target may be parenthesized: `SET (n).name = 'x'`.
+            let variable = if self.eat(Token::LParen) {
+                let name = self.parse_name()?;
+                self.expect(Token::RParen, "')' after the SET target")?;
+                name
+            } else {
+                self.parse_name()?
+            };
             if self.eat(Token::Dot) {
                 let key = self.parse_name()?;
                 let value = if remove {
@@ -341,9 +675,9 @@ impl<'a> Parser<'a> {
                     value,
                 });
             } else if self.eat(Token::Colon) {
-                let mut labels = vec![self.parse_name()?];
+                let mut labels = vec![self.parse_symbol_name()?];
                 while self.eat(Token::Colon) {
-                    labels.push(self.parse_name()?);
+                    labels.push(self.parse_symbol_name()?);
                 }
                 items.push(SetItem::Label { variable, labels });
             } else if !remove && self.eat(Token::PlusEquals) {
@@ -530,14 +864,54 @@ impl<'a> Parser<'a> {
         if matches!(self.peek(), Some(Token::Ident) | Some(Token::EscapedIdent)) {
             pattern.variable = Some(self.parse_name()?);
         }
-        while self.eat(Token::Colon) {
-            pattern.labels.push(self.parse_name()?);
+        if self.eat(Token::Colon) {
+            pattern.labels = self.parse_label_expr()?;
         }
         if self.peek() == Some(Token::LBrace) {
             pattern.properties = Some(self.parse_map_literal()?);
         }
         self.expect(Token::RParen, "')' to close a node pattern")?;
         Ok(pattern)
+    }
+
+    /// Label/type expression: `|` has the lowest precedence, then `&` and the
+    /// `:` chain shorthand, then `!` and parentheses.
+    fn parse_label_expr(&mut self) -> Result<LabelExpr> {
+        let mut parts = vec![self.parse_label_and()?];
+        while self.eat(Token::Pipe) {
+            parts.push(self.parse_label_and()?);
+        }
+        Ok(if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            LabelExpr::Or(parts)
+        })
+    }
+
+    fn parse_label_and(&mut self) -> Result<LabelExpr> {
+        let mut parts = vec![self.parse_label_unary()?];
+        while self.eat(Token::Amp) || self.eat(Token::Colon) {
+            parts.push(self.parse_label_unary()?);
+        }
+        Ok(if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            LabelExpr::And(parts)
+        })
+    }
+
+    fn parse_label_unary(&mut self) -> Result<LabelExpr> {
+        // `:T|:U` spells the second alternative with its own colon.
+        self.eat(Token::Colon);
+        if self.eat(Token::Bang) {
+            return Ok(LabelExpr::Not(Box::new(self.parse_label_unary()?)));
+        }
+        if self.eat(Token::LParen) {
+            let expr = self.parse_label_expr()?;
+            self.expect(Token::RParen, "')' to close a label expression")?;
+            return Ok(expr);
+        }
+        Ok(LabelExpr::Label(self.parse_symbol_name()?))
     }
 
     fn parse_relationship(&mut self) -> Result<RelationshipPattern> {
@@ -548,7 +922,7 @@ impl<'a> Parser<'a> {
         };
         let mut pattern = RelationshipPattern {
             variable: None,
-            types: Vec::new(),
+            types: LabelExpr::default(),
             direction: RelDirection::Undirected,
             var_length: None,
             properties: None,
@@ -558,10 +932,7 @@ impl<'a> Parser<'a> {
                 pattern.variable = Some(self.parse_name()?);
             }
             if self.eat(Token::Colon) {
-                pattern.types.push(self.parse_name()?);
-                while self.eat(Token::Pipe) {
-                    pattern.types.push(self.parse_name()?);
-                }
+                pattern.types = self.parse_label_expr()?;
             }
             if self.eat(Token::Star) {
                 pattern.var_length = Some(self.parse_var_length()?);
@@ -580,6 +951,10 @@ impl<'a> Parser<'a> {
             (Token::Minus, Token::Minus) => RelDirection::Undirected,
             (Token::Minus, Token::ArrowRight) => RelDirection::Outgoing,
             (Token::ArrowLeft, Token::Minus) => RelDirection::Incoming,
+            // Arrowheads on both sides (`<--` with `-->`, with or without
+            // brackets) spell an undirected relationship; the writer's
+            // CREATE planner rejects it there.
+            (Token::ArrowLeft, Token::ArrowRight) => RelDirection::Undirected,
             _ => return self.fail("invalid relationship direction"),
         };
         Ok(pattern)
@@ -632,6 +1007,22 @@ impl<'a> Parser<'a> {
                 Ok(self.source[spanned.start..spanned.end].to_owned())
             }
             _ => self.fail("expected a map key"),
+        }
+    }
+
+    /// A label or relationship type name: identifiers and keywords are
+    /// both accepted (`:CONTAINS` is a valid type).
+    fn parse_symbol_name(&mut self) -> Result<String> {
+        if matches!(self.peek(), Some(Token::Ident) | Some(Token::EscapedIdent)) {
+            return self.parse_name();
+        }
+        match self.peek() {
+            Some(token) if token.is_keyword() => {
+                self.advance();
+                let spanned = self.tokens[self.pos - 1];
+                Ok(self.source[spanned.start..spanned.end].to_owned())
+            }
+            _ => self.fail("expected a label or type name"),
         }
     }
 
@@ -697,44 +1088,62 @@ impl<'a> Parser<'a> {
         self.parse_comparison()
     }
 
+    /// Comparison operators bind looser than membership and string-list
+    /// predicates, and a chain such as `a < b < c` is the conjunction
+    /// `a < b AND b < c` (openCypher's chained comparison).
     fn parse_comparison(&mut self) -> Result<Expr> {
+        let mut left = self.parse_membership()?;
+        let mut conjuncts: Vec<Expr> = Vec::new();
+        loop {
+            let op = match self.peek() {
+                Some(Token::Equals) => BinaryOp::Eq,
+                Some(Token::NotEquals) => BinaryOp::Ne,
+                Some(Token::Less) => BinaryOp::Lt,
+                Some(Token::LessEquals) => BinaryOp::Le,
+                Some(Token::Greater) => BinaryOp::Gt,
+                Some(Token::GreaterEquals) => BinaryOp::Ge,
+                Some(Token::RegexMatch) => BinaryOp::Regex,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_membership()?;
+            conjuncts.push(binary(op, left.clone(), right.clone()));
+            left = right;
+        }
+        Ok(match conjuncts.len() {
+            0 => left,
+            1 => conjuncts.pop().expect("one conjunct"),
+            _ => {
+                let mut chains = conjuncts.into_iter();
+                let mut combined = chains.next().expect("first conjunct");
+                for conjunct in chains {
+                    combined = binary(BinaryOp::And, combined, conjunct);
+                }
+                combined
+            }
+        })
+    }
+
+    /// `IN`, `STARTS WITH`, `ENDS WITH` and `CONTAINS` bind tighter than the
+    /// comparison operators: `a = b IN c` is `a = (b IN c)`.
+    fn parse_membership(&mut self) -> Result<Expr> {
         let mut left = self.parse_additive()?;
         loop {
             let op = match self.peek() {
-                Some(Token::Equals) => Some(BinaryOp::Eq),
-                Some(Token::NotEquals) => Some(BinaryOp::Ne),
-                Some(Token::Less) => Some(BinaryOp::Lt),
-                Some(Token::LessEquals) => Some(BinaryOp::Le),
-                Some(Token::Greater) => Some(BinaryOp::Gt),
-                Some(Token::GreaterEquals) => Some(BinaryOp::Ge),
-                Some(Token::RegexMatch) => Some(BinaryOp::Regex),
-                Some(Token::In) => Some(BinaryOp::In),
-                Some(Token::Starts) => Some(BinaryOp::StartsWith),
-                Some(Token::Ends) => Some(BinaryOp::EndsWith),
-                Some(Token::Contains) => Some(BinaryOp::Contains),
-                _ => None,
+                Some(Token::In) => BinaryOp::In,
+                Some(Token::Starts) => BinaryOp::StartsWith,
+                Some(Token::Ends) => BinaryOp::EndsWith,
+                Some(Token::Contains) => BinaryOp::Contains,
+                _ => break,
             };
-            if let Some(op) = op {
-                self.advance();
-                if op == BinaryOp::StartsWith {
-                    self.expect(Token::With, "WITH after STARTS")?;
-                } else if op == BinaryOp::EndsWith {
-                    self.expect(Token::With, "WITH after ENDS")?;
-                }
-                let right = self.parse_additive()?;
-                left = binary(op, left, right);
-                continue;
+            self.advance();
+            if op == BinaryOp::StartsWith {
+                self.expect(Token::With, "WITH after STARTS")?;
+            } else if op == BinaryOp::EndsWith {
+                self.expect(Token::With, "WITH after ENDS")?;
             }
-            if self.eat(Token::Is) {
-                let negated = self.eat(Token::Not);
-                self.expect(Token::Null, "NULL after IS")?;
-                left = Expr::IsNull {
-                    expr: Box::new(left),
-                    negated,
-                };
-                continue;
-            }
-            break;
+            let right = self.parse_additive()?;
+            left = binary(op, left, right);
         }
         Ok(left)
     }
@@ -770,18 +1179,24 @@ impl<'a> Parser<'a> {
         Ok(left)
     }
 
+    /// Exponentiation is left-associative: `4 ^ 6 ^ 3` is `(4 ^ 6) ^ 3`.
     fn parse_power(&mut self) -> Result<Expr> {
-        let left = self.parse_unary()?;
-        if self.eat(Token::Caret) {
-            // Right-associative.
-            let right = self.parse_power()?;
-            return Ok(binary(BinaryOp::Pow, left, right));
+        let mut left = self.parse_unary()?;
+        while self.eat(Token::Caret) {
+            let right = self.parse_unary()?;
+            left = binary(BinaryOp::Pow, left, right);
         }
         Ok(left)
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {
         if self.eat(Token::Minus) {
+            // Fold the sign into a following number literal so that the full
+            // range down to `i64::MIN` and huge negative floats parse, and
+            // `-0.0` normalizes to `0.0` like Neo4j.
+            if let Some(literal) = self.try_parse_negative_number()? {
+                return Ok(literal);
+            }
             let expr = self.parse_unary()?;
             return Ok(Expr::Unary {
                 op: UnaryOp::Neg,
@@ -792,6 +1207,40 @@ impl<'a> Parser<'a> {
             return self.parse_unary();
         }
         self.parse_postfix()
+    }
+
+    /// The sign of a number literal immediately following a unary minus.
+    fn try_parse_negative_number(&mut self) -> Result<Option<Expr>> {
+        let spanned = match self.tokens.get(self.pos) {
+            Some(spanned) => *spanned,
+            None => return Ok(None),
+        };
+        let text = &self.source[spanned.start..spanned.end];
+        let value = match spanned.token {
+            Token::Float => {
+                self.advance();
+                let value = parse_float(text)?;
+                // Negative zero is normalized to positive zero.
+                Number::Float(if value == 0.0 { 0.0 } else { -value })
+            }
+            Token::Integer => {
+                self.advance();
+                parse_negative_decimal_integer(text)?
+            }
+            Token::HexInteger => {
+                self.advance();
+                parse_negative_radix_integer(text, 16, "0x")?
+            }
+            Token::OctalInteger => {
+                self.advance();
+                parse_negative_radix_integer(text, 8, "0o")?
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(match value {
+            Number::Int(value) => Expr::Literal(Value::Int(value)),
+            Number::Float(value) => Expr::Literal(Value::Float(value)),
+        }))
     }
 
     /// Parse a function-call argument list; the opening parenthesis has
@@ -812,6 +1261,17 @@ impl<'a> Parser<'a> {
         let mut expr = self.parse_primary()?;
         loop {
             match self.peek() {
+                // `IS [NOT] NULL` binds tighter than comparisons:
+                // `false = true IS NULL` is `false = (true IS NULL)`.
+                Some(Token::Is) => {
+                    self.advance();
+                    let negated = self.eat(Token::Not);
+                    self.expect(Token::Null, "NULL after IS")?;
+                    expr = Expr::IsNull {
+                        expr: Box::new(expr),
+                        negated,
+                    };
+                }
                 Some(Token::Dot) => {
                     self.advance();
                     let key = self.parse_name()?;
@@ -852,9 +1312,9 @@ impl<'a> Parser<'a> {
                 }
                 Some(Token::Colon) => {
                     self.advance();
-                    let mut labels = vec![self.parse_name()?];
+                    let mut labels = vec![self.parse_symbol_name()?];
                     while self.eat(Token::Colon) {
-                        labels.push(self.parse_name()?);
+                        labels.push(self.parse_symbol_name()?);
                     }
                     expr = Expr::LabelCheck {
                         expr: Box::new(expr),
@@ -876,16 +1336,24 @@ impl<'a> Parser<'a> {
         match spanned.token {
             Token::Integer => {
                 self.advance();
-                let value = text().parse::<i64>().map_err(|_| {
-                    Error::syntax(format!("integer literal {} out of range", text()))
-                })?;
+                Ok(match parse_decimal_integer(text())? {
+                    Number::Int(value) => Expr::Literal(Value::Int(value)),
+                    Number::Float(value) => Expr::Literal(Value::Float(value)),
+                })
+            }
+            Token::HexInteger => {
+                self.advance();
+                let value = parse_radix_integer(text(), 16, "0x")?;
+                Ok(Expr::Literal(Value::Int(value)))
+            }
+            Token::OctalInteger => {
+                self.advance();
+                let value = parse_radix_integer(text(), 8, "0o")?;
                 Ok(Expr::Literal(Value::Int(value)))
             }
             Token::Float => {
                 self.advance();
-                let value = text()
-                    .parse::<f64>()
-                    .map_err(|_| Error::syntax(format!("invalid float literal {}", text())))?;
+                let value = parse_float(text())?;
                 Ok(Expr::Literal(Value::Float(value)))
             }
             Token::StringSingle | Token::StringDouble => {
@@ -911,6 +1379,31 @@ impl<'a> Parser<'a> {
             }
             Token::Ident | Token::EscapedIdent => {
                 let name = self.parse_name()?;
+                // `exists { ... }` is an existential subquery, not a call.
+                if name.eq_ignore_ascii_case("exists") && self.peek() == Some(Token::LBrace) {
+                    self.advance();
+                    let clauses =
+                        if matches!(self.peek(), Some(Token::LParen) | Some(Token::LBracket)) {
+                            let patterns = self.parse_patterns()?;
+                            let where_clause = if self.eat(Token::Where) {
+                                Some(self.parse_expr()?)
+                            } else {
+                                None
+                            };
+                            vec![Clause::Match(MatchClause {
+                                optional: false,
+                                patterns,
+                                where_clause,
+                            })]
+                        } else {
+                            self.parse_clauses()?
+                        };
+                    self.expect(Token::RBrace, "'}' to close the EXISTS subquery")?;
+                    return Ok(Expr::ExistsSubquery(Box::new(QueryPart {
+                        union_all: false,
+                        clauses,
+                    })));
+                }
                 // Namespaced function calls such as `date.truncate(...)` or
                 // `duration.inDays(...)`: an identifier, a dot, a second
                 // identifier and an argument list.
@@ -1159,6 +1652,74 @@ fn binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
     }
 }
 
+/// A parsed number literal, before it becomes an [`Expr`].
+enum Number {
+    Int(i64),
+    Float(f64),
+}
+
+/// Parse a decimal integer literal, falling back to a float when the value
+/// exceeds the `u64` range (Neo4j parses arbitrarily long numbers as floats
+/// but rejects values that could have been a 64-bit unsigned integer).
+fn parse_decimal_integer(text: &str) -> Result<Number> {
+    if let Ok(value) = text.parse::<i64>() {
+        return Ok(Number::Int(value));
+    }
+    if text.parse::<u64>().is_ok() {
+        return Err(Error::syntax("integer literal overflows 64 bits"));
+    }
+    Ok(Number::Float(parse_float(text)?))
+}
+
+/// Parse a `0x`/`0o` integer literal.
+fn parse_radix_integer(text: &str, radix: u32, prefix: &str) -> Result<i64> {
+    let digits = text
+        .strip_prefix(prefix)
+        .or_else(|| text.strip_prefix(&prefix.to_ascii_uppercase()))
+        .unwrap_or(text);
+    let magnitude = u64::from_str_radix(digits, radix)
+        .map_err(|_| Error::syntax(format!("invalid integer literal `{text}`")))?;
+    i64::try_from(magnitude).map_err(|_| Error::syntax("integer literal overflows 64 bits"))
+}
+
+/// Parse the text following a unary minus.
+fn parse_negative_decimal_integer(text: &str) -> Result<Number> {
+    let signed = format!("-{text}");
+    if let Ok(value) = signed.parse::<i64>() {
+        return Ok(Number::Int(value));
+    }
+    match text.parse::<u64>() {
+        // Within the unsigned range: an overflow rather than a float.
+        Ok(_) => Err(Error::syntax("integer literal overflows 64 bits")),
+        Err(_) => Ok(Number::Float(parse_float(&signed)?)),
+    }
+}
+
+/// Parse the text following a unary minus for `0x`/`0o` literals.
+fn parse_negative_radix_integer(text: &str, radix: u32, prefix: &str) -> Result<Number> {
+    let digits = text
+        .strip_prefix(prefix)
+        .or_else(|| text.strip_prefix(&prefix.to_ascii_uppercase()))
+        .unwrap_or(text);
+    let magnitude = u64::from_str_radix(digits, radix)
+        .map_err(|_| Error::syntax(format!("invalid integer literal `{text}`")))?;
+    // Negating the magnitude covers `-2^63` exactly.
+    i64::try_from(0_i128 - magnitude as i128)
+        .map(Number::Int)
+        .map_err(|_| Error::syntax("integer literal overflows 64 bits"))
+}
+
+/// Parse a float literal, rejecting values that do not fit `f64`.
+fn parse_float(text: &str) -> Result<f64> {
+    let value = text
+        .parse::<f64>()
+        .map_err(|_| Error::syntax(format!("invalid float literal `{text}`")))?;
+    if !value.is_finite() {
+        return Err(Error::syntax("floating point literal overflows 64 bits"));
+    }
+    Ok(value)
+}
+
 fn unescape_string(raw: &str) -> Result<String> {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars();
@@ -1300,7 +1861,7 @@ mod tests {
         assert_eq!(matched.patterns.len(), 1);
         let path = &matched.patterns[0];
         assert_eq!(path.start.variable.as_deref(), Some("n"));
-        assert_eq!(path.start.labels, vec!["Person"]);
+        assert_eq!(path.start.labels, LabelExpr::Label("Person".to_owned()));
         assert!(path.start.properties.is_some());
         assert_eq!(path.segments.len(), 1);
         assert_eq!(
@@ -1308,6 +1869,143 @@ mod tests {
             RelDirection::Outgoing
         );
         assert!(matched.where_clause.is_some());
+    }
+
+    #[test]
+    fn parses_label_expressions() {
+        let query = parse("MATCH (n:A|B:C), (m:!D), (o:(A|B)&C) RETURN n, m, o").expect("parse");
+        let Clause::Match(matched) = &query.parts[0].clauses[0] else {
+            panic!("expected MATCH");
+        };
+        let label = |name: &str| LabelExpr::Label(name.to_owned());
+        assert_eq!(
+            matched.patterns[0].start.labels,
+            LabelExpr::Or(vec![
+                label("A"),
+                LabelExpr::And(vec![label("B"), label("C")])
+            ])
+        );
+        assert_eq!(
+            matched.patterns[1].start.labels,
+            LabelExpr::Not(Box::new(label("D")))
+        );
+        assert_eq!(
+            matched.patterns[2].start.labels,
+            LabelExpr::And(vec![
+                LabelExpr::Or(vec![label("A"), label("B")]),
+                label("C"),
+            ])
+        );
+        // Relationship type expressions share the grammar, including the
+        // `:T|:U` spelling of the second alternative.
+        let query = parse("MATCH ()-[:X|:!Y]-() RETURN 1").expect("parse");
+        let Clause::Match(matched) = &query.parts[0].clauses[0] else {
+            panic!("expected MATCH");
+        };
+        assert_eq!(
+            matched.patterns[0].segments[0].relationship.types,
+            LabelExpr::Or(vec![label("X"), LabelExpr::Not(Box::new(label("Y")))])
+        );
+    }
+
+    #[test]
+    fn parses_ddl_statements() {
+        let statement = parse_statement(
+            "CREATE INDEX person_name IF NOT EXISTS FOR (n:Person) ON (n.name, n.age)",
+        )
+        .expect("parse");
+        let Statement::Ddl(DdlStatement::CreateIndex(index)) = statement else {
+            panic!("expected CREATE INDEX");
+        };
+        assert_eq!(index.name, "person_name");
+        assert!(index.if_not_exists);
+        assert_eq!(
+            index.entity,
+            DdlEntity::Node {
+                label: "Person".to_owned()
+            }
+        );
+        assert_eq!(index.keys, vec!["name", "age"]);
+
+        let statement =
+            parse_statement("CREATE INDEX knows_weight FOR ()-[r:KNOWS]-() ON (r.weight)")
+                .expect("parse");
+        let Statement::Ddl(DdlStatement::CreateIndex(index)) = statement else {
+            panic!("expected CREATE INDEX");
+        };
+        assert_eq!(
+            index.entity,
+            DdlEntity::Edge {
+                edge_type: "KNOWS".to_owned()
+            }
+        );
+        assert!(!index.if_not_exists);
+        assert_eq!(index.keys, vec!["weight"]);
+
+        let statement = parse_statement(
+            "CREATE CONSTRAINT person_key FOR (n:Person) REQUIRE (n.name, n.surname) IS NODE KEY",
+        )
+        .expect("parse");
+        let Statement::Ddl(DdlStatement::CreateConstraint(constraint)) = statement else {
+            panic!("expected CREATE CONSTRAINT");
+        };
+        assert_eq!(constraint.kind, DdlConstraintKind::NodeKey);
+        assert_eq!(constraint.keys, vec!["name", "surname"]);
+
+        let statement = parse_statement(
+            "CREATE CONSTRAINT knows_weight FOR ()-[r:KNOWS]-() REQUIRE r.weight IS NOT NULL",
+        )
+        .expect("parse");
+        let Statement::Ddl(DdlStatement::CreateConstraint(constraint)) = statement else {
+            panic!("expected CREATE CONSTRAINT");
+        };
+        assert_eq!(constraint.kind, DdlConstraintKind::NotNull);
+
+        let statement = parse_statement("DROP CONSTRAINT person_key IF EXISTS").expect("parse");
+        assert_eq!(
+            statement,
+            Statement::Ddl(DdlStatement::DropConstraint {
+                name: "person_key".to_owned(),
+                if_exists: true,
+            })
+        );
+        let statement = parse_statement("DROP INDEX person_name").expect("parse");
+        assert_eq!(
+            statement,
+            Statement::Ddl(DdlStatement::DropIndex {
+                name: "person_name".to_owned(),
+                if_exists: false,
+            })
+        );
+    }
+
+    #[test]
+    fn ddl_errors_point_at_the_replacement() {
+        let err = parse_statement("CREATE INDEX ON :Person(name)").expect_err("old form");
+        assert!(err.message().contains("CREATE INDEX name FOR"), "{err}");
+        let err = parse_statement("CREATE CONSTRAINT ON (n:Person) ASSERT n.name IS UNIQUE")
+            .expect_err("old form");
+        assert!(err.message().contains("REQUIRE"), "{err}");
+        let err = parse_statement("SHOW INDEXES").expect_err("show");
+        assert_eq!(err.code(), crate::error::ErrorCode::Unsupported);
+        let err = parse_statement("CREATE INDEX FOR (n:Person) ON (n.name)").expect_err("name");
+        assert!(err.message().contains("name is required"), "{err}");
+        let err = parse_statement("CREATE CONSTRAINT c FOR ()-[r:T]-() REQUIRE r.p IS NODE KEY")
+            .expect_err("edge node key");
+        assert!(err.message().contains("NODE KEY"), "{err}");
+        let err = parse_statement("CREATE CONSTRAINT c FOR (n:N) REQUIRE (n.a, n.b) IS UNIQUE")
+            .expect_err("two keys");
+        assert!(err.message().contains("exactly one property"), "{err}");
+    }
+
+    #[test]
+    fn create_patterns_are_not_ddl() {
+        // `CREATE` followed by a pattern stays a query; identifiers named
+        // `index` and `drop` still work as variables.
+        let statement = parse_statement("CREATE (n:Index) RETURN n").expect("parse");
+        assert!(matches!(statement, Statement::Query(_)));
+        let statement = parse_statement("MATCH (index) RETURN index").expect("parse");
+        assert!(matches!(statement, Statement::Query(_)));
     }
 
     #[test]
@@ -1337,13 +2035,44 @@ mod tests {
     }
 
     #[test]
-    fn power_is_right_associative() {
+    fn parses_hex_octal_and_extreme_literals() {
+        let int_of = |query: &str| match expr_of(query) {
+            Expr::Literal(Value::Int(value)) => value,
+            other => panic!("expected integer literal, got {other:?}"),
+        };
+        assert_eq!(int_of("RETURN 0x1A2b"), 0x1a2b);
+        assert_eq!(int_of("RETURN 0o17"), 0o17);
+        assert_eq!(int_of("RETURN 0x7FFFFFFFFFFFFFFF"), i64::MAX);
+        assert_eq!(int_of("RETURN -0x8000000000000000"), i64::MIN);
+        assert_eq!(int_of("RETURN -0o1000000000000000000000"), i64::MIN);
+        assert_eq!(int_of("RETURN -9223372036854775808"), i64::MIN);
+
+        for query in [
+            "RETURN 9223372036854775808",
+            "RETURN -9223372036854775809",
+            "RETURN 0o1000000000000000000000",
+            "RETURN 1.34E999",
+        ] {
+            assert!(parse(query).is_err(), "{query}");
+        }
+
+        let float_of = |query: &str| match expr_of(query) {
+            Expr::Literal(Value::Float(value)) => value,
+            other => panic!("expected float literal, got {other:?}"),
+        };
+        assert_eq!(float_of("RETURN -0.0"), 0.0);
+        assert_eq!(float_of("RETURN -.0"), 0.0);
+        assert!(float_of("RETURN -12635418652381263541826355").is_sign_negative());
+    }
+
+    #[test]
+    fn power_is_left_associative() {
         let expr = expr_of("RETURN 2 ^ 3 ^ 2");
-        let Expr::Binary { op, right, .. } = expr else {
+        let Expr::Binary { op, left, .. } = expr else {
             panic!("expected binary");
         };
         assert_eq!(op, BinaryOp::Pow);
-        let Expr::Binary { op, .. } = *right else {
+        let Expr::Binary { op, .. } = *left else {
             panic!("expected nested power");
         };
         assert_eq!(op, BinaryOp::Pow);
@@ -1462,5 +2191,109 @@ mod tests {
             panic!("expected text");
         };
         assert_eq!(text.as_ref(), "a\nA");
+    }
+
+    #[test]
+    fn rejects_unterminated_strings_and_backticks() {
+        for source in ["RETURN 'abc", "RETURN \"abc", "RETURN `abc"] {
+            let err = parse(source).expect_err(source);
+            assert!(err.message().contains("line 1"), "{source}: {err}");
+        }
+        assert!(parse("RETURN 'a\\q'").is_err(), "invalid escape");
+    }
+
+    #[test]
+    fn rejects_malformed_relationship_patterns() {
+        for source in [
+            "MATCH (a)-[r->(b) RETURN a",
+            "MATCH (a)-[r:]->(b) RETURN a",
+            "MATCH (a)-[:KNOWS (b) RETURN a",
+            "MATCH (a)-[r] RETURN a",
+        ] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn variable_length_bounds_parse_in_both_directions() {
+        // Inverted bounds are an empty interval per the TCK, not a parse
+        // error: the engine returns no rows for them.
+        let query = parse("MATCH (a)-[*2..1]->(b) RETURN a").expect("inverted bounds");
+        let Clause::Match(matched) = &query.parts[0].clauses[0] else {
+            panic!("expected MATCH");
+        };
+        assert_eq!(
+            matched.patterns[0].segments[0].relationship.var_length,
+            Some(VarLength {
+                min: 2,
+                max: Some(1)
+            })
+        );
+        for source in [
+            "MATCH (a)-[*]->(b) RETURN a",
+            "MATCH (a)-[*1..]->(b) RETURN a",
+            "MATCH (a)-[*..3]->(b) RETURN a",
+            "MATCH (a)-[*..0]->(b) RETURN a",
+        ] {
+            assert!(parse(source).is_ok(), "{source}");
+        }
+    }
+
+    #[test]
+    fn rejects_multichar_field_terminators() {
+        let err = parse_statement("LOAD CSV FROM 'x.csv' AS row FIELDTERMINATOR 'ab' RETURN row")
+            .expect_err("two bytes");
+        assert!(err.message().contains("single-character"), "{err}");
+        // A one-byte terminator other than the default still parses.
+        assert!(
+            parse_statement("LOAD CSV FROM 'x.csv' AS row FIELDTERMINATOR ';' RETURN row").is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_property_access() {
+        for source in ["RETURN n.", "RETURN .name", "RETURN n..name"] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn rejects_missing_expressions() {
+        for source in [
+            "RETURN",
+            "MATCH (n) WHERE RETURN n",
+            "MATCH (n) WHERE n.age > RETURN n",
+            "UNWIND AS x RETURN x",
+        ] {
+            assert!(parse(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn rejects_empty_input_and_trailing_junk() {
+        assert!(parse("").is_err());
+        assert!(parse("   ").is_err());
+        assert!(parse("RETURN 1 2").is_err(), "trailing literal");
+        assert!(parse("RETURN 1 AS").is_err(), "dangling alias");
+    }
+
+    #[test]
+    fn parses_load_csv_headers_and_fields() {
+        let statement =
+            parse_statement("LOAD CSV WITH HEADERS FROM 'people.csv' AS row RETURN row.name")
+                .expect("parse");
+        let Statement::Query(query) = statement else {
+            panic!("expected query");
+        };
+        let Clause::LoadCsv {
+            with_headers,
+            field_terminator,
+            ..
+        } = &query.parts[0].clauses[0]
+        else {
+            panic!("expected LOAD CSV");
+        };
+        assert!(*with_headers);
+        assert_eq!(*field_terminator, None);
     }
 }

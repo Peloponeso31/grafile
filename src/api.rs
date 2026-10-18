@@ -261,7 +261,10 @@ impl Connection {
             phase: Phase::Runtime,
             error,
         };
-        let parsed = cypher::parse(source).map_err(compile)?;
+        let parsed = match cypher::parse_statement(source).map_err(compile)? {
+            cypher::Statement::Query(parsed) => parsed,
+            cypher::Statement::Ddl(ddl) => return self.execute_ddl(&ddl),
+        };
         let prepared =
             planner::plan_query(&mut self.db, &parsed, params.values()).map_err(compile)?;
         let program = codegen::compile(&prepared).map_err(compile)?;
@@ -302,9 +305,43 @@ impl Connection {
         self.query(source, &Params::new()).map(|_| ())
     }
 
+    /// Execute a schema DDL statement with the same transaction discipline as
+    /// a query: auto-commit unless a transaction is already open.
+    fn execute_ddl(&mut self, ddl: &cypher::DdlStatement) -> std::result::Result<Rows, PhaseError> {
+        let runtime = |error: Error| PhaseError {
+            phase: Phase::Runtime,
+            error,
+        };
+        let started = self.db.in_write_txn();
+        if !started && self.auto_commit {
+            self.db.begin_write().map_err(runtime)?;
+        }
+        match self.db.execute_ddl(ddl) {
+            Ok(()) => {
+                if !started && self.auto_commit {
+                    self.db.commit().map_err(runtime)?;
+                }
+                Ok(Rows {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    position: 0,
+                })
+            }
+            Err(error) => {
+                if !started && self.auto_commit {
+                    let _ = self.db.rollback();
+                }
+                Err(runtime(error))
+            }
+        }
+    }
+
     /// Return the query plan as text (like `EXPLAIN QUERY PLAN`).
     pub fn explain(&mut self, source: &str) -> Result<String> {
-        let parsed = cypher::parse(source)?;
+        let parsed = match cypher::parse_statement(source)? {
+            cypher::Statement::Query(parsed) => parsed,
+            cypher::Statement::Ddl(ddl) => return Ok(ddl.describe()),
+        };
         let prepared = planner::plan_query(&mut self.db, &parsed, &HashMap::new())?;
         let mut out = String::new();
         planner::explain(&prepared.plan, 0, &mut out);
@@ -313,7 +350,14 @@ impl Connection {
 
     /// Return the compiled VDBE program as text (like SQLite's `EXPLAIN`).
     pub fn explain_program(&mut self, source: &str) -> Result<String> {
-        let parsed = cypher::parse(source)?;
+        let parsed = match cypher::parse_statement(source)? {
+            cypher::Statement::Query(parsed) => parsed,
+            cypher::Statement::Ddl(_) => {
+                return Err(Error::unsupported(
+                    "DDL statements have no VDBE program; use explain",
+                ));
+            }
+        };
         let prepared = planner::plan_query(&mut self.db, &parsed, &HashMap::new())?;
         let program = codegen::compile(&prepared)?;
         let mut out = String::new();
@@ -415,7 +459,10 @@ mod tests {
     fn execution_failure_is_runtime() {
         let mut conn = connection();
         let err = conn
-            .query_with_phase("RETURN 1 + 'x'", &Params::new())
+            .query_with_phase(
+                "RETURN date('2020-01-01') < datetime('2020-01-01T00:00:00')",
+                &Params::new(),
+            )
             .expect_err("type error");
         assert_eq!(err.phase(), Phase::Runtime);
         assert_eq!(err.error().code(), ErrorCode::Type);

@@ -294,7 +294,7 @@ fn find_ge(
                     return Ok(Some(found));
                 }
             }
-            find_first(pager, interior.rightmost, kind)
+            find_ge(pager, interior.rightmost, kind, target)
         }
     }
 }
@@ -387,5 +387,150 @@ fn find_le(
             }
             Ok(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::btree::Btree;
+    use crate::vfs::mem::MemVfs;
+
+    fn test_pager() -> Pager {
+        Pager::create(
+            Arc::new(MemVfs::new()),
+            std::path::Path::new("cursor.db"),
+            4096,
+        )
+        .expect("pager")
+    }
+
+    fn key_of(cursor: &Cursor) -> u64 {
+        u64::from_be_bytes(cursor.key().try_into().expect("key"))
+    }
+
+    /// Insert `keys` with 200-byte values, forcing several leaf pages.
+    fn wide_model(
+        pager: &mut Pager,
+        keys: impl IntoIterator<Item = u64>,
+    ) -> (Btree, BTreeMap<u64, Vec<u8>>) {
+        let mut tree = Btree::create(pager, TreeKind::Table).expect("create");
+        let mut model = BTreeMap::new();
+        for key in keys {
+            let value = vec![(key % 251) as u8; 200];
+            tree.insert(pager, &key.to_be_bytes(), &value)
+                .expect("insert");
+            model.insert(key, value);
+        }
+        (tree, model)
+    }
+
+    #[test]
+    fn empty_tree_cursor_reports_no_position() {
+        let mut pager = test_pager();
+        pager.begin_write().expect("begin");
+        let tree = Btree::create(&mut pager, TreeKind::Table).expect("create");
+        let mut cursor = tree.cursor();
+        assert!(!cursor.first(&mut pager).expect("first"));
+        assert!(!cursor.is_valid());
+        assert!(cursor.key().is_empty());
+        assert!(!cursor.last(&mut pager).expect("last"));
+        assert!(!cursor.seek_ge(&mut pager, &1u64.to_be_bytes()).expect("ge"));
+        assert!(!cursor.seek_le(&mut pager, &1u64.to_be_bytes()).expect("le"));
+        assert!(!cursor.next(&mut pager).expect("next"));
+        assert!(!cursor.prev(&mut pager).expect("prev"));
+        assert!(cursor.value(&mut pager).is_err());
+        pager.commit().expect("commit");
+    }
+
+    #[test]
+    fn invalidate_clears_position_and_stops_iteration() {
+        let mut pager = test_pager();
+        pager.begin_write().expect("begin");
+        let (tree, _) = wide_model(&mut pager, [1, 2, 3]);
+        let mut cursor = tree.cursor();
+        assert!(cursor.first(&mut pager).expect("first"));
+        assert!(cursor.is_valid());
+        cursor.invalidate();
+        assert!(!cursor.is_valid());
+        assert!(cursor.key().is_empty());
+        assert!(!cursor.next(&mut pager).expect("next"));
+        assert!(!cursor.prev(&mut pager).expect("prev"));
+        assert!(cursor.first(&mut pager).expect("re-seek"));
+        assert!(cursor.is_valid());
+        pager.commit().expect("commit");
+    }
+
+    /// Seek sweeps must agree with a `BTreeMap` model across leaf pages,
+    /// including targets greater than every divider of an interior node.
+    #[test]
+    fn seeks_match_the_model_across_pages() {
+        let mut pager = test_pager();
+        pager.begin_write().expect("begin");
+        let (tree, model) = wide_model(&mut pager, (0..500u64).map(|i| i * 7));
+        for target in (0..3500u64).step_by(13) {
+            let mut cursor = tree.cursor();
+            let expected_ge = model.range(target..).next().map(|(key, _)| *key);
+            let found = cursor
+                .seek_ge(&mut pager, &target.to_be_bytes())
+                .expect("seek_ge");
+            assert_eq!(found, expected_ge.is_some(), "seek_ge({target})");
+            if let Some(key) = expected_ge {
+                assert_eq!(key_of(&cursor), key, "seek_ge({target})");
+                assert_eq!(
+                    cursor.value(&mut pager).expect("value"),
+                    model[&key],
+                    "seek_ge({target}) value"
+                );
+            }
+
+            let expected_le = model.range(..=target).next_back().map(|(key, _)| *key);
+            let found = cursor
+                .seek_le(&mut pager, &target.to_be_bytes())
+                .expect("seek_le");
+            assert_eq!(found, expected_le.is_some(), "seek_le({target})");
+            if let Some(key) = expected_le {
+                assert_eq!(key_of(&cursor), key, "seek_le({target})");
+            }
+        }
+        pager.commit().expect("commit");
+    }
+
+    #[test]
+    fn reverse_scan_visits_every_key_across_pages() {
+        let mut pager = test_pager();
+        pager.begin_write().expect("begin");
+        let (tree, model) = wide_model(&mut pager, (0..300u64).map(|i| i * 3));
+        let mut cursor = tree.cursor();
+        let mut seen = Vec::with_capacity(model.len());
+        let mut ok = cursor.last(&mut pager).expect("last");
+        while ok {
+            seen.push(key_of(&cursor));
+            ok = cursor.prev(&mut pager).expect("prev");
+        }
+        let expected: Vec<u64> = model.keys().rev().copied().collect();
+        assert_eq!(seen, expected);
+        pager.commit().expect("commit");
+    }
+
+    #[test]
+    fn cursor_value_resolves_overflow_chains() {
+        let mut pager = test_pager();
+        pager.begin_write().expect("begin");
+        let mut tree = Btree::create(&mut pager, TreeKind::Table).expect("create");
+        let big = vec![0x5Au8; 30_000];
+        tree.insert(&mut pager, &1u64.to_be_bytes(), &big)
+            .expect("insert");
+        tree.insert(&mut pager, &2u64.to_be_bytes(), b"small")
+            .expect("insert");
+        let mut cursor = tree.cursor();
+        assert!(cursor.first(&mut pager).expect("first"));
+        assert_eq!(cursor.value(&mut pager).expect("value"), big);
+        assert!(cursor.next(&mut pager).expect("next"));
+        assert_eq!(cursor.value(&mut pager).expect("value"), b"small");
+        pager.commit().expect("commit");
     }
 }

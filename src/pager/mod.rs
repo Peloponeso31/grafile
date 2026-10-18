@@ -836,6 +836,7 @@ fn write_header_page(page: &mut [u8], header: &DatabaseHeader) -> Result<()> {
 mod tests {
     use super::*;
     use crate::vfs::mem::{FaultConfig, MemVfs, new_store};
+    use proptest::prelude::*;
 
     const PAGE_SIZE: u32 = 4096;
 
@@ -1238,5 +1239,74 @@ mod tests {
         drop(a);
         b.begin_write().expect("b after drop");
         b.rollback().expect("rollback");
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// A commit interrupted at a random I/O operation (with or without a
+        /// torn write) must leave the database at a consistent state: either
+        /// every page and the version show the committed prefix, or all of
+        /// them show the new transaction. Mixed states are corruption.
+        #[test]
+        fn interrupted_commits_recover_to_a_consistent_state(
+            committed_txns in 1u32..4,
+            fail_after in proptest::option::of(0u64..45),
+            torn in any::<bool>(),
+        ) {
+            let store = new_store();
+            let path = Path::new("proptest-recovery.db");
+            let mut allocated: Vec<(u32, u8)> = Vec::new();
+            let result;
+            {
+                let vfs = MemVfs::from_store(store.clone());
+                let shared: Arc<dyn Vfs> = Arc::new(vfs.clone());
+                let mut pager = create_pager(shared, path);
+                for round in 1..=committed_txns {
+                    pager.begin_write().expect("begin");
+                    let page = pager.alloc_page().expect("alloc");
+                    init_page(&mut pager, page, PageType::TableLeaf).expect("init");
+                    {
+                        let data = pager.page_mut(page).expect("mutate");
+                        data[512] = round as u8;
+                        write_page_checksum(data);
+                    }
+                    pager.update_header(|header| header.user_version = round);
+                    pager.commit().expect("commit");
+                    allocated.push((page, round as u8));
+                }
+
+                pager.begin_write().expect("begin");
+                for (page, _) in &allocated {
+                    let data = pager.page_mut(*page).expect("mutate");
+                    data[512] = data[512].wrapping_add(100);
+                    write_page_checksum(data);
+                }
+                pager.update_header(|header| header.user_version = committed_txns + 1);
+                vfs.inject_fault(FaultConfig { fail_after_ops: fail_after, torn_write: torn });
+                result = pager.commit();
+            }
+
+            let vfs = Arc::new(MemVfs::from_store(store));
+            let mut pager = Pager::open(vfs, path, OpenMode::ReadWrite).expect("reopen recovers");
+            for page in 2..pager.header().page_count as u32 {
+                pager.page(page).expect("every page passes its checksum");
+            }
+
+            let version = pager.header().user_version;
+            let counter = pager.header().change_counter;
+            assert_eq!(counter, version, "version and change counter move together");
+            let old_state = version == committed_txns;
+            let new_state = version == committed_txns + 1;
+            assert!(old_state || new_state, "no mixed state: version {version}");
+            if result.is_ok() {
+                assert!(new_state, "a successful commit is visible");
+            }
+            for (page, round) in &allocated {
+                let byte = pager.page(*page).expect("page").data()[512];
+                let expected = if new_state { round.wrapping_add(100) } else { *round };
+                assert_eq!(byte, expected, "page {page} belongs to the same state");
+            }
+        }
     }
 }

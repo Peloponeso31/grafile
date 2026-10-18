@@ -14,7 +14,7 @@ use crate::error::{Error, Result};
 use crate::planner::Prepared;
 use crate::planner::plan::{CreateItem, Plan};
 use crate::record::Value;
-use crate::vdbe::{AggSpec, Op, Program, binary_code, func, unary_code};
+use crate::vdbe::{AggSpec, BuildPathPart, Op, Program, binary_code, func, unary_code};
 
 /// Register/variable context for the row currently being compiled.
 #[derive(Clone)]
@@ -107,6 +107,18 @@ impl Codegen {
         let index = self.constants.len() as u32;
         self.constants.push(value);
         index
+    }
+
+    /// Compile an edge type filter: constant pool indices for the names and
+    /// whether the pattern accepted any type (`None`).
+    fn edge_types(&mut self, types: &Option<Vec<String>>) -> (Vec<u32>, bool) {
+        let regs = types
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|name| self.const_index(Value::from(name.as_str())))
+            .collect();
+        (regs, types.is_none())
     }
 
     fn const_reg(&mut self, value: Value) -> u32 {
@@ -244,6 +256,8 @@ impl Codegen {
                 props,
                 min,
                 max,
+                reverse,
+                nodes,
             } => self.compile(input, ctx, &mut |cg, ctx| {
                 let src_reg = *ctx.vars.get(src).ok_or_else(|| undefined(src))?;
                 let cursor = cg.alloc_cursor();
@@ -252,31 +266,34 @@ impl Codegen {
                     crate::cypher::RelDirection::Incoming => 1u8,
                     crate::cypher::RelDirection::Undirected => 2u8,
                 };
-                let type_regs: Vec<u32> = types
-                    .iter()
-                    .map(|name| cg.const_index(Value::from(name.as_str())))
-                    .collect();
+                let (type_regs, any_type) = cg.edge_types(types);
                 cg.emit(Op::VarExpandOpen {
                     cursor,
                     src: src_reg,
                     direction: direction_code,
                     types: type_regs,
-                    any_type: types.is_empty(),
+                    any_type,
                     props: props.clone(),
                     min: *min,
                     max: *max,
                 });
                 let loop_start = cg.ops.len() as u32;
                 let edge_reg = cg.alloc_reg();
+                let nodes_reg = cg.alloc_reg();
                 let node_reg = cg.alloc_reg();
                 let jump = cg.emit(Op::VarExpandNext {
                     cursor,
                     edges: edge_reg,
+                    nodes: nodes_reg,
                     node: node_reg,
+                    reverse: *reverse,
                     target: 0,
                 });
                 if let Some(edge_var) = edge {
                     ctx.vars.insert(edge_var.clone(), edge_reg);
+                }
+                if let Some(nodes_var) = nodes {
+                    ctx.vars.insert(nodes_var.clone(), nodes_reg);
                 }
                 ctx.vars.insert(dst.clone(), node_reg);
                 ctx.window_len = cg.next_reg - ctx.window_start;
@@ -302,16 +319,13 @@ impl Codegen {
                     crate::cypher::RelDirection::Incoming => 1u8,
                     crate::cypher::RelDirection::Undirected => 2u8,
                 };
-                let type_regs: Vec<u32> = types
-                    .iter()
-                    .map(|name| cg.const_index(Value::from(name.as_str())))
-                    .collect();
+                let (type_regs, any_type) = cg.edge_types(types);
                 cg.emit(Op::OpenExpand {
                     cursor,
                     src: src_reg,
                     direction: direction_code,
                     types: type_regs,
-                    any_type: types.is_empty(),
+                    any_type,
                 });
                 let rewind = cg.emit(Op::Rewind { cursor, target: 0 });
                 let loop_start = cg.ops.len() as u32;
@@ -366,9 +380,18 @@ impl Codegen {
                 elements,
             } => self.compile(input, ctx, &mut |cg, ctx| {
                 let mut regs = Vec::with_capacity(elements.len());
-                for (name, splice) in elements {
-                    let reg = *ctx.vars.get(name).ok_or_else(|| undefined(name))?;
-                    regs.push((reg, *splice));
+                for element in elements {
+                    regs.push(match element {
+                        crate::planner::plan::PathElement::Value(name) => BuildPathPart::Value(
+                            *ctx.vars.get(name).ok_or_else(|| undefined(name))?,
+                        ),
+                        crate::planner::plan::PathElement::Segment { edges, nodes } => {
+                            BuildPathPart::Segment {
+                                edges: *ctx.vars.get(edges).ok_or_else(|| undefined(edges))?,
+                                nodes: *ctx.vars.get(nodes).ok_or_else(|| undefined(nodes))?,
+                            }
+                        }
+                    });
                 }
                 let dest = cg.alloc_reg();
                 cg.emit(Op::BuildPath {
@@ -455,6 +478,7 @@ impl Codegen {
                 min,
                 max,
                 all,
+                nodes,
             } => self.compile(input, ctx, &mut |cg, ctx| {
                 let src_reg = *ctx.vars.get(src).ok_or_else(|| undefined(src))?;
                 // An unbound target searches for the shortest path to every
@@ -466,17 +490,14 @@ impl Codegen {
                     crate::cypher::RelDirection::Incoming => 1u8,
                     crate::cypher::RelDirection::Undirected => 2u8,
                 };
-                let type_regs: Vec<u32> = types
-                    .iter()
-                    .map(|name| cg.const_index(Value::from(name.as_str())))
-                    .collect();
+                let (type_regs, any_type) = cg.edge_types(types);
                 cg.emit(Op::ShortestOpen {
                     cursor,
                     src: src_reg,
                     dst: dst_reg,
                     direction: direction_code,
                     types: type_regs,
-                    any_type: types.is_empty(),
+                    any_type,
                     props: props.clone(),
                     min: *min,
                     max: *max,
@@ -484,15 +505,21 @@ impl Codegen {
                 });
                 let loop_start = cg.ops.len() as u32;
                 let edge_reg = cg.alloc_reg();
+                let nodes_reg = cg.alloc_reg();
                 let node_reg = cg.alloc_reg();
                 let jump = cg.emit(Op::VarExpandNext {
                     cursor,
                     edges: edge_reg,
+                    nodes: nodes_reg,
                     node: node_reg,
+                    reverse: false,
                     target: 0,
                 });
                 if let Some(edge_var) = edge {
                     ctx.vars.insert(edge_var.clone(), edge_reg);
+                }
+                if let Some(nodes_var) = nodes {
+                    ctx.vars.insert(nodes_var.clone(), nodes_reg);
                 }
                 // A bound target keeps its register; only an unbound target
                 // is bound by the search.
@@ -843,12 +870,51 @@ impl Codegen {
                 cg.patch(jump, end)?;
                 Ok(())
             }),
-            Plan::Create { input, items } => self.compile(input, ctx, &mut |cg, ctx| {
-                for item in items {
-                    cg.compile_create_item(item, ctx, None)?;
-                }
-                out(cg, ctx)
+            Plan::LoadCsv {
+                input,
+                source,
+                alias,
+                with_headers,
+                field_terminator,
+            } => self.compile(input, ctx, &mut |cg, ctx| {
+                let source_reg = cg.compile_expr(source, ctx)?;
+                let cursor = cg.alloc_cursor();
+                cg.emit(Op::LoadCsvOpen {
+                    cursor,
+                    source: source_reg,
+                    with_headers: *with_headers,
+                    terminator: field_terminator.unwrap_or(',') as u8,
+                });
+                let base = cg.next_reg;
+                cg.alloc_reg();
+                let mut inner_ctx = ctx.clone();
+                inner_ctx.vars.insert(alias.clone(), base);
+                inner_ctx.window_start = base;
+                inner_ctx.window_len = 1;
+                let empty = cg.emit(Op::CtxRewind { cursor, target: 0 });
+                let loop_start = cg.ops.len() as u32;
+                cg.emit(Op::CtxData {
+                    cursor,
+                    start: base,
+                    count: 1,
+                });
+                out(cg, &mut inner_ctx)?;
+                let next = cg.emit(Op::CtxNext { cursor, target: 0 });
+                cg.emit(Op::Goto { target: loop_start });
+                let end = cg.ops.len() as u32;
+                cg.patch(empty, end)?;
+                cg.patch(next, end)?;
+                Ok(())
             }),
+            Plan::Create { input, items } => {
+                let mut apply = |cg: &mut Codegen, ctx: &mut Ctx| -> Result<()> {
+                    for item in items {
+                        cg.compile_create_item(item, ctx, None)?;
+                    }
+                    Ok(())
+                };
+                self.compile_updating(input, ctx, &mut apply, out)
+            }
             Plan::Merge {
                 input,
                 match_plan,
@@ -893,7 +959,13 @@ impl Codegen {
                 if let Some((var, elements)) = path {
                     let mut regs = Vec::with_capacity(elements.len());
                     for (name, splice) in elements {
-                        regs.push((cg.var_reg(outer_ctx, name)?, *splice));
+                        let reg = cg.var_reg(outer_ctx, name)?;
+                        if *splice {
+                            return Err(crate::error::Error::internal(
+                                "MERGE paths cannot splice variable-length segments",
+                            ));
+                        }
+                        regs.push(BuildPathPart::Value(reg));
                     }
                     let dest = cg.alloc_reg();
                     cg.emit(Op::BuildPath {
@@ -954,58 +1026,148 @@ impl Codegen {
                 cg.patch(next, end)?;
                 Ok(())
             }),
-            Plan::SetItems { input, items } => self.compile(input, ctx, &mut |cg, ctx| {
-                for item in items {
-                    cg.compile_set_item(item, ctx)?;
-                }
-                out(cg, ctx)
-            }),
-            Plan::RemoveItems { input, items } => self.compile(input, ctx, &mut |cg, ctx| {
-                for item in items {
-                    match item {
-                        SetItem::Property { variable, key, .. } => {
-                            let target = cg.var_reg(ctx, variable)?;
-                            let key_reg = cg.const_reg(Value::from(key.as_str()));
-                            let null = cg.null_reg();
-                            cg.emit(Op::SetProperty {
-                                target,
-                                key: key_reg,
-                                value: null,
-                            });
-                        }
-                        SetItem::Label { variable, labels } => {
-                            let target = cg.var_reg(ctx, variable)?;
-                            let labels_reg = cg.label_list_reg(labels);
-                            cg.emit(Op::SetLabels {
-                                target,
-                                labels: labels_reg,
-                                add: false,
-                            });
-                        }
-                        SetItem::Replace { .. } | SetItem::Append { .. } => {
-                            return Err(Error::unsupported(
-                                "REMOVE with whole-property replacement is not supported",
-                            ));
+            Plan::SetItems { input, items } => {
+                let mut apply = |cg: &mut Codegen, ctx: &mut Ctx| -> Result<()> {
+                    for item in items {
+                        cg.compile_set_item(item, ctx)?;
+                    }
+                    Ok(())
+                };
+                self.compile_updating(input, ctx, &mut apply, out)
+            }
+            Plan::RemoveItems { input, items } => {
+                let mut apply = |cg: &mut Codegen, ctx: &mut Ctx| -> Result<()> {
+                    for item in items {
+                        match item {
+                            SetItem::Property { variable, key, .. } => {
+                                let target = cg.var_reg(ctx, variable)?;
+                                let key_reg = cg.const_reg(Value::from(key.as_str()));
+                                let null = cg.null_reg();
+                                cg.emit(Op::SetProperty {
+                                    target,
+                                    key: key_reg,
+                                    value: null,
+                                });
+                            }
+                            SetItem::Label { variable, labels } => {
+                                let target = cg.var_reg(ctx, variable)?;
+                                let labels_reg = cg.label_list_reg(labels);
+                                cg.emit(Op::SetLabels {
+                                    target,
+                                    labels: labels_reg,
+                                    add: false,
+                                });
+                            }
+                            SetItem::Replace { .. } | SetItem::Append { .. } => {
+                                return Err(Error::unsupported(
+                                    "REMOVE with whole-property replacement is not supported",
+                                ));
+                            }
                         }
                     }
-                }
-                out(cg, ctx)
-            }),
+                    Ok(())
+                };
+                self.compile_updating(input, ctx, &mut apply, out)
+            }
             Plan::Delete {
                 input,
                 exprs,
                 detach,
-            } => self.compile(input, ctx, &mut |cg, ctx| {
-                for expr in exprs {
-                    let target = cg.compile_expr(expr, ctx)?;
+            } => {
+                let mut apply = |cg: &mut Codegen, ctx: &mut Ctx| -> Result<()> {
+                    // All targets of one DELETE are removed together, so a
+                    // path list can share endpoints (relationships first).
+                    let mut targets = Vec::with_capacity(exprs.len());
+                    for expr in exprs {
+                        targets.push(cg.compile_expr(expr, ctx)?);
+                    }
+                    let target = cg.alloc_reg();
+                    cg.emit(Op::BuildList {
+                        dest: target,
+                        items: targets,
+                    });
                     cg.emit(Op::DeleteAny {
                         target,
                         detach: *detach,
                     });
-                }
-                out(cg, ctx)
-            }),
+                    Ok(())
+                };
+                self.compile_updating(input, ctx, &mut apply, out)
+            }
         }
+    }
+
+    /// Compile an updating clause eagerly: materialize every input row,
+    /// apply `apply` to all of them, then hand the same rows to `out`. A
+    /// clause observes its entire input before the next clause can see its
+    /// writes.
+    fn compile_updating(
+        &mut self,
+        input: &Plan,
+        ctx: &mut Ctx,
+        apply: &mut dyn FnMut(&mut Codegen, &mut Ctx) -> Result<()>,
+        out: &mut dyn FnMut(&mut Codegen, &mut Ctx) -> Result<()>,
+    ) -> Result<()> {
+        let frame_start = ctx.window_start;
+        let cursor = self.alloc_cursor();
+        self.emit(Op::CollectOpen { cursor });
+        let mut produced: Option<Ctx> = None;
+        let mut collect_len = 0;
+        self.compile(input, ctx, &mut |cg, in_ctx| {
+            // Collect from the enclosing frame so outer variables (an
+            // UNWIND binding, say) survive into the apply and output loops.
+            collect_len = cg.next_reg - frame_start;
+            produced = Some(in_ctx.clone());
+            cg.emit(Op::CollectRow {
+                cursor,
+                start: frame_start,
+                count: collect_len,
+            });
+            Ok(())
+        })?;
+        let mut row_ctx = produced.ok_or_else(|| Error::internal("empty updating input"))?;
+        row_ctx.window_start = frame_start;
+        row_ctx.window_len = collect_len;
+        let mut apply_wrapper = |cg: &mut Codegen, ctx: &mut Ctx| -> Result<()> {
+            apply(cg, ctx)?;
+            // The apply step may bind new variables (CREATE does); store the
+            // widened window back into the row so `out` sees the values.
+            let count = cg.next_reg - ctx.window_start;
+            cg.emit(Op::CtxStore {
+                cursor,
+                start: ctx.window_start,
+                count,
+            });
+            ctx.window_len = count;
+            Ok(())
+        };
+        self.emit_ctx_loop(cursor, &mut row_ctx, &mut apply_wrapper)?;
+        self.emit_ctx_loop(cursor, &mut row_ctx, out)?;
+        Ok(())
+    }
+
+    /// Emit a loop over a collected cursor: copy every row into the context
+    /// window and run `body` for it.
+    fn emit_ctx_loop(
+        &mut self,
+        cursor: u32,
+        row_ctx: &mut Ctx,
+        body: &mut dyn FnMut(&mut Codegen, &mut Ctx) -> Result<()>,
+    ) -> Result<()> {
+        let rewind = self.emit(Op::CtxRewind { cursor, target: 0 });
+        let loop_start = self.ops.len() as u32;
+        self.emit(Op::CtxData {
+            cursor,
+            start: row_ctx.window_start,
+            count: row_ctx.window_len,
+        });
+        body(self, row_ctx)?;
+        let next = self.emit(Op::CtxNext { cursor, target: 0 });
+        self.emit(Op::Goto { target: loop_start });
+        let end = self.ops.len() as u32;
+        self.patch(rewind, end)?;
+        self.patch(next, end)?;
+        Ok(())
     }
 
     /// Compile `input`, truncate collected rows, then iterate the result.
@@ -1510,6 +1672,11 @@ impl Codegen {
 
     fn compile_expr_into(&mut self, expr: &Expr, ctx: &Ctx, dest: u32) -> Result<()> {
         match expr {
+            Expr::ExistsSubquery(_) => {
+                return Err(Error::unsupported(
+                    "EXISTS subqueries are only supported in predicates",
+                ));
+            }
             Expr::Literal(value) => {
                 let index = self.constants.len() as u32;
                 self.constants.push(value.clone());
@@ -1895,8 +2062,208 @@ fn scalar_function(name: &str) -> Result<u8> {
             Ok(func::LOCAL_DATETIME)
         }
         "datetime.transaction" | "datetime.statement" | "datetime.realtime" => Ok(func::DATETIME),
-        other => Err(Error::unsupported(format!(
-            "function `{other}` is not supported yet"
+        other => Err(Error::syntax(format!(
+            "UnknownFunction: `{other}` is not a known function"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::engine::Database;
+    use crate::planner::plan::AggFn;
+    use crate::planner::plan_query;
+    use crate::vfs::mem::MemVfs;
+
+    fn test_db() -> Database {
+        Database::create(Arc::new(MemVfs::new()), Path::new("codegen.db"), 4096).expect("create db")
+    }
+
+    fn compile_source(db: &mut Database, source: &str) -> Program {
+        let query = crate::cypher::parse(source).expect("parse");
+        let prepared = plan_query(db, &query, &std::collections::HashMap::new()).expect("plan");
+        compile(&prepared).expect("compile")
+    }
+
+    fn has_op(program: &Program, pred: impl Fn(&Op) -> bool) -> bool {
+        program.ops.iter().any(pred)
+    }
+
+    #[test]
+    fn scan_projects_binds_rows_and_halts() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "MATCH (n) RETURN n");
+        assert!(has_op(&program, |op| matches!(
+            op,
+            Op::OpenNodeScan { label: None, .. }
+        )));
+        assert!(has_op(&program, |op| matches!(op, Op::Rewind { .. })));
+        assert!(has_op(&program, |op| matches!(op, Op::Next { .. })));
+        assert!(has_op(&program, |op| matches!(op, Op::Bind { .. })));
+        assert!(has_op(&program, |op| matches!(op, Op::ResultRow { .. })));
+        assert_eq!(program.ops.last(), Some(&Op::Halt));
+        assert_eq!(program.columns, vec!["n".to_owned()]);
+        assert!(!program.mutating);
+    }
+
+    #[test]
+    fn return_literals_compile_to_constants() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "RETURN 1 AS x");
+        assert_eq!(
+            program.ops,
+            vec![
+                Op::Constant { dest: 0, value: 0 },
+                Op::Copy { dest: 1, src: 0 },
+                Op::ResultRow { start: 1, count: 1 },
+                Op::Halt,
+            ]
+        );
+        assert_eq!(program.constants, vec![Value::Int(1)]);
+        assert_eq!(program.columns, vec!["x".to_owned()]);
+    }
+
+    #[test]
+    fn label_scan_carries_the_label_name_constant() {
+        let mut db = test_db();
+        db.write(|db| db.ensure_label("Person")).expect("label");
+        let program = compile_source(&mut db, "MATCH (n:Person) RETURN n");
+        let label = program
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::OpenNodeScan {
+                    label: Some(reg), ..
+                } => Some(program.constants[*reg as usize].clone()),
+                _ => None,
+            })
+            .expect("labeled scan");
+        assert_eq!(label, Value::from("Person"));
+    }
+
+    #[test]
+    fn literal_index_lookup_compiles_to_index_scan() {
+        let mut db = test_db();
+        let index = db
+            .write(|db| db.create_node_index("name", Some("Person"), false))
+            .expect("index");
+        let program = compile_source(&mut db, "MATCH (n:Person {name: 'alice'}) RETURN n");
+        assert!(has_op(&program, |op| matches!(
+            op,
+            Op::OpenIndexScan { index: id, .. } if *id == index
+        )));
+        assert!(!has_op(&program, |op| matches!(
+            op,
+            Op::OpenNodeScan { .. }
+        )));
+        assert!(program.constants.contains(&Value::from("alice")));
+    }
+
+    #[test]
+    fn expansion_compiles_to_open_and_bind_expand() {
+        let mut db = test_db();
+        let edge_type = db
+            .write(|db| {
+                db.ensure_label("A")?;
+                db.ensure_edge_type("T")
+            })
+            .expect("schema");
+        let program = compile_source(&mut db, "MATCH (a:A)-[r:T]->(b) RETURN r");
+        assert!(has_op(&program, |op| matches!(
+            op,
+            Op::OpenExpand { types, .. } if types == &[edge_type]
+        )));
+        assert!(has_op(&program, |op| matches!(op, Op::BindExpand { .. })));
+    }
+
+    #[test]
+    fn variable_length_expansion_compiles_to_cursor_ops() {
+        let mut db = test_db();
+        db.write(|db| db.ensure_label("A")).expect("label");
+        let program = compile_source(&mut db, "MATCH (a:A)-[r*1..2]->(b) RETURN r");
+        assert!(has_op(&program, |op| matches!(
+            op,
+            Op::VarExpandOpen { .. }
+        )));
+        assert!(has_op(&program, |op| matches!(
+            op,
+            Op::VarExpandNext { .. }
+        )));
+    }
+
+    #[test]
+    fn sorting_and_limits_compile_to_row_cursors() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "MATCH (n) RETURN n ORDER BY n SKIP 1 LIMIT 2");
+        assert!(has_op(&program, |op| matches!(op, Op::SortRows { .. })));
+        assert!(has_op(&program, |op| matches!(op, Op::TruncateRows { .. })));
+    }
+
+    #[test]
+    fn aggregations_carry_their_function_specs() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "MATCH (n) RETURN count(*) AS c, sum(n.age) AS s");
+        let aggregate = program
+            .ops
+            .iter()
+            .find_map(|op| match op {
+                Op::HashAggregate { aggs, .. } => Some(aggs),
+                _ => None,
+            })
+            .expect("HashAggregate");
+        assert_eq!(aggregate.len(), 2);
+        assert_eq!(aggregate[0].func, AggFn::Count);
+        assert_eq!(aggregate[1].func, AggFn::Sum);
+    }
+
+    #[test]
+    fn distinct_compiles_to_dedup_rows() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "MATCH (n) RETURN DISTINCT n");
+        assert!(has_op(&program, |op| matches!(op, Op::DedupRows { .. })));
+    }
+
+    #[test]
+    fn pattern_comprehension_uses_a_collect_cursor() {
+        let mut db = test_db();
+        db.write(|db| {
+            db.ensure_label("Person")?;
+            db.ensure_edge_type("K")
+        })
+        .expect("schema");
+        let program = compile_source(&mut db, "MATCH (n:Person) RETURN [(n)-[:K]->(m) | m] AS ms");
+        assert!(has_op(&program, |op| matches!(op, Op::CollectOpen { .. })));
+        assert!(has_op(&program, |op| matches!(op, Op::CollectRow { .. })));
+    }
+
+    #[test]
+    fn create_compiles_to_mutation_ops() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "CREATE (:A {name: 'x'})");
+        assert!(has_op(&program, |op| matches!(op, Op::CreateNode { .. })));
+        assert!(program.mutating);
+    }
+
+    #[test]
+    fn merge_compiles_match_and_create_branches() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "MERGE (n:Person {name: 'x'})");
+        assert!(has_op(&program, |op| matches!(
+            op,
+            Op::CheckMergeProps { .. }
+        )));
+        assert!(has_op(&program, |op| matches!(op, Op::CreateNode { .. })));
+        assert!(program.mutating);
+    }
+
+    #[test]
+    fn delete_compiles_to_delete_any() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "MATCH (n) DELETE n");
+        assert!(has_op(&program, |op| matches!(op, Op::DeleteAny { .. })));
     }
 }

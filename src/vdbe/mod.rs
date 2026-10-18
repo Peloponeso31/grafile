@@ -9,6 +9,7 @@
 //! Values in registers are [`Reg`]: plain [`Value`]s plus node/edge
 //! references bound by cursors.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -357,6 +358,15 @@ pub enum Op {
         /// Number of registers.
         count: u32,
     },
+    /// Write the register window back into the current row of a row cursor.
+    CtxStore {
+        /// Cursor slot.
+        cursor: u32,
+        /// First register.
+        start: u32,
+        /// Number of registers.
+        count: u32,
+    },
     /// Read a property by name from a node, relationship or map.
     Property {
         /// Entity or map register.
@@ -386,8 +396,8 @@ pub enum Op {
     BuildPath {
         /// Destination register.
         dest: u32,
-        /// `(register, splice)` elements in path order.
-        elements: Vec<(u32, bool)>,
+        /// Elements in path order.
+        elements: Vec<BuildPathPart>,
     },
     /// Append a value to a list register (rebuilding the list).
     ListPush {
@@ -422,6 +432,17 @@ pub enum Op {
         /// Constant index of the procedure name.
         name: u32,
     },
+    /// Read a CSV file, filling a row cursor with one value per row.
+    LoadCsvOpen {
+        /// Cursor slot.
+        cursor: u32,
+        /// Source path register.
+        source: u32,
+        /// Whether the first row holds column names.
+        with_headers: bool,
+        /// Field separator byte.
+        terminator: u8,
+    },
     /// Open a shortest-path search from a node to a target node.
     ShortestOpen {
         /// Cursor slot.
@@ -451,8 +472,13 @@ pub enum Op {
         cursor: u32,
         /// Destination register for the edge list.
         edges: u32,
+        /// Destination register for the node list.
+        nodes: u32,
         /// Destination register for the end node.
         node: u32,
+        /// Whether the trail runs against the pattern direction, so the
+        /// bound lists read from the pattern's start.
+        reverse: bool,
         /// Jump target when exhausted.
         target: u32,
     },
@@ -542,6 +568,21 @@ pub enum Op {
 
 /// Sentinel property key id meaning "no such property".
 pub const NO_KEY: u32 = u32::MAX;
+
+/// One element of an [`Op::BuildPath`] sequence.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BuildPathPart {
+    /// A single value from a register.
+    Value(u32),
+    /// A variable-length segment: its relationship and node registers are
+    /// interleaved into the path (nodes first, then relationships).
+    Segment {
+        /// Register holding the relationship list.
+        edges: u32,
+        /// Register holding the node list.
+        nodes: u32,
+    },
+}
 
 /// Function codes for [`Op::Function`].
 pub mod func {
@@ -712,6 +753,7 @@ pub struct Program {
 
 /// Execute a program and return its result rows.
 pub fn execute(db: &mut Database, program: &Program) -> Result<Vec<Vec<Value>>> {
+    db.clear_deleted();
     let mut executor = Executor {
         db,
         program,
@@ -743,7 +785,7 @@ enum Cursor {
         pos: usize,
     },
     Trails {
-        items: Vec<(Vec<u64>, u64)>,
+        items: Vec<crate::engine::Trail>,
         pos: usize,
     },
     Rows {
@@ -1126,22 +1168,38 @@ impl<'a> Executor<'a> {
                 };
                 let value = match self.regs[*target as usize].clone() {
                     Reg::Value(Value::Null) => Value::Null,
-                    Reg::Node(id) | Reg::Value(Value::Node(id)) => match key {
-                        Some(key) => self
-                            .db
-                            .get_node(id)?
-                            .and_then(|record| record.get(key).cloned())
-                            .unwrap_or(Value::Null),
-                        None => Value::Null,
-                    },
-                    Reg::Edge(id) | Reg::Value(Value::Edge(id)) => match key {
-                        Some(key) => self
-                            .db
-                            .get_edge(id)?
-                            .and_then(|record| record.get(key).cloned())
-                            .unwrap_or(Value::Null),
-                        None => Value::Null,
-                    },
+                    Reg::Node(id) | Reg::Value(Value::Node(id)) => {
+                        if self.db.node_deleted(id) {
+                            return Err(Error::new(
+                                ErrorCode::NotFound,
+                                "EntityNotFound: the node has been deleted",
+                            ));
+                        }
+                        match key {
+                            Some(key) => self
+                                .db
+                                .get_node(id)?
+                                .and_then(|record| record.get(key).cloned())
+                                .unwrap_or(Value::Null),
+                            None => Value::Null,
+                        }
+                    }
+                    Reg::Edge(id) | Reg::Value(Value::Edge(id)) => {
+                        if self.db.deleted_edge_type(id).is_some() {
+                            return Err(Error::new(
+                                ErrorCode::NotFound,
+                                "EntityNotFound: the relationship has been deleted",
+                            ));
+                        }
+                        match key {
+                            Some(key) => self
+                                .db
+                                .get_edge(id)?
+                                .and_then(|record| record.get(key).cloned())
+                                .unwrap_or(Value::Null),
+                            None => Value::Null,
+                        }
+                    }
                     Reg::Value(Value::Map(entries)) => {
                         let Value::Text(name) = &self.program.constants[*name as usize] else {
                             return Err(Error::internal("property name is not a string"));
@@ -1182,14 +1240,39 @@ impl<'a> Executor<'a> {
                 self.regs[*dest as usize] = Reg::Value(Value::Bool(value.is_null()));
             }
             Op::HasLabel { node, label, dest } => {
-                let label_id = self.resolve_label(*label)?;
-                let result = match (self.regs[*node as usize].clone(), label_id) {
-                    (Reg::Node(id) | Reg::Value(Value::Node(id)), Some(label)) => self
-                        .db
-                        .get_node(id)?
-                        .map(|record| record.labels.contains(&label))
-                        .unwrap_or(false),
-                    _ => false,
+                let value = self.reg_value(*node)?;
+                let result = match value {
+                    Value::Node(id) => {
+                        let label_id = self.resolve_label(*label)?;
+                        self.db
+                            .get_node(id)?
+                            .map(|record| {
+                                label_id.is_some_and(|label| record.labels.contains(&label))
+                            })
+                            .unwrap_or(false)
+                    }
+                    // A label predicate on a relationship tests its type.
+                    Value::Edge(id) => {
+                        let Value::Text(name) = &self.program.constants[*label as usize] else {
+                            return Err(Error::internal("label name is not a string"));
+                        };
+                        let type_id = self.db.edge_type_id(name);
+                        self.db
+                            .get_edge(id)?
+                            .map(|record| type_id.is_some_and(|id| record.edge_type == id))
+                            .unwrap_or(false)
+                    }
+                    // The label of a null value is null.
+                    Value::Null => {
+                        self.regs[*dest as usize] = normalize_reg(Value::Null);
+                        return Ok(());
+                    }
+                    other => {
+                        return Err(Error::type_error(format!(
+                            "expected a node or relationship, got {}",
+                            other.type_name()
+                        )));
+                    }
                 };
                 self.regs[*dest as usize] = Reg::Value(Value::Bool(result));
             }
@@ -1318,9 +1401,15 @@ impl<'a> Executor<'a> {
                 let limit = match self.reg_value(*limit)? {
                     Value::Null => None,
                     Value::Int(value) if value >= 0 => Some(value as usize),
+                    Value::Float(_) => {
+                        return Err(Error::syntax(format!(
+                            "InvalidArgumentType: LIMIT expects an integer, got {}",
+                            self.reg_value(*limit)?.type_name()
+                        )));
+                    }
                     other => {
-                        return Err(Error::type_error(format!(
-                            "LIMIT expects a non-negative integer, got {}",
+                        return Err(Error::syntax(format!(
+                            "NegativeIntegerArgument: LIMIT expects a non-negative integer, got {}",
                             other.type_name()
                         )));
                     }
@@ -1400,6 +1489,24 @@ impl<'a> Executor<'a> {
                     self.regs[(*start as usize) + idx] = value;
                 }
             }
+            Op::CtxStore {
+                cursor,
+                start,
+                count,
+            } => {
+                let row: Vec<Reg> = (0..*count)
+                    .map(|idx| self.regs[(*start + idx) as usize].clone())
+                    .collect();
+                match &mut self.cursors[*cursor as usize] {
+                    Cursor::Rows { rows, pos } => match rows.get_mut(*pos) {
+                        Some(slot) => *slot = row,
+                        None => {
+                            return Err(Error::internal("CtxStore on exhausted cursor"));
+                        }
+                    },
+                    _ => return Err(Error::internal("CtxStore on a non-row cursor")),
+                }
+            }
             Op::VarExpandOpen {
                 cursor,
                 src,
@@ -1435,6 +1542,22 @@ impl<'a> Executor<'a> {
                     _ => return Err(Error::internal("procedure name is not text")),
                 };
                 let rows = self.procedure_rows(&name)?;
+                self.cursors[*cursor as usize] = Cursor::Rows { rows, pos: 0 };
+            }
+            Op::LoadCsvOpen {
+                cursor,
+                source,
+                with_headers,
+                terminator,
+            } => {
+                let value = self.reg_value(*source)?;
+                let Value::Text(path) = value else {
+                    return Err(Error::type_error(format!(
+                        "LOAD CSV FROM expects a path string, got {}",
+                        value.type_name()
+                    )));
+                };
+                let rows = load_csv_rows(&path, *with_headers, *terminator)?;
                 self.cursors[*cursor as usize] = Cursor::Rows { rows, pos: 0 };
             }
             Op::ShortestOpen {
@@ -1487,7 +1610,9 @@ impl<'a> Executor<'a> {
             Op::VarExpandNext {
                 cursor,
                 edges,
+                nodes,
                 node,
+                reverse,
                 target,
             } => {
                 let next = match &mut self.cursors[*cursor as usize] {
@@ -1501,10 +1626,20 @@ impl<'a> Executor<'a> {
                     _ => return Err(Error::internal("VarExpandNext on a non-trail cursor")),
                 };
                 match next {
-                    Some((edge_ids, end)) => {
-                        let values: Vec<Value> =
-                            edge_ids.iter().map(|id| Value::Edge(*id)).collect();
+                    Some(trail) => {
+                        // The end node stays the traversal's last node even
+                        // when the lists are read from the pattern's start.
+                        let end = trail.end();
+                        let mut values: Vec<Value> =
+                            trail.edges.iter().map(|id| Value::Edge(*id)).collect();
+                        let mut node_values: Vec<Value> =
+                            trail.nodes.iter().map(|id| Value::Node(*id)).collect();
+                        if *reverse {
+                            values.reverse();
+                            node_values.reverse();
+                        }
                         self.regs[*edges as usize] = Reg::Value(Value::List(values.into()));
+                        self.regs[*nodes as usize] = Reg::Value(Value::List(node_values.into()));
                         self.regs[*node as usize] = Reg::Node(end);
                     }
                     None => self.pc = *target as usize,
@@ -1512,11 +1647,35 @@ impl<'a> Executor<'a> {
             }
             Op::BuildPath { dest, elements } => {
                 let mut items: Vec<Value> = Vec::new();
-                for (reg, splice) in elements {
-                    let value = self.reg_value(*reg)?;
-                    match (splice, value) {
-                        (true, Value::List(inner)) => items.extend(inner.iter().cloned()),
-                        (_, value) => items.push(value),
+                for element in elements {
+                    match element {
+                        BuildPathPart::Value(reg) => items.push(self.reg_value(*reg)?),
+                        BuildPathPart::Segment { edges, nodes } => {
+                            // Interleave the segment's nodes and
+                            // relationships; a zero-length segment contains
+                            // only its start node, which is already on the
+                            // path.
+                            let edges = self.reg_value(*edges)?;
+                            let nodes = self.reg_value(*nodes)?;
+                            let (Value::List(edges), Value::List(nodes)) = (edges, nodes) else {
+                                return Err(Error::internal(
+                                    "variable-length path parts must be lists",
+                                ));
+                            };
+                            for (index, edge) in edges.iter().enumerate() {
+                                if let Some(node) = nodes.get(index)
+                                    && items.last() != Some(node)
+                                {
+                                    items.push(node.clone());
+                                }
+                                items.push(edge.clone());
+                            }
+                            if let Some(last) = nodes.last()
+                                && items.last() != Some(last)
+                            {
+                                items.push(last.clone());
+                            }
+                        }
                     }
                 }
                 self.regs[*dest as usize] = Reg::Value(Value::List(items.into()));
@@ -1708,21 +1867,26 @@ impl<'a> Executor<'a> {
                     }
                 }
             }
-            Op::DeleteAny { target, detach } => match self.reg_value(*target)? {
-                Value::Node(id) => {
-                    self.db.delete_node(id, *detach)?;
-                }
-                Value::Edge(id) => {
-                    self.db.delete_edge(id)?;
-                }
-                Value::Null => {}
-                other => {
-                    return Err(Error::type_error(format!(
-                        "DELETE expects a node or relationship, got {}",
-                        other.type_name()
-                    )));
-                }
-            },
+            Op::DeleteAny { target, detach } => {
+                // A `DELETE` target may be a path or a nested list of
+                // entities; every element is deleted.
+                self.delete_any(self.reg_value(*target)?, *detach)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_any(&mut self, value: Value, detach: bool) -> Result<()> {
+        // Flatten paths and nested lists first, then delete relationships
+        // before nodes so non-detach deletion succeeds.
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        collect_delete_targets(&value, &mut nodes, &mut edges)?;
+        for edge in edges {
+            self.db.delete_edge(edge)?;
+        }
+        for node in nodes {
+            self.db.delete_node(node, detach)?;
         }
         Ok(())
     }
@@ -1759,8 +1923,12 @@ impl<'a> Executor<'a> {
         match self.reg_value(reg)? {
             Value::Null => Ok(0),
             Value::Int(value) if value >= 0 => Ok(value as usize),
-            other => Err(Error::type_error(format!(
-                "expected a non-negative integer, got {}",
+            Value::Float(_) => Err(Error::syntax(format!(
+                "InvalidArgumentType: SKIP expects an integer, got {}",
+                self.reg_value(reg)?.type_name()
+            ))),
+            other => Err(Error::syntax(format!(
+                "NegativeIntegerArgument: SKIP expects a non-negative integer, got {}",
                 other.type_name()
             ))),
         }
@@ -1962,6 +2130,12 @@ impl<'a> Executor<'a> {
             },
             func::LABELS => match args.first() {
                 Some(Value::Node(id)) => {
+                    if self.db.node_deleted(*id) {
+                        return Err(Error::new(
+                            ErrorCode::NotFound,
+                            "EntityNotFound: the node has been deleted",
+                        ));
+                    }
                     let Some(record) = self.db.get_node(*id)? else {
                         return Ok(Value::Null);
                     };
@@ -1973,21 +2147,28 @@ impl<'a> Executor<'a> {
                     }
                     Ok(Value::List(names.into()))
                 }
-                _ => Ok(Value::Null),
+                Some(Value::Null) | None => Ok(Value::Null),
+                _ => Err(Error::type_error(
+                    "InvalidArgumentValue: labels() expects a node",
+                )),
             },
             func::TYPE => match args.first() {
                 Some(Value::Edge(id)) => {
-                    let Some(record) = self.db.get_edge(*id)? else {
-                        return Ok(Value::Null);
+                    // A relationship deleted by this statement still knows
+                    // its type.
+                    let type_id = match self.db.deleted_edge_type(*id) {
+                        Some(type_id) => Some(type_id),
+                        None => self.db.get_edge(*id)?.map(|record| record.edge_type),
                     };
-                    Ok(self
-                        .db
-                        .schema()
-                        .edge_type_name(record.edge_type)
+                    Ok(type_id
+                        .and_then(|type_id| self.db.schema().edge_type_name(type_id))
                         .map(|name| Value::Text(std::sync::Arc::from(name)))
                         .unwrap_or(Value::Null))
                 }
-                _ => Ok(Value::Null),
+                Some(Value::Null) | None => Ok(Value::Null),
+                _ => Err(Error::type_error(
+                    "InvalidArgumentValue: type() expects a relationship",
+                )),
             },
             func::START_NODE | func::END_NODE => match args.first() {
                 Some(Value::Edge(id)) => {
@@ -2001,7 +2182,10 @@ impl<'a> Executor<'a> {
                     };
                     Ok(Value::Node(node))
                 }
-                _ => Ok(Value::Null),
+                Some(Value::Null) | None => Ok(Value::Null),
+                _ => Err(Error::type_error(
+                    "InvalidArgumentValue: startNode()/endNode() expects a relationship",
+                )),
             },
             func::COALESCE => Ok(args
                 .iter()
@@ -2010,27 +2194,11 @@ impl<'a> Executor<'a> {
                 .unwrap_or(Value::Null)),
             func::TO_STRING => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
-                Some(Value::Int(value)) => Ok(Value::Text(std::sync::Arc::from(value.to_string()))),
-                Some(Value::Bool(value)) => {
-                    Ok(Value::Text(std::sync::Arc::from(value.to_string())))
-                }
-                Some(Value::Float(value)) => {
-                    let mut buffer = ryu::Buffer::new();
-                    Ok(Value::Text(std::sync::Arc::from(buffer.format(*value))))
-                }
                 Some(Value::Text(value)) => Ok(Value::Text(value.clone())),
-                Some(
-                    value @ (Value::Date(_)
-                    | Value::LocalTime(_)
-                    | Value::Time(_)
-                    | Value::LocalDateTime(_)
-                    | Value::DateTime(_)
-                    | Value::Duration(_)
-                    | Value::Point(_)),
-                ) => Ok(Value::Text(std::sync::Arc::from(
-                    format_value(value).as_str(),
-                ))),
-                Some(other) => Err(invalid_argument("toString", other)),
+                Some(value) => match scalar_text(value) {
+                    Some(text) => Ok(Value::Text(Arc::from(text.into_owned()))),
+                    None => Err(invalid_argument("toString", value)),
+                },
             },
             func::TO_INTEGER => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
@@ -2211,17 +2379,31 @@ impl<'a> Executor<'a> {
             func::DURATION_IN_SECONDS => call_duration_between(DurationDiff::InSeconds, args),
             func::PROPERTIES => match args.first() {
                 Some(Value::Node(id)) => {
+                    if self.db.node_deleted(*id) {
+                        return Err(Error::new(
+                            ErrorCode::NotFound,
+                            "EntityNotFound: the node has been deleted",
+                        ));
+                    }
                     let Some(record) = self.db.get_node(*id)? else {
                         return Ok(Value::Null);
                     };
                     Ok(Value::Map(self.props_to_map(&record.props)))
                 }
                 Some(Value::Edge(id)) => {
+                    if self.db.deleted_edge_type(*id).is_some() {
+                        return Err(Error::new(
+                            ErrorCode::NotFound,
+                            "EntityNotFound: the relationship has been deleted",
+                        ));
+                    }
                     let Some(record) = self.db.get_edge(*id)? else {
                         return Ok(Value::Null);
                     };
                     Ok(Value::Map(self.props_to_map(&record.props)))
                 }
+                // A map's properties are the map itself.
+                Some(Value::Map(_)) => Ok(args.first().cloned().expect("checked above")),
                 _ => Ok(Value::Null),
             },
             func::KEYS => match args.first() {
@@ -2817,7 +2999,7 @@ fn binary_op(op: u8, a: &Value, b: &Value) -> Result<Value> {
         },
         code::EQ => Ok(bool_value(value_equals(a, b))),
         code::NE => Ok(bool_value(value_equals(a, b).map(|equal| !equal))),
-        code::LT | code::LE | code::GT | code::GE => Ok(compare_value(op, a, b)),
+        code::LT | code::LE | code::GT | code::GE => compare_value(op, a, b),
         code::AND => Ok(kleene_and(a, b)),
         code::OR => Ok(kleene_or(a, b)),
         code::XOR => Ok(kleene_xor(a, b)),
@@ -2857,8 +3039,23 @@ fn numeric_or_concat(
     float_op: impl Fn(f64, f64) -> f64,
     int_op: impl Fn(i64, i64) -> i64,
 ) -> Result<Value> {
-    if let (Value::Text(x), Value::Text(y)) = (a, b) {
-        return Ok(Value::Text(format!("{x}{y}").into()));
+    // A string concatenates any scalar on either side, coercing the scalar
+    // through its text form. Lists keep their append/prepend semantics.
+    match (a, b) {
+        (Value::Text(x), Value::Text(y)) => {
+            return Ok(Value::Text(format!("{x}{y}").into()));
+        }
+        (Value::Text(x), other) => {
+            if let Some(y) = scalar_text(other) {
+                return Ok(Value::Text(format!("{x}{y}").into()));
+            }
+        }
+        (other, Value::Text(y)) => {
+            if let Some(x) = scalar_text(other) {
+                return Ok(Value::Text(format!("{x}{y}").into()));
+            }
+        }
+        _ => {}
     }
     match (a, b) {
         (Value::List(x), Value::List(y)) => {
@@ -2882,6 +3079,29 @@ fn numeric_or_concat(
     numeric(a, b, float_op, int_op)
 }
 
+/// Text form of a scalar for `toString()` and string concatenation. Returns
+/// `None` for values without a text form (null, collections, entities); the
+/// caller decides between an error, a null result or another operator branch.
+fn scalar_text(value: &Value) -> Option<Cow<'_, str>> {
+    match value {
+        Value::Int(value) => Some(Cow::Owned(value.to_string())),
+        Value::Bool(value) => Some(Cow::Owned(value.to_string())),
+        Value::Float(value) => {
+            let mut buffer = ryu::Buffer::new();
+            Some(Cow::Owned(buffer.format(*value).to_owned()))
+        }
+        Value::Text(value) => Some(Cow::Borrowed(value)),
+        Value::Date(_)
+        | Value::LocalTime(_)
+        | Value::Time(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime(_)
+        | Value::Duration(_)
+        | Value::Point(_) => Some(Cow::Owned(format_value(value))),
+        _ => None,
+    }
+}
+
 /// Resolve a slice bound against the list length: negative bounds count from
 /// the end and everything is clamped into range.
 fn slice_bound(which: &str, value: &Value, len: i64) -> Result<usize> {
@@ -2903,21 +3123,83 @@ fn type_error(operation: &str, a: &Value, b: &Value) -> Error {
     ))
 }
 
-fn compare_value(op: u8, a: &Value, b: &Value) -> Value {
-    use binary_code as code;
-    let ordering = match (a, b) {
-        (Value::Null, _) | (_, Value::Null) => return Value::Null,
+/// Lexicographic list ordering for the comparison operators: element-wise,
+/// then by length, with a null element making the comparison unknown.
+fn list_order(a: &[Value], b: &[Value]) -> Option<std::cmp::Ordering> {
+    for (left, right) in a.iter().zip(b.iter()) {
+        if left.is_null() || right.is_null() {
+            return None;
+        }
+        match value_order(left, right) {
+            Some(std::cmp::Ordering::Equal) => {}
+            Some(ordering) => return Some(ordering),
+            None => return None,
+        }
+    }
+    Some(a.len().cmp(&b.len()))
+}
+
+/// Ordering of two values under the comparison operators; `None` when the
+/// types are incomparable (which yields null).
+fn value_order(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
         (Value::Int(_), Value::Int(_))
         | (Value::Float(_), Value::Float(_))
         | (Value::Int(_), Value::Float(_))
         | (Value::Float(_), Value::Int(_)) => {
+            if matches!(a, Value::Float(value) if value.is_nan())
+                || matches!(b, Value::Float(value) if value.is_nan())
+            {
+                return None;
+            }
+            Some(a.as_number()?.total_cmp(&b.as_number()?))
+        }
+        (Value::Text(x), Value::Text(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
+        (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+        (Value::List(x), Value::List(y)) => list_order(x, y),
+        (Value::Date(x), Value::Date(y)) => Some(x.cmp(y)),
+        (Value::LocalTime(x), Value::LocalTime(y)) => Some(x.cmp(y)),
+        (Value::Time(x), Value::Time(y)) => Some(x.cmp(y)),
+        (Value::LocalDateTime(x), Value::LocalDateTime(y)) => Some(x.cmp(y)),
+        (Value::DateTime(x), Value::DateTime(y)) => Some(x.cmp(y)),
+        (Value::Duration(x), Value::Duration(y)) => Some(x.cmp(y)),
+        (Value::Point(x), Value::Point(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
+fn compare_value(op: u8, a: &Value, b: &Value) -> Result<Value> {
+    use binary_code as code;
+    let ordering = match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+        (Value::Int(_), Value::Int(_))
+        | (Value::Float(_), Value::Float(_))
+        | (Value::Int(_), Value::Float(_))
+        | (Value::Float(_), Value::Int(_)) => {
+            // NaN is incomparable: every ordering comparison is false.
+            if matches!(a, Value::Float(value) if value.is_nan())
+                || matches!(b, Value::Float(value) if value.is_nan())
+            {
+                return Ok(Value::Bool(false));
+            }
             let (Some(x), Some(y)) = (a.as_number(), b.as_number()) else {
-                return Value::Null;
+                return Ok(Value::Null);
             };
             x.total_cmp(&y)
         }
         (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        (Value::List(x), Value::List(y)) => {
+            // Lists and paths are distinct types: comparing one with the
+            // other yields null, like any other cross-type ordering.
+            if crate::record::is_path_shaped(x) != crate::record::is_path_shaped(y) {
+                return Ok(Value::Null);
+            }
+            match list_order(x, y) {
+                Some(ordering) => ordering,
+                None => return Ok(Value::Null),
+            }
+        }
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
         (Value::LocalTime(x), Value::LocalTime(y)) => x.cmp(y),
         (Value::Time(x), Value::Time(y)) => x.cmp(y),
@@ -2925,7 +3207,27 @@ fn compare_value(op: u8, a: &Value, b: &Value) -> Value {
         (Value::DateTime(x), Value::DateTime(y)) => x.cmp(y),
         (Value::Duration(x), Value::Duration(y)) => x.cmp(y),
         (Value::Point(x), Value::Point(y)) => x.cmp(y),
-        _ => return Value::Null,
+        (
+            Value::Date(_)
+            | Value::LocalTime(_)
+            | Value::Time(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime(_)
+            | Value::Duration(_),
+            Value::Date(_)
+            | Value::LocalTime(_)
+            | Value::Time(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime(_)
+            | Value::Duration(_),
+        ) => {
+            return Err(Error::type_error(format!(
+                "Cannot compare {} with {}",
+                a.type_name(),
+                b.type_name()
+            )));
+        }
+        _ => return Ok(Value::Null),
     };
     let result = match op {
         code::LT => ordering.is_lt(),
@@ -2933,7 +3235,7 @@ fn compare_value(op: u8, a: &Value, b: &Value) -> Value {
         code::GT => ordering.is_gt(),
         _ => ordering.is_ge(),
     };
-    Value::Bool(result)
+    Ok(Value::Bool(result))
 }
 
 fn kleene_and(a: &Value, b: &Value) -> Value {
@@ -3006,6 +3308,28 @@ fn regex_match(a: &Value, b: &Value) -> Value {
 }
 
 /// Convert entity values returned by functions into entity registers.
+/// Flatten the nodes and relationships reachable in a `DELETE` target:
+/// entities, paths and arbitrarily nested lists of them.
+fn collect_delete_targets(value: &Value, nodes: &mut Vec<u64>, edges: &mut Vec<u64>) -> Result<()> {
+    match value {
+        Value::Node(id) => nodes.push(*id),
+        Value::Edge(id) => edges.push(*id),
+        Value::List(items) => {
+            for item in items.iter() {
+                collect_delete_targets(item, nodes, edges)?;
+            }
+        }
+        Value::Null => {}
+        other => {
+            return Err(Error::type_error(format!(
+                "DELETE expects a node, relationship or path, got {}",
+                other.type_name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn normalize_reg(value: Value) -> Reg {
     match value {
         Value::Node(id) => Reg::Node(id),
@@ -3892,5 +4216,643 @@ pub fn format_value(value: &Value) -> String {
         Value::DateTime(value) => value.to_string(),
         Value::Duration(value) => value.to_string(),
         Value::Point(value) => value.to_string(),
+    }
+}
+
+/// Read a local CSV file into single-column rows: maps when the file has a
+/// header row, lists otherwise. Fields missing from a short row become null.
+fn load_csv_rows(path: &str, with_headers: bool, terminator: u8) -> Result<Vec<Vec<Reg>>> {
+    let path = path.strip_prefix("file://").unwrap_or(path);
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return Err(Error::unsupported(
+            "remote LOAD CSV over HTTP is not supported; use a local path",
+        ));
+    }
+    let file = std::fs::File::open(path).map_err(|error| {
+        Error::new(
+            ErrorCode::Io,
+            format!("cannot load CSV from `{path}`: {error}"),
+        )
+    })?;
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(with_headers)
+        .flexible(true)
+        .delimiter(terminator)
+        .from_reader(file);
+    let io_error = |error: csv::Error| {
+        Error::new(
+            ErrorCode::Io,
+            format!("cannot read CSV from `{path}`: {error}"),
+        )
+    };
+    let mut rows = Vec::new();
+    if with_headers {
+        let headers: Vec<std::sync::Arc<str>> = reader
+            .headers()
+            .map_err(io_error)?
+            .iter()
+            .map(std::sync::Arc::from)
+            .collect();
+        for record in reader.records() {
+            let record = record.map_err(io_error)?;
+            if record.len() > headers.len() {
+                return Err(Error::new(
+                    ErrorCode::Io,
+                    format!(
+                        "CSV row {} has {} fields but the header has {}",
+                        record.position().map_or(0, |pos| pos.line()),
+                        record.len(),
+                        headers.len()
+                    ),
+                ));
+            }
+            let entries: Vec<(std::sync::Arc<str>, Value)> = headers
+                .iter()
+                .enumerate()
+                .map(|(index, header)| {
+                    let value = record
+                        .get(index)
+                        .map_or(Value::Null, |field| Value::Text(field.into()));
+                    (header.clone(), value)
+                })
+                .collect();
+            rows.push(vec![Reg::Value(Value::Map(entries.into()))]);
+        }
+    } else {
+        for record in reader.records() {
+            let record = record.map_err(io_error)?;
+            let fields: Vec<Value> = record
+                .iter()
+                .map(|field| Value::Text(field.into()))
+                .collect();
+            rows.push(vec![Reg::Value(Value::List(fields.into()))]);
+        }
+    }
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::vfs::mem::MemVfs;
+
+    fn test_db() -> Database {
+        Database::create(Arc::new(MemVfs::new()), Path::new("vdbe.db"), 4096).expect("create db")
+    }
+
+    /// A three-node graph: two `Person` nodes and one `KNOWS` edge.
+    fn seeded_db() -> (Database, u64, u64, u64) {
+        let mut db = test_db();
+        let (alice, bob, edge) = db
+            .write(|db| {
+                let person = db.ensure_label("Person")?;
+                let knows = db.ensure_edge_type("KNOWS")?;
+                let name = db.ensure_property_key("name")?;
+                let alice = db.create_node(&[person], vec![(name, Value::from("alice"))])?;
+                let bob = db.create_node(&[person], vec![(name, Value::from("bob"))])?;
+                let edge = db.create_edge(knows, alice, bob, Vec::new())?;
+                Ok((alice, bob, edge))
+            })
+            .expect("seed");
+        (db, alice, bob, edge)
+    }
+
+    fn program(ops: Vec<Op>, constants: Vec<Value>, registers: u32, cursors: u32) -> Program {
+        Program {
+            ops,
+            constants,
+            cursor_count: cursors as usize,
+            register_count: registers as usize,
+            columns: Vec::new(),
+            mutating: false,
+        }
+    }
+
+    fn run(db: &mut Database, program: &Program) -> Result<Vec<Vec<Value>>> {
+        db.begin_read().expect("begin read");
+        let result = execute(db, program);
+        let _ = db.end_read();
+        result
+    }
+
+    #[test]
+    fn scan_loop_binds_every_node() {
+        let (mut db, alice, bob, _) = seeded_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Rewind {
+                    cursor: 0,
+                    target: 6,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+                Op::ResultRow { start: 0, count: 1 },
+                Op::Next {
+                    cursor: 0,
+                    target: 6,
+                },
+                Op::Goto { target: 2 },
+                Op::Halt,
+            ],
+            Vec::new(),
+            1,
+            1,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(rows, vec![vec![Value::Node(alice)], vec![Value::Node(bob)]]);
+    }
+
+    #[test]
+    fn rewind_skips_an_empty_cursor() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Rewind {
+                    cursor: 0,
+                    target: 3,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+                Op::Halt,
+            ],
+            Vec::new(),
+            1,
+            1,
+        );
+        assert_eq!(
+            run(&mut db, &program).expect("run"),
+            Vec::<Vec<Value>>::new()
+        );
+    }
+
+    #[test]
+    fn bind_on_an_exhausted_cursor_is_an_error() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+            ],
+            Vec::new(),
+            1,
+            1,
+        );
+        assert!(run(&mut db, &program).is_err());
+    }
+
+    #[test]
+    fn expand_binds_edge_and_neighbor() {
+        let (mut db, _, bob, edge) = seeded_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Rewind {
+                    cursor: 0,
+                    target: 11,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+                Op::OpenExpand {
+                    cursor: 1,
+                    src: 0,
+                    direction: 0,
+                    types: Vec::new(),
+                    any_type: true,
+                },
+                Op::Rewind {
+                    cursor: 1,
+                    target: 9,
+                },
+                Op::BindExpand {
+                    cursor: 1,
+                    edge: 1,
+                    node: 2,
+                },
+                Op::ResultRow { start: 1, count: 2 },
+                Op::Next {
+                    cursor: 1,
+                    target: 9,
+                },
+                Op::Goto { target: 5 },
+                Op::Next {
+                    cursor: 0,
+                    target: 11,
+                },
+                Op::Goto { target: 2 },
+                Op::Halt,
+            ],
+            Vec::new(),
+            3,
+            2,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(rows, vec![vec![Value::Edge(edge), Value::Node(bob)]]);
+    }
+
+    #[test]
+    fn property_reads_resolve_key_names() {
+        let (mut db, ..) = seeded_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Rewind {
+                    cursor: 0,
+                    target: 7,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+                Op::Property {
+                    target: 0,
+                    name: 0,
+                    dest: 1,
+                },
+                Op::ResultRow { start: 1, count: 1 },
+                Op::Next {
+                    cursor: 0,
+                    target: 7,
+                },
+                Op::Goto { target: 2 },
+                Op::Halt,
+            ],
+            vec![Value::from("name")],
+            2,
+            1,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(
+            rows,
+            vec![vec![Value::from("alice")], vec![Value::from("bob")]]
+        );
+    }
+
+    #[test]
+    fn comparison_with_null_yields_null() {
+        let mut db = test_db();
+        let constant = |dest: u32, index: u32| Op::Constant { dest, value: index };
+
+        let and_false = program(
+            vec![
+                Op::Null { dest: 0 },
+                constant(1, 0),
+                Op::Binary {
+                    op: binary_code::AND,
+                    left: 0,
+                    right: 1,
+                    dest: 2,
+                },
+                Op::ResultRow { start: 2, count: 1 },
+                Op::Halt,
+            ],
+            vec![Value::Bool(false)],
+            3,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &and_false).expect("run"),
+            vec![vec![Value::Bool(false)]],
+            "null AND false is false"
+        );
+
+        let eq_true = program(
+            vec![
+                Op::Null { dest: 0 },
+                constant(1, 0),
+                Op::Binary {
+                    op: binary_code::EQ,
+                    left: 0,
+                    right: 1,
+                    dest: 2,
+                },
+                Op::ResultRow { start: 2, count: 1 },
+                Op::Halt,
+            ],
+            vec![Value::Bool(true)],
+            3,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &eq_true).expect("run"),
+            vec![vec![Value::Null]],
+            "null = true is null"
+        );
+    }
+
+    #[test]
+    fn negating_null_yields_null() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::Null { dest: 0 },
+                Op::Unary {
+                    op: unary_code::NEG,
+                    src: 0,
+                    dest: 1,
+                },
+                Op::ResultRow { start: 1, count: 1 },
+                Op::Halt,
+            ],
+            Vec::new(),
+            2,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &program).expect("run"),
+            vec![vec![Value::Null]]
+        );
+    }
+
+    #[test]
+    fn subscript_reads_a_list_element() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::Constant { dest: 2, value: 2 },
+                Op::BuildList {
+                    dest: 3,
+                    items: vec![0, 1, 2],
+                },
+                Op::Constant { dest: 4, value: 3 },
+                Op::Subscript {
+                    base: 3,
+                    index: 4,
+                    dest: 5,
+                },
+                Op::ResultRow { start: 5, count: 1 },
+                Op::Halt,
+            ],
+            vec![
+                Value::Int(10),
+                Value::Int(20),
+                Value::Int(30),
+                Value::Int(1),
+            ],
+            6,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &program).expect("run"),
+            vec![vec![Value::Int(20)]]
+        );
+    }
+
+    #[test]
+    fn subscript_on_a_scalar_is_a_type_error() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::Subscript {
+                    base: 0,
+                    index: 1,
+                    dest: 2,
+                },
+                Op::Halt,
+            ],
+            vec![Value::Int(5), Value::Int(0)],
+            3,
+            0,
+        );
+        let err = run(&mut db, &program).expect_err("type error");
+        assert_eq!(err.code(), ErrorCode::Type);
+    }
+
+    #[test]
+    fn slice_honours_negative_bounds() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::Constant { dest: 2, value: 2 },
+                Op::Constant { dest: 3, value: 3 },
+                Op::Constant { dest: 4, value: 4 },
+                Op::BuildList {
+                    dest: 5,
+                    items: vec![0, 1, 2, 3, 4],
+                },
+                Op::Constant { dest: 6, value: 5 },
+                Op::Constant { dest: 7, value: 6 },
+                Op::Slice {
+                    base: 5,
+                    lower: 6,
+                    upper: 7,
+                    open_lower: false,
+                    open_upper: false,
+                    dest: 8,
+                },
+                Op::ResultRow { start: 8, count: 1 },
+                Op::Halt,
+            ],
+            vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
+                Value::Int(4),
+                Value::Int(5),
+                Value::Int(-3),
+                Value::Int(-1),
+            ],
+            9,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &program).expect("run"),
+            vec![vec![Value::List(vec![Value::Int(3), Value::Int(4)].into())]]
+        );
+    }
+
+    #[test]
+    fn hash_aggregate_groups_and_sums() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::CollectOpen { cursor: 0 },
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::Constant { dest: 0, value: 2 },
+                Op::Constant { dest: 1, value: 3 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::Constant { dest: 0, value: 4 },
+                Op::Constant { dest: 1, value: 5 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::HashAggregate {
+                    cursor: 0,
+                    prefix: 0,
+                    groups: 1,
+                    aggs: vec![AggSpec {
+                        func: AggFn::Sum,
+                        args: 1,
+                        star: false,
+                        distinct: false,
+                    }],
+                },
+                Op::CtxRewind {
+                    cursor: 0,
+                    target: 16,
+                },
+                Op::CtxData {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::ResultRow { start: 0, count: 2 },
+                Op::CtxNext {
+                    cursor: 0,
+                    target: 16,
+                },
+                Op::Goto { target: 12 },
+                Op::Halt,
+            ],
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Int(1),
+                Value::Int(20),
+                Value::Int(2),
+                Value::Int(30),
+            ],
+            2,
+            1,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(30)],
+                vec![Value::Int(2), Value::Int(30)],
+            ]
+        );
+    }
+
+    #[test]
+    fn dedup_rows_keeps_the_first_of_each_key() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::CollectOpen { cursor: 0 },
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::Constant { dest: 0, value: 2 },
+                Op::Constant { dest: 1, value: 3 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::Constant { dest: 0, value: 4 },
+                Op::Constant { dest: 1, value: 5 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::DedupRows {
+                    cursor: 0,
+                    prefix: 0,
+                    keys: 1,
+                },
+                Op::CtxRewind {
+                    cursor: 0,
+                    target: 16,
+                },
+                Op::CtxData {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::ResultRow { start: 0, count: 2 },
+                Op::CtxNext {
+                    cursor: 0,
+                    target: 16,
+                },
+                Op::Goto { target: 12 },
+                Op::Halt,
+            ],
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Int(1),
+                Value::Int(20),
+                Value::Int(2),
+                Value::Int(30),
+            ],
+            2,
+            1,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(10)],
+                vec![Value::Int(2), Value::Int(30)],
+            ]
+        );
+    }
+
+    #[test]
+    fn truncate_rows_rejects_a_float_limit() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::CollectOpen { cursor: 0 },
+                Op::Constant { dest: 0, value: 0 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 1,
+                },
+                Op::Constant { dest: 1, value: 1 },
+                Op::Constant { dest: 2, value: 2 },
+                Op::TruncateRows {
+                    cursor: 0,
+                    skip: 1,
+                    limit: 2,
+                },
+                Op::Halt,
+            ],
+            vec![Value::Int(7), Value::Int(0), Value::Float(1.0)],
+            3,
+            1,
+        );
+        let err = run(&mut db, &program).expect_err("float limit");
+        assert_eq!(err.code(), ErrorCode::Syntax);
+        assert!(err.message().contains("LIMIT"), "{err}");
     }
 }

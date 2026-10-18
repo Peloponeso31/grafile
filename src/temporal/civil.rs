@@ -513,4 +513,33 @@ mod tests {
         assert_eq!(iso_weeks_in_year(2015), 53);
         assert_eq!(iso_weeks_in_year(2016), 52);
     }
+
+    #[test]
+    fn leap_days_and_month_end_clamping() {
+        assert!(Date::new(2023, 2, 29).is_none(), "2023 is not a leap year");
+        assert!(Date::new(2024, 2, 29).is_some(), "2024 is a leap year");
+        assert!(Date::new(2023, 13, 1).is_none());
+        assert!(Date::new(2023, 0, 1).is_none());
+        assert!(Date::new(2023, 1, 0).is_none());
+
+        let january_end = Date::new(2024, 1, 31).expect("date");
+        assert_eq!(
+            january_end.add_months(1).expect("add").to_string(),
+            "2024-02-29",
+            "clamped to the leap February"
+        );
+        let non_leap = Date::new(2023, 1, 31).expect("date");
+        assert_eq!(
+            non_leap.add_months(1).expect("add").to_string(),
+            "2023-02-28"
+        );
+        assert_eq!(
+            non_leap.with_month(2).expect("month").to_string(),
+            "2023-02-28"
+        );
+        assert_eq!(
+            non_leap.add_months(-1).expect("back").to_string(),
+            "2022-12-31"
+        );
+    }
 }

@@ -748,4 +748,34 @@ mod tests {
         assert!(duration_from_fields(&fields(&[("centuries", number(1))])).is_err());
         assert!(duration_from_fields(&[]).is_err());
     }
+
+    #[test]
+    fn invalid_calendar_fields_are_rejected() {
+        let err = date_from_fields(&fields(&[
+            ("year", number(2023)),
+            ("month", number(2)),
+            ("day", number(29)),
+        ]))
+        .expect_err("February 29 in a non-leap year");
+        assert!(!err.is_empty());
+        for (key, value) in [("month", 13), ("day", 0), ("day", 32), ("month", 0)] {
+            let result = date_from_fields(&fields(&[("year", number(2023)), (key, number(value))]));
+            assert!(result.is_err(), "{key} = {value} must be rejected");
+        }
+        let leap = date_from_fields(&fields(&[
+            ("year", number(2024)),
+            ("month", number(2)),
+            ("day", number(29)),
+        ]))
+        .expect("February 29 in a leap year");
+        assert_eq!(leap.to_string(), "2024-02-29");
+    }
+
+    #[test]
+    fn duration_components_scale_into_the_smallest_unit() {
+        let duration =
+            duration_from_fields(&fields(&[("milliseconds", number(1500))])).expect("milliseconds");
+        assert_eq!(duration.to_string(), "PT1.5S");
+        assert_eq!((duration.seconds(), duration.milliseconds()), (1, 1500));
+    }
 }

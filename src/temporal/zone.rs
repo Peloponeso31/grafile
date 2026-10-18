@@ -196,4 +196,53 @@ mod tests {
         assert!(!is_known("Mars/Olympus"));
         assert!(offset_at_instant("Mars/Olympus", 0, 0).is_err());
     }
+
+    #[test]
+    fn dst_gap_resolves_to_the_time_after_the_transition() {
+        // Stockholm springs forward on 2017-03-26: 02:30 does not exist, and
+        // the "compatible" strategy shifts it past the gap (CEST, +02:00).
+        let gap = Civil {
+            year: 2017,
+            month: 3,
+            day: 26,
+            hour: 2,
+            minute: 30,
+            second: 0,
+            nanos: 0,
+        };
+        assert_eq!(offset_for_civil("Europe/Stockholm", gap), Ok(7200));
+    }
+
+    #[test]
+    fn dst_fold_resolves_to_the_first_occurrence() {
+        // Stockholm falls back on 2017-10-29: 02:30 happens twice, and the
+        // compatible strategy picks the first occurrence (CEST, +02:00).
+        let fold = Civil {
+            year: 2017,
+            month: 10,
+            day: 29,
+            hour: 2,
+            minute: 30,
+            second: 0,
+            nanos: 0,
+        };
+        assert_eq!(offset_for_civil("Europe/Stockholm", fold), Ok(7200));
+    }
+
+    #[test]
+    fn zone_lookups_reject_years_outside_the_database() {
+        let distant = |year: i64| Civil {
+            year,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            nanos: 0,
+        };
+        let err = offset_for_civil("Europe/Stockholm", distant(10_000)).expect_err("too far");
+        assert!(err.contains("out of range"), "{err}");
+        let err = offset_for_civil("Europe/Stockholm", distant(-10_000)).expect_err("too far");
+        assert!(err.contains("out of range"), "{err}");
+    }
 }

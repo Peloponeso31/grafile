@@ -125,6 +125,9 @@ pub enum Expr {
     },
     /// Pattern predicate `(a)-[:T]->(b)`; true when the pattern matches.
     Pattern(Box<PatternPath>),
+    /// `exists { ... }` subquery: its clauses are only inspected for
+    /// whether they match at least one row.
+    ExistsSubquery(Box<QueryPart>),
     /// `[p = (a)-[:T]->(b) WHERE predicate | projection]` comprehension.
     PatternComprehension {
         /// Pattern matched for every input row.
@@ -235,13 +238,68 @@ pub struct VarLength {
     pub max: Option<u32>,
 }
 
+/// A label (or relationship type) expression: names combined with `&`, `|`
+/// and `!`, as introduced by Neo4j 5. `:` chains are conjunctions too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LabelExpr {
+    /// A single label or type name.
+    Label(String),
+    /// Every sub-expression must match (empty means no label was written).
+    And(Vec<LabelExpr>),
+    /// At least one sub-expression must match.
+    Or(Vec<LabelExpr>),
+    /// The sub-expression must not match.
+    Not(Box<LabelExpr>),
+}
+
+impl Default for LabelExpr {
+    fn default() -> Self {
+        Self::And(Vec::new())
+    }
+}
+
+impl LabelExpr {
+    /// Whether no label was written at all.
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::And(parts) if parts.is_empty())
+    }
+
+    /// The label names when the expression is a conjunction of plain labels,
+    /// which is the only form write clauses accept.
+    pub fn plain_labels(&self) -> Option<Vec<String>> {
+        let mut labels = Vec::new();
+        self.collect_plain(&mut labels).then_some(labels)
+    }
+
+    /// Every label a matching node must carry. Disjunctions and negations
+    /// guarantee nothing even when they mention labels.
+    pub fn guaranteed_labels(&self) -> Vec<String> {
+        match self {
+            Self::Label(label) => vec![label.clone()],
+            Self::And(parts) => parts.iter().flat_map(Self::guaranteed_labels).collect(),
+            Self::Or(_) | Self::Not(_) => Vec::new(),
+        }
+    }
+
+    fn collect_plain(&self, labels: &mut Vec<String>) -> bool {
+        match self {
+            Self::Label(label) => {
+                labels.push(label.clone());
+                true
+            }
+            Self::And(parts) => parts.iter().all(|part| part.collect_plain(labels)),
+            Self::Or(_) | Self::Not(_) => false,
+        }
+    }
+}
+
 /// Node pattern `(var:Label {props})`.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct NodePattern {
     /// Optional variable.
     pub variable: Option<String>,
-    /// Label names.
-    pub labels: Vec<String>,
+    /// Label expression.
+    pub labels: LabelExpr,
     /// Optional inline property map.
     pub properties: Option<Expr>,
 }
@@ -251,8 +309,8 @@ pub struct NodePattern {
 pub struct RelationshipPattern {
     /// Optional variable.
     pub variable: Option<String>,
-    /// Edge type names.
-    pub types: Vec<String>,
+    /// Relationship type expression.
+    pub types: LabelExpr,
     /// Direction.
     pub direction: RelDirection,
     /// Optional variable-length bounds.
@@ -315,6 +373,9 @@ pub struct ReturnItem {
     pub expr: Expr,
     /// Alias written with `AS`.
     pub alias: Option<String>,
+    /// The expression exactly as written, used as the column name when the
+    /// item has no alias.
+    pub text: Option<String>,
 }
 
 /// An `ORDER BY` key.
@@ -423,6 +484,17 @@ pub enum Clause {
         /// Alias for each element.
         alias: String,
     },
+    /// `LOAD CSV [WITH HEADERS] FROM source AS alias [FIELDTERMINATOR char]`.
+    LoadCsv {
+        /// Whether the first row holds column names.
+        with_headers: bool,
+        /// Source path expression (evaluated per input row).
+        source: Expr,
+        /// Variable bound to each row (a map with headers, a list without).
+        alias: String,
+        /// Field separator; defaults to a comma.
+        field_terminator: Option<char>,
+    },
     /// `FOREACH (var IN list | updating clauses)`.
     Foreach {
         /// Loop variable.
@@ -458,4 +530,139 @@ pub struct QueryPart {
     pub union_all: bool,
     /// Clauses in order.
     pub clauses: Vec<Clause>,
+}
+
+/// A parsed statement: a query or a schema DDL command.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Statement {
+    /// A regular query.
+    Query(Query),
+    /// A schema command (`CREATE INDEX`, `CREATE CONSTRAINT`, `DROP ...`).
+    Ddl(DdlStatement),
+}
+
+/// A schema DDL command.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DdlStatement {
+    /// `CREATE INDEX name [IF NOT EXISTS] FOR (n:Label) ON (n.key, ...)`
+    CreateIndex(DdlIndex),
+    /// `CREATE CONSTRAINT name [IF NOT EXISTS] FOR ... REQUIRE ...`
+    CreateConstraint(DdlConstraint),
+    /// `DROP INDEX name [IF EXISTS]`
+    DropIndex {
+        /// Index name.
+        name: String,
+        /// Whether a missing index is an error.
+        if_exists: bool,
+    },
+    /// `DROP CONSTRAINT name [IF EXISTS]`
+    DropConstraint {
+        /// Constraint name.
+        name: String,
+        /// Whether a missing constraint is an error.
+        if_exists: bool,
+    },
+}
+
+impl DdlStatement {
+    /// One-line description for `EXPLAIN` output.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::CreateIndex(index) => format!(
+                "CreateIndex {} on {} keys=[{}]{}",
+                index.name,
+                index.entity.describe(),
+                index.keys.join(", "),
+                if index.if_not_exists {
+                    " if_not_exists"
+                } else {
+                    ""
+                }
+            ),
+            Self::CreateConstraint(constraint) => format!(
+                "CreateConstraint {} on {} kind={:?} keys=[{}]{}",
+                constraint.name,
+                constraint.entity.describe(),
+                constraint.kind,
+                constraint.keys.join(", "),
+                if constraint.if_not_exists {
+                    " if_not_exists"
+                } else {
+                    ""
+                }
+            ),
+            Self::DropIndex { name, if_exists } => format!(
+                "DropIndex {name}{}",
+                if *if_exists { " if_exists" } else { "" }
+            ),
+            Self::DropConstraint { name, if_exists } => format!(
+                "DropConstraint {name}{}",
+                if *if_exists { " if_exists" } else { "" }
+            ),
+        }
+    }
+}
+
+/// The entity an index or constraint applies to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DdlEntity {
+    /// Nodes carrying a label.
+    Node {
+        /// Label name.
+        label: String,
+    },
+    /// Relationships of a type.
+    Edge {
+        /// Edge type name.
+        edge_type: String,
+    },
+}
+
+impl DdlEntity {
+    /// One-line description for `EXPLAIN` output.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Node { label } => format!("(n:{label})"),
+            Self::Edge { edge_type } => format!("()-[r:{edge_type}]-()"),
+        }
+    }
+}
+
+/// `CREATE INDEX` body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DdlIndex {
+    /// Index name.
+    pub name: String,
+    /// Whether an existing index of that name is not an error.
+    pub if_not_exists: bool,
+    /// Indexed entity.
+    pub entity: DdlEntity,
+    /// Property key names in key order.
+    pub keys: Vec<String>,
+}
+
+/// `CREATE CONSTRAINT` body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DdlConstraint {
+    /// Constraint name.
+    pub name: String,
+    /// Whether an existing constraint of that name is not an error.
+    pub if_not_exists: bool,
+    /// Constrained entity.
+    pub entity: DdlEntity,
+    /// Constraint kind.
+    pub kind: DdlConstraintKind,
+    /// Property key names in key order.
+    pub keys: Vec<String>,
+}
+
+/// Kinds of DDL constraints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DdlConstraintKind {
+    /// `IS UNIQUE`
+    Unique,
+    /// `IS NOT NULL`
+    NotNull,
+    /// `REQUIRE (n.a, ...) IS NODE KEY` (nodes only).
+    NodeKey,
 }
