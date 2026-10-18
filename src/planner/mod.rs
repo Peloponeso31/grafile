@@ -2875,7 +2875,7 @@ fn check_expr_kinds_with(
         }
         Expr::Function { name, args, .. } => {
             let first = args.first();
-            let argument = first.and_then(&kind);
+            let argument = first.and_then(kind);
             match name.to_ascii_lowercase().as_str() {
                 "labels" | "properties" | "keys" => require(
                     argument,
