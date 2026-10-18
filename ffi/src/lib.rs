@@ -1433,7 +1433,7 @@ mod tests {
         assert!(db.is_null());
         assert!(!err.is_null(), "out_err must carry the message");
         let message = unsafe { CStr::from_ptr(err) }.to_str().expect("utf8");
-        assert!(message.to_lowercase().contains("no such file"), "{message}");
+        assert!(message.contains("NotFound"), "{message}");
         unsafe { grafile_free(err as *mut c_void) };
     }
 
