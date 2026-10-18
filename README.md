@@ -135,8 +135,8 @@ Debian/Ubuntu users can install the `.deb`; Fedora/RHEL users the `.rpm`
 (x86_64 and aarch64 packages are released):
 
 ```console
-$ sudo dpkg -i grafile_0.2.0-1_amd64.deb
-$ sudo rpm -i grafile-0.2.0-1.x86_64.rpm
+$ sudo dpkg -i grafile_0.2.1-1_amd64.deb
+$ sudo rpm -i grafile-0.2.1-1.x86_64.rpm
 ```
 
 Windows, once the first manifest is merged into the winget community
