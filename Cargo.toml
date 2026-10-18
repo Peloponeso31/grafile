@@ -1,6 +1,6 @@
 [package]
 name = "grafile"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Single-file graph database with a Cypher shell"
 license = "MIT"
