@@ -186,3 +186,106 @@ impl File for StdFileHandle {
         &self.path
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_write_and_read_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("file.db");
+        let vfs = StdVfs;
+        let file = vfs.open(&path, OpenMode::Create).expect("open");
+        file.write_at(b"hello", 0).expect("write");
+        assert_eq!(file.size().expect("size"), 5);
+        file.sync_all().expect("sync");
+        drop(file);
+
+        let file = vfs.open(&path, OpenMode::ReadWrite).expect("reopen");
+        let mut buf = [0u8; 5];
+        file.read_at(&mut buf, 0).expect("read");
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[test]
+    fn writes_are_positioned_without_a_seek_cursor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("positioned.db");
+        let vfs = StdVfs;
+        let file = vfs.open(&path, OpenMode::Create).expect("open");
+        file.write_at(b"hello", 4).expect("write");
+        assert_eq!(file.size().expect("size"), 9);
+        let mut gap = [0u8; 4];
+        file.read_at(&mut gap, 0).expect("read gap");
+        assert_eq!(gap, [0, 0, 0, 0], "the gap reads as zeros");
+        let mut tail = [0u8; 5];
+        file.read_at(&mut tail, 4).expect("read tail");
+        assert_eq!(&tail, b"hello");
+    }
+
+    #[test]
+    fn set_len_truncates_and_extends() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("resize.db");
+        let vfs = StdVfs;
+        let file = vfs.open(&path, OpenMode::Create).expect("open");
+        file.write_at(b"abcdefghij", 0).expect("write");
+        file.set_len(4).expect("truncate");
+        assert_eq!(file.size().expect("size"), 4);
+        let mut buf = [0u8; 4];
+        file.read_at(&mut buf, 0).expect("read");
+        assert_eq!(&buf, b"abcd");
+        let mut past_end = [0u8; 1];
+        assert!(file.read_at(&mut past_end, 4).is_err(), "read past the end");
+        file.set_len(8).expect("extend");
+        assert_eq!(file.size().expect("size"), 8);
+        file.read_at(&mut past_end, 7).expect("read extended tail");
+        assert_eq!(past_end, [0]);
+    }
+
+    #[test]
+    fn opening_a_missing_file_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("missing.db");
+        let vfs = StdVfs;
+        assert!(vfs.open(&path, OpenMode::ReadOnly).is_err());
+        assert!(vfs.open(&path, OpenMode::ReadWrite).is_err());
+        assert!(!vfs.exists(&path).expect("exists"));
+    }
+
+    #[test]
+    fn remove_is_idempotent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("gone.db");
+        let vfs = StdVfs;
+        vfs.remove(&path).expect("missing is fine");
+        let file = vfs.open(&path, OpenMode::Create).expect("create");
+        drop(file);
+        assert!(vfs.exists(&path).expect("exists"));
+        vfs.remove(&path).expect("remove");
+        assert!(!vfs.exists(&path).expect("exists"));
+        vfs.remove(&path).expect("second remove is fine");
+    }
+
+    #[test]
+    fn rename_replaces_the_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let from = dir.path().join("from.db");
+        let to = dir.path().join("to.db");
+        let vfs = StdVfs;
+        let file = vfs.open(&from, OpenMode::Create).expect("create");
+        file.write_at(b"data", 0).expect("write");
+        drop(file);
+
+        let stale = vfs.open(&to, OpenMode::Create).expect("create target");
+        drop(stale);
+        vfs.rename(&from, &to).expect("rename");
+        assert!(!vfs.exists(&from).expect("exists"));
+        let file = vfs.open(&to, OpenMode::ReadOnly).expect("open target");
+        let mut buf = [0u8; 4];
+        file.read_at(&mut buf, 0).expect("read");
+        assert_eq!(&buf, b"data");
+        assert_eq!(file.path(), to.as_path());
+    }
+}

@@ -13,6 +13,10 @@
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::temporal::civil::Date;
+use crate::temporal::datetime::{DateTime, LocalDateTime, LocalTime, Time};
+use crate::temporal::duration::Duration;
+use crate::temporal::point::Point;
 
 /// A dynamically typed property or expression value.
 ///
@@ -40,6 +44,20 @@ pub enum Value {
     Node(u64),
     /// Reference to an edge by id (engine-internal; not storable).
     Edge(u64),
+    /// A civil date.
+    Date(Date),
+    /// A wall-clock time.
+    LocalTime(LocalTime),
+    /// A wall-clock time with a fixed UTC offset.
+    Time(Time),
+    /// A civil datetime without a zone.
+    LocalDateTime(LocalDateTime),
+    /// A datetime with an offset and optional IANA zone.
+    DateTime(DateTime),
+    /// A duration of months, days and seconds.
+    Duration(Duration),
+    /// A spatial point.
+    Point(Point),
 }
 
 impl Value {
@@ -56,6 +74,13 @@ impl Value {
             Self::Map(_) => "map",
             Self::Node(_) => "node",
             Self::Edge(_) => "relationship",
+            Self::Date(_) => "date",
+            Self::LocalTime(_) => "local time",
+            Self::Time(_) => "time",
+            Self::LocalDateTime(_) => "local datetime",
+            Self::DateTime(_) => "datetime",
+            Self::Duration(_) => "duration",
+            Self::Point(_) => "point",
         }
     }
 
@@ -114,6 +139,13 @@ impl PartialEq for Value {
             (Self::Map(a), Self::Map(b)) => a == b,
             (Self::Node(a), Self::Node(b)) => a == b,
             (Self::Edge(a), Self::Edge(b)) => a == b,
+            (Self::Date(a), Self::Date(b)) => a == b,
+            (Self::LocalTime(a), Self::LocalTime(b)) => a == b,
+            (Self::Time(a), Self::Time(b)) => a == b,
+            (Self::LocalDateTime(a), Self::LocalDateTime(b)) => a == b,
+            (Self::DateTime(a), Self::DateTime(b)) => a == b,
+            (Self::Duration(a), Self::Duration(b)) => a == b,
+            (Self::Point(a), Self::Point(b)) => a == b,
             _ => false,
         }
     }
@@ -144,35 +176,93 @@ impl Ord for Value {
             (Self::Float(a), Self::Int(b)) => float_cmp(*a, *b as f64),
             (Self::Text(a), Self::Text(b)) => a.as_bytes().cmp(b.as_bytes()),
             (Self::Bytes(a), Self::Bytes(b)) => a.cmp(b),
-            (Self::List(a), Self::List(b)) => a.cmp(b),
+            (Self::List(a), Self::List(b)) => compare_lists(a, b),
             (Self::Map(a), Self::Map(b)) => a.cmp(b),
             (Self::Node(a), Self::Node(b)) => a.cmp(b),
             (Self::Edge(a), Self::Edge(b)) => a.cmp(b),
+            (Self::Date(a), Self::Date(b)) => a.cmp(b),
+            (Self::LocalTime(a), Self::LocalTime(b)) => a.cmp(b),
+            (Self::Time(a), Self::Time(b)) => a.cmp(b),
+            (Self::LocalDateTime(a), Self::LocalDateTime(b)) => a.cmp(b),
+            (Self::DateTime(a), Self::DateTime(b)) => a.cmp(b),
+            (Self::Duration(a), Self::Duration(b)) => a.cmp(b),
+            (Self::Point(a), Self::Point(b)) => a.cmp(b),
             _ => rank(self).cmp(&rank(other)),
         }
     }
 }
 
 fn float_cmp(a: f64, b: f64) -> std::cmp::Ordering {
-    if a == b {
-        // Treat -0.0 and 0.0 as equal, matching `PartialEq`.
-        return std::cmp::Ordering::Equal;
+    use std::cmp::Ordering;
+    // `0.0 / 0.0` produces a negative NaN on x86 and a positive one on
+    // aarch64; `total_cmp` would order the two differently. NaN is the
+    // greatest number in every environment instead.
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => Ordering::Equal,
+        (true, false) => Ordering::Greater,
+        (false, true) => Ordering::Less,
+        (false, false) => {
+            if a == b {
+                // Treat -0.0 and 0.0 as equal, matching `PartialEq`.
+                return Ordering::Equal;
+            }
+            a.total_cmp(&b)
+        }
     }
-    a.total_cmp(&b)
 }
 
+/// Cross-type orderability, matching Neo4j: maps first, then nodes,
+/// relationships, lists, strings, booleans, numbers, with null last
+/// (`ORDER BY` places nulls last ascending). Paths are lists internally, so
+/// they rank with lists and are separated by [`compare_lists`].
 fn rank(value: &Value) -> u8 {
     match value {
-        Value::Null => 0,
-        Value::Bool(_) => 1,
-        Value::Int(_) | Value::Float(_) => 2,
-        Value::Text(_) => 3,
-        Value::Bytes(_) => 4,
-        Value::List(_) => 5,
-        Value::Map(_) => 6,
-        Value::Node(_) => 7,
-        Value::Edge(_) => 8,
+        Value::Map(_) => 1,
+        Value::Node(_) => 2,
+        Value::Edge(_) => 3,
+        Value::List(_) => 4,
+        Value::Bytes(_) => 5,
+        Value::Text(_) => 6,
+        Value::Bool(_) => 7,
+        Value::Int(_) | Value::Float(_) => 8,
+        Value::Date(_) => 9,
+        Value::LocalTime(_) => 10,
+        Value::Time(_) => 11,
+        Value::LocalDateTime(_) => 12,
+        Value::DateTime(_) => 13,
+        Value::Duration(_) => 14,
+        Value::Point(_) => 15,
+        Value::Null => 16,
     }
+}
+
+/// Compare two lists: lexicographic element-wise, with path-shaped lists
+/// (alternating nodes and relationships) ordering after plain lists like
+/// Neo4j's `Path` type. Null elements compare last via [`rank`].
+fn compare_lists(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    match (is_path_shaped(a), is_path_shaped(b)) {
+        (false, true) => return std::cmp::Ordering::Less,
+        (true, false) => return std::cmp::Ordering::Greater,
+        _ => {}
+    }
+    a.cmp(b)
+}
+
+/// Whether a list has the shape of a path: `[node, edge, node, ..., node]`.
+pub fn is_path_shaped(items: &[Value]) -> bool {
+    items.len() >= 3
+        && items.len() % 2 == 1
+        && matches!(items[0], Value::Node(_))
+        && items
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .all(|item| matches!(item, Value::Edge(_)))
+        && items
+            .iter()
+            .skip(2)
+            .step_by(2)
+            .all(|item| matches!(item, Value::Node(_)))
 }
 
 /// Cypher equality: `None` when either side is null or the types are
@@ -189,6 +279,34 @@ pub fn value_equals(a: &Value, b: &Value) -> Option<bool> {
         (Value::Bytes(x), Value::Bytes(y)) => Some(x == y),
         (Value::Node(x), Value::Node(y)) => Some(x == y),
         (Value::Edge(x), Value::Edge(y)) => Some(x == y),
+        (Value::Date(x), Value::Date(y)) => Some(x == y),
+        (Value::LocalTime(x), Value::LocalTime(y)) => Some(x == y),
+        (Value::Time(x), Value::Time(y)) => Some(x == y),
+        (Value::LocalDateTime(x), Value::LocalDateTime(y)) => Some(x == y),
+        (Value::DateTime(x), Value::DateTime(y)) => Some(x == y),
+        (Value::Duration(x), Value::Duration(y)) => Some(x == y),
+        (Value::Point(x), Value::Point(y)) => Some(x == y),
+        // Temporal and spatial values never equal values of another type.
+        (
+            Value::Date(_)
+            | Value::LocalTime(_)
+            | Value::Time(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime(_)
+            | Value::Duration(_)
+            | Value::Point(_),
+            _,
+        )
+        | (
+            _,
+            Value::Date(_)
+            | Value::LocalTime(_)
+            | Value::Time(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime(_)
+            | Value::Duration(_)
+            | Value::Point(_),
+        ) => Some(false),
         (Value::List(x), Value::List(y)) => {
             if x.len() != y.len() {
                 return Some(false);
@@ -203,7 +321,27 @@ pub fn value_equals(a: &Value, b: &Value) -> Option<bool> {
             }
             if unknown { None } else { Some(true) }
         }
-        _ => None,
+        (Value::Map(x), Value::Map(y)) => {
+            // Maps equal when they have the same keys and equal values;
+            // `{k: null}` is not equal to `{}`.
+            if x.len() != y.len() {
+                return Some(false);
+            }
+            let mut unknown = false;
+            for (key, value) in x.iter() {
+                let Some((_, other)) = y.iter().find(|(name, _)| name == key) else {
+                    return Some(false);
+                };
+                match value_equals(value, other) {
+                    Some(true) => {}
+                    Some(false) => return Some(false),
+                    None => unknown = true,
+                }
+            }
+            if unknown { None } else { Some(true) }
+        }
+        // Values of different types are never equal (not unknown).
+        _ => Some(false),
     }
 }
 
@@ -290,6 +428,13 @@ mod tag {
     pub const TEXT: u8 = 5;
     pub const BYTES: u8 = 6;
     pub const LIST: u8 = 7;
+    pub const DATE: u8 = 8;
+    pub const LOCAL_TIME: u8 = 9;
+    pub const TIME: u8 = 10;
+    pub const LOCAL_DATETIME: u8 = 11;
+    pub const DATETIME: u8 = 12;
+    pub const DURATION: u8 = 13;
+    pub const POINT: u8 = 14;
 }
 
 /// Encode a value into a record buffer.
@@ -322,6 +467,51 @@ pub fn encode_value(out: &mut Vec<u8>, value: &Value) {
             for item in values.iter() {
                 encode_value(out, item);
             }
+        }
+        Value::Date(date) => {
+            out.push(tag::DATE);
+            encode_varint(out, zigzag_encode(date.days()));
+        }
+        Value::LocalTime(time) => {
+            out.push(tag::LOCAL_TIME);
+            encode_varint(out, time.nanos() as u64);
+        }
+        Value::Time(time) => {
+            out.push(tag::TIME);
+            encode_varint(out, time.local().nanos() as u64);
+            encode_varint(out, zigzag_encode(time.offset() as i64));
+        }
+        Value::LocalDateTime(datetime) => {
+            out.push(tag::LOCAL_DATETIME);
+            encode_varint(out, zigzag_encode(datetime.seconds()));
+            encode_varint(out, datetime.nanos() as u64);
+        }
+        Value::DateTime(datetime) => {
+            out.push(tag::DATETIME);
+            encode_varint(out, zigzag_encode(datetime.local().seconds()));
+            encode_varint(out, datetime.local().nanos() as u64);
+            encode_varint(out, zigzag_encode(datetime.offset() as i64));
+            match datetime.zone() {
+                Some(zone) => {
+                    encode_varint(out, zone.len() as u64 + 1);
+                    out.extend_from_slice(zone.as_bytes());
+                }
+                None => encode_varint(out, 0),
+            }
+        }
+        Value::Duration(duration) => {
+            out.push(tag::DURATION);
+            encode_varint(out, zigzag_encode(duration.months()));
+            encode_varint(out, zigzag_encode(duration.days()));
+            encode_varint(out, zigzag_encode(duration.seconds()));
+            encode_varint(out, zigzag_encode(duration.nanos() as i64));
+        }
+        Value::Point(point) => {
+            out.push(tag::POINT);
+            out.extend_from_slice(&point.srid().to_le_bytes());
+            out.extend_from_slice(&point.x().to_bits().to_le_bytes());
+            out.extend_from_slice(&point.y().to_bits().to_le_bytes());
+            out.extend_from_slice(&point.z().unwrap_or(f64::NAN).to_bits().to_le_bytes());
         }
         // Maps and entity references are engine-internal and never stored;
         // the engine validates property values before encoding.
@@ -370,6 +560,76 @@ pub fn decode_value(input: &[u8], pos: &mut usize) -> Result<Value> {
                 values.push(decode_value(input, pos)?);
             }
             Ok(Value::List(Arc::from(values)))
+        }
+        tag::DATE => {
+            let days = zigzag_decode(decode_varint(input, pos)?);
+            Ok(Value::Date(Date::from_days(days)))
+        }
+        tag::LOCAL_TIME => {
+            let nanos = decode_varint(input, pos)? as i64;
+            LocalTime::from_nanos(nanos)
+                .map(Value::LocalTime)
+                .ok_or_else(|| Error::corrupt("invalid local time in record"))
+        }
+        tag::TIME => {
+            let nanos = decode_varint(input, pos)? as i64;
+            let offset = zigzag_decode(decode_varint(input, pos)?) as i32;
+            let local = LocalTime::from_nanos(nanos)
+                .ok_or_else(|| Error::corrupt("invalid time in record"))?;
+            Time::new(local, offset)
+                .map(Value::Time)
+                .ok_or_else(|| Error::corrupt("invalid time offset in record"))
+        }
+        tag::LOCAL_DATETIME => {
+            let seconds = zigzag_decode(decode_varint(input, pos)?);
+            let nanos = decode_varint(input, pos)? as i64;
+            LocalDateTime::from_epoch(seconds, nanos)
+                .map(Value::LocalDateTime)
+                .ok_or_else(|| Error::corrupt("invalid local datetime in record"))
+        }
+        tag::DATETIME => {
+            let seconds = zigzag_decode(decode_varint(input, pos)?);
+            let nanos = decode_varint(input, pos)? as i64;
+            let offset = zigzag_decode(decode_varint(input, pos)?) as i32;
+            let zone_len = decode_varint(input, pos)? as usize;
+            let zone = if zone_len == 0 {
+                None
+            } else {
+                let bytes = take(input, pos, zone_len - 1)?;
+                let name = std::str::from_utf8(bytes)
+                    .map_err(|_| Error::corrupt("invalid UTF-8 in zone name"))?;
+                Some(Arc::<str>::from(name))
+            };
+            let local = LocalDateTime::from_epoch(seconds, nanos)
+                .ok_or_else(|| Error::corrupt("invalid datetime in record"))?;
+            DateTime::new(local, offset, zone)
+                .map(Value::DateTime)
+                .ok_or_else(|| Error::corrupt("invalid datetime offset in record"))
+        }
+        tag::DURATION => {
+            let months = zigzag_decode(decode_varint(input, pos)?);
+            let days = zigzag_decode(decode_varint(input, pos)?);
+            let seconds = zigzag_decode(decode_varint(input, pos)?);
+            let nanos = zigzag_decode(decode_varint(input, pos)?);
+            Duration::new(months, days, seconds, nanos)
+                .map(Value::Duration)
+                .ok_or_else(|| Error::corrupt("invalid duration in record"))
+        }
+        tag::POINT => {
+            let srid = i32::from_le_bytes(take(input, pos, 4)?.try_into().expect("slice length"));
+            let x = f64::from_bits(u64::from_le_bytes(
+                take(input, pos, 8)?.try_into().expect("slice length"),
+            ));
+            let y = f64::from_bits(u64::from_le_bytes(
+                take(input, pos, 8)?.try_into().expect("slice length"),
+            ));
+            let z = f64::from_bits(u64::from_le_bytes(
+                take(input, pos, 8)?.try_into().expect("slice length"),
+            ));
+            let z = (!z.is_nan()).then_some(z);
+            Point::new(srid, x, y, z)
+                .map(Value::Point)
+                .ok_or_else(|| Error::corrupt("invalid point in record"))
         }
         other => Err(Error::corrupt(format!("unknown value tag {other}"))),
     }
@@ -568,6 +828,13 @@ mod index_tag {
     pub const TEXT: u8 = 5;
     pub const BYTES: u8 = 6;
     pub const LIST: u8 = 7;
+    pub const DATE: u8 = 8;
+    pub const LOCAL_TIME: u8 = 9;
+    pub const TIME: u8 = 10;
+    pub const LOCAL_DATETIME: u8 = 11;
+    pub const DATETIME: u8 = 12;
+    pub const DURATION: u8 = 13;
+    pub const POINT: u8 = 14;
 }
 
 /// Encode a value so that byte order equals value order.
@@ -586,13 +853,7 @@ pub fn encode_index_key(out: &mut Vec<u8>, value: &Value) {
         }
         Value::Float(value) => {
             out.push(index_tag::FLOAT);
-            let bits = value.to_bits();
-            let flipped = if bits >> 63 == 1 {
-                !bits
-            } else {
-                bits ^ (1u64 << 63)
-            };
-            out.extend_from_slice(&flipped.to_be_bytes());
+            encode_ordered_float(out, *value);
         }
         Value::Text(value) => {
             out.push(index_tag::TEXT);
@@ -609,11 +870,82 @@ pub fn encode_index_key(out: &mut Vec<u8>, value: &Value) {
             }
             out.extend_from_slice(&[0x00, 0x01]);
         }
+        Value::Date(date) => {
+            out.push(index_tag::DATE);
+            encode_ordered_i128(out, date.days() as i128);
+        }
+        Value::LocalTime(time) => {
+            out.push(index_tag::LOCAL_TIME);
+            encode_ordered_i128(out, time.nanos() as i128);
+        }
+        Value::Time(time) => {
+            out.push(index_tag::TIME);
+            encode_ordered_i128(out, time.utc_nanos() as i128);
+            encode_ordered_i128(out, time.offset() as i128);
+        }
+        Value::LocalDateTime(datetime) => {
+            out.push(index_tag::LOCAL_DATETIME);
+            encode_ordered_i128(out, datetime.epoch_nanos());
+        }
+        Value::DateTime(datetime) => {
+            out.push(index_tag::DATETIME);
+            encode_ordered_i128(out, datetime.instant_nanos());
+            encode_ordered_i128(out, datetime.offset() as i128);
+            encode_escaped(out, datetime.zone().unwrap_or_default().as_bytes());
+        }
+        Value::Duration(duration) => {
+            out.push(index_tag::DURATION);
+            // Durations order by their normalized length; the components
+            // break ties so the encoding stays total and stable.
+            encode_ordered_i128(out, duration.normalized_nanos());
+            encode_ordered_i128(out, duration.months() as i128);
+            encode_ordered_i128(out, duration.days() as i128);
+            encode_ordered_i128(out, duration.seconds() as i128);
+            encode_ordered_i128(out, duration.nanos() as i128);
+        }
+        Value::Point(point) => {
+            out.push(index_tag::POINT);
+            encode_ordered_i128(out, point.srid() as i128);
+            encode_ordered_float(out, point.x());
+            encode_ordered_float(out, point.y());
+            match point.z() {
+                Some(z) => {
+                    out.push(1);
+                    encode_ordered_float(out, z);
+                }
+                None => out.push(0),
+            }
+        }
         Value::Map(_) | Value::Node(_) | Value::Edge(_) => {
             debug_assert!(false, "attempted to index an unstorable value");
             out.push(index_tag::NULL);
         }
     }
+}
+
+/// Encode a signed integer so that byte order matches numeric order.
+fn encode_ordered_i128(out: &mut Vec<u8>, value: i128) {
+    let flipped = (value as u128) ^ (1u128 << 127);
+    out.extend_from_slice(&flipped.to_be_bytes());
+}
+
+/// Encode a float with the usual sign-flipping trick; NaN sorts last.
+///
+/// NaNs are canonicalized to the positive quiet NaN first: the sign bit of
+/// an arithmetic NaN is platform-dependent (`0.0 / 0.0` is negative on x86),
+/// and without canonicalization a negative NaN would encode smallest.
+fn encode_ordered_float(out: &mut Vec<u8>, value: f64) {
+    let bits = if value.is_nan() {
+        f64::NAN.to_bits()
+    } else {
+        value.to_bits()
+    };
+    let flipped = if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits ^ (1u64 << 63)
+    };
+    out.extend_from_slice(&flipped.to_be_bytes());
 }
 
 fn encode_escaped(out: &mut Vec<u8>, bytes: &[u8]) {
@@ -713,13 +1045,19 @@ mod tests {
 
     /// Total order used by the index encoding, for test comparison.
     ///
-    /// Within a type, values compare naturally (floats by `total_cmp`, which
-    /// matches the bit transform). Across types, tag order decides.
+    /// Within a type, values compare naturally; floats by `total_cmp` with
+    /// NaN canonicalized last (matching the bit transform). Across types,
+    /// tag order decides.
     fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         match (a, b) {
             (Value::Int(x), Value::Int(y)) => x.cmp(y),
-            (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
+            (Value::Float(x), Value::Float(y)) => match (x.is_nan(), y.is_nan()) {
+                (true, true) => Ordering::Equal,
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                (false, false) => x.total_cmp(y),
+            },
             (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
             (Value::Null, Value::Null) => Ordering::Equal,
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
@@ -738,7 +1076,14 @@ mod tests {
             Value::Text(_) => 5,
             Value::Bytes(_) => 6,
             Value::List(_) => 7,
-            Value::Map(_) | Value::Node(_) | Value::Edge(_) => 8,
+            Value::Date(_) => 8,
+            Value::LocalTime(_) => 9,
+            Value::Time(_) => 10,
+            Value::LocalDateTime(_) => 11,
+            Value::DateTime(_) => 12,
+            Value::Duration(_) => 13,
+            Value::Point(_) => 14,
+            Value::Map(_) | Value::Node(_) | Value::Edge(_) => 15,
         }
     }
 
@@ -760,6 +1105,35 @@ mod tests {
         encode_index_key(&mut neg, &Value::Float(-1.5));
         encode_index_key(&mut pos, &Value::Float(1.5));
         assert!(neg < pos);
+    }
+
+    #[test]
+    fn nan_orders_last_regardless_of_its_sign_bit() {
+        use std::cmp::Ordering;
+        // x86_64's SSE produces a negative NaN for `0.0 / 0.0`; aarch64 a
+        // positive one. Both must order like the greatest number and must
+        // encode to the same index key.
+        let negative_nan = Value::Float(f64::from_bits(0xFFF8_0000_0000_0000));
+        let positive_nan = Value::Float(f64::NAN);
+        for nan in [&negative_nan, &positive_nan] {
+            assert_eq!(nan.cmp(&Value::Float(1.5)), Ordering::Greater);
+            assert_eq!(nan.cmp(&Value::Float(f64::INFINITY)), Ordering::Greater);
+            assert_eq!(Value::Float(1.5).cmp(nan), Ordering::Less);
+        }
+        assert_eq!(
+            negative_nan.cmp(&positive_nan),
+            Ordering::Equal,
+            "all NaNs are one group"
+        );
+
+        let mut negative_key = Vec::new();
+        let mut positive_key = Vec::new();
+        encode_index_key(&mut negative_key, &negative_nan);
+        encode_index_key(&mut positive_key, &positive_nan);
+        assert_eq!(negative_key, positive_key);
+        let mut one_and_a_half = Vec::new();
+        encode_index_key(&mut one_and_a_half, &Value::Float(1.5));
+        assert!(one_and_a_half < negative_key, "NaN keys sort last");
     }
 
     #[test]

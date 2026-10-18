@@ -9,7 +9,9 @@
 //! Values in registers are [`Reg`]: plain [`Value`]s plus node/edge
 //! references bound by cursors.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::cypher::UnaryOp;
 use crate::engine::Database;
@@ -17,6 +19,12 @@ use crate::error::{Error, ErrorCode, Result};
 use crate::matrix::Direction;
 use crate::planner::plan::AggFn;
 use crate::record::{Value, value_equals};
+use crate::temporal::between;
+use crate::temporal::civil::Date;
+use crate::temporal::construct::{self, Field, TruncateUnit};
+use crate::temporal::datetime::{DateTime, LocalDateTime, LocalTime, Time};
+use crate::temporal::duration::Duration;
+use crate::temporal::point::Point;
 
 /// A register value: a plain value or an entity reference.
 #[derive(Debug, Clone, PartialEq)]
@@ -65,6 +73,8 @@ impl Eq for Reg {}
 pub struct AggSpec {
     /// Aggregation function.
     pub func: AggFn,
+    /// How many argument values each row feeds this aggregation.
+    pub args: u8,
     /// Whether the argument is `*` (only meaningful for `count`).
     pub star: bool,
     /// Whether only distinct argument values are aggregated.
@@ -348,6 +358,15 @@ pub enum Op {
         /// Number of registers.
         count: u32,
     },
+    /// Write the register window back into the current row of a row cursor.
+    CtxStore {
+        /// Cursor slot.
+        cursor: u32,
+        /// First register.
+        start: u32,
+        /// Number of registers.
+        count: u32,
+    },
     /// Read a property by name from a node, relationship or map.
     Property {
         /// Entity or map register.
@@ -377,8 +396,8 @@ pub enum Op {
     BuildPath {
         /// Destination register.
         dest: u32,
-        /// `(register, splice)` elements in path order.
-        elements: Vec<(u32, bool)>,
+        /// Elements in path order.
+        elements: Vec<BuildPathPart>,
     },
     /// Append a value to a list register (rebuilding the list).
     ListPush {
@@ -413,6 +432,17 @@ pub enum Op {
         /// Constant index of the procedure name.
         name: u32,
     },
+    /// Read a CSV file, filling a row cursor with one value per row.
+    LoadCsvOpen {
+        /// Cursor slot.
+        cursor: u32,
+        /// Source path register.
+        source: u32,
+        /// Whether the first row holds column names.
+        with_headers: bool,
+        /// Field separator byte.
+        terminator: u8,
+    },
     /// Open a shortest-path search from a node to a target node.
     ShortestOpen {
         /// Cursor slot.
@@ -442,8 +472,13 @@ pub enum Op {
         cursor: u32,
         /// Destination register for the edge list.
         edges: u32,
+        /// Destination register for the node list.
+        nodes: u32,
         /// Destination register for the end node.
         node: u32,
+        /// Whether the trail runs against the pattern direction, so the
+        /// bound lists read from the pattern's start.
+        reverse: bool,
         /// Jump target when exhausted.
         target: u32,
     },
@@ -534,6 +569,21 @@ pub enum Op {
 /// Sentinel property key id meaning "no such property".
 pub const NO_KEY: u32 = u32::MAX;
 
+/// One element of an [`Op::BuildPath`] sequence.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BuildPathPart {
+    /// A single value from a register.
+    Value(u32),
+    /// A variable-length segment: its relationship and node registers are
+    /// interleaved into the path (nodes first, then relationships).
+    Segment {
+        /// Register holding the relationship list.
+        edges: u32,
+        /// Register holding the node list.
+        nodes: u32,
+    },
+}
+
 /// Function codes for [`Op::Function`].
 pub mod func {
     /// `id(x)`
@@ -566,6 +616,122 @@ pub mod func {
     pub const RELATIONSHIPS: u8 = 13;
     /// `length(path)`
     pub const LENGTH: u8 = 14;
+    /// `toBoolean(x)`
+    pub const TO_BOOLEAN: u8 = 15;
+    /// `range(start, end [, step])`
+    pub const RANGE: u8 = 16;
+    /// `head(list)`
+    pub const HEAD: u8 = 17;
+    /// `last(list)`
+    pub const LAST: u8 = 18;
+    /// `tail(list)`
+    pub const TAIL: u8 = 19;
+    /// `reverse(list|string)`
+    pub const REVERSE: u8 = 20;
+    /// `split(original, delimiter)`
+    pub const SPLIT: u8 = 21;
+    /// `substring(original, start [, length])`
+    pub const SUBSTRING: u8 = 22;
+    /// `rand()`
+    pub const RAND: u8 = 23;
+    /// `toUpper(string)`
+    pub const TO_UPPER: u8 = 24;
+    /// `toLower(string)`
+    pub const TO_LOWER: u8 = 25;
+    /// `trim(string)`
+    pub const TRIM: u8 = 26;
+    /// `ltrim(string)`
+    pub const LTRIM: u8 = 27;
+    /// `rtrim(string)`
+    pub const RTRIM: u8 = 28;
+    /// `left(string, length)`
+    pub const LEFT: u8 = 29;
+    /// `right(string, length)`
+    pub const RIGHT: u8 = 30;
+    /// `replace(original, search, replacement)`
+    pub const REPLACE: u8 = 31;
+    /// `abs(x)`
+    pub const ABS: u8 = 32;
+    /// `ceil(x)`
+    pub const CEIL: u8 = 33;
+    /// `floor(x)`
+    pub const FLOOR: u8 = 34;
+    /// `round(x)`
+    pub const ROUND: u8 = 35;
+    /// `sign(x)`
+    pub const SIGN: u8 = 36;
+    /// `sqrt(x)`
+    pub const SQRT: u8 = 37;
+    /// `exp(x)`
+    pub const EXP: u8 = 38;
+    /// `log(x)`
+    pub const LOG: u8 = 39;
+    /// `log10(x)`
+    pub const LOG10: u8 = 40;
+    /// `sin(x)`
+    pub const SIN: u8 = 41;
+    /// `cos(x)`
+    pub const COS: u8 = 42;
+    /// `tan(x)`
+    pub const TAN: u8 = 43;
+    /// `cot(x)`
+    pub const COT: u8 = 44;
+    /// `asin(x)`
+    pub const ASIN: u8 = 45;
+    /// `acos(x)`
+    pub const ACOS: u8 = 46;
+    /// `atan(x)`
+    pub const ATAN: u8 = 47;
+    /// `atan2(y, x)`
+    pub const ATAN2: u8 = 48;
+    /// `degrees(x)`
+    pub const DEGREES: u8 = 49;
+    /// `radians(x)`
+    pub const RADIANS: u8 = 50;
+    /// `haversin(x)`
+    pub const HAVERSIN: u8 = 51;
+    /// `pi()`
+    pub const PI: u8 = 52;
+    /// `e()`
+    pub const E: u8 = 53;
+    /// `date(...)`
+    pub const DATE: u8 = 54;
+    /// `localtime(...)`
+    pub const LOCALTIME: u8 = 55;
+    /// `time(...)`
+    pub const TIME: u8 = 56;
+    /// `localdatetime(...)`
+    pub const LOCAL_DATETIME: u8 = 57;
+    /// `datetime(...)`
+    pub const DATETIME: u8 = 58;
+    /// `duration(...)`
+    pub const DURATION: u8 = 59;
+    /// `point({...})`
+    pub const POINT: u8 = 60;
+    /// `distance(a, b)`
+    pub const DISTANCE: u8 = 61;
+    /// `date.truncate(unit, value [, map])`
+    pub const DATE_TRUNCATE: u8 = 62;
+    /// `localtime.truncate(unit, value [, map])`
+    pub const LOCALTIME_TRUNCATE: u8 = 63;
+    /// `time.truncate(unit, value [, map])`
+    pub const TIME_TRUNCATE: u8 = 64;
+    /// `localdatetime.truncate(unit, value [, map])`
+    pub const LOCAL_DATETIME_TRUNCATE: u8 = 65;
+    /// `datetime.truncate(unit, value [, map])`
+    pub const DATETIME_TRUNCATE: u8 = 66;
+    /// `datetime.fromepoch(seconds, nanos)`
+    pub const DATETIME_FROM_EPOCH: u8 = 67;
+    /// `datetime.fromepochmillis(millis)`
+    pub const DATETIME_FROM_EPOCH_MILLIS: u8 = 68;
+    /// `duration.between(from, to)`
+    pub const DURATION_BETWEEN: u8 = 69;
+    /// `duration.inMonths(from, to)`
+    pub const DURATION_IN_MONTHS: u8 = 70;
+    /// `duration.inDays(from, to)`
+    pub const DURATION_IN_DAYS: u8 = 71;
+    /// `duration.inSeconds(from, to)`
+    pub const DURATION_IN_SECONDS: u8 = 72;
 }
 
 /// A compiled VDBE program.
@@ -587,6 +753,7 @@ pub struct Program {
 
 /// Execute a program and return its result rows.
 pub fn execute(db: &mut Database, program: &Program) -> Result<Vec<Vec<Value>>> {
+    db.clear_deleted();
     let mut executor = Executor {
         db,
         program,
@@ -595,6 +762,7 @@ pub fn execute(db: &mut Database, program: &Program) -> Result<Vec<Vec<Value>>> 
         results: Vec::new(),
         key_ids: vec![None; program.constants.len()],
         label_ids: vec![None; program.constants.len()],
+        statement_time: system_local_datetime(),
         pc: 0,
         steps: 0,
     };
@@ -617,7 +785,7 @@ enum Cursor {
         pos: usize,
     },
     Trails {
-        items: Vec<(Vec<u64>, u64)>,
+        items: Vec<crate::engine::Trail>,
         pos: usize,
     },
     Rows {
@@ -638,6 +806,9 @@ struct Executor<'a> {
     results: Vec<Vec<Value>>,
     key_ids: Vec<Option<u32>>,
     label_ids: Vec<Option<u32>>,
+    /// The statement's start time, shared by the clock functions so two
+    /// `datetime()` calls in one query observe the same instant.
+    statement_time: LocalDateTime,
     pc: usize,
     steps: u64,
 }
@@ -829,6 +1000,7 @@ impl<'a> Executor<'a> {
                     0 => match value {
                         Value::Int(value) => Value::Int(value.wrapping_neg()),
                         Value::Float(value) => Value::Float(-value),
+                        Value::Duration(value) => Value::Duration(-value),
                         Value::Null => Value::Null,
                         other => {
                             return Err(Error::type_error(format!(
@@ -996,22 +1168,38 @@ impl<'a> Executor<'a> {
                 };
                 let value = match self.regs[*target as usize].clone() {
                     Reg::Value(Value::Null) => Value::Null,
-                    Reg::Node(id) | Reg::Value(Value::Node(id)) => match key {
-                        Some(key) => self
-                            .db
-                            .get_node(id)?
-                            .and_then(|record| record.get(key).cloned())
-                            .unwrap_or(Value::Null),
-                        None => Value::Null,
-                    },
-                    Reg::Edge(id) | Reg::Value(Value::Edge(id)) => match key {
-                        Some(key) => self
-                            .db
-                            .get_edge(id)?
-                            .and_then(|record| record.get(key).cloned())
-                            .unwrap_or(Value::Null),
-                        None => Value::Null,
-                    },
+                    Reg::Node(id) | Reg::Value(Value::Node(id)) => {
+                        if self.db.node_deleted(id) {
+                            return Err(Error::new(
+                                ErrorCode::NotFound,
+                                "EntityNotFound: the node has been deleted",
+                            ));
+                        }
+                        match key {
+                            Some(key) => self
+                                .db
+                                .get_node(id)?
+                                .and_then(|record| record.get(key).cloned())
+                                .unwrap_or(Value::Null),
+                            None => Value::Null,
+                        }
+                    }
+                    Reg::Edge(id) | Reg::Value(Value::Edge(id)) => {
+                        if self.db.deleted_edge_type(id).is_some() {
+                            return Err(Error::new(
+                                ErrorCode::NotFound,
+                                "EntityNotFound: the relationship has been deleted",
+                            ));
+                        }
+                        match key {
+                            Some(key) => self
+                                .db
+                                .get_edge(id)?
+                                .and_then(|record| record.get(key).cloned())
+                                .unwrap_or(Value::Null),
+                            None => Value::Null,
+                        }
+                    }
                     Reg::Value(Value::Map(entries)) => {
                         let Value::Text(name) = &self.program.constants[*name as usize] else {
                             return Err(Error::internal("property name is not a string"));
@@ -1021,6 +1209,22 @@ impl<'a> Executor<'a> {
                             .find(|(entry, _)| entry.as_ref() == name.as_ref())
                             .map(|(_, value)| value.clone())
                             .unwrap_or(Value::Null)
+                    }
+                    Reg::Value(
+                        value @ (Value::Date(_)
+                        | Value::LocalTime(_)
+                        | Value::Time(_)
+                        | Value::LocalDateTime(_)
+                        | Value::DateTime(_)
+                        | Value::Duration(_)
+                        | Value::Point(_)),
+                    ) => {
+                        // Temporal and spatial values expose components as
+                        // property-like accessors (`d.year`, `p.x`).
+                        let Value::Text(name) = &self.program.constants[*name as usize] else {
+                            return Err(Error::internal("property name is not a string"));
+                        };
+                        temporal_accessor(&value, name)?
                     }
                     other => {
                         return Err(Error::type_error(format!(
@@ -1036,14 +1240,39 @@ impl<'a> Executor<'a> {
                 self.regs[*dest as usize] = Reg::Value(Value::Bool(value.is_null()));
             }
             Op::HasLabel { node, label, dest } => {
-                let label_id = self.resolve_label(*label)?;
-                let result = match (self.regs[*node as usize].clone(), label_id) {
-                    (Reg::Node(id), Some(label)) => self
-                        .db
-                        .get_node(id)?
-                        .map(|record| record.labels.contains(&label))
-                        .unwrap_or(false),
-                    _ => false,
+                let value = self.reg_value(*node)?;
+                let result = match value {
+                    Value::Node(id) => {
+                        let label_id = self.resolve_label(*label)?;
+                        self.db
+                            .get_node(id)?
+                            .map(|record| {
+                                label_id.is_some_and(|label| record.labels.contains(&label))
+                            })
+                            .unwrap_or(false)
+                    }
+                    // A label predicate on a relationship tests its type.
+                    Value::Edge(id) => {
+                        let Value::Text(name) = &self.program.constants[*label as usize] else {
+                            return Err(Error::internal("label name is not a string"));
+                        };
+                        let type_id = self.db.edge_type_id(name);
+                        self.db
+                            .get_edge(id)?
+                            .map(|record| type_id.is_some_and(|id| record.edge_type == id))
+                            .unwrap_or(false)
+                    }
+                    // The label of a null value is null.
+                    Value::Null => {
+                        self.regs[*dest as usize] = normalize_reg(Value::Null);
+                        return Ok(());
+                    }
+                    other => {
+                        return Err(Error::type_error(format!(
+                            "expected a node or relationship, got {}",
+                            other.type_name()
+                        )));
+                    }
                 };
                 self.regs[*dest as usize] = Reg::Value(Value::Bool(result));
             }
@@ -1172,9 +1401,15 @@ impl<'a> Executor<'a> {
                 let limit = match self.reg_value(*limit)? {
                     Value::Null => None,
                     Value::Int(value) if value >= 0 => Some(value as usize),
+                    Value::Float(_) => {
+                        return Err(Error::syntax(format!(
+                            "InvalidArgumentType: LIMIT expects an integer, got {}",
+                            self.reg_value(*limit)?.type_name()
+                        )));
+                    }
                     other => {
-                        return Err(Error::type_error(format!(
-                            "LIMIT expects a non-negative integer, got {}",
+                        return Err(Error::syntax(format!(
+                            "NegativeIntegerArgument: LIMIT expects a non-negative integer, got {}",
                             other.type_name()
                         )));
                     }
@@ -1254,6 +1489,24 @@ impl<'a> Executor<'a> {
                     self.regs[(*start as usize) + idx] = value;
                 }
             }
+            Op::CtxStore {
+                cursor,
+                start,
+                count,
+            } => {
+                let row: Vec<Reg> = (0..*count)
+                    .map(|idx| self.regs[(*start + idx) as usize].clone())
+                    .collect();
+                match &mut self.cursors[*cursor as usize] {
+                    Cursor::Rows { rows, pos } => match rows.get_mut(*pos) {
+                        Some(slot) => *slot = row,
+                        None => {
+                            return Err(Error::internal("CtxStore on exhausted cursor"));
+                        }
+                    },
+                    _ => return Err(Error::internal("CtxStore on a non-row cursor")),
+                }
+            }
             Op::VarExpandOpen {
                 cursor,
                 src,
@@ -1289,6 +1542,22 @@ impl<'a> Executor<'a> {
                     _ => return Err(Error::internal("procedure name is not text")),
                 };
                 let rows = self.procedure_rows(&name)?;
+                self.cursors[*cursor as usize] = Cursor::Rows { rows, pos: 0 };
+            }
+            Op::LoadCsvOpen {
+                cursor,
+                source,
+                with_headers,
+                terminator,
+            } => {
+                let value = self.reg_value(*source)?;
+                let Value::Text(path) = value else {
+                    return Err(Error::type_error(format!(
+                        "LOAD CSV FROM expects a path string, got {}",
+                        value.type_name()
+                    )));
+                };
+                let rows = load_csv_rows(&path, *with_headers, *terminator)?;
                 self.cursors[*cursor as usize] = Cursor::Rows { rows, pos: 0 };
             }
             Op::ShortestOpen {
@@ -1341,7 +1610,9 @@ impl<'a> Executor<'a> {
             Op::VarExpandNext {
                 cursor,
                 edges,
+                nodes,
                 node,
+                reverse,
                 target,
             } => {
                 let next = match &mut self.cursors[*cursor as usize] {
@@ -1355,10 +1626,20 @@ impl<'a> Executor<'a> {
                     _ => return Err(Error::internal("VarExpandNext on a non-trail cursor")),
                 };
                 match next {
-                    Some((edge_ids, end)) => {
-                        let values: Vec<Value> =
-                            edge_ids.iter().map(|id| Value::Edge(*id)).collect();
+                    Some(trail) => {
+                        // The end node stays the traversal's last node even
+                        // when the lists are read from the pattern's start.
+                        let end = trail.end();
+                        let mut values: Vec<Value> =
+                            trail.edges.iter().map(|id| Value::Edge(*id)).collect();
+                        let mut node_values: Vec<Value> =
+                            trail.nodes.iter().map(|id| Value::Node(*id)).collect();
+                        if *reverse {
+                            values.reverse();
+                            node_values.reverse();
+                        }
                         self.regs[*edges as usize] = Reg::Value(Value::List(values.into()));
+                        self.regs[*nodes as usize] = Reg::Value(Value::List(node_values.into()));
                         self.regs[*node as usize] = Reg::Node(end);
                     }
                     None => self.pc = *target as usize,
@@ -1366,11 +1647,35 @@ impl<'a> Executor<'a> {
             }
             Op::BuildPath { dest, elements } => {
                 let mut items: Vec<Value> = Vec::new();
-                for (reg, splice) in elements {
-                    let value = self.reg_value(*reg)?;
-                    match (splice, value) {
-                        (true, Value::List(inner)) => items.extend(inner.iter().cloned()),
-                        (_, value) => items.push(value),
+                for element in elements {
+                    match element {
+                        BuildPathPart::Value(reg) => items.push(self.reg_value(*reg)?),
+                        BuildPathPart::Segment { edges, nodes } => {
+                            // Interleave the segment's nodes and
+                            // relationships; a zero-length segment contains
+                            // only its start node, which is already on the
+                            // path.
+                            let edges = self.reg_value(*edges)?;
+                            let nodes = self.reg_value(*nodes)?;
+                            let (Value::List(edges), Value::List(nodes)) = (edges, nodes) else {
+                                return Err(Error::internal(
+                                    "variable-length path parts must be lists",
+                                ));
+                            };
+                            for (index, edge) in edges.iter().enumerate() {
+                                if let Some(node) = nodes.get(index)
+                                    && items.last() != Some(node)
+                                {
+                                    items.push(node.clone());
+                                }
+                                items.push(edge.clone());
+                            }
+                            if let Some(last) = nodes.last()
+                                && items.last() != Some(last)
+                            {
+                                items.push(last.clone());
+                            }
+                        }
                     }
                 }
                 self.regs[*dest as usize] = Reg::Value(Value::List(items.into()));
@@ -1463,20 +1768,20 @@ impl<'a> Executor<'a> {
             Op::SetProperty { target, key, value } => {
                 let key_name = self.reg_text(*key)?;
                 let value = self.reg_value(*value)?;
-                match self.regs[*target as usize].clone() {
-                    Reg::Node(id) => {
+                match self.reg_value(*target)? {
+                    Value::Node(id) => {
                         let key_id = self.db.ensure_property_key(&key_name)?;
                         self.db.set_node_property(id, key_id, value)?;
                     }
-                    Reg::Edge(id) => {
+                    Value::Edge(id) => {
                         let key_id = self.db.ensure_property_key(&key_name)?;
                         self.db.set_edge_property(id, key_id, value)?;
                     }
-                    Reg::Value(Value::Null) => {}
+                    Value::Null => {}
                     other => {
                         return Err(Error::type_error(format!(
                             "SET expects a node or relationship, got {}",
-                            other.to_value().type_name()
+                            other.type_name()
                         )));
                     }
                 }
@@ -1521,18 +1826,18 @@ impl<'a> Executor<'a> {
                     }
                 };
                 // Replacing properties on a null binding is a no-op.
-                match self.regs[*target as usize].clone() {
-                    Reg::Value(Value::Null) => {}
-                    Reg::Node(id) => {
+                match self.reg_value(*target)? {
+                    Value::Null => {}
+                    Value::Node(id) => {
                         self.db.replace_node_properties(id, entries)?;
                     }
-                    Reg::Edge(id) => {
+                    Value::Edge(id) => {
                         self.db.replace_edge_properties(id, entries)?;
                     }
                     other => {
                         return Err(Error::type_error(format!(
                             "SET expects a node or relationship, got {}",
-                            other.to_value().type_name()
+                            other.type_name()
                         )));
                     }
                 }
@@ -1542,41 +1847,46 @@ impl<'a> Executor<'a> {
                 // value remove the property, like `SET n.key = null`.
                 if !matches!(self.regs[*target as usize], Reg::Value(Value::Null)) {
                     let entries = self.resolve_props(*props)?;
-                    match self.regs[*target as usize] {
-                        Reg::Node(id) => {
+                    match self.reg_value(*target)? {
+                        Value::Node(id) => {
                             for (key, value) in entries {
                                 self.db.set_node_property(id, key, value)?;
                             }
                         }
-                        Reg::Edge(id) => {
+                        Value::Edge(id) => {
                             for (key, value) in entries {
                                 self.db.set_edge_property(id, key, value)?;
                             }
                         }
-                        ref other => {
+                        other => {
                             return Err(Error::type_error(format!(
                                 "SET += expects a node or relationship, got {}",
-                                other.to_value().type_name()
+                                other.type_name()
                             )));
                         }
                     }
                 }
             }
-            Op::DeleteAny { target, detach } => match self.regs[*target as usize].clone() {
-                Reg::Node(id) => {
-                    self.db.delete_node(id, *detach)?;
-                }
-                Reg::Edge(id) => {
-                    self.db.delete_edge(id)?;
-                }
-                Reg::Value(Value::Null) => {}
-                other => {
-                    return Err(Error::type_error(format!(
-                        "DELETE expects a node or relationship, got {}",
-                        other.to_value().type_name()
-                    )));
-                }
-            },
+            Op::DeleteAny { target, detach } => {
+                // A `DELETE` target may be a path or a nested list of
+                // entities; every element is deleted.
+                self.delete_any(self.reg_value(*target)?, *detach)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_any(&mut self, value: Value, detach: bool) -> Result<()> {
+        // Flatten paths and nested lists first, then delete relationships
+        // before nodes so non-detach deletion succeeds.
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        collect_delete_targets(&value, &mut nodes, &mut edges)?;
+        for edge in edges {
+            self.db.delete_edge(edge)?;
+        }
+        for node in nodes {
+            self.db.delete_node(node, detach)?;
         }
         Ok(())
     }
@@ -1591,6 +1901,9 @@ impl<'a> Executor<'a> {
     fn reg_node(&self, reg: u32) -> Result<u64> {
         match self.regs.get(reg as usize) {
             Some(Reg::Node(id)) => Ok(*id),
+            // Entities that travelled through a list (collect/UNWIND) lose
+            // their bound-register form and arrive as plain values.
+            Some(Reg::Value(Value::Node(id))) => Ok(*id),
             Some(other) => Err(Error::type_error(format!(
                 "expected a node, got {}",
                 other.to_value().type_name()
@@ -1610,8 +1923,12 @@ impl<'a> Executor<'a> {
         match self.reg_value(reg)? {
             Value::Null => Ok(0),
             Value::Int(value) if value >= 0 => Ok(value as usize),
-            other => Err(Error::type_error(format!(
-                "expected a non-negative integer, got {}",
+            Value::Float(_) => Err(Error::syntax(format!(
+                "InvalidArgumentType: SKIP expects an integer, got {}",
+                self.reg_value(reg)?.type_name()
+            ))),
+            other => Err(Error::syntax(format!(
+                "NegativeIntegerArgument: SKIP expects a non-negative integer, got {}",
                 other.type_name()
             ))),
         }
@@ -1774,9 +2091,11 @@ impl<'a> Executor<'a> {
             let accumulators = table
                 .entry(key)
                 .or_insert_with(|| aggs.iter().map(|spec| AggState::new(*spec)).collect());
+            let mut offset = prefix + group_count;
             for (idx, spec) in aggs.iter().enumerate() {
-                let input = &row[prefix + group_count + idx];
-                accumulators[idx].step(spec, input);
+                let inputs = &row[offset..offset + spec.args as usize];
+                accumulators[idx].step(spec, inputs)?;
+                offset += spec.args as usize;
             }
         }
         if table.is_empty() && group_count == 0 {
@@ -1811,6 +2130,12 @@ impl<'a> Executor<'a> {
             },
             func::LABELS => match args.first() {
                 Some(Value::Node(id)) => {
+                    if self.db.node_deleted(*id) {
+                        return Err(Error::new(
+                            ErrorCode::NotFound,
+                            "EntityNotFound: the node has been deleted",
+                        ));
+                    }
                     let Some(record) = self.db.get_node(*id)? else {
                         return Ok(Value::Null);
                     };
@@ -1822,21 +2147,28 @@ impl<'a> Executor<'a> {
                     }
                     Ok(Value::List(names.into()))
                 }
-                _ => Ok(Value::Null),
+                Some(Value::Null) | None => Ok(Value::Null),
+                _ => Err(Error::type_error(
+                    "InvalidArgumentValue: labels() expects a node",
+                )),
             },
             func::TYPE => match args.first() {
                 Some(Value::Edge(id)) => {
-                    let Some(record) = self.db.get_edge(*id)? else {
-                        return Ok(Value::Null);
+                    // A relationship deleted by this statement still knows
+                    // its type.
+                    let type_id = match self.db.deleted_edge_type(*id) {
+                        Some(type_id) => Some(type_id),
+                        None => self.db.get_edge(*id)?.map(|record| record.edge_type),
                     };
-                    Ok(self
-                        .db
-                        .schema()
-                        .edge_type_name(record.edge_type)
+                    Ok(type_id
+                        .and_then(|type_id| self.db.schema().edge_type_name(type_id))
                         .map(|name| Value::Text(std::sync::Arc::from(name)))
                         .unwrap_or(Value::Null))
                 }
-                _ => Ok(Value::Null),
+                Some(Value::Null) | None => Ok(Value::Null),
+                _ => Err(Error::type_error(
+                    "InvalidArgumentValue: type() expects a relationship",
+                )),
             },
             func::START_NODE | func::END_NODE => match args.first() {
                 Some(Value::Edge(id)) => {
@@ -1850,38 +2182,57 @@ impl<'a> Executor<'a> {
                     };
                     Ok(Value::Node(node))
                 }
-                _ => Ok(Value::Null),
+                Some(Value::Null) | None => Ok(Value::Null),
+                _ => Err(Error::type_error(
+                    "InvalidArgumentValue: startNode()/endNode() expects a relationship",
+                )),
             },
             func::COALESCE => Ok(args
                 .iter()
                 .find(|value| !value.is_null())
                 .cloned()
                 .unwrap_or(Value::Null)),
-            func::TO_STRING => Ok(match args.first() {
-                Some(Value::Null) | None => Value::Null,
-                Some(value) => Value::Text(std::sync::Arc::from(format_value(value).as_str())),
-            }),
-            func::TO_INTEGER => Ok(match args.first() {
-                Some(Value::Int(value)) => Value::Int(*value),
-                Some(Value::Float(value)) => Value::Int(*value as i64),
-                Some(Value::Bool(value)) => Value::Int(i64::from(*value)),
-                Some(Value::Text(text)) => text
-                    .trim()
-                    .parse::<i64>()
+            func::TO_STRING => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::Text(value)) => Ok(Value::Text(value.clone())),
+                Some(value) => match scalar_text(value) {
+                    Some(text) => Ok(Value::Text(Arc::from(text.into_owned()))),
+                    None => Err(invalid_argument("toString", value)),
+                },
+            },
+            func::TO_INTEGER => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::Int(value)) => Ok(Value::Int(*value)),
+                Some(Value::Float(value)) => Ok(truncate_to_int(*value)
                     .map(Value::Int)
-                    .unwrap_or(Value::Null),
-                _ => Value::Null,
-            }),
-            func::TO_FLOAT => Ok(match args.first() {
-                Some(Value::Int(value)) => Value::Float(*value as f64),
-                Some(Value::Float(value)) => Value::Float(*value),
-                Some(Value::Text(text)) => text
+                    .unwrap_or(Value::Null)),
+                Some(Value::Bool(value)) => Ok(Value::Int(i64::from(*value))),
+                Some(Value::Text(text)) => {
+                    Ok(text_to_integer(text).map(Value::Int).unwrap_or(Value::Null))
+                }
+                Some(other) => Err(invalid_argument("toInteger", other)),
+            },
+            func::TO_FLOAT => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::Int(value)) => Ok(Value::Float(*value as f64)),
+                Some(Value::Float(value)) => Ok(Value::Float(*value)),
+                Some(Value::Text(text)) => Ok(text
                     .trim()
                     .parse::<f64>()
                     .map(Value::Float)
-                    .unwrap_or(Value::Null),
-                _ => Value::Null,
-            }),
+                    .unwrap_or(Value::Null)),
+                Some(other) => Err(invalid_argument("toFloat", other)),
+            },
+            func::TO_BOOLEAN => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::Bool(value)) => Ok(Value::Bool(*value)),
+                Some(Value::Text(text)) => Ok(match text.to_ascii_lowercase().as_str() {
+                    "true" => Value::Bool(true),
+                    "false" => Value::Bool(false),
+                    _ => Value::Null,
+                }),
+                Some(other) => Err(invalid_argument("toBoolean", other)),
+            },
             func::SIZE => Ok(match args.first() {
                 Some(Value::List(items)) => Value::Int(items.len() as i64),
                 Some(Value::Text(text)) => Value::Int(text.chars().count() as i64),
@@ -1918,19 +2269,141 @@ impl<'a> Executor<'a> {
                 ),
                 _ => Value::Null,
             }),
+            func::RANGE => call_range(args),
+            func::HEAD | func::LAST => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::List(items)) => Ok(match func {
+                    func::HEAD => items.first().cloned().unwrap_or(Value::Null),
+                    _ => items.last().cloned().unwrap_or(Value::Null),
+                }),
+                Some(other) => Err(invalid_argument(
+                    if func == func::HEAD { "head" } else { "last" },
+                    other,
+                )),
+            },
+            func::TAIL => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::List(items)) => {
+                    Ok(Value::List(items.iter().skip(1).cloned().collect()))
+                }
+                Some(other) => Err(invalid_argument("tail", other)),
+            },
+            func::REVERSE => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::Text(text)) => {
+                    Ok(Value::Text(text.chars().rev().collect::<String>().into()))
+                }
+                Some(Value::List(items)) => Ok(Value::List(items.iter().rev().cloned().collect())),
+                Some(other) => Err(invalid_argument("reverse", other)),
+            },
+            func::SPLIT => call_split(args),
+            func::SUBSTRING => call_substring(args),
+            func::RAND => Ok(Value::Float(fastrand::f64())),
+            func::TO_UPPER => text_map(args, "toUpper", |text| text.to_uppercase()),
+            func::TO_LOWER => text_map(args, "toLower", |text| text.to_lowercase()),
+            func::TRIM => text_map(args, "trim", |text| text.trim().to_owned()),
+            func::LTRIM => text_map(args, "ltrim", |text| text.trim_start().to_owned()),
+            func::RTRIM => text_map(args, "rtrim", |text| text.trim_end().to_owned()),
+            func::LEFT | func::RIGHT => call_left_right(func, args),
+            func::REPLACE => call_replace(args),
+            func::ABS => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::Int(value)) => Ok(match value.checked_abs() {
+                    Some(value) => Value::Int(value),
+                    // `abs(i64::MIN)` overflows into float, like Neo4j.
+                    None => Value::Float((*value as f64).abs()),
+                }),
+                Some(Value::Float(value)) => Ok(Value::Float(value.abs())),
+                Some(other) => Err(invalid_argument("abs", other)),
+            },
+            func::SIGN => match args.first() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(Value::Int(value)) => Ok(Value::Int(value.signum())),
+                Some(Value::Float(value)) => Ok(Value::Int(if value.is_nan() {
+                    0
+                } else if *value > 0.0 {
+                    1
+                } else if *value < 0.0 {
+                    -1
+                } else {
+                    0
+                })),
+                Some(other) => Err(invalid_argument("sign", other)),
+            },
+            func::CEIL => float_map(args, "ceil", f64::ceil),
+            func::FLOOR => float_map(args, "floor", f64::floor),
+            func::ROUND => float_map(args, "round", f64::round),
+            func::SQRT => float_map(args, "sqrt", f64::sqrt),
+            func::EXP => float_map(args, "exp", f64::exp),
+            func::LOG => float_map(args, "log", f64::ln),
+            func::LOG10 => float_map(args, "log10", f64::log10),
+            func::SIN => float_map(args, "sin", f64::sin),
+            func::COS => float_map(args, "cos", f64::cos),
+            func::TAN => float_map(args, "tan", f64::tan),
+            func::COT => float_map(args, "cot", |value| 1.0 / value.tan()),
+            func::ASIN => float_map(args, "asin", f64::asin),
+            func::ACOS => float_map(args, "acos", f64::acos),
+            func::ATAN => float_map(args, "atan", f64::atan),
+            func::ATAN2 => match (args.first(), args.get(1)) {
+                (Some(Value::Null), _) | (_, Some(Value::Null)) | (None, _) => Ok(Value::Null),
+                (Some(first), Some(second)) => {
+                    let y = number_argument("atan2", first)?;
+                    let x = number_argument("atan2", second)?;
+                    Ok(Value::Float(y.atan2(x)))
+                }
+                (Some(other), None) => Err(invalid_argument("atan2", other)),
+            },
+            func::DEGREES => float_map(args, "degrees", f64::to_degrees),
+            func::RADIANS => float_map(args, "radians", f64::to_radians),
+            func::HAVERSIN => float_map(args, "haversin", |value| (1.0 - value.cos()) / 2.0),
+            func::PI => Ok(Value::Float(std::f64::consts::PI)),
+            func::E => Ok(Value::Float(std::f64::consts::E)),
+            func::DATE => call_date(args, self.statement_time),
+            func::LOCALTIME => call_localtime(args, self.statement_time),
+            func::TIME => call_time(args, self.statement_time),
+            func::LOCAL_DATETIME => call_localdatetime(args, self.statement_time),
+            func::DATETIME => call_datetime(args, self.statement_time),
+            func::DURATION => call_duration(args),
+            func::POINT => call_point(args),
+            func::DISTANCE => call_distance(args),
+            func::DATE_TRUNCATE => call_truncate(TruncateKind::Date, args),
+            func::LOCALTIME_TRUNCATE => call_truncate(TruncateKind::LocalTime, args),
+            func::TIME_TRUNCATE => call_truncate(TruncateKind::Time, args),
+            func::LOCAL_DATETIME_TRUNCATE => call_truncate(TruncateKind::LocalDateTime, args),
+            func::DATETIME_TRUNCATE => call_truncate(TruncateKind::DateTime, args),
+            func::DATETIME_FROM_EPOCH => call_datetime_from_epoch(args),
+            func::DATETIME_FROM_EPOCH_MILLIS => call_datetime_from_epoch_millis(args),
+            func::DURATION_BETWEEN => call_duration_between(DurationDiff::Between, args),
+            func::DURATION_IN_MONTHS => call_duration_between(DurationDiff::InMonths, args),
+            func::DURATION_IN_DAYS => call_duration_between(DurationDiff::InDays, args),
+            func::DURATION_IN_SECONDS => call_duration_between(DurationDiff::InSeconds, args),
             func::PROPERTIES => match args.first() {
                 Some(Value::Node(id)) => {
+                    if self.db.node_deleted(*id) {
+                        return Err(Error::new(
+                            ErrorCode::NotFound,
+                            "EntityNotFound: the node has been deleted",
+                        ));
+                    }
                     let Some(record) = self.db.get_node(*id)? else {
                         return Ok(Value::Null);
                     };
                     Ok(Value::Map(self.props_to_map(&record.props)))
                 }
                 Some(Value::Edge(id)) => {
+                    if self.db.deleted_edge_type(*id).is_some() {
+                        return Err(Error::new(
+                            ErrorCode::NotFound,
+                            "EntityNotFound: the relationship has been deleted",
+                        ));
+                    }
                     let Some(record) = self.db.get_edge(*id)? else {
                         return Ok(Value::Null);
                     };
                     Ok(Value::Map(self.props_to_map(&record.props)))
                 }
+                // A map's properties are the map itself.
+                Some(Value::Map(_)) => Ok(args.first().cloned().expect("checked above")),
                 _ => Ok(Value::Null),
             },
             func::KEYS => match args.first() {
@@ -2003,14 +2476,14 @@ impl AggState {
         }
     }
 
-    fn step(&mut self, spec: &AggSpec, input: &Reg) {
+    fn step(&mut self, spec: &AggSpec, inputs: &[Reg]) -> Result<()> {
         if spec.distinct {
-            let value = input.to_value();
+            let value = inputs[0].to_value();
             if value.is_null() || !self.seen.insert(value) {
-                return;
+                return Ok(());
             }
         }
-        self.accumulator.step(spec, input);
+        self.accumulator.step(spec, inputs)
     }
 
     fn finish(self, spec: &AggSpec) -> Value {
@@ -2022,10 +2495,32 @@ impl AggState {
 enum Accumulator {
     Count(i64),
     Sum(SumState),
-    Avg { sum: f64, count: i64 },
+    Avg {
+        sum: f64,
+        count: i64,
+    },
     Min(Option<Value>),
     Max(Option<Value>),
     Collect(Vec<Value>),
+    /// `percentileCont`: interpolated numeric values and the latest
+    /// percentile argument.
+    PercentileCont {
+        values: Vec<f64>,
+        percentile: Option<f64>,
+    },
+    /// `percentileDisc`: original values (types preserved) and the latest
+    /// percentile argument.
+    PercentileDisc {
+        values: Vec<Value>,
+        percentile: Option<f64>,
+    },
+    /// Welford's online variance for `stDev` (sample) and `stDevP`.
+    StDev {
+        count: u64,
+        mean: f64,
+        m2: f64,
+        sample: bool,
+    },
 }
 
 enum SumState {
@@ -2043,11 +2538,62 @@ impl Accumulator {
             AggFn::Min => Self::Min(None),
             AggFn::Max => Self::Max(None),
             AggFn::Collect => Self::Collect(Vec::new()),
+            AggFn::PercentileCont => Self::PercentileCont {
+                values: Vec::new(),
+                percentile: None,
+            },
+            AggFn::PercentileDisc => Self::PercentileDisc {
+                values: Vec::new(),
+                percentile: None,
+            },
+            AggFn::StDev | AggFn::StDevP => Self::StDev {
+                count: 0,
+                mean: 0.0,
+                m2: 0.0,
+                sample: spec.func == AggFn::StDev,
+            },
         }
     }
 
-    fn step(&mut self, spec: &AggSpec, input: &Reg) {
-        let value = input.to_value();
+    /// Feed one row's argument values into the accumulator. Percentile
+    /// arguments are validated here so out-of-range values fail at runtime.
+    fn step(&mut self, spec: &AggSpec, inputs: &[Reg]) -> Result<()> {
+        match self {
+            Self::PercentileCont { values, percentile } => {
+                *percentile = Some(percentile_argument(inputs.get(1))?);
+                if let Some(number) = inputs[0].to_value().as_number() {
+                    values.push(number);
+                }
+                return Ok(());
+            }
+            Self::PercentileDisc { values, percentile } => {
+                *percentile = Some(percentile_argument(inputs.get(1))?);
+                let value = inputs[0].to_value();
+                if !value.is_null() {
+                    values.push(value);
+                }
+                return Ok(());
+            }
+            Self::StDev {
+                count, mean, m2, ..
+            } => {
+                if let Some(number) = inputs[0].to_value().as_number() {
+                    // Welford's online algorithm keeps the running variance
+                    // stable without buffering every value.
+                    *count += 1;
+                    let delta = number - *mean;
+                    *mean += delta / *count as f64;
+                    *m2 += delta * (number - *mean);
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        self.step_value(spec, inputs[0].to_value());
+        Ok(())
+    }
+
+    fn step_value(&mut self, spec: &AggSpec, value: Value) {
         match self {
             Self::Count(count) => {
                 if spec.star || !value.is_null() {
@@ -2092,6 +2638,9 @@ impl Accumulator {
                     items.push(value);
                 }
             }
+            // Multi-input accumulators are handled by `step` before this
+            // point.
+            Self::PercentileCont { .. } | Self::PercentileDisc { .. } | Self::StDev { .. } => {}
         }
     }
 
@@ -2112,8 +2661,206 @@ impl Accumulator {
             }
             Self::Min(value) | Self::Max(value) => value.unwrap_or(Value::Null),
             Self::Collect(items) => Value::List(items.into()),
+            Self::PercentileCont {
+                mut values,
+                percentile,
+            } => {
+                let Some(percentile) = percentile.filter(|_| !values.is_empty()) else {
+                    return Value::Null;
+                };
+                values.sort_by(f64::total_cmp);
+                let position = percentile * (values.len() - 1) as f64;
+                let lower = position.floor() as usize;
+                let upper = position.ceil() as usize;
+                let fraction = position - lower as f64;
+                Value::Float(values[lower] + (values[upper] - values[lower]) * fraction)
+            }
+            Self::PercentileDisc {
+                mut values,
+                percentile,
+            } => {
+                let Some(percentile) = percentile.filter(|_| !values.is_empty()) else {
+                    return Value::Null;
+                };
+                values.sort();
+                // Nearest-rank method: the first value at or above the
+                // requested percentile rank.
+                let rank = (percentile * values.len() as f64).ceil().max(1.0);
+                values[rank as usize - 1].clone()
+            }
+            Self::StDev {
+                count, m2, sample, ..
+            } => {
+                if count == 0 {
+                    Value::Null
+                } else if sample && count == 1 {
+                    Value::Float(0.0)
+                } else {
+                    let divisor = if sample {
+                        (count - 1) as f64
+                    } else {
+                        count as f64
+                    };
+                    Value::Float((m2 / divisor).sqrt())
+                }
+            }
         }
     }
+}
+
+/// Interpret the percentile argument of `percentileCont`/`percentileDisc`,
+/// which must be a number between 0 and 1.
+fn percentile_argument(input: Option<&Reg>) -> Result<f64> {
+    let value = input.map(Reg::to_value).unwrap_or(Value::Null);
+    let number = match value {
+        Value::Int(number) => number as f64,
+        Value::Float(number) => number,
+        other => return Err(invalid_argument("percentile", &other)),
+    };
+    if !(0.0..=1.0).contains(&number) {
+        return Err(Error::new(
+            crate::error::ErrorCode::Range,
+            "percentile must be between 0 and 1",
+        ));
+    }
+    Ok(number)
+}
+
+/// Add a duration to a date: whole months first (clamped), then the days
+/// field plus the whole days contained in the seconds field, matching
+/// Neo4j's calendar arithmetic.
+fn date_plus_duration(date: Date, duration: Duration) -> Result<Date> {
+    let out_of_range = || Error::type_error("date arithmetic out of range");
+    let date = date
+        .add_months(duration.months())
+        .ok_or_else(out_of_range)?;
+    let extra_days = duration.days() + duration.seconds() / 86_400;
+    date.add_days(extra_days).ok_or_else(out_of_range)
+}
+
+/// Add a duration to a wall-clock time; months and days do not contribute.
+fn localtime_plus_duration(time: LocalTime, duration: Duration) -> LocalTime {
+    let rest = duration.seconds() % 86_400;
+    let nanos = time.nanos() + rest * 1_000_000_000 + duration.nanos() as i64;
+    LocalTime::from_nanos_wrapped(nanos)
+}
+
+/// Add a duration to a zone-less datetime: calendar months and days first,
+/// then the remaining time of day.
+fn localdatetime_plus_duration(
+    datetime: LocalDateTime,
+    duration: Duration,
+) -> Result<LocalDateTime> {
+    let out_of_range = || Error::type_error("datetime arithmetic out of range");
+    let date = date_plus_duration(datetime.date(), duration)?;
+    let nanos_of_day = datetime.time().nanos()
+        + (duration.seconds() % 86_400) * 1_000_000_000
+        + duration.nanos() as i64;
+    let carry = nanos_of_day.div_euclid(86_400_000_000_000);
+    let rest = nanos_of_day.rem_euclid(86_400_000_000_000);
+    let date = date.add_days(carry).ok_or_else(out_of_range)?;
+    Ok(LocalDateTime::new(
+        date,
+        LocalTime::from_nanos(rest).expect("wrapped time of day"),
+    ))
+}
+
+/// Add a duration to an offset/zoned datetime; named zones resolve their
+/// offset again for the resulting local time.
+fn datetime_plus_duration(datetime: &DateTime, duration: Duration) -> Result<DateTime> {
+    let local = localdatetime_plus_duration(datetime.local(), duration)?;
+    let offset = match datetime.zone() {
+        Some(zone) => crate::temporal::construct::zone_offset(zone, local.date(), local.time())
+            .map_err(Error::type_error)?,
+        None => datetime.offset(),
+    };
+    DateTime::new(local, offset, datetime.zone().map(Arc::<str>::from))
+        .ok_or_else(|| Error::type_error("datetime arithmetic out of range"))
+}
+
+/// Temporal `+`; `None` falls back to the numeric/concatenation path.
+fn temporal_add(a: &Value, b: &Value) -> Result<Option<Value>> {
+    let (temporal, duration) = match (a, b) {
+        (Value::Duration(duration), other) | (other, Value::Duration(duration)) => {
+            (other, Some(*duration))
+        }
+        (other, _) => (other, None),
+    };
+    let Some(duration) = duration else {
+        return Ok(None);
+    };
+    match temporal {
+        Value::Null => Ok(Some(Value::Null)),
+        Value::Duration(other) => Ok(Some(Value::Duration(
+            (*other + duration).ok_or_else(|| Error::type_error("duration overflow"))?,
+        ))),
+        Value::Date(date) => Ok(Some(Value::Date(date_plus_duration(*date, duration)?))),
+        Value::LocalTime(time) => Ok(Some(Value::LocalTime(localtime_plus_duration(
+            *time, duration,
+        )))),
+        Value::Time(time) => Ok(Some(Value::Time(
+            Time::new(
+                localtime_plus_duration(time.local(), duration),
+                time.offset(),
+            )
+            .expect("valid offset"),
+        ))),
+        Value::LocalDateTime(datetime) => Ok(Some(Value::LocalDateTime(
+            localdatetime_plus_duration(*datetime, duration)?,
+        ))),
+        Value::DateTime(datetime) => Ok(Some(Value::DateTime(datetime_plus_duration(
+            datetime, duration,
+        )?))),
+        other => Err(Error::type_error(format!(
+            "cannot add a duration to {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Temporal `-`; `None` falls back to the numeric path.
+fn temporal_sub(a: &Value, b: &Value) -> Result<Option<Value>> {
+    match (a, b) {
+        (Value::Duration(left), Value::Duration(right)) => Ok(Some(Value::Duration(
+            (*left - *right).ok_or_else(|| Error::type_error("duration overflow"))?,
+        ))),
+        (Value::Null, Value::Duration(_)) | (Value::Duration(_), Value::Null) => {
+            Ok(Some(Value::Null))
+        }
+        (_, Value::Duration(right)) => temporal_add(a, &Value::Duration(-*right)),
+        _ => Ok(None),
+    }
+}
+
+/// Duration multiplication (and division when `divide` is set); `None`
+/// falls back to the numeric path.
+fn temporal_scale(a: &Value, b: &Value, divide: bool) -> Result<Option<Value>> {
+    match (a, b) {
+        (Value::Null, Value::Duration(_)) | (Value::Duration(_), Value::Null) => {
+            Ok(Some(Value::Null))
+        }
+        (Value::Duration(duration), Value::Int(factor)) => {
+            scale_duration(*duration, *factor as f64, divide).map(Some)
+        }
+        (Value::Duration(duration), Value::Float(factor)) => {
+            scale_duration(*duration, *factor, divide).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn scale_duration(duration: Duration, factor: f64, divide: bool) -> Result<Value> {
+    if divide && factor == 0.0 {
+        return Ok(Value::Null);
+    }
+    let scaled = if divide {
+        duration.divided(factor)
+    } else {
+        duration.multiplied(factor)
+    };
+    scaled
+        .map(Value::Duration)
+        .ok_or_else(|| Error::type_error("duration arithmetic out of range"))
 }
 
 /// Operator codes for [`Op::Unary`].
@@ -2207,16 +2954,31 @@ pub const fn unary_code(op: UnaryOp) -> u8 {
 fn binary_op(op: u8, a: &Value, b: &Value) -> Result<Value> {
     use binary_code as code;
     match op {
-        code::ADD => numeric_or_concat(a, b, |x, y| x + y, |x, y| x.wrapping_add(y)),
-        code::SUB => numeric(a, b, |x, y| x - y, |x, y| x.wrapping_sub(y)),
-        code::MUL => numeric(a, b, |x, y| x * y, |x, y| x.wrapping_mul(y)),
-        code::DIV => match (a, b) {
-            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-            (Value::Int(_), Value::Int(0)) => Ok(Value::Null),
-            (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_div(*y))),
-            _ => match (a.as_number(), b.as_number()) {
-                (Some(x), Some(y)) => Ok(Value::Float(x / y)),
-                _ => Err(type_error("division", a, b)),
+        code::ADD => match temporal_add(a, b)? {
+            Some(value) => Ok(value),
+            None => numeric_or_concat(a, b, |x, y| x + y, |x, y| x.wrapping_add(y)),
+        },
+        code::SUB => match temporal_sub(a, b)? {
+            Some(value) => Ok(value),
+            None => numeric(a, b, |x, y| x - y, |x, y| x.wrapping_sub(y)),
+        },
+        code::MUL => match temporal_scale(a, b, false)? {
+            Some(value) => Ok(value),
+            None => match temporal_scale(b, a, false)? {
+                Some(value) => Ok(value),
+                None => numeric(a, b, |x, y| x * y, |x, y| x.wrapping_mul(y)),
+            },
+        },
+        code::DIV => match temporal_scale(a, b, true)? {
+            Some(value) => Ok(value),
+            None => match (a, b) {
+                (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+                (Value::Int(_), Value::Int(0)) => Ok(Value::Null),
+                (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_div(*y))),
+                _ => match (a.as_number(), b.as_number()) {
+                    (Some(x), Some(y)) => Ok(Value::Float(x / y)),
+                    _ => Err(type_error("division", a, b)),
+                },
             },
         },
         code::MOD => match (a, b) {
@@ -2237,7 +2999,7 @@ fn binary_op(op: u8, a: &Value, b: &Value) -> Result<Value> {
         },
         code::EQ => Ok(bool_value(value_equals(a, b))),
         code::NE => Ok(bool_value(value_equals(a, b).map(|equal| !equal))),
-        code::LT | code::LE | code::GT | code::GE => Ok(compare_value(op, a, b)),
+        code::LT | code::LE | code::GT | code::GE => compare_value(op, a, b),
         code::AND => Ok(kleene_and(a, b)),
         code::OR => Ok(kleene_or(a, b)),
         code::XOR => Ok(kleene_xor(a, b)),
@@ -2277,8 +3039,23 @@ fn numeric_or_concat(
     float_op: impl Fn(f64, f64) -> f64,
     int_op: impl Fn(i64, i64) -> i64,
 ) -> Result<Value> {
-    if let (Value::Text(x), Value::Text(y)) = (a, b) {
-        return Ok(Value::Text(format!("{x}{y}").into()));
+    // A string concatenates any scalar on either side, coercing the scalar
+    // through its text form. Lists keep their append/prepend semantics.
+    match (a, b) {
+        (Value::Text(x), Value::Text(y)) => {
+            return Ok(Value::Text(format!("{x}{y}").into()));
+        }
+        (Value::Text(x), other) => {
+            if let Some(y) = scalar_text(other) {
+                return Ok(Value::Text(format!("{x}{y}").into()));
+            }
+        }
+        (other, Value::Text(y)) => {
+            if let Some(x) = scalar_text(other) {
+                return Ok(Value::Text(format!("{x}{y}").into()));
+            }
+        }
+        _ => {}
     }
     match (a, b) {
         (Value::List(x), Value::List(y)) => {
@@ -2302,6 +3079,29 @@ fn numeric_or_concat(
     numeric(a, b, float_op, int_op)
 }
 
+/// Text form of a scalar for `toString()` and string concatenation. Returns
+/// `None` for values without a text form (null, collections, entities); the
+/// caller decides between an error, a null result or another operator branch.
+fn scalar_text(value: &Value) -> Option<Cow<'_, str>> {
+    match value {
+        Value::Int(value) => Some(Cow::Owned(value.to_string())),
+        Value::Bool(value) => Some(Cow::Owned(value.to_string())),
+        Value::Float(value) => {
+            let mut buffer = ryu::Buffer::new();
+            Some(Cow::Owned(buffer.format(*value).to_owned()))
+        }
+        Value::Text(value) => Some(Cow::Borrowed(value)),
+        Value::Date(_)
+        | Value::LocalTime(_)
+        | Value::Time(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime(_)
+        | Value::Duration(_)
+        | Value::Point(_) => Some(Cow::Owned(format_value(value))),
+        _ => None,
+    }
+}
+
 /// Resolve a slice bound against the list length: negative bounds count from
 /// the end and everything is clamped into range.
 fn slice_bound(which: &str, value: &Value, len: i64) -> Result<usize> {
@@ -2323,22 +3123,111 @@ fn type_error(operation: &str, a: &Value, b: &Value) -> Error {
     ))
 }
 
-fn compare_value(op: u8, a: &Value, b: &Value) -> Value {
-    use binary_code as code;
-    let ordering = match (a, b) {
-        (Value::Null, _) | (_, Value::Null) => return Value::Null,
+/// Lexicographic list ordering for the comparison operators: element-wise,
+/// then by length, with a null element making the comparison unknown.
+fn list_order(a: &[Value], b: &[Value]) -> Option<std::cmp::Ordering> {
+    for (left, right) in a.iter().zip(b.iter()) {
+        if left.is_null() || right.is_null() {
+            return None;
+        }
+        match value_order(left, right) {
+            Some(std::cmp::Ordering::Equal) => {}
+            Some(ordering) => return Some(ordering),
+            None => return None,
+        }
+    }
+    Some(a.len().cmp(&b.len()))
+}
+
+/// Ordering of two values under the comparison operators; `None` when the
+/// types are incomparable (which yields null).
+fn value_order(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
         (Value::Int(_), Value::Int(_))
         | (Value::Float(_), Value::Float(_))
         | (Value::Int(_), Value::Float(_))
         | (Value::Float(_), Value::Int(_)) => {
+            if matches!(a, Value::Float(value) if value.is_nan())
+                || matches!(b, Value::Float(value) if value.is_nan())
+            {
+                return None;
+            }
+            Some(a.as_number()?.total_cmp(&b.as_number()?))
+        }
+        (Value::Text(x), Value::Text(y)) => Some(x.as_bytes().cmp(y.as_bytes())),
+        (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+        (Value::List(x), Value::List(y)) => list_order(x, y),
+        (Value::Date(x), Value::Date(y)) => Some(x.cmp(y)),
+        (Value::LocalTime(x), Value::LocalTime(y)) => Some(x.cmp(y)),
+        (Value::Time(x), Value::Time(y)) => Some(x.cmp(y)),
+        (Value::LocalDateTime(x), Value::LocalDateTime(y)) => Some(x.cmp(y)),
+        (Value::DateTime(x), Value::DateTime(y)) => Some(x.cmp(y)),
+        (Value::Duration(x), Value::Duration(y)) => Some(x.cmp(y)),
+        (Value::Point(x), Value::Point(y)) => Some(x.cmp(y)),
+        _ => None,
+    }
+}
+
+fn compare_value(op: u8, a: &Value, b: &Value) -> Result<Value> {
+    use binary_code as code;
+    let ordering = match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+        (Value::Int(_), Value::Int(_))
+        | (Value::Float(_), Value::Float(_))
+        | (Value::Int(_), Value::Float(_))
+        | (Value::Float(_), Value::Int(_)) => {
+            // NaN is incomparable: every ordering comparison is false.
+            if matches!(a, Value::Float(value) if value.is_nan())
+                || matches!(b, Value::Float(value) if value.is_nan())
+            {
+                return Ok(Value::Bool(false));
+            }
             let (Some(x), Some(y)) = (a.as_number(), b.as_number()) else {
-                return Value::Null;
+                return Ok(Value::Null);
             };
             x.total_cmp(&y)
         }
         (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
         (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
-        _ => return Value::Null,
+        (Value::List(x), Value::List(y)) => {
+            // Lists and paths are distinct types: comparing one with the
+            // other yields null, like any other cross-type ordering.
+            if crate::record::is_path_shaped(x) != crate::record::is_path_shaped(y) {
+                return Ok(Value::Null);
+            }
+            match list_order(x, y) {
+                Some(ordering) => ordering,
+                None => return Ok(Value::Null),
+            }
+        }
+        (Value::Date(x), Value::Date(y)) => x.cmp(y),
+        (Value::LocalTime(x), Value::LocalTime(y)) => x.cmp(y),
+        (Value::Time(x), Value::Time(y)) => x.cmp(y),
+        (Value::LocalDateTime(x), Value::LocalDateTime(y)) => x.cmp(y),
+        (Value::DateTime(x), Value::DateTime(y)) => x.cmp(y),
+        (Value::Duration(x), Value::Duration(y)) => x.cmp(y),
+        (Value::Point(x), Value::Point(y)) => x.cmp(y),
+        (
+            Value::Date(_)
+            | Value::LocalTime(_)
+            | Value::Time(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime(_)
+            | Value::Duration(_),
+            Value::Date(_)
+            | Value::LocalTime(_)
+            | Value::Time(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime(_)
+            | Value::Duration(_),
+        ) => {
+            return Err(Error::type_error(format!(
+                "Cannot compare {} with {}",
+                a.type_name(),
+                b.type_name()
+            )));
+        }
+        _ => return Ok(Value::Null),
     };
     let result = match op {
         code::LT => ordering.is_lt(),
@@ -2346,7 +3235,7 @@ fn compare_value(op: u8, a: &Value, b: &Value) -> Value {
         code::GT => ordering.is_gt(),
         _ => ordering.is_ge(),
     };
-    Value::Bool(result)
+    Ok(Value::Bool(result))
 }
 
 fn kleene_and(a: &Value, b: &Value) -> Value {
@@ -2419,6 +3308,28 @@ fn regex_match(a: &Value, b: &Value) -> Value {
 }
 
 /// Convert entity values returned by functions into entity registers.
+/// Flatten the nodes and relationships reachable in a `DELETE` target:
+/// entities, paths and arbitrarily nested lists of them.
+fn collect_delete_targets(value: &Value, nodes: &mut Vec<u64>, edges: &mut Vec<u64>) -> Result<()> {
+    match value {
+        Value::Node(id) => nodes.push(*id),
+        Value::Edge(id) => edges.push(*id),
+        Value::List(items) => {
+            for item in items.iter() {
+                collect_delete_targets(item, nodes, edges)?;
+            }
+        }
+        Value::Null => {}
+        other => {
+            return Err(Error::type_error(format!(
+                "DELETE expects a node, relationship or path, got {}",
+                other.type_name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn normalize_reg(value: Value) -> Reg {
     match value {
         Value::Node(id) => Reg::Node(id),
@@ -2427,7 +3338,853 @@ fn normalize_reg(value: Value) -> Reg {
     }
 }
 
-/// Format a value the way Cypher's `toString` does.
+/// Read a component from a temporal or spatial value (`d.year`, `t.offset`,
+/// `du.months`, `p.x`).
+fn temporal_accessor(value: &Value, key: &str) -> Result<Value> {
+    let integer = Value::Int;
+    match value {
+        Value::Date(date) => match key {
+            "year" => Ok(integer(date.year())),
+            "quarter" => Ok(integer(date.quarter() as i64)),
+            "month" => Ok(integer(date.month() as i64)),
+            "week" => Ok(integer(date.iso_week().1 as i64)),
+            "weekYear" => Ok(integer(date.iso_week().0)),
+            "day" => Ok(integer(date.day() as i64)),
+            "ordinalDay" => Ok(integer(date.ordinal_day() as i64)),
+            "weekDay" => Ok(integer(date.iso_weekday() as i64)),
+            "dayOfQuarter" => Ok(integer(date.day_of_quarter() as i64)),
+            _ => Err(unknown_field(key, value)),
+        },
+        Value::LocalTime(time) => match key {
+            "hour" => Ok(integer(time.hour())),
+            "minute" => Ok(integer(time.minute())),
+            "second" => Ok(integer(time.second())),
+            "millisecond" => Ok(integer(time.millisecond())),
+            "microsecond" => Ok(integer(time.microsecond())),
+            "nanosecond" => Ok(integer(time.nanosecond())),
+            _ => Err(unknown_field(key, value)),
+        },
+        Value::Time(time) => match key {
+            "hour" => Ok(integer(time.local().hour())),
+            "minute" => Ok(integer(time.local().minute())),
+            "second" => Ok(integer(time.local().second())),
+            "millisecond" => Ok(integer(time.local().millisecond())),
+            "microsecond" => Ok(integer(time.local().microsecond())),
+            "nanosecond" => Ok(integer(time.local().nanosecond())),
+            "timezone" | "offset" => Ok(offset_text(time.offset())),
+            "offsetMinutes" => Ok(integer(time.offset_minutes())),
+            "offsetSeconds" => Ok(integer(time.offset_seconds())),
+            _ => Err(unknown_field(key, value)),
+        },
+        Value::LocalDateTime(datetime) => match key {
+            "year" => Ok(integer(datetime.date().year())),
+            "quarter" => Ok(integer(datetime.date().quarter() as i64)),
+            "month" => Ok(integer(datetime.date().month() as i64)),
+            "week" => Ok(integer(datetime.date().iso_week().1 as i64)),
+            "weekYear" => Ok(integer(datetime.date().iso_week().0)),
+            "day" => Ok(integer(datetime.date().day() as i64)),
+            "ordinalDay" => Ok(integer(datetime.date().ordinal_day() as i64)),
+            "weekDay" => Ok(integer(datetime.date().iso_weekday() as i64)),
+            "dayOfQuarter" => Ok(integer(datetime.date().day_of_quarter() as i64)),
+            "hour" => Ok(integer(datetime.time().hour())),
+            "minute" => Ok(integer(datetime.time().minute())),
+            "second" => Ok(integer(datetime.time().second())),
+            "millisecond" => Ok(integer(datetime.time().millisecond())),
+            "microsecond" => Ok(integer(datetime.time().microsecond())),
+            "nanosecond" => Ok(integer(datetime.time().nanosecond())),
+            _ => Err(unknown_field(key, value)),
+        },
+        Value::DateTime(datetime) => {
+            // The calendar and clock accessors come from the local civil
+            // datetime; the rest are instant or zone related.
+            if let Ok(value) = temporal_accessor(&Value::LocalDateTime(datetime.local()), key) {
+                return Ok(value);
+            }
+            match key {
+                "timezone" => Ok(match datetime.zone() {
+                    Some(zone) => Value::Text(zone.into()),
+                    None => Value::Null,
+                }),
+                "offset" => Ok(offset_text(datetime.offset())),
+                "offsetMinutes" => Ok(integer(datetime.offset() as i64 / 60)),
+                "offsetSeconds" => Ok(integer(datetime.offset() as i64)),
+                "epochSeconds" => Ok(integer(datetime.epoch_seconds())),
+                "epochMillis" => Ok(integer(datetime.epoch_millis())),
+                _ => Err(unknown_field(key, value)),
+            }
+        }
+        Value::Duration(duration) => {
+            let number = match key {
+                "years" => duration.years(),
+                "quarters" => duration.quarters(),
+                "months" => duration.months(),
+                "weeks" => duration.weeks(),
+                "days" => duration.days(),
+                "hours" => duration.hours(),
+                "minutes" => duration.minutes(),
+                "seconds" => duration.seconds(),
+                "milliseconds" => duration.milliseconds(),
+                "microseconds" => duration.microseconds(),
+                "nanoseconds" => duration.nanoseconds(),
+                "quartersOfYear" => duration.quarters_of_year(),
+                "monthsOfQuarter" => duration.months_of_quarter(),
+                "monthsOfYear" => duration.months_of_year(),
+                "daysOfWeek" => duration.days_of_week(),
+                "minutesOfHour" => duration.minutes_of_hour(),
+                "secondsOfMinute" => duration.seconds_of_minute(),
+                "millisecondsOfSecond" => duration.milliseconds_of_second(),
+                "microsecondsOfSecond" => duration.microseconds_of_second(),
+                "nanosecondsOfSecond" => duration.nanoseconds_of_second(),
+                _ => return Err(unknown_field(key, value)),
+            };
+            Ok(integer(number))
+        }
+        Value::Point(point) => match key {
+            "x" => Ok(Value::Float(point.x())),
+            "y" => Ok(Value::Float(point.y())),
+            "z" => Ok(point.z().map(Value::Float).unwrap_or(Value::Null)),
+            "longitude" => Ok(Value::Float(point.longitude())),
+            "latitude" => Ok(Value::Float(point.latitude())),
+            "height" => Ok(point.height().map(Value::Float).unwrap_or(Value::Null)),
+            "srid" => Ok(integer(point.srid() as i64)),
+            "crs" => Ok(Value::Text(point.crs().into())),
+            _ => Err(unknown_field(key, value)),
+        },
+        _ => Err(unknown_field(key, value)),
+    }
+}
+
+fn offset_text(offset: i32) -> Value {
+    Value::Text(crate::temporal::datetime::format_offset(offset).into())
+}
+
+fn unknown_field(key: &str, value: &Value) -> Error {
+    Error::type_error(format!(
+        "unknown field `{key}` on a {} value",
+        value.type_name()
+    ))
+}
+
+/// Convert a field map into constructor fields, or `None` when the value is
+/// not a map at all.
+fn field_map(name: &str, value: &Value) -> Result<Option<Vec<(String, Field)>>> {
+    let Value::Map(entries) = value else {
+        return Ok(None);
+    };
+    let mut fields = Vec::with_capacity(entries.len());
+    for (key, value) in entries.iter() {
+        let field = match value {
+            Value::Int(number) => Field::Number(*number as f64),
+            Value::Float(number) => Field::Number(*number),
+            Value::Text(text) => Field::Text(text.to_string()),
+            Value::Date(date) => Field::Date(*date),
+            Value::LocalTime(time) => Field::LocalTime(*time),
+            Value::Time(time) => Field::Time(*time),
+            Value::LocalDateTime(datetime) => Field::LocalDateTime(*datetime),
+            Value::DateTime(datetime) => Field::DateTime(datetime.clone()),
+            other => {
+                return Err(Error::type_error(format!(
+                    "{name}() map key `{key}` has unsupported type {}",
+                    other.type_name()
+                )));
+            }
+        };
+        fields.push((key.to_string(), field));
+    }
+    Ok(Some(fields))
+}
+
+/// Construct a date: from a map, a string, a date or another temporal value.
+fn call_date(args: &[Value], now: LocalDateTime) -> Result<Value> {
+    let Some(value) = args.first() else {
+        return Ok(Value::Date(now.date()));
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(fields) = field_map("date", value)? {
+        return construct::date_from_fields(&fields)
+            .map(Value::Date)
+            .map_err(|message| Error::type_error(format!("date(): {message}")));
+    }
+    Ok(match value {
+        Value::Date(date) => Value::Date(*date),
+        Value::DateTime(datetime) => Value::Date(datetime.local().date()),
+        Value::LocalDateTime(datetime) => Value::Date(datetime.date()),
+        Value::Text(text) => Value::Date(
+            text.parse()
+                .map_err(|message| Error::type_error(format!("date(): {message}")))?,
+        ),
+        other => return Err(invalid_argument("date", other)),
+    })
+}
+
+/// Construct a local time.
+fn call_localtime(args: &[Value], now: LocalDateTime) -> Result<Value> {
+    let Some(value) = args.first() else {
+        return Ok(Value::LocalTime(now.time()));
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(fields) = field_map("localtime", value)? {
+        return construct::localtime_from_fields(&fields)
+            .map(Value::LocalTime)
+            .map_err(|message| Error::type_error(format!("localtime(): {message}")));
+    }
+    Ok(match value {
+        Value::LocalTime(time) => Value::LocalTime(*time),
+        Value::Time(time) => Value::LocalTime(time.local()),
+        Value::DateTime(datetime) => Value::LocalTime(datetime.local().time()),
+        Value::LocalDateTime(datetime) => Value::LocalTime(datetime.time()),
+        Value::Text(text) => Value::LocalTime(
+            text.parse()
+                .map_err(|message| Error::type_error(format!("localtime(): {message}")))?,
+        ),
+        other => return Err(invalid_argument("localtime", other)),
+    })
+}
+
+/// Construct a time with offset.
+fn call_time(args: &[Value], now: LocalDateTime) -> Result<Value> {
+    let Some(value) = args.first() else {
+        return Ok(Value::Time(Time::new(now.time(), 0).expect("zero offset")));
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(fields) = field_map("time", value)? {
+        return construct::time_from_fields(&fields)
+            .map(Value::Time)
+            .map_err(|message| Error::type_error(format!("time(): {message}")));
+    }
+    Ok(match value {
+        Value::Time(time) => Value::Time(*time),
+        Value::LocalTime(time) => Value::Time(Time::new(*time, 0).expect("zero offset")),
+        Value::DateTime(datetime) => Value::Time(
+            Time::new(datetime.local().time(), datetime.offset()).expect("valid offset"),
+        ),
+        Value::LocalDateTime(datetime) => {
+            Value::Time(Time::new(datetime.time(), 0).expect("zero offset"))
+        }
+        Value::Text(text) => Value::Time(
+            text.parse()
+                .map_err(|message| Error::type_error(format!("time(): {message}")))?,
+        ),
+        other => return Err(invalid_argument("time", other)),
+    })
+}
+
+/// Construct a zone-less datetime.
+fn call_localdatetime(args: &[Value], now: LocalDateTime) -> Result<Value> {
+    let Some(value) = args.first() else {
+        return Ok(Value::LocalDateTime(now));
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(fields) = field_map("localdatetime", value)? {
+        return construct::localdatetime_from_fields(&fields)
+            .map(Value::LocalDateTime)
+            .map_err(|message| Error::type_error(format!("localdatetime(): {message}")));
+    }
+    Ok(match value {
+        Value::LocalDateTime(datetime) => Value::LocalDateTime(*datetime),
+        Value::DateTime(datetime) => Value::LocalDateTime(datetime.local()),
+        Value::Date(date) => Value::LocalDateTime(LocalDateTime::new(
+            *date,
+            LocalTime::new(0, 0, 0, 0).expect("midnight"),
+        )),
+        Value::LocalTime(time) => Value::LocalDateTime(LocalDateTime::new(
+            Date::new(1970, 1, 1).expect("epoch"),
+            *time,
+        )),
+        Value::Time(time) => Value::LocalDateTime(LocalDateTime::new(
+            Date::new(1970, 1, 1).expect("epoch"),
+            time.local(),
+        )),
+        Value::Text(text) => Value::LocalDateTime(
+            text.parse()
+                .map_err(|message| Error::type_error(format!("localdatetime(): {message}")))?,
+        ),
+        other => return Err(invalid_argument("localdatetime", other)),
+    })
+}
+
+/// Construct a datetime with an offset and optional zone.
+fn call_datetime(args: &[Value], now: LocalDateTime) -> Result<Value> {
+    let Some(value) = args.first() else {
+        return Ok(Value::DateTime(
+            DateTime::new(now, 0, None).expect("zero offset"),
+        ));
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(fields) = field_map("datetime", value)? {
+        return construct::datetime_from_fields(&fields)
+            .map(Value::DateTime)
+            .map_err(|message| Error::type_error(format!("datetime(): {message}")));
+    }
+    Ok(match value {
+        Value::DateTime(datetime) => Value::DateTime(datetime.clone()),
+        Value::LocalDateTime(datetime) => {
+            Value::DateTime(DateTime::new(*datetime, 0, None).expect("zero offset"))
+        }
+        Value::Date(date) => Value::DateTime(
+            DateTime::new(
+                LocalDateTime::new(*date, LocalTime::new(0, 0, 0, 0).expect("midnight")),
+                0,
+                None,
+            )
+            .expect("zero offset"),
+        ),
+        Value::LocalTime(time) => Value::DateTime(
+            DateTime::new(
+                LocalDateTime::new(Date::new(1970, 1, 1).expect("epoch"), *time),
+                0,
+                None,
+            )
+            .expect("zero offset"),
+        ),
+        Value::Time(time) => Value::DateTime(
+            DateTime::new(
+                LocalDateTime::new(Date::new(1970, 1, 1).expect("epoch"), time.local()),
+                time.offset(),
+                None,
+            )
+            .expect("valid offset"),
+        ),
+        Value::Text(text) => Value::DateTime(
+            text.parse()
+                .map_err(|message| Error::type_error(format!("datetime(): {message}")))?,
+        ),
+        other => return Err(invalid_argument("datetime", other)),
+    })
+}
+
+/// Construct a duration.
+fn call_duration(args: &[Value]) -> Result<Value> {
+    let Some(value) = args.first() else {
+        return Err(Error::type_error("duration() requires a map or string"));
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    if let Some(fields) = field_map("duration", value)? {
+        return construct::duration_from_fields(&fields)
+            .map(Value::Duration)
+            .map_err(|message| Error::type_error(format!("duration(): {message}")));
+    }
+    Ok(match value {
+        Value::Duration(duration) => Value::Duration(*duration),
+        Value::Text(text) => Value::Duration(
+            text.parse()
+                .map_err(|message| Error::type_error(format!("duration(): {message}")))?,
+        ),
+        other => return Err(invalid_argument("duration", other)),
+    })
+}
+
+/// Construct a point from `{x, y, z?, srid?}` or
+/// `{longitude, latitude, height?, srid?}`.
+fn call_point(args: &[Value]) -> Result<Value> {
+    let Some(Value::Map(entries)) = args.first() else {
+        match args.first() {
+            Some(Value::Null) => return Ok(Value::Null),
+            Some(other) => return Err(invalid_argument("point", other)),
+            None => return Err(Error::type_error("point() requires a map")),
+        }
+    };
+    let number = |key: &str| -> Option<f64> {
+        entries
+            .iter()
+            .find(|(name, _)| name.as_ref() == key)
+            .and_then(|(_, value)| match value {
+                Value::Int(number) => Some(*number as f64),
+                Value::Float(number) => Some(*number),
+                _ => None,
+            })
+    };
+    let srid = entries
+        .iter()
+        .find(|(name, _)| name.as_ref() == "srid")
+        .map(|(_, value)| match value {
+            Value::Int(number) => Ok(*number as i32),
+            other => Err(Error::type_error(format!(
+                "point(): `srid` must be an integer, got {}",
+                other.type_name()
+            ))),
+        })
+        .transpose()?;
+    let (x, y, z, default_srid) = match (number("x"), number("y")) {
+        (Some(x), Some(y)) => {
+            let z = number("z");
+            let srid = if z.is_some() {
+                crate::temporal::point::CARTESIAN_3D
+            } else {
+                crate::temporal::point::CARTESIAN_2D
+            };
+            (x, y, z, srid)
+        }
+        _ => match (number("longitude"), number("latitude")) {
+            (Some(x), Some(y)) => {
+                let z = number("height");
+                let srid = if z.is_some() {
+                    crate::temporal::point::WGS84_3D
+                } else {
+                    crate::temporal::point::WGS84_2D
+                };
+                (x, y, z, srid)
+            }
+            _ => {
+                return Err(Error::type_error(
+                    "point() requires x/y or longitude/latitude",
+                ));
+            }
+        },
+    };
+    let srid = srid.unwrap_or(default_srid);
+    Point::new(srid, x, y, z)
+        .map(Value::Point)
+        .ok_or_else(|| Error::type_error("point(): invalid srid or coordinates"))
+}
+
+/// Which value `*.truncate` returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TruncateKind {
+    Date,
+    LocalTime,
+    Time,
+    LocalDateTime,
+    DateTime,
+}
+
+/// `*.truncate(unit, value [, map])`: floor a temporal value to a unit and
+/// apply component overrides.
+fn call_truncate(kind: TruncateKind, args: &[Value]) -> Result<Value> {
+    let name = match kind {
+        TruncateKind::Date => "date.truncate",
+        TruncateKind::LocalTime => "localtime.truncate",
+        TruncateKind::Time => "time.truncate",
+        TruncateKind::LocalDateTime => "localdatetime.truncate",
+        TruncateKind::DateTime => "datetime.truncate",
+    };
+    let unit_text = match args.first() {
+        Some(Value::Text(text)) => text,
+        Some(other) => return Err(invalid_argument(name, other)),
+        None => return Err(Error::type_error(format!("{name}() requires a unit"))),
+    };
+    let unit = TruncateUnit::parse(unit_text)
+        .ok_or_else(|| Error::type_error(format!("{name}(): unknown unit `{unit_text}`")))?;
+    let Some(value) = args.get(1) else {
+        return Err(Error::type_error(format!("{name}() requires a value")));
+    };
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    let overrides = match args.get(2) {
+        Some(map) => field_map(name, map)?.ok_or_else(|| {
+            Error::type_error(format!("{name}(): the third argument must be a map"))
+        })?,
+        None => Vec::new(),
+    };
+    let midnight = LocalTime::new(0, 0, 0, 0).expect("midnight");
+    let epoch = Date::new(1970, 1, 1).expect("epoch");
+    let (date, time, offset, zone): (Date, LocalTime, i32, Option<Arc<str>>) = match value {
+        Value::Date(date) => (*date, midnight, 0, None),
+        Value::LocalTime(time) => (epoch, *time, 0, None),
+        Value::Time(time) => (epoch, time.local(), time.offset(), None),
+        Value::LocalDateTime(datetime) => (datetime.date(), datetime.time(), 0, None),
+        Value::DateTime(datetime) => (
+            datetime.local().date(),
+            datetime.local().time(),
+            datetime.offset(),
+            datetime.zone().map(Arc::<str>::from),
+        ),
+        other => return Err(invalid_argument(name, other)),
+    };
+    let date = if unit.is_time_unit() {
+        date
+    } else {
+        construct::truncate_date(unit, date, &overrides)
+            .map_err(|message| Error::type_error(format!("{name}(): {message}")))?
+    };
+    let time = construct::truncate_time(unit, time, &overrides)
+        .map_err(|message| Error::type_error(format!("{name}(): {message}")))?;
+    Ok(match kind {
+        TruncateKind::Date => Value::Date(date),
+        TruncateKind::LocalTime => Value::LocalTime(time),
+        TruncateKind::Time => {
+            // A timezone override resolves against the epoch date, since a
+            // `TIME` value has no calendar date of its own.
+            let offset = match construct::timezone_override(&overrides, epoch, time)
+                .map_err(|message| Error::type_error(format!("{name}(): {message}")))?
+            {
+                Some((offset, _)) => offset,
+                None => offset,
+            };
+            Value::Time(
+                Time::new(time, offset).ok_or_else(|| Error::type_error("offset out of range"))?,
+            )
+        }
+        TruncateKind::LocalDateTime => Value::LocalDateTime(LocalDateTime::new(date, time)),
+        TruncateKind::DateTime => {
+            let (offset, zone) = match construct::timezone_override(&overrides, date, time)
+                .map_err(|message| Error::type_error(format!("{name}(): {message}")))?
+            {
+                Some(pair) => pair,
+                None => match &zone {
+                    Some(zone) => (
+                        construct::zone_offset(zone, date, time)
+                            .map_err(|message| Error::type_error(format!("{name}(): {message}")))?,
+                        Some(zone.clone()),
+                    ),
+                    None => (offset, None),
+                },
+            };
+            let local = LocalDateTime::new(date, time);
+            Value::DateTime(
+                DateTime::new(local, offset, zone)
+                    .ok_or_else(|| Error::type_error("offset out of range"))?,
+            )
+        }
+    })
+}
+
+/// Which difference function runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurationDiff {
+    Between,
+    InMonths,
+    InDays,
+    InSeconds,
+}
+
+/// `duration.between`/`inMonths`/`inDays`/`inSeconds`.
+fn call_duration_between(kind: DurationDiff, args: &[Value]) -> Result<Value> {
+    let name = match kind {
+        DurationDiff::Between => "duration.between",
+        DurationDiff::InMonths => "duration.inMonths",
+        DurationDiff::InDays => "duration.inDays",
+        DurationDiff::InSeconds => "duration.inSeconds",
+    };
+    let (Some(from), Some(to)) = (args.first(), args.get(1)) else {
+        return Err(Error::type_error(format!(
+            "{name}() requires two arguments"
+        )));
+    };
+    if from.is_null() || to.is_null() {
+        return Ok(Value::Null);
+    }
+    let (Some(from), Some(to)) = (between::instant_of(from), between::instant_of(to)) else {
+        let other = if between::instant_of(from).is_none() {
+            from
+        } else {
+            to
+        };
+        return Err(invalid_argument(name, other));
+    };
+    let duration = match kind {
+        DurationDiff::Between => between::between(&from, &to),
+        DurationDiff::InMonths => between::in_months(&from, &to),
+        DurationDiff::InDays => between::in_days(&from, &to),
+        DurationDiff::InSeconds => between::in_seconds(&from, &to),
+    };
+    duration
+        .map(Value::Duration)
+        .ok_or_else(|| Error::type_error(format!("{name}(): out of range")))
+}
+
+/// `datetime.fromepoch(seconds, nanos)`: an epoch timestamp in UTC.
+fn call_datetime_from_epoch(args: &[Value]) -> Result<Value> {
+    match (args.first(), args.get(1)) {
+        (Some(Value::Int(seconds)), Some(Value::Int(nanos))) => {
+            let local = LocalDateTime::from_epoch(*seconds, *nanos)
+                .ok_or_else(|| Error::type_error("datetime.fromepoch(): out of range"))?;
+            Ok(Value::DateTime(
+                DateTime::new(local, 0, None).expect("zero offset"),
+            ))
+        }
+        (Some(Value::Null), _) | (None, _) | (_, Some(Value::Null)) => Ok(Value::Null),
+        (Some(other), _) => Err(invalid_argument("datetime.fromepoch", other)),
+    }
+}
+
+/// `datetime.fromepochmillis(millis)`: an epoch timestamp in UTC.
+fn call_datetime_from_epoch_millis(args: &[Value]) -> Result<Value> {
+    match args.first() {
+        Some(Value::Int(millis)) => {
+            let seconds = millis.div_euclid(1_000);
+            let nanos = millis.rem_euclid(1_000) * 1_000_000;
+            let local = LocalDateTime::from_epoch(seconds, nanos)
+                .ok_or_else(|| Error::type_error("datetime.fromepochmillis(): out of range"))?;
+            Ok(Value::DateTime(
+                DateTime::new(local, 0, None).expect("zero offset"),
+            ))
+        }
+        Some(Value::Null) | None => Ok(Value::Null),
+        Some(other) => Err(invalid_argument("datetime.fromepochmillis", other)),
+    }
+}
+
+/// `distance(a, b)` between two points.
+fn call_distance(args: &[Value]) -> Result<Value> {
+    match (args.first(), args.get(1)) {
+        (Some(Value::Null), _) | (_, Some(Value::Null)) => Ok(Value::Null),
+        (Some(Value::Point(a)), Some(Value::Point(b))) => {
+            a.distance(*b).map(Value::Float).map_err(Error::type_error)
+        }
+        (Some(other), _) => Err(invalid_argument("distance", other)),
+        (_, Some(other)) => Err(invalid_argument("distance", other)),
+        (None, _) => Err(Error::type_error("distance() requires two points")),
+    }
+}
+
+/// The current UTC local datetime.
+fn system_local_datetime() -> LocalDateTime {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    LocalDateTime::new(
+        Date::from_days((now.as_secs() / 86_400) as i64),
+        LocalTime::from_nanos(
+            (now.subsec_nanos() as i64) + (now.as_secs() % 86_400) as i64 * 1_000_000_000,
+        )
+        .expect("valid time of day"),
+    )
+}
+
+/// Largest list `range()` will materialize; guards against runaway queries
+/// like `range(0, 9223372036854775807)`.
+const MAX_RANGE_ELEMENTS: i64 = 10_000_000;
+
+/// `range(start, end [, step])`: an inclusive arithmetic sequence of
+/// integers. A step of zero raises a range error, non-integer arguments a
+/// type error, and an inconsistent direction yields the empty list.
+fn call_range(args: &[Value]) -> Result<Value> {
+    let mut numbers = [0_i64; 3];
+    let mut count = 0;
+    for (index, number) in numbers.iter_mut().enumerate() {
+        match args.get(index) {
+            Some(Value::Int(value)) => {
+                *number = *value;
+                count += 1;
+            }
+            Some(Value::Null) => return Ok(Value::Null),
+            // A missing step defaults to 1; a missing end cannot form one.
+            None if index == 2 => break,
+            None => return Ok(Value::Null),
+            // The TCK classifies non-integer bounds as an argument error,
+            // not a type error.
+            Some(other) => {
+                return Err(Error::new(
+                    crate::error::ErrorCode::Misuse,
+                    format!("range() does not accept {} values", other.type_name()),
+                ));
+            }
+        }
+    }
+    if count < 2 {
+        return Ok(Value::Null);
+    }
+    let [start, end, step] = if count == 2 {
+        [numbers[0], numbers[1], 1]
+    } else {
+        numbers
+    };
+    if step == 0 {
+        return Err(Error::new(
+            crate::error::ErrorCode::Range,
+            "range() step must not be zero",
+        ));
+    }
+    let mut values = Vec::new();
+    let mut value = start;
+    while if step > 0 { value <= end } else { value >= end } {
+        if values.len() as i64 >= MAX_RANGE_ELEMENTS {
+            return Err(Error::new(
+                crate::error::ErrorCode::Range,
+                format!("range() produces more than {MAX_RANGE_ELEMENTS} elements"),
+            ));
+        }
+        values.push(Value::Int(value));
+        match value.checked_add(step) {
+            Some(next) => value = next,
+            None => break,
+        }
+    }
+    Ok(Value::List(values.into()))
+}
+
+/// `split(original, delimiter)`: an empty delimiter splits into characters.
+fn call_split(args: &[Value]) -> Result<Value> {
+    let original = match args.first() {
+        Some(Value::Null) | None => return Ok(Value::Null),
+        Some(Value::Text(text)) => text,
+        Some(other) => return Err(invalid_argument("split", other)),
+    };
+    let delimiter = match args.get(1) {
+        Some(Value::Null) | None => return Ok(Value::Null),
+        Some(Value::Text(text)) => text,
+        Some(other) => return Err(invalid_argument("split", other)),
+    };
+    let parts: Vec<Value> = if delimiter.is_empty() {
+        original
+            .chars()
+            .map(|c| Value::Text(c.to_string().into()))
+            .collect()
+    } else {
+        original
+            .split(delimiter.as_ref())
+            .map(|part| Value::Text(part.into()))
+            .collect()
+    };
+    Ok(Value::List(parts.into()))
+}
+
+/// `substring(original, start [, length])`, counted in characters. Negative
+/// start or length raise a type error; a start past the end yields the empty
+/// string.
+fn call_substring(args: &[Value]) -> Result<Value> {
+    let text = match args.first() {
+        Some(Value::Null) | None => return Ok(Value::Null),
+        Some(Value::Text(text)) => text,
+        Some(other) => return Err(invalid_argument("substring", other)),
+    };
+    let start = match args.get(1) {
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Int(start)) if *start >= 0 => *start as usize,
+        Some(Value::Int(_)) => {
+            return Err(Error::type_error("substring() start must not be negative"));
+        }
+        Some(other) => return Err(invalid_argument("substring", other)),
+        None => 0,
+    };
+    let length = match args.get(2) {
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Int(length)) if *length >= 0 => Some(*length as usize),
+        Some(Value::Int(_)) => {
+            return Err(Error::type_error("substring() length must not be negative"));
+        }
+        Some(other) => return Err(invalid_argument("substring", other)),
+        None => None,
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let start = start.min(chars.len());
+    let end = match length {
+        Some(length) => start.saturating_add(length).min(chars.len()),
+        None => chars.len(),
+    };
+    let slice: String = chars[start..end].iter().collect();
+    Ok(Value::Text(slice.into()))
+}
+
+/// `left(original, length)` and `right(original, length)`, counted in
+/// characters; lengths past the end clamp.
+fn call_left_right(func: u8, args: &[Value]) -> Result<Value> {
+    let name = if func == func::LEFT { "left" } else { "right" };
+    let text = match args.first() {
+        Some(Value::Null) | None => return Ok(Value::Null),
+        Some(Value::Text(text)) => text,
+        Some(other) => return Err(invalid_argument(name, other)),
+    };
+    let length = match args.get(1) {
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Int(length)) if *length >= 0 => *length as usize,
+        Some(Value::Int(_)) => {
+            return Err(Error::type_error(format!(
+                "{name}() length must not be negative"
+            )));
+        }
+        Some(other) => return Err(invalid_argument(name, other)),
+        None => 0,
+    };
+    let chars = text.chars();
+    let slice: String = if func == func::LEFT {
+        chars.take(length).collect()
+    } else {
+        let total = text.chars().count();
+        chars.skip(total.saturating_sub(length)).collect()
+    };
+    Ok(Value::Text(slice.into()))
+}
+
+/// `replace(original, search, replacement)`.
+fn call_replace(args: &[Value]) -> Result<Value> {
+    let mut texts = [""; 3];
+    for (slot, index) in texts.iter_mut().zip(0..3) {
+        match args.get(index) {
+            Some(Value::Null) | None => return Ok(Value::Null),
+            Some(Value::Text(text)) => *slot = text,
+            Some(other) => return Err(invalid_argument("replace", other)),
+        }
+    }
+    let [original, search, replacement] = texts;
+    Ok(Value::Text(original.replace(search, replacement).into()))
+}
+
+/// Interpret a value as a number for a math function.
+fn number_argument(name: &str, value: &Value) -> Result<f64> {
+    match value {
+        Value::Int(number) => Ok(*number as f64),
+        Value::Float(number) => Ok(*number),
+        other => Err(invalid_argument(name, other)),
+    }
+}
+
+/// Apply a float transformation: null propagates and integers are widened.
+fn float_map(args: &[Value], name: &str, f: impl FnOnce(f64) -> f64) -> Result<Value> {
+    match args.first() {
+        Some(Value::Null) | None => Ok(Value::Null),
+        Some(value) => Ok(Value::Float(f(number_argument(name, value)?))),
+    }
+}
+
+/// Apply a string transformation, propagating nulls and rejecting other
+/// types.
+fn text_map(args: &[Value], name: &str, f: impl FnOnce(&str) -> String) -> Result<Value> {
+    match args.first() {
+        Some(Value::Null) | None => Ok(Value::Null),
+        Some(Value::Text(text)) => Ok(Value::Text(f(text).into())),
+        Some(other) => Err(invalid_argument(name, other)),
+    }
+}
+
+/// Invalid argument for a scalar function, reported as a runtime `TypeError`
+/// like openCypher's `InvalidArgumentValue`.
+fn invalid_argument(name: &str, value: &Value) -> Error {
+    Error::type_error(format!(
+        "{name}() does not accept {} values",
+        value.type_name()
+    ))
+}
+
+/// Truncate a float toward zero like `toInteger`; NaN and infinities have no
+/// integer value and yield `None`, as does anything outside the `i64` range.
+fn truncate_to_int(value: f64) -> Option<i64> {
+    if !value.is_finite() {
+        return None;
+    }
+    let truncated = value.trunc();
+    // `i64::MAX as f64` rounds up to 2^63, so the upper bound is exclusive.
+    if truncated >= i64::MIN as f64 && truncated < i64::MAX as f64 {
+        Some(truncated as i64)
+    } else {
+        None
+    }
+}
+
+/// Parse text as an integer, accepting the float notation the TCK requires
+/// (`toInteger('2.9')` is 2); unparsable text yields `None`.
+fn text_to_integer(text: &str) -> Option<i64> {
+    let text = text.trim();
+    if let Ok(value) = text.parse::<i64>() {
+        return Some(value);
+    }
+    truncate_to_int(text.parse::<f64>().ok()?)
+}
+
 pub fn format_value(value: &Value) -> String {
     match value {
         Value::Null => "null".to_owned(),
@@ -2452,5 +4209,650 @@ pub fn format_value(value: &Value) -> String {
         }
         Value::Node(id) => format!("(node {id})"),
         Value::Edge(id) => format!("[edge {id}]"),
+        Value::Date(value) => value.to_string(),
+        Value::LocalTime(value) => value.to_string(),
+        Value::Time(value) => value.to_string(),
+        Value::LocalDateTime(value) => value.to_string(),
+        Value::DateTime(value) => value.to_string(),
+        Value::Duration(value) => value.to_string(),
+        Value::Point(value) => value.to_string(),
+    }
+}
+
+/// Read a local CSV file into single-column rows: maps when the file has a
+/// header row, lists otherwise. Fields missing from a short row become null.
+fn load_csv_rows(path: &str, with_headers: bool, terminator: u8) -> Result<Vec<Vec<Reg>>> {
+    let path = path.strip_prefix("file://").unwrap_or(path);
+    if path.starts_with("http://") || path.starts_with("https://") {
+        return Err(Error::unsupported(
+            "remote LOAD CSV over HTTP is not supported; use a local path",
+        ));
+    }
+    let file = std::fs::File::open(path).map_err(|error| {
+        Error::new(
+            ErrorCode::Io,
+            format!("cannot load CSV from `{path}`: {error}"),
+        )
+    })?;
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(with_headers)
+        .flexible(true)
+        .delimiter(terminator)
+        .from_reader(file);
+    let io_error = |error: csv::Error| {
+        Error::new(
+            ErrorCode::Io,
+            format!("cannot read CSV from `{path}`: {error}"),
+        )
+    };
+    let mut rows = Vec::new();
+    if with_headers {
+        let headers: Vec<std::sync::Arc<str>> = reader
+            .headers()
+            .map_err(io_error)?
+            .iter()
+            .map(std::sync::Arc::from)
+            .collect();
+        for record in reader.records() {
+            let record = record.map_err(io_error)?;
+            if record.len() > headers.len() {
+                return Err(Error::new(
+                    ErrorCode::Io,
+                    format!(
+                        "CSV row {} has {} fields but the header has {}",
+                        record.position().map_or(0, |pos| pos.line()),
+                        record.len(),
+                        headers.len()
+                    ),
+                ));
+            }
+            let entries: Vec<(std::sync::Arc<str>, Value)> = headers
+                .iter()
+                .enumerate()
+                .map(|(index, header)| {
+                    let value = record
+                        .get(index)
+                        .map_or(Value::Null, |field| Value::Text(field.into()));
+                    (header.clone(), value)
+                })
+                .collect();
+            rows.push(vec![Reg::Value(Value::Map(entries.into()))]);
+        }
+    } else {
+        for record in reader.records() {
+            let record = record.map_err(io_error)?;
+            let fields: Vec<Value> = record
+                .iter()
+                .map(|field| Value::Text(field.into()))
+                .collect();
+            rows.push(vec![Reg::Value(Value::List(fields.into()))]);
+        }
+    }
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::vfs::mem::MemVfs;
+
+    fn test_db() -> Database {
+        Database::create(Arc::new(MemVfs::new()), Path::new("vdbe.db"), 4096).expect("create db")
+    }
+
+    /// A three-node graph: two `Person` nodes and one `KNOWS` edge.
+    fn seeded_db() -> (Database, u64, u64, u64) {
+        let mut db = test_db();
+        let (alice, bob, edge) = db
+            .write(|db| {
+                let person = db.ensure_label("Person")?;
+                let knows = db.ensure_edge_type("KNOWS")?;
+                let name = db.ensure_property_key("name")?;
+                let alice = db.create_node(&[person], vec![(name, Value::from("alice"))])?;
+                let bob = db.create_node(&[person], vec![(name, Value::from("bob"))])?;
+                let edge = db.create_edge(knows, alice, bob, Vec::new())?;
+                Ok((alice, bob, edge))
+            })
+            .expect("seed");
+        (db, alice, bob, edge)
+    }
+
+    fn program(ops: Vec<Op>, constants: Vec<Value>, registers: u32, cursors: u32) -> Program {
+        Program {
+            ops,
+            constants,
+            cursor_count: cursors as usize,
+            register_count: registers as usize,
+            columns: Vec::new(),
+            mutating: false,
+        }
+    }
+
+    fn run(db: &mut Database, program: &Program) -> Result<Vec<Vec<Value>>> {
+        db.begin_read().expect("begin read");
+        let result = execute(db, program);
+        let _ = db.end_read();
+        result
+    }
+
+    #[test]
+    fn scan_loop_binds_every_node() {
+        let (mut db, alice, bob, _) = seeded_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Rewind {
+                    cursor: 0,
+                    target: 6,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+                Op::ResultRow { start: 0, count: 1 },
+                Op::Next {
+                    cursor: 0,
+                    target: 6,
+                },
+                Op::Goto { target: 2 },
+                Op::Halt,
+            ],
+            Vec::new(),
+            1,
+            1,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(rows, vec![vec![Value::Node(alice)], vec![Value::Node(bob)]]);
+    }
+
+    #[test]
+    fn rewind_skips_an_empty_cursor() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Rewind {
+                    cursor: 0,
+                    target: 3,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+                Op::Halt,
+            ],
+            Vec::new(),
+            1,
+            1,
+        );
+        assert_eq!(
+            run(&mut db, &program).expect("run"),
+            Vec::<Vec<Value>>::new()
+        );
+    }
+
+    #[test]
+    fn bind_on_an_exhausted_cursor_is_an_error() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+            ],
+            Vec::new(),
+            1,
+            1,
+        );
+        assert!(run(&mut db, &program).is_err());
+    }
+
+    #[test]
+    fn expand_binds_edge_and_neighbor() {
+        let (mut db, _, bob, edge) = seeded_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Rewind {
+                    cursor: 0,
+                    target: 11,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+                Op::OpenExpand {
+                    cursor: 1,
+                    src: 0,
+                    direction: 0,
+                    types: Vec::new(),
+                    any_type: true,
+                },
+                Op::Rewind {
+                    cursor: 1,
+                    target: 9,
+                },
+                Op::BindExpand {
+                    cursor: 1,
+                    edge: 1,
+                    node: 2,
+                },
+                Op::ResultRow { start: 1, count: 2 },
+                Op::Next {
+                    cursor: 1,
+                    target: 9,
+                },
+                Op::Goto { target: 5 },
+                Op::Next {
+                    cursor: 0,
+                    target: 11,
+                },
+                Op::Goto { target: 2 },
+                Op::Halt,
+            ],
+            Vec::new(),
+            3,
+            2,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(rows, vec![vec![Value::Edge(edge), Value::Node(bob)]]);
+    }
+
+    #[test]
+    fn property_reads_resolve_key_names() {
+        let (mut db, ..) = seeded_db();
+        let program = program(
+            vec![
+                Op::OpenNodeScan {
+                    cursor: 0,
+                    label: None,
+                },
+                Op::Rewind {
+                    cursor: 0,
+                    target: 7,
+                },
+                Op::Bind { cursor: 0, dest: 0 },
+                Op::Property {
+                    target: 0,
+                    name: 0,
+                    dest: 1,
+                },
+                Op::ResultRow { start: 1, count: 1 },
+                Op::Next {
+                    cursor: 0,
+                    target: 7,
+                },
+                Op::Goto { target: 2 },
+                Op::Halt,
+            ],
+            vec![Value::from("name")],
+            2,
+            1,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(
+            rows,
+            vec![vec![Value::from("alice")], vec![Value::from("bob")]]
+        );
+    }
+
+    #[test]
+    fn comparison_with_null_yields_null() {
+        let mut db = test_db();
+        let constant = |dest: u32, index: u32| Op::Constant { dest, value: index };
+
+        let and_false = program(
+            vec![
+                Op::Null { dest: 0 },
+                constant(1, 0),
+                Op::Binary {
+                    op: binary_code::AND,
+                    left: 0,
+                    right: 1,
+                    dest: 2,
+                },
+                Op::ResultRow { start: 2, count: 1 },
+                Op::Halt,
+            ],
+            vec![Value::Bool(false)],
+            3,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &and_false).expect("run"),
+            vec![vec![Value::Bool(false)]],
+            "null AND false is false"
+        );
+
+        let eq_true = program(
+            vec![
+                Op::Null { dest: 0 },
+                constant(1, 0),
+                Op::Binary {
+                    op: binary_code::EQ,
+                    left: 0,
+                    right: 1,
+                    dest: 2,
+                },
+                Op::ResultRow { start: 2, count: 1 },
+                Op::Halt,
+            ],
+            vec![Value::Bool(true)],
+            3,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &eq_true).expect("run"),
+            vec![vec![Value::Null]],
+            "null = true is null"
+        );
+    }
+
+    #[test]
+    fn negating_null_yields_null() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::Null { dest: 0 },
+                Op::Unary {
+                    op: unary_code::NEG,
+                    src: 0,
+                    dest: 1,
+                },
+                Op::ResultRow { start: 1, count: 1 },
+                Op::Halt,
+            ],
+            Vec::new(),
+            2,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &program).expect("run"),
+            vec![vec![Value::Null]]
+        );
+    }
+
+    #[test]
+    fn subscript_reads_a_list_element() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::Constant { dest: 2, value: 2 },
+                Op::BuildList {
+                    dest: 3,
+                    items: vec![0, 1, 2],
+                },
+                Op::Constant { dest: 4, value: 3 },
+                Op::Subscript {
+                    base: 3,
+                    index: 4,
+                    dest: 5,
+                },
+                Op::ResultRow { start: 5, count: 1 },
+                Op::Halt,
+            ],
+            vec![
+                Value::Int(10),
+                Value::Int(20),
+                Value::Int(30),
+                Value::Int(1),
+            ],
+            6,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &program).expect("run"),
+            vec![vec![Value::Int(20)]]
+        );
+    }
+
+    #[test]
+    fn subscript_on_a_scalar_is_a_type_error() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::Subscript {
+                    base: 0,
+                    index: 1,
+                    dest: 2,
+                },
+                Op::Halt,
+            ],
+            vec![Value::Int(5), Value::Int(0)],
+            3,
+            0,
+        );
+        let err = run(&mut db, &program).expect_err("type error");
+        assert_eq!(err.code(), ErrorCode::Type);
+    }
+
+    #[test]
+    fn slice_honours_negative_bounds() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::Constant { dest: 2, value: 2 },
+                Op::Constant { dest: 3, value: 3 },
+                Op::Constant { dest: 4, value: 4 },
+                Op::BuildList {
+                    dest: 5,
+                    items: vec![0, 1, 2, 3, 4],
+                },
+                Op::Constant { dest: 6, value: 5 },
+                Op::Constant { dest: 7, value: 6 },
+                Op::Slice {
+                    base: 5,
+                    lower: 6,
+                    upper: 7,
+                    open_lower: false,
+                    open_upper: false,
+                    dest: 8,
+                },
+                Op::ResultRow { start: 8, count: 1 },
+                Op::Halt,
+            ],
+            vec![
+                Value::Int(1),
+                Value::Int(2),
+                Value::Int(3),
+                Value::Int(4),
+                Value::Int(5),
+                Value::Int(-3),
+                Value::Int(-1),
+            ],
+            9,
+            0,
+        );
+        assert_eq!(
+            run(&mut db, &program).expect("run"),
+            vec![vec![Value::List(vec![Value::Int(3), Value::Int(4)].into())]]
+        );
+    }
+
+    #[test]
+    fn hash_aggregate_groups_and_sums() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::CollectOpen { cursor: 0 },
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::Constant { dest: 0, value: 2 },
+                Op::Constant { dest: 1, value: 3 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::Constant { dest: 0, value: 4 },
+                Op::Constant { dest: 1, value: 5 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::HashAggregate {
+                    cursor: 0,
+                    prefix: 0,
+                    groups: 1,
+                    aggs: vec![AggSpec {
+                        func: AggFn::Sum,
+                        args: 1,
+                        star: false,
+                        distinct: false,
+                    }],
+                },
+                Op::CtxRewind {
+                    cursor: 0,
+                    target: 16,
+                },
+                Op::CtxData {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::ResultRow { start: 0, count: 2 },
+                Op::CtxNext {
+                    cursor: 0,
+                    target: 16,
+                },
+                Op::Goto { target: 12 },
+                Op::Halt,
+            ],
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Int(1),
+                Value::Int(20),
+                Value::Int(2),
+                Value::Int(30),
+            ],
+            2,
+            1,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(30)],
+                vec![Value::Int(2), Value::Int(30)],
+            ]
+        );
+    }
+
+    #[test]
+    fn dedup_rows_keeps_the_first_of_each_key() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::CollectOpen { cursor: 0 },
+                Op::Constant { dest: 0, value: 0 },
+                Op::Constant { dest: 1, value: 1 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::Constant { dest: 0, value: 2 },
+                Op::Constant { dest: 1, value: 3 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::Constant { dest: 0, value: 4 },
+                Op::Constant { dest: 1, value: 5 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::DedupRows {
+                    cursor: 0,
+                    prefix: 0,
+                    keys: 1,
+                },
+                Op::CtxRewind {
+                    cursor: 0,
+                    target: 16,
+                },
+                Op::CtxData {
+                    cursor: 0,
+                    start: 0,
+                    count: 2,
+                },
+                Op::ResultRow { start: 0, count: 2 },
+                Op::CtxNext {
+                    cursor: 0,
+                    target: 16,
+                },
+                Op::Goto { target: 12 },
+                Op::Halt,
+            ],
+            vec![
+                Value::Int(1),
+                Value::Int(10),
+                Value::Int(1),
+                Value::Int(20),
+                Value::Int(2),
+                Value::Int(30),
+            ],
+            2,
+            1,
+        );
+        let rows = run(&mut db, &program).expect("run");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Value::Int(1), Value::Int(10)],
+                vec![Value::Int(2), Value::Int(30)],
+            ]
+        );
+    }
+
+    #[test]
+    fn truncate_rows_rejects_a_float_limit() {
+        let mut db = test_db();
+        let program = program(
+            vec![
+                Op::CollectOpen { cursor: 0 },
+                Op::Constant { dest: 0, value: 0 },
+                Op::CollectRow {
+                    cursor: 0,
+                    start: 0,
+                    count: 1,
+                },
+                Op::Constant { dest: 1, value: 1 },
+                Op::Constant { dest: 2, value: 2 },
+                Op::TruncateRows {
+                    cursor: 0,
+                    skip: 1,
+                    limit: 2,
+                },
+                Op::Halt,
+            ],
+            vec![Value::Int(7), Value::Int(0), Value::Float(1.0)],
+            3,
+            1,
+        );
+        let err = run(&mut db, &program).expect_err("float limit");
+        assert_eq!(err.code(), ErrorCode::Syntax);
+        assert!(err.message().contains("LIMIT"), "{err}");
     }
 }

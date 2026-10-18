@@ -103,11 +103,11 @@ src/            library + CLI (main.rs)
   api.rs        Connection, Params, Rows
 benches/        criterion: storage, queries, insert (SQLite baselines)
 examples/       profile_insert.rs: insert-path profiling workload
-tests/          end-to-end Cypher integration tests
+tests/          end-to-end Cypher suites by feature area, CLI tests, helpers
 ffi/            C ABI crate, header and language examples
 tck-runner/     openCypher TCK harness (see docs/tck.md)
 third_party/    vendored openCypher TCK (submodule)
-docs/           format.md, ffi.md, tck.md, roadmap.md
+docs/           format.md, ffi.md, tck.md, roadmap.md, benchmarks.md
 ```
 
 ## Installation
@@ -119,15 +119,24 @@ verifies its SHA-256, and installs to `~/.local/bin` without sudo:
 $ curl -LsSf https://github.com/Peloponeso31/grafile/releases/latest/download/install.sh | sh
 ```
 
-Set `GRAFILE_INSTALL_DIR` to install elsewhere, or `GRAFILE_VERSION` to pin a
-release.
+Set `GRAFILE_PREFIX` to install elsewhere, or `GRAFILE_VERSION` to pin a
+release. Alongside the binary the script installs the FFI library
+(`lib/libgrafile.*`), the C header (`include/grafile.h`) and pkg-config
+metadata (`lib/pkgconfig/grafile.pc`), so programs can link with:
+
+```console
+$ export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig:$PKG_CONFIG_PATH"
+$ cc app.c $(pkg-config --cflags --libs grafile)
+```
+
+See [docs/ffi.md](docs/ffi.md) for the C ABI.
 
 Debian/Ubuntu users can install the `.deb`; Fedora/RHEL users the `.rpm`
 (x86_64 and aarch64 packages are released):
 
 ```console
-$ sudo dpkg -i grafile_0.1.0-1_amd64.deb
-$ sudo rpm -i grafile-0.1.0-1.x86_64.rpm
+$ sudo dpkg -i grafile_0.2.0-1_amd64.deb
+$ sudo rpm -i grafile-0.2.0-1.x86_64.rpm
 ```
 
 Windows, once the first manifest is merged into the winget community
@@ -188,7 +197,7 @@ The interactive shell remembers a few conveniences:
 | Command | Effect |
 | --- | --- |
 | `.schema` | labels, relationship types and property keys |
-| `.indexes` | index definitions |
+| `.indexes` | index and constraint definitions |
 | `.meta` | database header: page size, UUID, freelist, tree roots |
 | `.mode NAME` | output mode: `table`, `box`, `csv`, `json`, `markdown`, … |
 | `.headers on\|off` | column titles |
@@ -270,10 +279,20 @@ for row in rows.iter() {
 # Ok::<(), grafile::Error>(())
 ```
 
-Property indexes are a DDL extension (openCypher has no DDL, and the shell
-does not expose index creation yet; Cypher `CREATE INDEX` / `CREATE
-CONSTRAINT` statements are scheduled in [docs/roadmap.md](docs/roadmap.md)
-Phase 5):
+Schema DDL is a Neo4j extension (openCypher defines none). It runs as
+regular statements from the shell, scripts or the API:
+
+```console
+grafile> CREATE CONSTRAINT person_email IF NOT EXISTS FOR (n:Person) REQUIRE n.email IS UNIQUE
+grafile> CREATE INDEX person_name FOR (n:Person) ON (n.name)
+grafile> DROP CONSTRAINT person_email IF EXISTS
+```
+
+`IS UNIQUE`, `IS NOT NULL` and `REQUIRE (n.a, n.b) IS NODE KEY` are
+enforced on creation, property removal and whole-map replacement, and
+the edge form `FOR ()-[r:TYPE]-()` covers unique and not-null edge
+constraints. `SHOW INDEXES` / `SHOW CONSTRAINTS` are not supported. The
+Rust API keeps the direct constructors:
 
 ```rust
 conn.create_node_index("name", Some("Person"), true)?; // unique index
@@ -318,29 +337,53 @@ in `ffi/examples/`.
 ## Cypher support
 
 Implemented: `MATCH` (node and relationship patterns, directions, type
-disjunction, inline property filters), `WHERE`, `RETURN` and `WITH` (with
-`DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`), `UNWIND`, `CREATE`, `MERGE` (with
+disjunction and label expressions — `:A|B`, `:A&B`, `:!A` — inline
+property filters including non-literal values),
+`OPTIONAL MATCH`, `WHERE`, `RETURN` and `WITH` (with
+`DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`), `UNWIND`,
+`LOAD CSV [WITH HEADERS] FROM file AS row`, `CREATE`, `MERGE` (with
 `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE` /
-`DETACH DELETE`, `UNION` / `UNION ALL`, `SET n += {…}`, parameters
+`DETACH DELETE`, `FOREACH`, `CALL` for built-in `db.*` procedures,
+`UNION` / `UNION ALL`, `SET n += {…}`, parameters
 (`$name`), list and map literals, map field access and subscript
 (`m.k`, `m['k']`), list indexing and slicing (`list[1..3]`), list
-comprehensions, quantifiers (`all`, `any`, `none`, `single`), `reduce()`,
-variable-length paths (`*1..3`), named paths (`p = …`) with `nodes(p)`,
+comprehensions, pattern predicates and pattern comprehensions,
+quantifiers (`all`, `any`, `none`, `single`), `reduce()`,
+variable-length paths (`*1..3`), `shortestPath()` / `allShortestPaths()`,
+named paths (`p = …`) with `nodes(p)`,
 `relationships(p)` and `length(p)`, `CASE`,
 `IS [NOT] NULL`, string predicates (`STARTS WITH`, `ENDS WITH`, `CONTAINS`,
 `=~`), label predicates, three-valued logic, and the aggregations `count`,
-`sum`, `avg`, `min`, `max`, `collect` (with `DISTINCT` and expressions over
-aggregations). Scalar functions: `id`, `labels`,
-`type`, `startNode`, `endNode`, `coalesce`, `toString`, `toInteger`,
-`toFloat`, `size`, `properties`, `keys`.
+`sum`, `avg`, `min`, `max`, `collect`, `percentileCont`, `percentileDisc`,
+`stDev`, `stDevP` (with `DISTINCT` and expressions over aggregations).
+Scalar functions: the graph accessors (`id`, `labels`, `type`, `startNode`,
+`endNode`, `properties`, `keys`, `nodes`, `relationships`, `size`,
+`length`), conversions (`toString`, `toInteger`, `toFloat`, `toBoolean`),
+list functions (`range` with two or three arguments, `head`, `last`, `tail`,
+`reverse`, `split`, `substring`, `coalesce`), string functions (`toUpper`,
+`toLower`, `trim`, `ltrim`, `rtrim`, `left`, `right`, `replace`) and the
+math library (`abs`, `sign`, `ceil`, `floor`, `round`, `sqrt`, `exp`, `log`,
+`log10`, `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`, `atan2`,
+`haversin`, `degrees`, `radians`, `pi`, `e`, `rand`).
 
-Explicit gaps fail with clear `Unsupported` errors instead of wrong results:
-pattern predicates and pattern comprehensions, map projections, `FOREACH`,
-`CALL`, most of the function library, and temporal/spatial types.
-The plan to close them, ordered by TCK scenario share, is in
-[docs/roadmap.md](docs/roadmap.md). Storage-side work tracked alongside it:
-WAL mode for concurrent readers, delete rebalancing and `VACUUM`-style
-compaction, bulk loading, and streaming scans.
+Temporal and spatial values are first class: `date`, `localtime`, `time`,
+`localdatetime`, `datetime` (fixed offsets and IANA zones like
+`Europe/Stockholm`), `duration` and `point`, built from strings, component
+maps or other temporal values, comparable and storable, with ISO 8601
+serialization, component accessors (`d.year`, `t.offset`, `du.months`,
+`p.longitude`), calendar and clock arithmetic (`date + duration`, `duration
+* 2`), `duration.between`/`inMonths`/`inDays`/`inSeconds`,
+`date.truncate`/`datetime.truncate` and friends (millennium through
+microsecond), plus `distance()` for cartesian and WGS-84 points.
+
+Explicit gaps fail with clear `Unsupported` errors instead of wrong
+results: `REMOVE n = {…}`, map projections (`n{.name}`), `SHOW
+INDEXES`/`SHOW CONSTRAINTS`, and negated or conjunctive type expressions
+on variable-length and shortest-path patterns. The plan to close them,
+ordered by TCK scenario share, is in [docs/roadmap.md](docs/roadmap.md).
+Storage-side work tracked alongside it: WAL mode for concurrent
+readers, delete rebalancing and `VACUUM`-style compaction, bulk loading,
+and streaming scans.
 
 ## Conformance: the openCypher TCK
 
@@ -356,8 +399,9 @@ $ cargo run -p tck-runner --release      # exits 0 when the gate passes
 The gate fails on unexpected failures, harness errors (steps or cells the
 runner cannot evaluate) and **stale allow-list entries**, so a fix must prune
 its allow-list entries in the same commit. Current baseline: 3897 scenarios,
-2084 passing (53.5% of the suite, 100% of applicable scenarios), 1813
-allow-listed, zero harness errors. Run instructions, error mapping and
+3844 passing (98.6% of the suite, 100% of applicable scenarios), 53
+allow-listed (the CALL procedure family, a non-goal, and one nested pattern
+comprehension), zero harness errors. Run instructions, error mapping and
 comparison semantics are documented in [docs/tck.md](docs/tck.md).
 
 ## Testing
@@ -367,43 +411,31 @@ $ cargo test --workspace   # unit + property + crash recovery + integration + FF
 $ cargo bench              # criterion: storage, queries, insert
 ```
 
-- Unit tests live beside the code; B+tree and fragment codecs are also checked
-  against reference models with `proptest` (`proptest-regressions/` keeps seed
-  corpora for past failures).
+- Unit tests live beside the code; B+tree, fragment codecs and crash recovery
+  are also checked against reference models with `proptest`
+  (`proptest-regressions/` keeps seed corpora for past failures).
 - Crash recovery is exercised with the fault-injecting `MemVfs`, which fails
   or tears writes at every operation boundary; reopened databases are verified
-  for integrity.
-- `tests/cypher_engine.rs` drives end-to-end Cypher through the public API.
+  for integrity, including a randomized multi-fault commit proptest.
+- `tests/` holds end-to-end suites by feature area (`matching`, `functions`,
+  `temporal`, `paths`, `writes`, `schema`, `transactions`, ...) sharing
+  helpers from `tests/support/`, plus `tests/cli.rs` for the binary's flags,
+  scripts, piped input and exit codes.
 - The TCK harness has fixture-based tests for the gate itself plus a parse and
   classification test over every vendored feature file.
-- CI builds and tests the FFI crate on macOS, Linux and Windows (with C and
-  Python smoke tests on macOS and Linux) and runs the TCK gate on every pull
-  request.
+- CI runs formatting, clippy, documentation, the full test suite on macOS and
+  Linux and a benchmark smoke run on every pull request; the FFI crate is
+  built and tested on macOS, Linux and Windows (with C and Python smoke tests
+  on macOS and Linux) and the TCK gate runs on every pull request.
 
 ## Performance
 
-10 000 inserts in one transaction, Apple silicon, release build
-(`cargo bench --bench insert`); the SQLite column uses `rusqlite` with bundled
-SQLite as a baseline:
-
-| Workload | grafile | SQLite |
-|---|---:|---:|
-| nodes, in-memory | 2.9 ms | 1.2 ms |
-| nodes + unique index, in-memory | 10.5 ms | 2.3 ms |
-| chain edges, in-memory | 6.7 ms | — |
-| `UNWIND … CREATE` (20 batches) | 6.4 ms | — |
-| nodes, real file (2 transactions) | 13.0 ms | 1.8 ms (1 transaction) |
-
-Reads are served from the bitmap adjacency index rather than by scanning.
-End-to-end Cypher latency on a 5 000-node chain graph (in-memory, release
-build, `cargo bench --bench queries`; each measurement includes parsing,
-planning, compilation and execution):
-
-| Query | Time |
-|---|---:|
-| indexed point lookup (`MATCH (n:Person {seed: $id})`) | 2.8 µs |
-| indexed one-hop traversal (`MATCH (a:Person {seed: $id})-[:KNOWS]->(b)`) | 4.5 µs |
-| label count over 5 000 nodes (`count(*)`) | 1.6 µs |
+`cargo bench` measures the storage layer, end-to-end Cypher latency and write
+workloads against SQLite baselines. Point lookups are single-digit
+microseconds, label counts run at ~50 ns per row, indexed equality is
+thousands of times faster than a label scan and 30 KB overflow values read in
+under a microsecond. Current numbers, methodology and the baseline-comparison
+workflow live in [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Contributing
 

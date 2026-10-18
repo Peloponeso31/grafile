@@ -14,14 +14,14 @@ use std::collections::HashMap;
 use hashlink::LinkedHashMap as FastMap;
 
 use crate::cypher::{
-    BinaryOp, Clause, Expr, MatchClause, NodePattern, PatternPath, Query, RelDirection, ReturnItem,
-    SetItem, Shortest, SortItem, UnaryOp,
+    BinaryOp, Clause, Expr, LabelExpr, MatchClause, NodePattern, PatternPath, QuantifierKind,
+    Query, RelDirection, RelationshipPattern, ReturnItem, SetItem, Shortest, SortItem, UnaryOp,
 };
 use crate::engine::Database;
 use crate::error::{Error, ErrorCode, Result};
 use crate::record::Value;
 use crate::vdbe::NO_KEY;
-use plan::{AggFn, AggItem, CreateItem, IndexSeek, Plan};
+use plan::{AggFn, AggItem, CreateItem, IndexSeek, PathElement, Plan};
 
 pub use plan::explain;
 
@@ -42,8 +42,13 @@ enum VarKind {
     Node,
     Edge,
     Value,
+    /// A variable-length relationship binding: a list of relationships.
+    EdgeList,
     /// A named path; usable neither as a node nor as a relationship.
     Path,
+    /// A variable known to hold a scalar (or list or map) of this kind,
+    /// which rules it out as a node or relationship binding.
+    Scalar(Kind),
 }
 
 /// Where a pattern expression appears, which decides whether plan-level
@@ -127,13 +132,26 @@ impl<'a> Planner<'a> {
 
     /// Plan one query part (a pipeline of clauses) on its own scope.
     fn plan_part(&mut self, clauses: &[Clause]) -> Result<(Plan, Vec<String>, bool)> {
+        self.plan_part_with(clauses, FastMap::new())
+    }
+
+    /// Plan one query part on top of an initial scope; used by `EXISTS`
+    /// subqueries, whose clauses see the enclosing variables.
+    fn plan_part_with(
+        &mut self,
+        clauses: &[Clause],
+        scope: FastMap<String, VarKind>,
+    ) -> Result<(Plan, Vec<String>, bool)> {
         let mut plan = Plan::Empty;
-        let mut scope: FastMap<String, VarKind> = FastMap::new();
+        let mut scope = scope;
         let mut columns = Vec::new();
         let mut mutating = false;
         for clause in clauses {
             match clause {
                 Clause::Match(matched) => {
+                    // Relationship-variable reuse errors apply within one
+                    // MATCH clause; later clauses may rebind the variable.
+                    self.pattern_rels.clear();
                     self.plan_match(matched, &mut plan, &mut scope)?;
                 }
                 clause @ (Clause::Create(_)
@@ -199,6 +217,22 @@ impl<'a> Planner<'a> {
                     };
                     scope.insert(alias.clone(), VarKind::Value);
                 }
+                Clause::LoadCsv {
+                    with_headers,
+                    source,
+                    alias,
+                    field_terminator,
+                } => {
+                    validate_expr(source, &scope)?;
+                    plan = Plan::LoadCsv {
+                        input: Box::new(plan),
+                        source: source.clone(),
+                        alias: alias.clone(),
+                        with_headers: *with_headers,
+                        field_terminator: *field_terminator,
+                    };
+                    scope.insert(alias.clone(), VarKind::Value);
+                }
                 Clause::With {
                     distinct,
                     items,
@@ -216,6 +250,7 @@ impl<'a> Planner<'a> {
                         limit,
                         where_clause.as_ref(),
                         &scope,
+                        true,
                     )?;
                     plan = new_plan;
                     scope = new_scope;
@@ -230,7 +265,7 @@ impl<'a> Planner<'a> {
                     limit,
                 } => {
                     let (new_plan, _, new_columns) = self.plan_projection(
-                        plan, items, *distinct, order, skip, limit, None, &scope,
+                        plan, items, *distinct, order, skip, limit, None, &scope, false,
                     )?;
                     plan = new_plan;
                     columns = new_columns;
@@ -297,6 +332,14 @@ impl<'a> Planner<'a> {
             Clause::Delete { detach, exprs } => {
                 for expr in exprs {
                     validate_expr(expr, scope)?;
+                    if let Some(kind) = static_kind(expr, scope)
+                        && !matches!(
+                            kind,
+                            Kind::Node | Kind::Edge | Kind::Path | Kind::List | Kind::Null
+                        )
+                    {
+                        return Err(Error::syntax("DELETE expects a node, relationship or path"));
+                    }
                 }
                 *plan = Plan::Delete {
                     input: Box::new(std::mem::replace(plan, Plan::Empty)),
@@ -345,6 +388,7 @@ impl<'a> Planner<'a> {
             let mut predicate = predicate.clone();
             self.extract_patterns(&mut predicate, plan, scope, PatternContext::Predicate)?;
             validate_expr(&predicate, scope)?;
+            check_predicate_kind(&predicate, scope)?;
             *plan = Plan::Filter {
                 input: Box::new(plan.clone()),
                 predicate,
@@ -376,6 +420,7 @@ impl<'a> Planner<'a> {
                 PatternContext::Predicate,
             )?;
             validate_expr(&predicate, &inner_scope)?;
+            check_predicate_kind(&predicate, &inner_scope)?;
             inner = Plan::Filter {
                 input: Box::new(inner),
                 predicate,
@@ -468,12 +513,65 @@ impl<'a> Planner<'a> {
             };
             return Ok(());
         }
+        if let Expr::ExistsSubquery(part) = expr {
+            if context == PatternContext::Nested {
+                return Err(Error::unsupported(
+                    "EXISTS subqueries inside comprehensions are not supported",
+                ));
+            }
+            // The subquery runs as a semi-join: its clauses build an inner
+            // plan over the enclosing scope, and only whether it produced a
+            // row is visible.
+            for clause in &part.clauses {
+                match clause {
+                    Clause::Match(_)
+                    | Clause::With { .. }
+                    | Clause::Return { .. }
+                    | Clause::Unwind { .. }
+                    | Clause::LoadCsv { .. } => {}
+                    _ => {
+                        return Err(Error::syntax(
+                            "InvalidClauseComposition: EXISTS only allows reading clauses",
+                        ));
+                    }
+                }
+            }
+            let (inner, _, _) = self.plan_part_with(&part.clauses, scope.clone())?;
+            let hidden = self.anon_name("exists");
+            scope.insert(hidden.clone(), VarKind::Value);
+            *plan = Plan::PatternPredicate {
+                input: Box::new(std::mem::replace(plan, Plan::Empty)),
+                inner: Box::new(inner),
+                var: hidden.clone(),
+            };
+            *expr = Expr::Variable(hidden);
+            return Ok(());
+        }
         match expr {
+            Expr::ExistsSubquery(_) => Err(Error::internal(
+                "EXISTS subquery survived pattern extraction",
+            )),
             Expr::Pattern(_) | Expr::PatternComprehension { .. } => {
                 if context == PatternContext::Nested {
                     return Err(Error::unsupported(
                         "pattern expressions inside list comprehensions are not supported",
                     ));
+                }
+                if let Expr::Pattern(path) = expr
+                    && let Some(var) = &path.start.variable
+                    && path.segments.is_empty()
+                {
+                    // A lone node pattern is a label predicate when it has
+                    // labels; a bare variable pattern has no value.
+                    if path.start.labels.is_empty() && path.start.properties.is_none() {
+                        return Err(Error::syntax(
+                            "InvalidArgumentType: a single node pattern is not a value",
+                        ));
+                    }
+                    if !path.start.labels.is_empty() && path.start.properties.is_none() {
+                        *expr = label_expr_filter(var, &path.start.labels);
+                        return Ok(());
+                    }
                 }
                 if context == PatternContext::Value && matches!(expr, Expr::Pattern(_)) {
                     return Err(Error::syntax(
@@ -697,6 +795,7 @@ impl<'a> Planner<'a> {
         plan: &mut Plan,
         scope: &mut FastMap<String, VarKind>,
     ) -> Result<()> {
+        check_path_conflicts(path)?;
         let segment = match path.segments.as_slice() {
             [segment] => segment,
             _ => {
@@ -710,6 +809,19 @@ impl<'a> Planner<'a> {
             return Err(Error::syntax(
                 "shortestPath requires a variable-length relationship pattern",
             ));
+        };
+        let types = if rel.types.is_empty() {
+            None
+        } else {
+            match positive_type_names(&rel.types) {
+                Some(names) => Some(names),
+                None => {
+                    return Err(Error::unsupported(
+                        "type expressions with negation or conjunction are not \
+                         supported in shortest paths",
+                    ));
+                }
+            }
         };
         let (props, prop_exprs) =
             self.pattern_props(rel.properties.as_ref(), "relationship", scope)?;
@@ -774,13 +886,14 @@ impl<'a> Planner<'a> {
             }
             None => self.anon_name("rel"),
         };
+        let shortest_nodes_var = bind_path.as_ref().map(|_| self.anon_name("nodes"));
         *plan = Plan::ShortestPath {
             input: Box::new(plan.clone()),
             src: src_node.var.clone(),
             dst: dst_node.var.clone(),
             edge: Some(edge_var.clone()),
             direction,
-            types: rel.types.clone(),
+            types,
             props: props
                 .into_iter()
                 .map(|(name, _, value)| (name, value))
@@ -788,6 +901,7 @@ impl<'a> Planner<'a> {
             min: bounds.min,
             max: bounds.max,
             all,
+            nodes: shortest_nodes_var.clone(),
         };
         // The search binds the target; labels and properties it does not
         // enforce become a post-filter.
@@ -804,9 +918,11 @@ impl<'a> Planner<'a> {
                 )));
             }
             let elements = vec![
-                (start.var.clone(), false),
-                (edge_var.clone(), true),
-                (end.var.clone(), false),
+                PathElement::Value(start.var.clone()),
+                PathElement::Segment {
+                    edges: edge_var.clone(),
+                    nodes: shortest_nodes_var.clone().expect("shortest path node list"),
+                },
             ];
             scope.insert(path_var.clone(), VarKind::Path);
             *plan = Plan::BindPath {
@@ -824,6 +940,7 @@ impl<'a> Planner<'a> {
         plan: &mut Plan,
         scope: &mut FastMap<String, VarKind>,
     ) -> Result<()> {
+        check_path_conflicts(path)?;
         if path.shortest != Shortest::Plain {
             let all = path.shortest == Shortest::AllShortest;
             return self.plan_shortest(path, all, path.variable.clone(), false, plan, scope);
@@ -833,11 +950,15 @@ impl<'a> Planner<'a> {
         struct RelInfo {
             index: usize,
             var: String,
-            types: Vec<String>,
+            types: Option<Vec<String>>,
+            type_filter: Option<LabelExpr>,
             direction: RelDirection,
             props: Vec<(String, Value)>,
             prop_exprs: Vec<(String, Expr)>,
             var_length: Option<crate::cypher::VarLength>,
+            /// Hidden variable for the traversal's node list, when a named
+            /// path needs the intermediate nodes.
+            nodes_var: Option<String>,
         }
         let mut rels: Vec<RelInfo> = Vec::new();
         for segment in &path.segments {
@@ -848,7 +969,7 @@ impl<'a> Planner<'a> {
                 Some(var) => var.clone(),
                 None => self.anon_name("rel"),
             };
-            let types = rel.types.clone();
+            let (types, type_filter) = self.plan_rel_types(rel, rel.var_length.is_some())?;
             let (literals, prop_exprs) =
                 self.pattern_props(rel.properties.as_ref(), "relationship", scope)?;
             if rel.var_length.is_some() && !prop_exprs.is_empty() {
@@ -860,6 +981,7 @@ impl<'a> Planner<'a> {
                 index: nodes.len() - 2,
                 var,
                 types,
+                type_filter,
                 direction: rel.direction,
                 props: literals
                     .into_iter()
@@ -867,6 +989,11 @@ impl<'a> Planner<'a> {
                     .collect(),
                 prop_exprs,
                 var_length: rel.var_length,
+                nodes_var: if rel.var_length.is_some() && path.variable.is_some() {
+                    Some(self.anon_name("nodes"))
+                } else {
+                    None
+                },
             });
         }
 
@@ -876,6 +1003,12 @@ impl<'a> Planner<'a> {
             .collect();
         let mut scanned = vec![false; nodes.len()];
         let mut handled = vec![false; rels.len()];
+        // Relationship variables bound by this pattern; openCypher requires
+        // every relationship in a pattern to be distinct.
+        let mut distinct_edges: Vec<String> = Vec::new();
+        // Variable-length segments: their edge lists must not overlap with
+        // any other relationship of the pattern either.
+        let mut segments: Vec<String> = Vec::new();
         loop {
             if bound.iter().all(|b| *b) && handled.iter().all(|h| *h) {
                 break;
@@ -887,12 +1020,12 @@ impl<'a> Planner<'a> {
                     continue;
                 }
                 let (from, to) = (rel.index, rel.index + 1);
-                let direction = if bound[from] && !bound[to] {
-                    Some((from, to, rel.direction))
+                let (direction, reverse) = if bound[from] && !bound[to] {
+                    (Some((from, to, rel.direction)), false)
                 } else if bound[to] && !bound[from] {
-                    Some((to, from, flip(rel.direction)))
+                    (Some((to, from, flip(rel.direction))), true)
                 } else {
-                    None
+                    (None, false)
                 };
                 let Some((from_idx, to_idx, direction)) = direction else {
                     continue;
@@ -902,7 +1035,15 @@ impl<'a> Planner<'a> {
                 let edge_var = if edge_bound {
                     self.anon_name("rel")
                 } else {
-                    scope.insert(rel.var.clone(), VarKind::Edge);
+                    // A variable-length binding is a list of relationships.
+                    scope.insert(
+                        rel.var.clone(),
+                        if rel.var_length.is_some() {
+                            VarKind::EdgeList
+                        } else {
+                            VarKind::Edge
+                        },
+                    );
                     self.pattern_rels.insert(rel.var.clone());
                     rel.var.clone()
                 };
@@ -917,6 +1058,8 @@ impl<'a> Planner<'a> {
                         props: rel.props.clone(),
                         min: bounds.min,
                         max: bounds.max,
+                        reverse,
+                        nodes: rel.nodes_var.clone(),
                     },
                     None => Plan::Expand {
                         input: Box::new(plan.clone()),
@@ -930,8 +1073,20 @@ impl<'a> Planner<'a> {
                 };
                 constrain_edge(plan, &edge_var, &rel.var, edge_bound);
                 constrain_edge_props(plan, &edge_var, &rel.prop_exprs);
+                constrain_edge_types(plan, &edge_var, &rel.type_filter);
                 scope.insert(nodes[to_idx].var.clone(), VarKind::Node);
-                bound[to_idx] = true;
+                if rel.var_length.is_none() {
+                    distinct_edges.push(edge_var.clone());
+                } else {
+                    segments.push(edge_var.clone());
+                }
+                // Binding the endpoint may bind a repeated variable used by
+                // other pattern elements as well.
+                for (index, node) in nodes.iter().enumerate() {
+                    if scope.contains_key(&node.var) {
+                        bound[index] = true;
+                    }
+                }
                 handled[idx] = true;
                 progressed = true;
                 break;
@@ -955,7 +1110,15 @@ impl<'a> Planner<'a> {
                 let edge_var = if edge_bound {
                     self.anon_name("rel")
                 } else {
-                    scope.insert(rel.var.clone(), VarKind::Edge);
+                    // A variable-length binding is a list of relationships.
+                    scope.insert(
+                        rel.var.clone(),
+                        if rel.var_length.is_some() {
+                            VarKind::EdgeList
+                        } else {
+                            VarKind::Edge
+                        },
+                    );
                     self.pattern_rels.insert(rel.var.clone());
                     rel.var.clone()
                 };
@@ -970,6 +1133,8 @@ impl<'a> Planner<'a> {
                         props: rel.props.clone(),
                         min: bounds.min,
                         max: bounds.max,
+                        reverse: false,
+                        nodes: rel.nodes_var.clone(),
                     },
                     None => Plan::Expand {
                         input: Box::new(plan.clone()),
@@ -991,6 +1156,12 @@ impl<'a> Planner<'a> {
                 };
                 constrain_edge(plan, &edge_var, &rel.var, edge_bound);
                 constrain_edge_props(plan, &edge_var, &rel.prop_exprs);
+                constrain_edge_types(plan, &edge_var, &rel.type_filter);
+                if rel.var_length.is_none() {
+                    distinct_edges.push(edge_var.clone());
+                } else {
+                    segments.push(edge_var.clone());
+                }
                 handled[idx] = true;
                 progressed = true;
                 break;
@@ -1014,6 +1185,65 @@ impl<'a> Planner<'a> {
             };
             bound[idx] = true;
             scanned[idx] = true;
+            // The scan may bind a variable that other pattern elements
+            // mention; they are bound now too.
+            for (index, node) in nodes.iter().enumerate() {
+                if scope.contains_key(&node.var) {
+                    bound[index] = true;
+                }
+            }
+        }
+        // Every relationship in one pattern binds a distinct edge. A
+        // variable-length segment is a list, so its relationships must not
+        // contain any fixed relationship of the pattern nor overlap another
+        // segment's list.
+        for left in 0..distinct_edges.len() {
+            for right in (left + 1)..distinct_edges.len() {
+                *plan = Plan::Filter {
+                    input: Box::new(plan.clone()),
+                    predicate: Expr::Binary {
+                        op: BinaryOp::Ne,
+                        left: Box::new(Expr::Variable(distinct_edges[left].clone())),
+                        right: Box::new(Expr::Variable(distinct_edges[right].clone())),
+                    },
+                };
+            }
+        }
+        for segment in &segments {
+            for fixed in &distinct_edges {
+                *plan = Plan::Filter {
+                    input: Box::new(plan.clone()),
+                    predicate: Expr::Unary {
+                        op: UnaryOp::Not,
+                        expr: Box::new(Expr::Binary {
+                            op: BinaryOp::In,
+                            left: Box::new(Expr::Variable(fixed.clone())),
+                            right: Box::new(Expr::Variable(segment.clone())),
+                        }),
+                    },
+                };
+            }
+        }
+        for left in 0..segments.len() {
+            for right in (left + 1)..segments.len() {
+                let element = self.anon_name("element");
+                *plan = Plan::Filter {
+                    input: Box::new(plan.clone()),
+                    predicate: Expr::Unary {
+                        op: UnaryOp::Not,
+                        expr: Box::new(Expr::Quantifier {
+                            kind: QuantifierKind::Any,
+                            var: element.clone(),
+                            list: Box::new(Expr::Variable(segments[left].clone())),
+                            predicate: Box::new(Expr::Binary {
+                                op: BinaryOp::In,
+                                left: Box::new(Expr::Variable(element)),
+                                right: Box::new(Expr::Variable(segments[right].clone())),
+                            }),
+                        }),
+                    },
+                };
+            }
         }
         // Constraints a scan did not enforce: every label beyond the first on
         // scanned nodes, and all labels and literal properties on nodes that
@@ -1033,10 +1263,22 @@ impl<'a> Planner<'a> {
                     "variable `{path_var}` is already bound"
                 )));
             }
-            let mut elements = vec![(nodes[0].var.clone(), false)];
+            let mut elements = vec![PathElement::Value(nodes[0].var.clone())];
             for (idx, rel) in rels.iter().enumerate() {
-                elements.push((rel.var.clone(), rel.var_length.is_some()));
-                elements.push((nodes[idx + 1].var.clone(), false));
+                match (&rel.var_length, &rel.nodes_var) {
+                    (Some(_), Some(nodes_var)) => {
+                        // A variable-length segment carries its own node
+                        // list; the end node is its last element.
+                        elements.push(PathElement::Segment {
+                            edges: rel.var.clone(),
+                            nodes: nodes_var.clone(),
+                        });
+                    }
+                    _ => {
+                        elements.push(PathElement::Value(rel.var.clone()));
+                        elements.push(PathElement::Value(nodes[idx + 1].var.clone()));
+                    }
+                }
             }
             scope.insert(path_var.clone(), VarKind::Path);
             *plan = Plan::BindPath {
@@ -1064,19 +1306,26 @@ impl<'a> Planner<'a> {
             // A value may hold a relationship, or a relationship list when
             // the pattern is variable-length.
             VarKind::Value => return Ok(true),
+            // A variable-length binding may serve another variable-length
+            // segment (as a list of relationships).
+            VarKind::EdgeList if var_length => {}
             VarKind::Edge => {}
-            VarKind::Node | VarKind::Path => {
+            VarKind::EdgeList | VarKind::Node | VarKind::Path | VarKind::Scalar(_) => {
                 return Err(Error::syntax(format!(
                     "variable `{var}` is already bound to a {}",
                     if *kind == VarKind::Node {
                         "node"
-                    } else {
+                    } else if *kind == VarKind::Path {
                         "path"
+                    } else if matches!(kind, VarKind::Scalar(_)) {
+                        "value"
+                    } else {
+                        "relationship"
                     }
                 )));
             }
         }
-        if !var_length && self.pattern_rels.contains(var) {
+        if self.pattern_rels.contains(var) {
             return Err(Error::syntax(format!(
                 "variable `{var}` is already bound in a preceding pattern"
             )));
@@ -1110,7 +1359,8 @@ impl<'a> Planner<'a> {
         let schema = self.db.schema();
         node.props.iter().any(|(_, key_id, _)| {
             schema.node_indexes.iter().any(|index| {
-                index.key_id == *key_id
+                index.seekable()
+                    && index.key_id() == *key_id
                     && (index.label_id == 0 || node.label_ids.contains(&index.label_id))
             })
         })
@@ -1125,7 +1375,8 @@ impl<'a> Planner<'a> {
         // Prefer an index seek on a literal property.
         for (_, key_id, value) in &node.props {
             let index = schema.node_indexes.iter().find(|index| {
-                index.key_id == *key_id
+                index.seekable()
+                    && index.key_id() == *key_id
                     && (index.label_id == 0 || node.label_ids.contains(&index.label_id))
             });
             if let Some(index) = index {
@@ -1136,7 +1387,7 @@ impl<'a> Planner<'a> {
                     .map(|(name, _, value)| (name.clone(), value.clone()))
                     .collect();
                 return Ok((
-                    node.label_names.first().cloned(),
+                    node.anchor.clone(),
                     Some(IndexSeek {
                         index_id: index.id,
                         key_id: *key_id,
@@ -1147,13 +1398,37 @@ impl<'a> Planner<'a> {
             }
         }
         Ok((
-            node.label_names.first().cloned(),
+            node.anchor.clone(),
             None,
             node.props
                 .iter()
                 .map(|(name, _, value)| (name.clone(), value.clone()))
                 .collect(),
         ))
+    }
+
+    /// Lower a type expression for an expansion: positive disjunctions keep
+    /// their names (resolved against the catalog at execution time, so types
+    /// created later in the same query still match); anything with a
+    /// negation or conjunction needs a runtime filter and no restriction.
+    fn plan_rel_types(
+        &self,
+        rel: &RelationshipPattern,
+        var_length: bool,
+    ) -> Result<(Option<Vec<String>>, Option<LabelExpr>)> {
+        if rel.types.is_empty() {
+            return Ok((None, None));
+        }
+        if let Some(names) = positive_type_names(&rel.types) {
+            return Ok((Some(names), None));
+        }
+        if var_length {
+            return Err(Error::unsupported(
+                "type expressions with negation or conjunction are not supported \
+                 in variable-length relationships",
+            ));
+        }
+        Ok((None, Some(rel.types.clone())))
     }
 
     fn planned_node(
@@ -1164,14 +1439,19 @@ impl<'a> Planner<'a> {
         let var = match &pattern.variable {
             Some(var) => {
                 if let Some(kind) = scope.get(var)
-                    && matches!(kind, VarKind::Edge | VarKind::Path)
+                    && matches!(
+                        kind,
+                        VarKind::Edge | VarKind::EdgeList | VarKind::Path | VarKind::Scalar(_)
+                    )
                 {
                     return Err(Error::syntax(format!(
                         "variable `{var}` is already bound to a {}",
-                        if *kind == VarKind::Edge {
-                            "relationship"
-                        } else {
+                        if *kind == VarKind::Path {
                             "path"
+                        } else if matches!(kind, VarKind::Scalar(_)) {
+                            "value"
+                        } else {
+                            "relationship"
                         }
                     )));
                 }
@@ -1180,16 +1460,21 @@ impl<'a> Planner<'a> {
             None => self.anon_name("node"),
         };
         let mut label_ids = Vec::new();
-        for label in &pattern.labels {
-            // A missing label yields an impossible id so the scan is empty
-            // but the variable is still bound.
-            label_ids.push(self.db.label_id(label).unwrap_or(u32::MAX));
+        let mut anchor = None;
+        if !pattern.labels.is_empty() {
+            for label in pattern.labels.guaranteed_labels() {
+                // A missing label yields an impossible id so the scan is empty
+                // but the variable is still bound.
+                label_ids.push(self.db.label_id(&label).unwrap_or(u32::MAX));
+            }
+            anchor = pattern.labels.guaranteed_labels().into_iter().next();
         }
         let (props, prop_exprs) = self.pattern_props(pattern.properties.as_ref(), "node", scope)?;
         Ok(PlannedNode {
             var,
             label_ids,
-            label_names: pattern.labels.clone(),
+            labels: pattern.labels.clone(),
+            anchor,
             props,
             prop_exprs,
         })
@@ -1247,7 +1532,8 @@ impl<'a> Planner<'a> {
         let mut items = Vec::new();
         let mut local_scope: FastMap<String, VarKind> = scope.clone();
         for path in patterns {
-            let start = self.create_node_item(&path.start, &local_scope)?;
+            let start =
+                self.create_node_item(&path.start, &local_scope, !path.segments.is_empty())?;
             if let Some(item) = &start {
                 local_scope.insert(item.var().to_owned(), VarKind::Node);
                 items.push(item.clone());
@@ -1261,7 +1547,7 @@ impl<'a> Planner<'a> {
                     .ok_or_else(|| Error::internal("anonymous bound node"))?,
             };
             for segment in &path.segments {
-                let node_item = self.create_node_item(&segment.node, &local_scope)?;
+                let node_item = self.create_node_item(&segment.node, &local_scope, true)?;
                 if let Some(item) = &node_item {
                     local_scope.insert(item.var().to_owned(), VarKind::Node);
                     items.push(item.clone());
@@ -1275,14 +1561,20 @@ impl<'a> Planner<'a> {
                         .ok_or_else(|| Error::internal("anonymous bound node"))?,
                 };
                 let rel = &segment.relationship;
-                if rel.types.len() != 1 {
-                    return Err(Error::syntax(
-                        "relationships in CREATE must have exactly one type",
-                    ));
+                if rel.direction == RelDirection::Undirected {
+                    return Err(Error::syntax("CREATE requires a directed relationship"));
                 }
+                let edge_type = match rel.types.plain_labels() {
+                    Some(types) if types.len() == 1 => types[0].clone(),
+                    _ => {
+                        return Err(Error::syntax(
+                            "relationships in CREATE must have exactly one type",
+                        ));
+                    }
+                };
                 if rel.var_length.is_some() {
-                    return Err(Error::unsupported(
-                        "variable-length relationships cannot be created",
+                    return Err(Error::syntax(
+                        "CreatingVarLength: variable-length relationships cannot be created",
                     ));
                 }
                 let var = match &rel.variable {
@@ -1292,11 +1584,19 @@ impl<'a> Planner<'a> {
                 let (props, prop_exprs) =
                     self.create_props(rel.properties.as_ref(), &local_scope)?;
                 local_scope.insert(var.clone(), VarKind::Edge);
+                // A left-pointing pattern (`(a)<-[:T]-(b)`) swaps the
+                // endpoints: the relationship still runs from `b` to `a`.
+                let (src, dst) = match rel.direction {
+                    RelDirection::Incoming => (next_var.clone(), prev_var),
+                    RelDirection::Outgoing | RelDirection::Undirected => {
+                        (prev_var, next_var.clone())
+                    }
+                };
                 items.push(CreateItem::Edge {
                     var,
-                    edge_type: rel.types[0].clone(),
-                    src: prev_var,
-                    dst: next_var.clone(),
+                    edge_type,
+                    src,
+                    dst,
                     props,
                     prop_exprs,
                 });
@@ -1310,16 +1610,30 @@ impl<'a> Planner<'a> {
         &mut self,
         pattern: &NodePattern,
         scope: &FastMap<String, VarKind>,
+        attached: bool,
     ) -> Result<Option<CreateItem>> {
         let var = match &pattern.variable {
-            Some(var) if scope.contains_key(var) => return Ok(None),
+            Some(var) if scope.contains_key(var) => {
+                // An already-bound variable may anchor a relationship, but
+                // cannot gain labels or properties, nor stand alone.
+                if !pattern.labels.is_empty() || pattern.properties.is_some() {
+                    return Err(Error::syntax(format!("variable `{var}` is already bound")));
+                }
+                if !attached {
+                    return Err(Error::syntax(format!("variable `{var}` is already bound")));
+                }
+                return Ok(None);
+            }
             Some(var) => var.clone(),
             None => self.anon_name("node"),
         };
         let (props, prop_exprs) = self.create_props(pattern.properties.as_ref(), scope)?;
+        let labels = pattern.labels.plain_labels().ok_or_else(|| {
+            Error::syntax("label expressions cannot be created; use plain `:Label` names")
+        })?;
         Ok(Some(CreateItem::Node {
             var,
-            labels: pattern.labels.clone(),
+            labels,
             props,
             prop_exprs,
         }))
@@ -1384,7 +1698,11 @@ impl<'a> Planner<'a> {
         }
         for segment in &path.segments {
             let rel = &segment.relationship;
-            if rel.types.len() != 1 {
+            if rel
+                .types
+                .plain_labels()
+                .is_none_or(|types| types.len() != 1)
+            {
                 return Err(Error::syntax(
                     "relationships in MERGE must have exactly one type",
                 ));
@@ -1403,7 +1721,7 @@ impl<'a> Planner<'a> {
         let mut items: Vec<CreateItem> = Vec::new();
         let mut path_vars: Vec<String> = Vec::new();
         let mut local = scope.clone();
-        let start_item = self.create_node_item(&path.start, &local)?;
+        let start_item = self.create_node_item(&path.start, &local, true)?;
         if path.segments.is_empty() && start_item.is_none() {
             let name = path.start.variable.as_deref().unwrap_or("?");
             return Err(Error::syntax(format!(
@@ -1428,7 +1746,7 @@ impl<'a> Planner<'a> {
         let mut src = start_var;
         for segment in &path.segments {
             let rel = &segment.relationship;
-            let node_item = self.create_node_item(&segment.node, &local)?;
+            let node_item = self.create_node_item(&segment.node, &local, true)?;
             let node_var = match &node_item {
                 Some(item) => {
                     local.insert(item.var().to_owned(), VarKind::Node);
@@ -1452,9 +1770,17 @@ impl<'a> Planner<'a> {
                 RelDirection::Outgoing | RelDirection::Undirected => (src, node_var.clone()),
             };
             let (props, prop_exprs) = self.create_props(rel.properties.as_ref(), scope)?;
+            let edge_type = match rel.types.plain_labels() {
+                Some(types) if types.len() == 1 => types[0].clone(),
+                _ => {
+                    return Err(Error::syntax(
+                        "relationships in MERGE must have exactly one type",
+                    ));
+                }
+            };
             items.push(CreateItem::Edge {
                 var: var.clone(),
-                edge_type: rel.types[0].clone(),
+                edge_type,
                 src: from,
                 dst: to,
                 props,
@@ -1551,6 +1877,7 @@ impl<'a> Planner<'a> {
 
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn plan_projection(
         &mut self,
         input: Plan,
@@ -1561,27 +1888,56 @@ impl<'a> Planner<'a> {
         limit: &Option<Expr>,
         where_clause: Option<&Expr>,
         scope: &FastMap<String, VarKind>,
+        require_aliases: bool,
     ) -> Result<(Plan, FastMap<String, VarKind>, Vec<String>)> {
-        // Expand `*` items.
+        // Expand `*` items; the TCK pins the column order to the sorted
+        // variable names.
         let mut expanded: Vec<(Expr, String)> = Vec::new();
         for item in items {
             if item.star {
-                for (var, _) in scope.iter() {
-                    if var.starts_with("  ") {
-                        continue;
-                    }
+                let mut stars: Vec<&String> =
+                    scope.keys().filter(|var| !var.starts_with("  ")).collect();
+                stars.sort();
+                for var in stars {
                     expanded.push((Expr::Variable(var.clone()), var.clone()));
                 }
             } else {
+                if require_aliases
+                    && item.alias.is_none()
+                    && !matches!(item.expr, Expr::Variable(_))
+                {
+                    return Err(Error::syntax(
+                        "unaliased expression in WITH; use AS to name it",
+                    ));
+                }
                 let name = match &item.alias {
                     Some(alias) => alias.clone(),
-                    None => default_name(&item.expr),
+                    // The column keeps the expression exactly as written.
+                    None => item
+                        .text
+                        .clone()
+                        .unwrap_or_else(|| default_name(&item.expr)),
                 };
                 expanded.push((item.expr.clone(), name));
             }
         }
         if expanded.is_empty() {
+            // `WITH *` over an empty scope is a legal no-op; `RETURN *`
+            // without variables is an error.
+            let all_stars = items.iter().all(|item| item.star);
+            if all_stars && require_aliases && order.is_empty() && skip.is_none() && limit.is_none()
+            {
+                return Ok((input, FastMap::new(), Vec::new()));
+            }
             return Err(Error::syntax("RETURN/WITH requires at least one item"));
+        }
+        let mut seen_names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (_, name) in &expanded {
+            if !seen_names.insert(name.as_str()) {
+                return Err(Error::syntax(format!(
+                    "MultipleResultsWithSameName: `{name}` is projected more than once"
+                )));
+            }
         }
         let mut input = input;
         let mut scope = scope.clone();
@@ -1602,7 +1958,33 @@ impl<'a> Planner<'a> {
                 .map(|(expr, name)| (name.clone(), expr_kind(expr, &scope)))
                 .collect();
             if validate_expr(predicate, &projected).is_ok() {
+                check_predicate_kind(predicate, &projected)?;
                 filter_after = Some(predicate.clone());
+            } else if let Ok(rewritten) = rewrite_expr(predicate, &mut |sub| {
+                // Replace projected aliases by their defining expressions so
+                // the predicate can filter before the projection; this is how
+                // a WHERE sees variables bound before and after the WITH.
+                let Expr::Variable(name) = sub else {
+                    return Ok(None);
+                };
+                match expanded.iter().find(|(_, item)| item == name) {
+                    Some((expr, _)) if !contains_aggregation(expr) => Ok(Some(expr.clone())),
+                    _ => Ok(None),
+                }
+            }) && !contains_aggregation(&rewritten)
+                && validate_expr(&rewritten, &scope).is_ok()
+            {
+                check_predicate_kind(&rewritten, &scope)?;
+                self.extract_patterns(
+                    &mut rewritten.clone(),
+                    &mut input,
+                    &mut scope,
+                    PatternContext::Predicate,
+                )?;
+                input = Plan::Filter {
+                    input: Box::new(input),
+                    predicate: rewritten,
+                };
             } else {
                 let mut predicate = predicate.clone();
                 self.extract_patterns(
@@ -1612,6 +1994,7 @@ impl<'a> Planner<'a> {
                     PatternContext::Predicate,
                 )?;
                 validate_expr(&predicate, &scope)?;
+                check_predicate_kind(&predicate, &scope)?;
                 input = Plan::Filter {
                     input: Box::new(input),
                     predicate,
@@ -1626,50 +2009,52 @@ impl<'a> Planner<'a> {
         let mut groups: Vec<(Expr, String)> = Vec::new();
         let mut aggs: Vec<AggItem> = Vec::new();
         let mut post: Vec<(Expr, String)> = Vec::new();
+        // Plain items are grouping keys even when an aggregate expression
+        // that references them appears first.
+        for (expr, name) in &expanded {
+            if !contains_aggregation(expr) {
+                groups.push((expr.clone(), name.clone()));
+            }
+        }
         for (expr, name) in &expanded {
             if has_aggregation_inside_comprehension(expr) {
                 return Err(Error::syntax(
                     "aggregations are not allowed inside list comprehensions",
                 ));
             }
-            if let Some((func, argument, star, distinct)) = aggregate_call(expr)? {
+            if let Some((func, arguments, star, distinct)) = aggregate_call(expr)? {
+                check_aggregate_arguments(&arguments)?;
                 aggs.push(AggItem {
                     func,
-                    argument: aggregate_argument(func, argument, star, &scope)?,
+                    arguments: aggregate_arguments(func, &arguments, star, &scope)?,
                     distinct,
                     name: name.clone(),
                 });
             } else if contains_aggregation(expr) {
                 let mut residual = rewrite_expr(expr, &mut |sub| {
-                    let Some((func, argument, star, distinct)) = aggregate_call(sub)? else {
+                    let Some((func, arguments, star, distinct)) = aggregate_call(sub)? else {
                         return Ok(None);
                     };
+                    check_aggregate_arguments(&arguments)?;
                     let hidden = format!("  agg{}", aggs.len());
                     aggs.push(AggItem {
                         func,
-                        argument: aggregate_argument(func, argument, star, &scope)?,
+                        arguments: aggregate_arguments(func, &arguments, star, &scope)?,
                         distinct,
                         name: hidden.clone(),
                     });
                     Ok(Some(Expr::Variable(hidden)))
                 })?;
-                residual = rewrite_expr(&residual, &mut |sub| {
-                    if let Some((_, group)) = groups.iter().find(|(group, _)| group == sub) {
-                        return Ok(Some(Expr::Variable(group.clone())));
-                    }
-                    if references_unresolved(sub, &groups, &aggs)
-                        && !references_aggregation(sub, &aggs)
-                    {
-                        let hidden = format!("  grp{}", groups.len());
-                        validate_expr(sub, &scope)?;
-                        groups.push((sub.clone(), hidden.clone()));
-                        return Ok(Some(Expr::Variable(hidden)));
-                    }
-                    Ok(None)
-                })?;
+                residual = hoist_groups(&residual, &mut groups, &aggs, &scope)?;
+                // Everything left must be a grouping key, an aggregation or
+                // a constant; anything else has no value to take.
+                if has_free_variable(&residual, &groups, &aggs) {
+                    return Err(Error::syntax(
+                        "AmbiguousAggregationExpression: an expression with an aggregation may \
+                         only reference projected values",
+                    ));
+                }
                 post.push((residual, name.clone()));
-            } else {
-                groups.push((expr.clone(), name.clone()));
             }
         }
         // Post-aggregation expressions may only reference grouping keys,
@@ -1696,26 +2081,53 @@ impl<'a> Planner<'a> {
                 .iter()
                 .map(|(expr, name)| (name.clone(), expr_kind(expr, &scope)))
                 .collect();
+            let mut agg_scope: FastMap<String, VarKind> = FastMap::new();
+            if !aggs.is_empty() {
+                for (_, group) in &groups {
+                    agg_scope.insert(group.clone(), VarKind::Value);
+                }
+                for item in &aggs {
+                    agg_scope.insert(item.name.clone(), VarKind::Value);
+                }
+                for (_, name) in &post {
+                    agg_scope.insert(name.clone(), VarKind::Value);
+                }
+            }
             for key in order {
-                let expr =
-                    if let Some((_, alias)) = expanded.iter().find(|(expr, _)| expr == &key.expr) {
-                        Expr::Variable(alias.clone())
-                    } else if validate_expr(&key.expr, &visible_names).is_ok() {
+                let named = match &key.expr {
+                    Expr::Variable(name) if expanded.iter().any(|(_, item)| item == name) => {
+                        Some(key.expr.clone())
+                    }
+                    _ => None,
+                };
+                let expr = if let Some(expr) = named {
+                    expr
+                } else if let Some((_, alias)) = expanded.iter().find(|(expr, _)| expr == &key.expr)
+                {
+                    Expr::Variable(alias.clone())
+                } else if aggs.is_empty() {
+                    if contains_aggregation(&key.expr) {
+                        return Err(Error::syntax(
+                            "InvalidAggregation: ORDER BY cannot aggregate when RETURN/WITH does not",
+                        ));
+                    }
+                    if validate_expr(&key.expr, &visible_names).is_ok() {
                         key.expr.clone()
-                    } else if aggs.is_empty() && !distinct {
+                    } else if !distinct {
                         validate_expr(&key.expr, &scope)?;
                         let hidden = format!("  sort{}", hidden_keys.len());
                         hidden_keys.push((key.expr.clone(), hidden.clone()));
                         Expr::Variable(hidden)
-                    } else if aggs.is_empty() {
-                        return Err(Error::unsupported(
-                            "ORDER BY on non-projected values cannot be combined with DISTINCT",
-                        ));
                     } else {
-                        return Err(Error::unsupported(
-                            "ORDER BY after aggregation must reference projected values",
+                        return Err(Error::syntax(
+                            "ORDER BY cannot sort on values removed by DISTINCT",
                         ));
-                    };
+                    }
+                } else {
+                    let rewritten = rewrite_sort_key(&key.expr, &groups, &aggs)?;
+                    validate_expr(&rewritten, &agg_scope)?;
+                    rewritten
+                };
                 sort_keys.push((expr, key.ascending));
             }
         }
@@ -1731,7 +2143,7 @@ impl<'a> Planner<'a> {
                 items: projection_items.clone(),
             };
             for (expr, name) in &projection_items {
-                new_scope.insert(name.clone(), expr_kind(expr, &scope));
+                new_scope.insert(name.clone(), alias_kind(expr, &scope));
             }
         } else {
             plan = Plan::Aggregate {
@@ -1794,14 +2206,14 @@ impl<'a> Planner<'a> {
             };
         }
         if let Some(skip) = skip {
-            validate_expr(skip, &new_scope)?;
+            validate_projection_limit(skip, "SKIP")?;
             plan = Plan::Skip {
                 input: Box::new(plan),
                 count: skip.clone(),
             };
         }
         if let Some(limit) = limit {
-            validate_expr(limit, &new_scope)?;
+            validate_projection_limit(limit, "LIMIT")?;
             plan = Plan::Limit {
                 input: Box::new(plan),
                 count: limit.clone(),
@@ -1829,7 +2241,7 @@ impl<'a> Planner<'a> {
         // Output scope maps names to output registers; nodes keep their kind.
         let mut output_scope = FastMap::new();
         for (expr, name) in &expanded {
-            output_scope.insert(name.clone(), expr_kind(expr, &scope));
+            output_scope.insert(name.clone(), alias_kind(expr, &scope));
         }
         let _ = std::mem::replace(&mut new_scope, output_scope);
         Ok((plan, new_scope, columns))
@@ -1839,8 +2251,13 @@ impl<'a> Planner<'a> {
 /// A node pattern with resolved names.
 struct PlannedNode {
     var: String,
+    /// Ids of the labels every match is guaranteed to carry (used for index
+    /// selection); disjunctions and negations contribute nothing.
     label_ids: Vec<u32>,
-    label_names: Vec<String>,
+    /// The pattern's label expression.
+    labels: LabelExpr,
+    /// Label the scan can anchor on, if the expression guarantees one.
+    anchor: Option<String>,
     /// Literal properties as `(name, key id, value)`.
     props: Vec<(String, u32, Value)>,
     prop_exprs: Vec<(String, Expr)>,
@@ -1873,6 +2290,40 @@ fn constrain_edge_props(plan: &mut Plan, edge_var: &str, props: &[(String, Expr)
     }
 }
 
+/// Apply a relationship type expression at runtime; only expressions with
+/// negation or conjunction need this, plain disjunctions restrict the
+/// traversal itself.
+fn constrain_edge_types(plan: &mut Plan, edge_var: &str, filter: &Option<LabelExpr>) {
+    if let Some(filter) = filter {
+        *plan = Plan::Filter {
+            input: Box::new(plan.clone()),
+            predicate: label_expr_filter(edge_var, filter),
+        };
+    }
+}
+
+/// Type names of a positive disjunction of plain types, or `None` when the
+/// expression uses negation or conjunction. Names are resolved against the
+/// catalog at execution time, so types created earlier in the same query
+/// still match.
+fn positive_type_names(expr: &LabelExpr) -> Option<Vec<String>> {
+    let mut names = Vec::new();
+    collect_positive_types(expr, &mut names).then_some(names)
+}
+
+fn collect_positive_types(expr: &LabelExpr, names: &mut Vec<String>) -> bool {
+    match expr {
+        LabelExpr::Label(label) => {
+            if !names.contains(label) {
+                names.push(label.clone());
+            }
+            true
+        }
+        LabelExpr::Or(parts) => parts.iter().all(|part| collect_positive_types(part, names)),
+        LabelExpr::And(_) | LabelExpr::Not(_) => false,
+    }
+}
+
 fn constrain_edge(plan: &mut Plan, edge_var: &str, rel_var: &str, edge_bound: bool) {
     if !edge_bound {
         return;
@@ -1886,21 +2337,18 @@ fn constrain_edge(plan: &mut Plan, edge_var: &str, rel_var: &str, edge_bound: bo
     };
 }
 
-/// Predicates for node constraints a scan did not apply. Scans enforce the
-/// first label and all literal properties, so only the remaining labels are
-/// left; nodes bound by the scope or an expansion need everything.
+/// Predicates for node constraints a scan did not apply. A scan enforces the
+/// anchor label alone, so only that exact single-label pattern is skipped;
+/// everything else is checked (cheap and always correct). Bound nodes need
+/// their label expression and literal properties checked as well.
 fn node_constraints(node: &PlannedNode, scanned: bool) -> Option<Expr> {
     let mut predicates: Vec<Expr> = Vec::new();
-    let labels: &[String] = if scanned {
-        node.label_names.get(1..).unwrap_or(&[])
-    } else {
-        &node.label_names
-    };
-    if !labels.is_empty() {
-        predicates.push(Expr::LabelCheck {
-            expr: Box::new(Expr::Variable(node.var.clone())),
-            labels: labels.to_vec(),
-        });
+    if !node.labels.is_empty() {
+        let enforced_by_scan = scanned
+            && matches!(&node.labels, LabelExpr::Label(label) if node.anchor.as_deref() == Some(label));
+        if !enforced_by_scan {
+            predicates.push(label_expr_filter(&node.var, &node.labels));
+        }
     }
     if !scanned {
         // Scans apply literal properties themselves; bound nodes need them
@@ -1934,6 +2382,41 @@ fn node_constraints(node: &PlannedNode, scanned: bool) -> Option<Expr> {
     })
 }
 
+/// Lower a label expression over a variable to a boolean expression built
+/// from single-label checks; `Op::HasLabel` tests node labels as well as
+/// relationship types.
+fn label_expr_filter(var: &str, expr: &LabelExpr) -> Expr {
+    let check = |label: &String| Expr::LabelCheck {
+        expr: Box::new(Expr::Variable(var.to_owned())),
+        labels: vec![label.clone()],
+    };
+    match expr {
+        LabelExpr::Label(label) => check(label),
+        LabelExpr::And(parts) => parts
+            .iter()
+            .map(|part| label_expr_filter(var, part))
+            .reduce(|left, right| Expr::Binary {
+                op: BinaryOp::And,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+            .expect("non-empty conjunction"),
+        LabelExpr::Or(parts) => parts
+            .iter()
+            .map(|part| label_expr_filter(var, part))
+            .reduce(|left, right| Expr::Binary {
+                op: BinaryOp::Or,
+                left: Box::new(left),
+                right: Box::new(right),
+            })
+            .expect("non-empty disjunction"),
+        LabelExpr::Not(inner) => Expr::Unary {
+            op: UnaryOp::Not,
+            expr: Box::new(label_expr_filter(var, inner)),
+        },
+    }
+}
+
 fn flip(direction: RelDirection) -> RelDirection {
     match direction {
         RelDirection::Outgoing => RelDirection::Incoming,
@@ -1963,6 +2446,7 @@ fn undefined_variable(name: &str) -> Error {
 
 /// Validate that all variables in an expression are in scope.
 fn validate_expr(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
+    check_expr_kinds(expr, scope)?;
     match expr {
         Expr::Variable(name) => {
             if scope.contains_key(name) {
@@ -2032,6 +2516,9 @@ fn validate_expr(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
         Expr::Pattern(_) | Expr::PatternComprehension { .. } => Err(Error::syntax(
             "pattern expressions are only allowed in predicates",
         )),
+        // Rewritten into a pattern predicate before validation; a survivor
+        // is boolean by construction.
+        Expr::ExistsSubquery(_) => Ok(()),
         Expr::Unary { expr, .. } => validate_expr(expr, scope),
         Expr::Binary { left, right, .. } => {
             validate_expr(left, scope)?;
@@ -2077,6 +2564,443 @@ fn validate_expr(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
     }
 }
 
+/// A statically known value kind, used for compile-time type checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// `null` (usable where any type is expected).
+    Null,
+    /// A boolean.
+    Boolean,
+    /// A number.
+    Number,
+    /// A string.
+    Text,
+    /// A list.
+    List,
+    /// A map.
+    Map,
+    /// A node.
+    Node,
+    /// A relationship.
+    Edge,
+    /// A named path.
+    Path,
+    /// A temporal value.
+    Temporal,
+    /// A spatial point.
+    Point,
+}
+
+impl Kind {
+    /// A short name for error messages.
+    fn name(self) -> &'static str {
+        match self {
+            Self::Null => "null",
+            Self::Boolean => "boolean",
+            Self::Number => "number",
+            Self::Text => "string",
+            Self::List => "list",
+            Self::Map => "map",
+            Self::Node => "node",
+            Self::Edge => "relationship",
+            Self::Path => "path",
+            Self::Temporal => "temporal",
+            Self::Point => "point",
+        }
+    }
+}
+
+/// The kind of an expression when it can be decided without looking at the
+/// data; `None` when it depends on runtime values.
+fn static_kind(expr: &Expr, scope: &FastMap<String, VarKind>) -> Option<Kind> {
+    static_kind_with(expr, scope, None)
+}
+
+/// [`static_kind`] with an optional overlay of locally bound kinds (for
+/// example the element kind of a comprehension's source list).
+fn static_kind_with(
+    expr: &Expr,
+    scope: &FastMap<String, VarKind>,
+    locals: Option<&FastMap<String, Kind>>,
+) -> Option<Kind> {
+    match expr {
+        Expr::ExistsSubquery(_) => Some(Kind::Boolean),
+        Expr::Literal(value) => Some(match value {
+            Value::Null => Kind::Null,
+            Value::Bool(_) => Kind::Boolean,
+            Value::Int(_) | Value::Float(_) => Kind::Number,
+            Value::Text(_) => Kind::Text,
+            Value::Bytes(_) => Kind::List,
+            Value::List(_) => Kind::List,
+            Value::Map(_) => Kind::Map,
+            Value::Node(_) => Kind::Node,
+            Value::Edge(_) => Kind::Edge,
+            Value::Date(_)
+            | Value::LocalTime(_)
+            | Value::Time(_)
+            | Value::LocalDateTime(_)
+            | Value::DateTime(_)
+            | Value::Duration(_) => Kind::Temporal,
+            Value::Point(_) => Kind::Point,
+        }),
+        Expr::Parameter(_) => None,
+        Expr::Variable(name) => match locals.and_then(|locals| locals.get(name).copied()) {
+            Some(kind) => Some(kind),
+            None => match scope.get(name) {
+                Some(VarKind::Node) => Some(Kind::Node),
+                Some(VarKind::Edge) => Some(Kind::Edge),
+                Some(VarKind::EdgeList) => Some(Kind::List),
+                Some(VarKind::Path) => Some(Kind::Path),
+                Some(VarKind::Scalar(kind)) => Some(*kind),
+                Some(VarKind::Value) | None => None,
+            },
+        },
+        Expr::Property { base, key } => {
+            match (static_kind_with(base, scope, locals), base.as_ref()) {
+                // A map literal exposes its entries' kinds.
+                (Some(Kind::Map), Expr::Map(entries)) => entries
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .and_then(|(_, value)| static_kind_with(value, scope, locals)),
+                _ => None,
+            }
+        }
+        // Indexing yields an element or property value of unknown kind.
+        Expr::Subscript { .. } => None,
+        Expr::Slice { base, .. } => {
+            static_kind(base, scope).filter(|kind| *kind == Kind::List || *kind == Kind::Text)
+        }
+        Expr::ListComprehension { .. } | Expr::PatternComprehension { .. } => Some(Kind::List),
+        Expr::Quantifier { .. } => Some(Kind::Boolean),
+        Expr::Reduce { .. } => None,
+        Expr::Unary { op, .. } => Some(match op {
+            UnaryOp::Neg => Kind::Number,
+            UnaryOp::Not => Kind::Boolean,
+        }),
+        Expr::Binary { op, left, right } => Some(match op {
+            BinaryOp::Add => {
+                let (left, right) = (
+                    static_kind_with(left, scope, locals),
+                    static_kind_with(right, scope, locals),
+                );
+                if left == Some(Kind::Text) || right == Some(Kind::Text) {
+                    Kind::Text
+                } else if left == Some(Kind::List) || right == Some(Kind::List) {
+                    Kind::List
+                } else if left == Some(Kind::Number) && right == Some(Kind::Number) {
+                    Kind::Number
+                } else {
+                    return None;
+                }
+            }
+            BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod | BinaryOp::Pow => {
+                Kind::Number
+            }
+            _ => Kind::Boolean,
+        }),
+        Expr::Function { name, args, .. } => static_function_kind(name, args, scope, locals),
+        Expr::List(_) => Some(Kind::List),
+        Expr::Map(_) => Some(Kind::Map),
+        Expr::Case {
+            alternatives,
+            default,
+            ..
+        } => {
+            let mut kinds = alternatives
+                .iter()
+                .map(|(_, then)| static_kind(then, scope))
+                .chain(
+                    default
+                        .as_deref()
+                        .map(|default| static_kind(default, scope)),
+                )
+                .collect::<Vec<_>>();
+            kinds.dedup();
+            match kinds.as_slice() {
+                [Some(kind)] => Some(*kind),
+                _ => None,
+            }
+        }
+        Expr::IsNull { .. } | Expr::LabelCheck { .. } => Some(Kind::Boolean),
+        Expr::Pattern(_) => Some(Kind::Boolean),
+    }
+}
+
+/// The result kind of a built-in function, when known.
+fn static_function_kind(
+    name: &str,
+    args: &[Expr],
+    scope: &FastMap<String, VarKind>,
+    locals: Option<&FastMap<String, Kind>>,
+) -> Option<Kind> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "id" | "size" | "length" | "count" | "sum" | "avg" | "stdev" | "stdevp"
+        | "percentilecont" | "percentiledisc" | "tointeger" | "tofloat" | "distance" | "abs"
+        | "sign" | "ceil" | "floor" | "round" | "sqrt" | "exp" | "log" | "log10" | "sin"
+        | "cos" | "tan" | "cot" | "asin" | "acos" | "atan" | "atan2" | "degrees" | "radians"
+        | "haversin" | "pi" | "e" | "rand" => Kind::Number,
+        "labels" | "keys" | "nodes" | "relationships" | "collect" | "range" | "tail"
+        | "reverse" | "split" => Kind::List,
+        "properties" => Kind::Map,
+        "type" | "tostring" | "substring" | "toupper" | "tolower" | "trim" | "ltrim" | "rtrim"
+        | "left" | "right" | "replace" => Kind::Text,
+        "toboolean" => Kind::Boolean,
+        "startnode" | "endnode" => Kind::Node,
+        "date" | "localtime" | "time" | "localdatetime" | "datetime" | "duration" => Kind::Temporal,
+        "point" => Kind::Point,
+        "coalesce" => {
+            let mut kinds = args
+                .iter()
+                .map(|arg| static_kind_with(arg, scope, locals))
+                .collect::<Vec<_>>();
+            kinds.dedup();
+            match kinds.as_slice() {
+                [Some(kind)] => *kind,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    })
+}
+
+/// Statically check an expression's operators and built-in arguments.
+fn check_expr_kinds(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
+    check_expr_kinds_with(expr, scope, None)
+}
+
+/// The element kind of a list expression, when it can be decided (a list
+/// literal with elements of one kind).
+fn list_element_kind(
+    list: &Expr,
+    scope: &FastMap<String, VarKind>,
+    locals: Option<&FastMap<String, Kind>>,
+) -> Option<Kind> {
+    let Expr::List(items) = list else {
+        return None;
+    };
+    let mut kinds = items
+        .iter()
+        .map(|item| static_kind_with(item, scope, locals))
+        .collect::<Vec<_>>();
+    kinds.dedup();
+    match kinds.as_slice() {
+        [Some(kind)] => Some(*kind),
+        _ => None,
+    }
+}
+
+fn check_expr_kinds_with(
+    expr: &Expr,
+    scope: &FastMap<String, VarKind>,
+    locals: Option<&FastMap<String, Kind>>,
+) -> Result<()> {
+    let require = |kind: Option<Kind>, wanted: &[Kind], what: &str| -> Result<()> {
+        if let Some(kind) = kind
+            && !wanted.contains(&kind)
+        {
+            return Err(Error::syntax(format!(
+                "{what} expects {}, got {}",
+                wanted
+                    .iter()
+                    .map(|kind| kind.name())
+                    .collect::<Vec<_>>()
+                    .join(" or "),
+                kind.name()
+            )));
+        }
+        Ok(())
+    };
+    let require_type = |kind: Option<Kind>, wanted: &[Kind], what: &str| -> Result<()> {
+        if let Some(kind) = kind
+            && !wanted.contains(&kind)
+        {
+            return Err(Error::type_error(format!(
+                "{what} expects {}, got {}",
+                wanted
+                    .iter()
+                    .map(|kind| kind.name())
+                    .collect::<Vec<_>>()
+                    .join(" or "),
+                kind.name()
+            )));
+        }
+        Ok(())
+    };
+    let kind = |e: &Expr| static_kind_with(e, scope, locals);
+    match expr {
+        Expr::Unary {
+            op: UnaryOp::Not,
+            expr: operand,
+        } => {
+            require(
+                static_kind(operand, scope),
+                &[Kind::Boolean, Kind::Null],
+                "NOT",
+            )?;
+        }
+        Expr::Binary { op, left, right } => match op {
+            BinaryOp::And | BinaryOp::Or | BinaryOp::Xor => {
+                require(kind(left), &[Kind::Boolean, Kind::Null], "boolean operator")?;
+                require(
+                    kind(right),
+                    &[Kind::Boolean, Kind::Null],
+                    "boolean operator",
+                )?;
+            }
+            BinaryOp::In => {
+                require(kind(right), &[Kind::List, Kind::Null], "IN")?;
+            }
+            _ => {}
+        },
+        Expr::Property { base, .. } => {
+            // Property access works on maps, entities, temporal values and
+            // points; lists and scalars are type errors, a path is not even
+            // statically resolvable.
+            let base_kind = kind(base);
+            if base_kind == Some(Kind::Path) {
+                return Err(Error::syntax("a path has no properties"));
+            }
+            require_type(
+                base_kind,
+                &[
+                    Kind::Map,
+                    Kind::Node,
+                    Kind::Edge,
+                    Kind::Temporal,
+                    Kind::Point,
+                    Kind::Null,
+                ],
+                "property access",
+            )?;
+        }
+        Expr::Function { name, args, .. } => {
+            let first = args.first();
+            let argument = first.and_then(kind);
+            match name.to_ascii_lowercase().as_str() {
+                "labels" | "properties" | "keys" => require(
+                    argument,
+                    &[Kind::Node, Kind::Edge, Kind::Map, Kind::Null],
+                    name,
+                )?,
+                "type" | "startnode" | "endnode" => {
+                    require(argument, &[Kind::Edge, Kind::Null], name)?
+                }
+                "length" => require(argument, &[Kind::List, Kind::Path, Kind::Null], name)?,
+                "size" => require(argument, &[Kind::List, Kind::Text, Kind::Null], name)?,
+                _ => {}
+            }
+        }
+        Expr::Quantifier {
+            var,
+            list,
+            predicate,
+            ..
+        } => {
+            check_expr_kinds_with(list, scope, locals)?;
+            let inner = binder_locals(var, list, scope, locals);
+            check_expr_kinds_with(predicate, scope, inner.as_ref())?;
+            require(
+                static_kind_with(predicate, scope, inner.as_ref()),
+                &[Kind::Boolean, Kind::Null],
+                "quantifier predicate",
+            )?;
+            return Ok(());
+        }
+        Expr::ListComprehension {
+            var,
+            list,
+            predicate,
+            projection,
+        } => {
+            check_expr_kinds_with(list, scope, locals)?;
+            let inner = binder_locals(var, list, scope, locals);
+            if let Some(predicate) = predicate {
+                check_expr_kinds_with(predicate, scope, inner.as_ref())?;
+                require(
+                    static_kind_with(predicate, scope, inner.as_ref()),
+                    &[Kind::Boolean, Kind::Null],
+                    "comprehension predicate",
+                )?;
+            }
+            if let Some(projection) = projection {
+                check_expr_kinds_with(projection, scope, inner.as_ref())?;
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    // Arithmetic requires numbers, with the documented exceptions: `+`
+    // concatenates and appends, and durations scale by numbers.
+    if let Expr::Binary { op, left, right } = expr {
+        let (left_kind, right_kind) = (kind(left), kind(right));
+        let arithmetic = |wanted: &[Kind], what: &str| -> Result<()> {
+            require(left_kind, wanted, what)?;
+            require(right_kind, wanted, what)
+        };
+        match op {
+            BinaryOp::Sub | BinaryOp::Mod | BinaryOp::Pow => {
+                arithmetic(&[Kind::Number, Kind::Temporal, Kind::Null], "arithmetic")?
+            }
+            BinaryOp::Mul | BinaryOp::Div => {
+                arithmetic(&[Kind::Number, Kind::Temporal, Kind::Null], "arithmetic")?;
+                // A duration scales by a number; two durations do not.
+                if left_kind == Some(Kind::Temporal) && right_kind == Some(Kind::Temporal) {
+                    return Err(Error::syntax(
+                        "a duration scales by a number, not another duration",
+                    ));
+                }
+            }
+            BinaryOp::Add => {
+                // `+` concatenates strings, appends to lists (whatever the
+                // element is) and adds numbers or durations.
+                let allowed = left_kind == Some(Kind::Text)
+                    || right_kind == Some(Kind::Text)
+                    || left_kind == Some(Kind::List)
+                    || right_kind == Some(Kind::List)
+                    || matches!(
+                        left_kind,
+                        None | Some(Kind::Number) | Some(Kind::Temporal) | Some(Kind::Null)
+                    ) && matches!(
+                        right_kind,
+                        None | Some(Kind::Number) | Some(Kind::Temporal) | Some(Kind::Null)
+                    );
+                if !allowed {
+                    return Err(Error::syntax(
+                        "arithmetic expects numbers, strings or lists",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+    // Recurse into subexpressions: the checks above only see the node they
+    // match, and operators nest arbitrarily.
+    let mut error = None;
+    for_each_child(expr, &mut |child| {
+        if error.is_none() {
+            error = check_expr_kinds_with(child, scope, locals).err();
+        }
+    });
+    match error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+/// The element-kind overlay for a comprehension or quantifier binder, when
+/// the list's element kind is known.
+fn binder_locals(
+    var: &str,
+    list: &Expr,
+    scope: &FastMap<String, VarKind>,
+    locals: Option<&FastMap<String, Kind>>,
+) -> Option<FastMap<String, Kind>> {
+    let element = list_element_kind(list, scope, locals)?;
+    let mut inner = locals.cloned().unwrap_or_default();
+    inner.insert(var.to_owned(), element);
+    Some(inner)
+}
+
 fn expr_kind(expr: &Expr, scope: &FastMap<String, VarKind>) -> VarKind {
     match expr {
         Expr::Variable(name) => scope.get(name).copied().unwrap_or(VarKind::Value),
@@ -2084,15 +3008,42 @@ fn expr_kind(expr: &Expr, scope: &FastMap<String, VarKind>) -> VarKind {
     }
 }
 
+/// The scope kind to record for a projection alias. Carrying through a
+/// variable keeps its kind; a statically known non-entity expression
+/// becomes a scalar binding so patterns cannot reuse it as an entity.
+fn alias_kind(expr: &Expr, scope: &FastMap<String, VarKind>) -> VarKind {
+    let kind = expr_kind(expr, scope);
+    if kind != VarKind::Value {
+        return kind;
+    }
+    // A list literal of relationships stays usable as a variable-length
+    // relationship binding.
+    if let Some(Kind::Edge) = list_element_kind(expr, scope, None) {
+        return VarKind::EdgeList;
+    }
+    match static_kind(expr, scope) {
+        Some(Kind::Node) => VarKind::Node,
+        Some(Kind::Edge) => VarKind::Edge,
+        Some(Kind::Path) => VarKind::Path,
+        // Null is compatible with every kind, so it stays unconstrained.
+        Some(Kind::Null) | None => VarKind::Value,
+        Some(other) => VarKind::Scalar(other),
+    }
+}
+
 fn default_name(expr: &Expr) -> String {
     match expr {
         Expr::Variable(name) => name.clone(),
         Expr::Pattern(_) => "pattern".to_owned(),
+        Expr::ExistsSubquery(_) => "exists { ... }".to_owned(),
         Expr::PatternComprehension { projection, .. } => {
             format!("[pattern | {}]", default_name(projection))
         }
         Expr::Parameter(name) => format!("${name}"),
         Expr::Literal(value) => literal_text(value),
+        Expr::LabelCheck { expr, labels } => {
+            format!("({}:{})", default_name(expr), labels.join(":"))
+        }
         Expr::Property { base, key } => format!("{}.{}", property_base_name(base), key),
         Expr::Subscript { base, index } => {
             format!("{}[{}]", subscript_base_name(base), default_name(index))
@@ -2156,23 +3107,20 @@ fn default_name(expr: &Expr) -> String {
             }
         }
         Expr::Unary { op, expr } => match op {
-            UnaryOp::Neg => format!("-{}", default_name(expr)),
-            UnaryOp::Not => format!("NOT {}", default_name(expr)),
+            UnaryOp::Neg => format!("-{}", operand_name(expr, UNARY_PRECEDENCE, false, None)),
+            UnaryOp::Not => format!("NOT {}", operand_name(expr, NOT_PRECEDENCE, false, None)),
         },
-        Expr::Binary { op, left, right } => format!(
-            "{} {} {}",
-            default_name(left),
-            binary_text(*op),
-            default_name(right)
-        ),
+        Expr::Binary { op, left, right } => {
+            let precedence = op_precedence(*op);
+            let left = operand_name(left, precedence, false, Some(*op));
+            let right = operand_name(right, precedence, true, Some(*op));
+            format!("{left} {} {right}", binary_text(*op))
+        }
         Expr::IsNull { expr, negated } => format!(
             "{} IS {}NULL",
             default_name(expr),
             if *negated { "NOT " } else { "" }
         ),
-        Expr::LabelCheck { expr, labels } => {
-            format!("{}:{}", default_name(expr), labels.join(":"))
-        }
         Expr::List(items) => format!(
             "[{}]",
             items
@@ -2190,6 +3138,98 @@ fn default_name(expr: &Expr) -> String {
                 .join(", ")
         ),
         Expr::Case { .. } => "CASE".to_owned(),
+    }
+}
+
+/// Precedence levels mirroring the expression grammar in the parser; larger
+/// values bind tighter.
+const OR_PRECEDENCE: u8 = 1;
+const XOR_PRECEDENCE: u8 = 2;
+const AND_PRECEDENCE: u8 = 3;
+const NOT_PRECEDENCE: u8 = 4;
+const COMPARISON_PRECEDENCE: u8 = 5;
+const ADDITIVE_PRECEDENCE: u8 = 6;
+const MULTIPLICATIVE_PRECEDENCE: u8 = 7;
+const POWER_PRECEDENCE: u8 = 8;
+const UNARY_PRECEDENCE: u8 = 9;
+const ATOMIC_PRECEDENCE: u8 = 10;
+
+/// Binding strength of a binary operator.
+fn op_precedence(op: BinaryOp) -> u8 {
+    match op {
+        BinaryOp::Or => OR_PRECEDENCE,
+        BinaryOp::Xor => XOR_PRECEDENCE,
+        BinaryOp::And => AND_PRECEDENCE,
+        BinaryOp::Eq
+        | BinaryOp::Ne
+        | BinaryOp::Lt
+        | BinaryOp::Le
+        | BinaryOp::Gt
+        | BinaryOp::Ge
+        | BinaryOp::Regex
+        | BinaryOp::In
+        | BinaryOp::StartsWith
+        | BinaryOp::EndsWith
+        | BinaryOp::Contains => COMPARISON_PRECEDENCE,
+        BinaryOp::Add | BinaryOp::Sub => ADDITIVE_PRECEDENCE,
+        BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => MULTIPLICATIVE_PRECEDENCE,
+        BinaryOp::Pow => POWER_PRECEDENCE,
+    }
+}
+
+/// Whether chaining the operator needs no parentheses: `a + b + c`,
+/// `a AND b AND c`.
+fn op_associative(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Add | BinaryOp::Mul | BinaryOp::And | BinaryOp::Or | BinaryOp::Xor
+    )
+}
+
+/// Binding strength of an arbitrary expression: binary operators, unary
+/// operators and the comparison-shaped predicates.
+fn expr_precedence(expr: &Expr) -> u8 {
+    match expr {
+        Expr::Binary { op, .. } => op_precedence(*op),
+        Expr::Unary {
+            op: UnaryOp::Not, ..
+        } => NOT_PRECEDENCE,
+        Expr::Unary {
+            op: UnaryOp::Neg, ..
+        } => UNARY_PRECEDENCE,
+        Expr::IsNull { .. } | Expr::LabelCheck { .. } => COMPARISON_PRECEDENCE,
+        _ => ATOMIC_PRECEDENCE,
+    }
+}
+
+/// Render `expr` as an operand of an operator with `precedence`, adding
+/// parentheses wherever the operator tree would otherwise re-parse
+/// differently, so `12 / 4 * (3 - 2 * 4)` keeps its parentheses.
+fn operand_name(expr: &Expr, precedence: u8, right: bool, parent: Option<BinaryOp>) -> String {
+    let child = expr_precedence(expr);
+    let parenthesize = if child < precedence {
+        true
+    } else if child > precedence {
+        false
+    } else if !right {
+        // A same-precedence left operand only needs parentheses under a
+        // right-associative operator, which the grammar has none of.
+        false
+    } else {
+        match parent {
+            // `a - (b - c)` and `a / (b * c)` would re-associate; associative
+            // operators only need parentheses when the operator differs.
+            Some(parent_op) => {
+                let same = matches!(expr, Expr::Binary { op, .. } if *op == parent_op);
+                !(same && op_associative(parent_op))
+            }
+            None => true,
+        }
+    };
+    if parenthesize {
+        format!("({})", default_name(expr))
+    } else {
+        default_name(expr)
     }
 }
 
@@ -2226,7 +3266,10 @@ fn literal_text(value: &Value) -> String {
         Value::Null => "null".to_owned(),
         Value::Bool(inner) => inner.to_string(),
         Value::Int(inner) => inner.to_string(),
-        Value::Float(inner) => format!("{inner}"),
+        Value::Float(inner) => {
+            let mut buffer = ryu::Buffer::new();
+            buffer.format(*inner).to_owned()
+        }
         Value::Text(inner) => format!("'{inner}'"),
         other => format!("{other:?}"),
     }
@@ -2258,9 +3301,9 @@ fn binary_text(op: BinaryOp) -> &'static str {
 }
 
 /// Whether an expression is exactly an aggregation call, returning the
-/// function, optional argument and star flag.
+/// function, its arguments and the star flag.
 #[allow(clippy::type_complexity)]
-fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool, bool)>> {
+fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Vec<&Expr>, bool, bool)>> {
     let Expr::Function {
         name,
         distinct,
@@ -2277,6 +3320,10 @@ fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool, boo
         "min" => AggFn::Min,
         "max" => AggFn::Max,
         "collect" => AggFn::Collect,
+        "percentilecont" => AggFn::PercentileCont,
+        "percentiledisc" => AggFn::PercentileDisc,
+        "stdev" => AggFn::StDev,
+        "stdevp" => AggFn::StDevP,
         _ => return Ok(None),
     };
     if *star {
@@ -2286,29 +3333,161 @@ fn aggregate_call(expr: &Expr) -> Result<Option<(AggFn, Option<&Expr>, bool, boo
         if *distinct {
             return Err(Error::syntax("count(DISTINCT *) is not valid"));
         }
-        return Ok(Some((func, None, true, false)));
+        return Ok(Some((func, Vec::new(), true, false)));
     }
-    match args.len() {
-        1 => Ok(Some((func, Some(&args[0]), false, *distinct))),
-        0 => Err(Error::syntax(format!("{name} requires an argument"))),
-        _ => Err(Error::unsupported("aggregations with multiple arguments")),
+    let expected = match func {
+        AggFn::PercentileCont | AggFn::PercentileDisc => 2,
+        _ => 1,
+    };
+    if args.len() != expected {
+        return Err(Error::syntax(format!(
+            "{name}() expects {expected} argument(s)"
+        )));
+    }
+    Ok(Some((func, args.iter().collect(), false, *distinct)))
+}
+
+/// The arguments of an aggregation, with `count(*)` becoming `count(1)`.
+fn aggregate_arguments(
+    func: AggFn,
+    arguments: &[&Expr],
+    star: bool,
+    scope: &FastMap<String, VarKind>,
+) -> Result<Vec<Expr>> {
+    if star {
+        return Ok(vec![Expr::Literal(Value::Int(1))]);
+    }
+    if arguments.is_empty() {
+        return Err(Error::syntax(format!("{func:?} requires an argument")));
+    }
+    for argument in arguments {
+        validate_expr(argument, scope)?;
+    }
+    Ok(arguments
+        .iter()
+        .map(|argument| (*argument).clone())
+        .collect())
+}
+
+/// Reject aggregations of aggregations and non-deterministic arguments.
+fn check_aggregate_arguments(arguments: &[&Expr]) -> Result<()> {
+    for argument in arguments {
+        if contains_aggregation(argument) {
+            return Err(Error::syntax(
+                "NestedAggregation: an aggregation cannot contain another aggregation",
+            ));
+        }
+        if contains_function(argument, &["rand"]) {
+            return Err(Error::syntax(
+                "NonConstantExpression: an aggregation cannot use non-deterministic functions",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite an ORDER BY key of an aggregating projection: aggregation calls
+/// become references to their projected columns, and simple projected
+/// expressions become references to their grouping keys.
+///
+/// # Errors
+///
+/// Returns `Error::syntax` when an aggregation is not projected or a complex
+/// expression is combined with an aggregation (ambiguous semantics).
+fn rewrite_sort_key(expr: &Expr, groups: &[(Expr, String)], aggs: &[AggItem]) -> Result<Expr> {
+    rewrite_expr(expr, &mut |sub| {
+        if let Some((func, args, star, distinct)) = aggregate_call(sub)? {
+            for item in aggs {
+                let same_args = if star {
+                    matches!(&item.arguments[..], [Expr::Literal(Value::Int(1))])
+                } else {
+                    item.arguments.len() == args.len()
+                        && item.arguments.iter().zip(args.iter()).all(|(a, b)| a == *b)
+                };
+                if item.func == func && item.distinct == distinct && same_args {
+                    return Ok(Some(Expr::Variable(item.name.clone())));
+                }
+            }
+            return Err(Error::syntax(
+                "UndefinedVariable: ORDER BY cannot use an aggregation that is not projected",
+            ));
+        }
+        if let Some((_, group)) = groups.iter().find(|(group, _)| group == sub) {
+            if is_atom_expr(sub) {
+                return Ok(Some(Expr::Variable(group.clone())));
+            }
+            return Err(Error::syntax(
+                "AmbiguousAggregationExpression: an ORDER BY item with an aggregation may only \
+                 combine projected variables and aggregations",
+            ));
+        }
+        Ok(None)
+    })
+}
+
+/// A relationship and a node of the same pattern may not share a variable.
+///
+/// # Errors
+///
+/// Returns `Error::syntax` when a variable names both a node and a
+/// relationship within one path.
+fn check_path_conflicts(path: &PatternPath) -> Result<()> {
+    let mut rel_vars: Vec<&str> = Vec::new();
+    for segment in &path.segments {
+        if let Some(var) = &segment.relationship.variable {
+            rel_vars.push(var);
+        }
+    }
+    if rel_vars.is_empty() {
+        return Ok(());
+    }
+    let mut node_vars: Vec<&str> = Vec::new();
+    if let Some(var) = &path.start.variable {
+        node_vars.push(var);
+    }
+    for segment in &path.segments {
+        if let Some(var) = &segment.node.variable {
+            node_vars.push(var);
+        }
+    }
+    if let Some(var) = path
+        .variable
+        .as_deref()
+        .filter(|var| rel_vars.contains(var) || node_vars.contains(var))
+    {
+        return Err(Error::syntax(format!(
+            "VariableTypeConflict: path variable `{var}` is also bound in the pattern"
+        )));
+    }
+    if let Some(var) = rel_vars.iter().find(|var| node_vars.contains(*var)) {
+        return Err(Error::syntax(format!(
+            "VariableTypeConflict: variable `{var}` is bound both as a node and as a relationship"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether an expression is a constant, a variable or a chain of property
+/// accesses, i.e. something that can appear next to an aggregation without
+/// changing the grouping.
+fn is_atom_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Variable(_) | Expr::Literal(_) | Expr::Parameter(_) => true,
+        Expr::Property { base, .. } => is_atom_expr(base),
+        _ => false,
     }
 }
 
-/// The argument of an aggregation, with `count(*)` becoming `count(1)`.
-fn aggregate_argument(
-    func: AggFn,
-    argument: Option<&Expr>,
-    star: bool,
-    scope: &FastMap<String, VarKind>,
-) -> Result<Expr> {
-    if star {
-        return Ok(Expr::Literal(Value::Int(1)));
+/// `SKIP` and `LIMIT` must not depend on variables; the value itself is
+/// range checked at compile time for literals (in `substitute_items`) and at
+/// execution time for everything else.
+fn validate_projection_limit(expr: &Expr, what: &str) -> Result<()> {
+    if has_free_variable(expr, &[], &[]) {
+        return Err(Error::syntax(format!(
+            "NonConstantExpression: {what} must not depend on variables"
+        )));
     }
-    let argument =
-        argument.ok_or_else(|| Error::syntax(format!("{func:?} requires an argument")))?;
-    validate_expr(argument, scope)?;
-    Ok(argument.clone())
+    Ok(())
 }
 
 /// Rewrite an expression top-down; `f` may replace a subexpression and stop
@@ -2319,6 +3498,7 @@ fn rewrite_expr(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>) -
     }
     Ok(match expr {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => expr.clone(),
+        Expr::ExistsSubquery(_) => expr.clone(),
         Expr::Pattern(path) => Expr::Pattern(Box::new(rewrite_pattern(path, f)?)),
         Expr::PatternComprehension {
             path,
@@ -2479,22 +3659,6 @@ fn rewrite_pattern(
     Ok(path)
 }
 
-/// Whether the inline property expressions of a pattern path reference a
-/// variable satisfying `pred`.
-fn pattern_references(path: &PatternPath, pred: &mut dyn FnMut(&str) -> bool) -> bool {
-    path.start
-        .properties
-        .as_ref()
-        .is_some_and(|expr| expr_references(expr, pred))
-        || path.segments.iter().any(|segment| {
-            segment
-                .relationship
-                .properties
-                .as_ref()
-                .is_some_and(|expr| expr_references(expr, pred))
-        })
-}
-
 /// Whether the inline property expressions of a pattern path contain an
 /// aggregation.
 fn pattern_has_aggregation(path: &PatternPath) -> bool {
@@ -2511,98 +3675,385 @@ fn pattern_has_aggregation(path: &PatternPath) -> bool {
         })
 }
 
-/// Whether any variable reference in `expr` satisfies `pred`.
-fn expr_references(expr: &Expr, pred: &mut dyn FnMut(&str) -> bool) -> bool {
-    match expr {
-        Expr::Variable(name) => pred(name),
-        Expr::Literal(_) | Expr::Parameter(_) => false,
-        Expr::Pattern(path) => pattern_references(path, pred),
+/// A predicate must be boolean (or null); statically known scalars are
+/// rejected when the clause is planned.
+fn check_predicate_kind(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
+    if let Some(kind) = static_kind(expr, scope)
+        && !matches!(kind, Kind::Boolean | Kind::Null)
+    {
+        return Err(Error::syntax(format!(
+            "InvalidArgumentType: a predicate must be a boolean, got {}",
+            kind.name()
+        )));
+    }
+    Ok(())
+}
+
+/// Whether `expr` references a variable that is neither bound inside the
+/// expression itself (comprehension, quantifier, `reduce` and pattern
+/// binders) nor the name of a grouping key or aggregation output.
+fn has_free_variable(expr: &Expr, groups: &[(Expr, String)], aggs: &[AggItem]) -> bool {
+    fn walk(
+        expr: &Expr,
+        bound: &mut Vec<String>,
+        groups: &[(Expr, String)],
+        aggs: &[AggItem],
+    ) -> bool {
+        match expr {
+            Expr::Variable(name) => {
+                if bound.iter().any(|entry| entry == name) {
+                    return false;
+                }
+                !(groups.iter().any(|(_, group)| group == name)
+                    || aggs.iter().any(|item| &item.name == name))
+            }
+            Expr::Literal(_) | Expr::Parameter(_) => false,
+            Expr::Pattern(path) => walk_pattern(path, bound, groups, aggs),
+            Expr::PatternComprehension {
+                path,
+                predicate,
+                projection,
+            } => {
+                if walk_pattern(path, bound, groups, aggs) {
+                    return true;
+                }
+                let mark = bound.len();
+                pattern_variables(path, bound);
+                let found = predicate
+                    .as_deref()
+                    .is_some_and(|predicate| walk(predicate, bound, groups, aggs))
+                    || walk(projection, bound, groups, aggs);
+                bound.truncate(mark);
+                found
+            }
+            Expr::ListComprehension {
+                var,
+                list,
+                predicate,
+                projection,
+            } => {
+                if walk(list, bound, groups, aggs) {
+                    return true;
+                }
+                bound.push(var.clone());
+                let found = predicate
+                    .as_deref()
+                    .is_some_and(|predicate| walk(predicate, bound, groups, aggs))
+                    || projection
+                        .as_deref()
+                        .is_some_and(|projection| walk(projection, bound, groups, aggs));
+                bound.pop();
+                found
+            }
+            Expr::Quantifier {
+                var,
+                list,
+                predicate,
+                ..
+            } => {
+                if walk(list, bound, groups, aggs) {
+                    return true;
+                }
+                bound.push(var.clone());
+                let found = walk(predicate, bound, groups, aggs);
+                bound.pop();
+                found
+            }
+            Expr::Reduce {
+                accumulator,
+                init,
+                var,
+                list,
+                expression,
+            } => {
+                if walk(init, bound, groups, aggs) || walk(list, bound, groups, aggs) {
+                    return true;
+                }
+                bound.push(accumulator.clone());
+                bound.push(var.clone());
+                let found = walk(expression, bound, groups, aggs);
+                bound.pop();
+                bound.pop();
+                found
+            }
+            other => {
+                let mut found = false;
+                for_each_child(other, &mut |child| {
+                    if !found {
+                        found = walk(child, bound, groups, aggs);
+                    }
+                });
+                found
+            }
+        }
+    }
+
+    fn walk_pattern(
+        path: &PatternPath,
+        bound: &mut Vec<String>,
+        groups: &[(Expr, String)],
+        aggs: &[AggItem],
+    ) -> bool {
+        pattern_properties(path)
+            .iter()
+            .any(|expr| walk(expr, bound, groups, aggs))
+    }
+
+    walk(expr, &mut Vec::new(), groups, aggs)
+}
+
+/// Rewrite a post-aggregation residual, hoisting every subexpression that
+/// references a pre-aggregation variable onto a grouping key. References to
+/// variables bound inside comprehensions, quantifiers and `reduce` bodies
+/// stay in place: they are resolved by their binder, not by a grouping key.
+fn hoist_groups(
+    expr: &Expr,
+    groups: &mut Vec<(Expr, String)>,
+    aggs: &[AggItem],
+    scope: &FastMap<String, VarKind>,
+) -> Result<Expr> {
+    hoist_walk(expr, groups, aggs, scope, &[])
+}
+
+fn hoist_walk(
+    expr: &Expr,
+    groups: &mut Vec<(Expr, String)>,
+    aggs: &[AggItem],
+    scope: &FastMap<String, VarKind>,
+    bound: &[String],
+) -> Result<Expr> {
+    if let Some((_, group)) = groups.iter().find(|(group, _)| group == expr) {
+        // Only constants and property chains may be picked out of an
+        // aggregate-containing expression; anything more complex is
+        // ambiguous.
+        if is_atom_expr(expr) {
+            return Ok(Expr::Variable(group.clone()));
+        }
+        return Err(Error::syntax(
+            "AmbiguousAggregationExpression: an expression with an aggregation may not combine \
+             non-constant subexpressions",
+        ));
+    }
+    Ok(match expr {
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => expr.clone(),
+        Expr::ExistsSubquery(_) => expr.clone(),
+        Expr::Pattern(path) => {
+            Expr::Pattern(Box::new(hoist_pattern(path, groups, aggs, scope, bound)?))
+        }
         Expr::PatternComprehension {
             path,
             predicate,
             projection,
         } => {
-            pattern_references(path, pred)
-                || predicate
+            let path = hoist_pattern(path, groups, aggs, scope, bound)?;
+            let mut inner = bound.to_vec();
+            pattern_variables(&path, &mut inner);
+            Expr::PatternComprehension {
+                path: Box::new(path),
+                predicate: predicate
                     .as_deref()
-                    .is_some_and(|e| expr_references(e, pred))
-                || expr_references(projection, pred)
+                    .map(|predicate| {
+                        hoist_walk(predicate, groups, aggs, scope, &inner).map(Box::new)
+                    })
+                    .transpose()?,
+                projection: Box::new(hoist_walk(projection, groups, aggs, scope, &inner)?),
+            }
         }
-        Expr::Property { base, .. } => expr_references(base, pred),
-        Expr::Subscript { base, index } => {
-            expr_references(base, pred) || expr_references(index, pred)
-        }
-        Expr::Slice { base, lower, upper } => {
-            expr_references(base, pred)
-                || lower.as_deref().is_some_and(|e| expr_references(e, pred))
-                || upper.as_deref().is_some_and(|e| expr_references(e, pred))
-        }
+        Expr::Property { base, key } => Expr::Property {
+            base: Box::new(hoist_walk(base, groups, aggs, scope, bound)?),
+            key: key.clone(),
+        },
+        Expr::Subscript { base, index } => Expr::Subscript {
+            base: Box::new(hoist_walk(base, groups, aggs, scope, bound)?),
+            index: Box::new(hoist_walk(index, groups, aggs, scope, bound)?),
+        },
+        Expr::Slice { base, lower, upper } => Expr::Slice {
+            base: Box::new(hoist_walk(base, groups, aggs, scope, bound)?),
+            lower: lower
+                .as_deref()
+                .map(|lower| hoist_walk(lower, groups, aggs, scope, bound).map(Box::new))
+                .transpose()?,
+            upper: upper
+                .as_deref()
+                .map(|upper| hoist_walk(upper, groups, aggs, scope, bound).map(Box::new))
+                .transpose()?,
+        },
         Expr::ListComprehension {
+            var,
             list,
             predicate,
             projection,
-            ..
         } => {
-            expr_references(list, pred)
-                || predicate
+            let list = Box::new(hoist_walk(list, groups, aggs, scope, bound)?);
+            let mut inner = bound.to_vec();
+            inner.push(var.clone());
+            Expr::ListComprehension {
+                var: var.clone(),
+                list,
+                predicate: predicate
                     .as_deref()
-                    .is_some_and(|e| expr_references(e, pred))
-                || projection
+                    .map(|predicate| {
+                        hoist_walk(predicate, groups, aggs, scope, &inner).map(Box::new)
+                    })
+                    .transpose()?,
+                projection: projection
                     .as_deref()
-                    .is_some_and(|e| expr_references(e, pred))
+                    .map(|projection| {
+                        hoist_walk(projection, groups, aggs, scope, &inner).map(Box::new)
+                    })
+                    .transpose()?,
+            }
         }
         Expr::Quantifier {
-            list, predicate, ..
-        } => expr_references(list, pred) || expr_references(predicate, pred),
+            kind,
+            var,
+            list,
+            predicate,
+        } => {
+            let list = Box::new(hoist_walk(list, groups, aggs, scope, bound)?);
+            let mut inner = bound.to_vec();
+            inner.push(var.clone());
+            Expr::Quantifier {
+                kind: *kind,
+                var: var.clone(),
+                list,
+                predicate: Box::new(hoist_walk(predicate, groups, aggs, scope, &inner)?),
+            }
+        }
         Expr::Reduce {
+            accumulator,
             init,
+            var,
             list,
             expression,
-            ..
         } => {
-            expr_references(init, pred)
-                || expr_references(list, pred)
-                || expr_references(expression, pred)
+            let init = Box::new(hoist_walk(init, groups, aggs, scope, bound)?);
+            let list = Box::new(hoist_walk(list, groups, aggs, scope, bound)?);
+            let mut inner = bound.to_vec();
+            inner.push(accumulator.clone());
+            inner.push(var.clone());
+            Expr::Reduce {
+                accumulator: accumulator.clone(),
+                init,
+                var: var.clone(),
+                list,
+                expression: Box::new(hoist_walk(expression, groups, aggs, scope, &inner)?),
+            }
         }
-        Expr::Unary { expr, .. } => expr_references(expr, pred),
-        Expr::Binary { left, right, .. } => {
-            expr_references(left, pred) || expr_references(right, pred)
-        }
-        Expr::Function { args, .. } => args.iter().any(|arg| expr_references(arg, pred)),
-        Expr::List(items) => items.iter().any(|item| expr_references(item, pred)),
-        Expr::Map(entries) => entries
-            .iter()
-            .any(|(_, value)| expr_references(value, pred)),
+        Expr::Unary { op, expr: operand } => Expr::Unary {
+            op: *op,
+            expr: Box::new(hoist_walk(operand, groups, aggs, scope, bound)?),
+        },
+        Expr::Binary { op, left, right } => Expr::Binary {
+            op: *op,
+            left: Box::new(hoist_walk(left, groups, aggs, scope, bound)?),
+            right: Box::new(hoist_walk(right, groups, aggs, scope, bound)?),
+        },
+        Expr::Function {
+            name,
+            distinct,
+            star,
+            args,
+        } => Expr::Function {
+            name: name.clone(),
+            distinct: *distinct,
+            star: *star,
+            args: args
+                .iter()
+                .map(|arg| hoist_walk(arg, groups, aggs, scope, bound))
+                .collect::<Result<_>>()?,
+        },
+        Expr::List(items) => Expr::List(
+            items
+                .iter()
+                .map(|item| hoist_walk(item, groups, aggs, scope, bound))
+                .collect::<Result<_>>()?,
+        ),
+        Expr::Map(entries) => Expr::Map(
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    Ok((key.clone(), hoist_walk(value, groups, aggs, scope, bound)?))
+                })
+                .collect::<Result<_>>()?,
+        ),
         Expr::Case {
             subject,
             alternatives,
             default,
-        } => {
-            subject
+        } => Expr::Case {
+            subject: subject
                 .as_deref()
-                .is_some_and(|subject| expr_references(subject, pred))
-                || alternatives
-                    .iter()
-                    .any(|(when, then)| expr_references(when, pred) || expr_references(then, pred))
-                || default
-                    .as_deref()
-                    .is_some_and(|default| expr_references(default, pred))
-        }
-        Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => expr_references(expr, pred),
-    }
-}
-
-/// Whether `expr` references a variable that is not a grouping key or an
-/// aggregation output.
-fn references_unresolved(expr: &Expr, groups: &[(Expr, String)], aggs: &[AggItem]) -> bool {
-    expr_references(expr, &mut |name| {
-        !groups.iter().any(|(_, group)| group == name) && !aggs.iter().any(|item| item.name == name)
+                .map(|subject| hoist_walk(subject, groups, aggs, scope, bound).map(Box::new))
+                .transpose()?,
+            alternatives: alternatives
+                .iter()
+                .map(|(when, then)| {
+                    Ok((
+                        hoist_walk(when, groups, aggs, scope, bound)?,
+                        hoist_walk(then, groups, aggs, scope, bound)?,
+                    ))
+                })
+                .collect::<Result<_>>()?,
+            default: default
+                .as_deref()
+                .map(|default| hoist_walk(default, groups, aggs, scope, bound).map(Box::new))
+                .transpose()?,
+        },
+        Expr::IsNull {
+            expr: inner,
+            negated,
+        } => Expr::IsNull {
+            expr: Box::new(hoist_walk(inner, groups, aggs, scope, bound)?),
+            negated: *negated,
+        },
+        Expr::LabelCheck {
+            expr: inner,
+            labels,
+        } => Expr::LabelCheck {
+            expr: Box::new(hoist_walk(inner, groups, aggs, scope, bound)?),
+            labels: labels.clone(),
+        },
     })
 }
 
-/// Whether `expr` references an aggregation output.
-fn references_aggregation(expr: &Expr, aggs: &[AggItem]) -> bool {
-    expr_references(expr, &mut |name| aggs.iter().any(|item| item.name == name))
+/// Hoist the free variables of a pattern's inline property maps.
+fn hoist_pattern(
+    path: &PatternPath,
+    groups: &mut Vec<(Expr, String)>,
+    aggs: &[AggItem],
+    scope: &FastMap<String, VarKind>,
+    bound: &[String],
+) -> Result<PatternPath> {
+    let mut path = path.clone();
+    if let Some(properties) = &path.start.properties {
+        path.start.properties = Some(hoist_walk(properties, groups, aggs, scope, bound)?);
+    }
+    for segment in &mut path.segments {
+        if let Some(properties) = &segment.relationship.properties {
+            segment.relationship.properties =
+                Some(hoist_walk(properties, groups, aggs, scope, bound)?);
+        }
+    }
+    Ok(path)
+}
+
+/// Append the variables a pattern path binds to `names`.
+fn pattern_variables(path: &PatternPath, names: &mut Vec<String>) {
+    if let Some(name) = &path.variable {
+        names.push(name.clone());
+    }
+    if let Some(name) = &path.start.variable {
+        names.push(name.clone());
+    }
+    for segment in &path.segments {
+        if let Some(name) = &segment.relationship.variable {
+            names.push(name.clone());
+        }
+        if let Some(name) = &segment.node.variable {
+            names.push(name.clone());
+        }
+    }
 }
 
 /// Whether an aggregation appears inside a comprehension body, quantifier
@@ -2619,6 +4070,7 @@ fn has_aggregation_inside_comprehension(expr: &Expr) -> bool {
                 || contains_aggregation(projection)
         }
         Expr::Pattern(path) => pattern_has_aggregation(path),
+        Expr::ExistsSubquery(_) => false,
         Expr::ListComprehension {
             list,
             predicate,
@@ -2690,23 +4142,21 @@ fn has_aggregation_inside_comprehension(expr: &Expr) -> bool {
     }
 }
 
-fn contains_aggregation(expr: &Expr) -> bool {
+/// Call `f` on every direct child expression of `expr`.
+fn for_each_child(expr: &Expr, mut f: &mut dyn FnMut(&Expr)) {
     match expr {
-        Expr::Function { name, args, .. } => {
-            let lower = name.to_ascii_lowercase();
-            matches!(
-                lower.as_str(),
-                "count" | "sum" | "avg" | "min" | "max" | "collect"
-            ) || args.iter().any(contains_aggregation)
-        }
-        Expr::Property { base, .. } | Expr::Unary { expr: base, .. } => contains_aggregation(base),
+        Expr::ExistsSubquery(_) => {}
+        Expr::Function { args, .. } => args.iter().for_each(&mut f),
+        Expr::Property { base, .. } | Expr::Unary { expr: base, .. } => f(base),
         Expr::Subscript { base, index } => {
-            contains_aggregation(base) || contains_aggregation(index)
+            f(base);
+            f(index);
         }
         Expr::Slice { base, lower, upper } => {
-            contains_aggregation(base)
-                || lower.as_deref().is_some_and(contains_aggregation)
-                || upper.as_deref().is_some_and(contains_aggregation)
+            f(base);
+            for bound in [lower, upper].into_iter().flatten() {
+                f(bound);
+            }
         }
         Expr::ListComprehension {
             list,
@@ -2714,52 +4164,124 @@ fn contains_aggregation(expr: &Expr) -> bool {
             projection,
             ..
         } => {
-            contains_aggregation(list)
-                || predicate.as_deref().is_some_and(contains_aggregation)
-                || projection.as_deref().is_some_and(contains_aggregation)
+            f(list);
+            for part in [predicate, projection].into_iter().flatten() {
+                f(part);
+            }
         }
         Expr::Quantifier {
             list, predicate, ..
-        } => contains_aggregation(list) || contains_aggregation(predicate),
+        } => {
+            f(list);
+            f(predicate);
+        }
         Expr::Reduce {
             init,
             list,
             expression,
             ..
         } => {
-            contains_aggregation(init)
-                || contains_aggregation(list)
-                || contains_aggregation(expression)
+            f(init);
+            f(list);
+            f(expression);
         }
         Expr::Binary { left, right, .. } => {
-            contains_aggregation(left) || contains_aggregation(right)
+            f(left);
+            f(right);
         }
-        Expr::List(items) => items.iter().any(contains_aggregation),
-        Expr::Map(entries) => entries.iter().any(|(_, value)| contains_aggregation(value)),
+        Expr::List(items) => items.iter().for_each(&mut f),
+        Expr::Map(entries) => entries.iter().for_each(|(_, value)| f(value)),
         Expr::Case {
             subject,
             alternatives,
             default,
         } => {
-            subject.as_ref().is_some_and(|s| contains_aggregation(s))
-                || alternatives
-                    .iter()
-                    .any(|(a, b)| contains_aggregation(a) || contains_aggregation(b))
-                || default.as_ref().is_some_and(|d| contains_aggregation(d))
+            for part in subject.iter() {
+                f(part);
+            }
+            for (when, then) in alternatives {
+                f(when);
+                f(then);
+            }
+            for part in default.iter() {
+                f(part);
+            }
         }
-        Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => contains_aggregation(expr),
-        Expr::Pattern(path) => pattern_has_aggregation(path),
+        Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => f(expr),
+        Expr::Pattern(path) => pattern_properties(path).iter().for_each(|expr| f(expr)),
         Expr::PatternComprehension {
             path,
             predicate,
             projection,
         } => {
-            pattern_has_aggregation(path)
-                || predicate.as_deref().is_some_and(contains_aggregation)
-                || contains_aggregation(projection)
+            pattern_properties(path).iter().for_each(|expr| f(expr));
+            if let Some(predicate) = predicate {
+                f(predicate);
+            }
+            f(projection);
         }
-        Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => false,
+        Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => {}
     }
+}
+
+/// Whether any subexpression satisfies `pred` (including `expr` itself).
+fn any_subexpr(expr: &Expr, pred: &mut dyn FnMut(&Expr) -> bool) -> bool {
+    if pred(expr) {
+        return true;
+    }
+    let mut found = false;
+    for_each_child(expr, &mut |child| {
+        if !found {
+            found = any_subexpr(child, pred);
+        }
+    });
+    found
+}
+
+/// The inline property expressions of every node and relationship of a path.
+fn pattern_properties(path: &PatternPath) -> Vec<&Expr> {
+    let mut out = Vec::new();
+    if let Some(expr) = &path.start.properties {
+        out.push(expr);
+    }
+    for segment in &path.segments {
+        if let Some(expr) = &segment.node.properties {
+            out.push(expr);
+        }
+        if let Some(expr) = &segment.relationship.properties {
+            out.push(expr);
+        }
+    }
+    out
+}
+
+/// The aggregate function names of the Cypher aggregation family.
+const AGGREGATE_NAMES: [&str; 10] = [
+    "count",
+    "sum",
+    "avg",
+    "min",
+    "max",
+    "collect",
+    "percentilecont",
+    "percentiledisc",
+    "stdev",
+    "stdevp",
+];
+
+fn contains_aggregation(expr: &Expr) -> bool {
+    any_subexpr(expr, &mut |sub| {
+        matches!(sub, Expr::Function { name, .. }
+            if AGGREGATE_NAMES.contains(&name.to_ascii_lowercase().as_str()))
+    })
+}
+
+/// Whether `expr` calls one of the named functions.
+fn contains_function(expr: &Expr, names: &[&str]) -> bool {
+    any_subexpr(expr, &mut |sub| {
+        matches!(sub, Expr::Function { name, .. }
+            if names.contains(&name.to_ascii_lowercase().as_str()))
+    })
 }
 
 // ---- parameter substitution ----
@@ -2849,6 +4371,7 @@ fn substitute_clause(clause: &mut Clause, params: &HashMap<String, Value>) -> Re
             ..
         } => substitute_items(items, order, skip, limit, params),
         Clause::Unwind { expr, .. } => substitute_expr(expr, params),
+        Clause::LoadCsv { source, .. } => substitute_expr(source, params),
     }
 }
 
@@ -2864,6 +4387,23 @@ fn substitute_items(
     }
     for key in order {
         substitute_expr(&mut key.expr, params)?;
+    }
+    // Bad count literals are compile errors; parameter values that only
+    // become literals here are range checked during execution instead.
+    for (bound, what) in [(skip.as_ref(), "SKIP"), (limit.as_ref(), "LIMIT")] {
+        match bound {
+            Some(Expr::Literal(Value::Int(value))) if *value < 0 => {
+                return Err(Error::syntax(format!(
+                    "NegativeIntegerArgument: {what} expects a non-negative integer"
+                )));
+            }
+            Some(Expr::Literal(Value::Float(_))) => {
+                return Err(Error::syntax(format!(
+                    "InvalidArgumentType: {what} expects an integer"
+                )));
+            }
+            _ => {}
+        }
     }
     if let Some(skip) = skip {
         substitute_expr(skip, params)?;
@@ -2916,6 +4456,12 @@ fn substitute_pattern(path: &mut PatternPath, params: &HashMap<String, Value>) -
 
 fn substitute_expr(expr: &mut Expr, params: &HashMap<String, Value>) -> Result<()> {
     match expr {
+        Expr::ExistsSubquery(part) => {
+            for clause in &mut part.clauses {
+                substitute_clause(clause, params)?;
+            }
+            Ok(())
+        }
         Expr::Parameter(name) => {
             let value = params.get(name).cloned().ok_or_else(|| {
                 Error::new(
@@ -3027,5 +4573,335 @@ fn substitute_expr(expr: &mut Expr, params: &HashMap<String, Value>) -> Result<(
         Expr::IsNull { expr, .. } => substitute_expr(expr, params),
         Expr::LabelCheck { expr, .. } => substitute_expr(expr, params),
         Expr::Literal(_) | Expr::Variable(_) => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::vfs::mem::MemVfs;
+
+    fn test_db() -> Database {
+        Database::create(Arc::new(MemVfs::new()), Path::new("plan.db"), 4096).expect("create db")
+    }
+
+    fn prepare(db: &mut Database, source: &str) -> Prepared {
+        let query = crate::cypher::parse(source).expect("parse");
+        plan_query(db, &query, &HashMap::new()).expect("plan")
+    }
+
+    fn text(prepared: &Prepared) -> String {
+        let mut out = String::new();
+        explain(&prepared.plan, 0, &mut out);
+        out
+    }
+
+    #[test]
+    fn unlabeled_match_scans_every_node() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH (n) RETURN n");
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::NodeScan { var, label, .. } = input.as_ref() else {
+            panic!("expected NodeScan, got {input:?}");
+        };
+        assert_eq!(var, "n");
+        assert!(label.is_none());
+    }
+
+    #[test]
+    fn label_scan_keeps_residual_properties() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH (n:Person {name: 'alice'}) RETURN n");
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::NodeScan {
+            var,
+            label,
+            seek,
+            props,
+            ..
+        } = input.as_ref()
+        else {
+            panic!("expected NodeScan, got {input:?}");
+        };
+        assert_eq!(var, "n");
+        assert_eq!(label.as_deref(), Some("Person"));
+        assert!(seek.is_none());
+        assert_eq!(props.len(), 1);
+        assert_eq!(props[0].0, "name");
+    }
+
+    #[test]
+    fn index_seek_is_chosen_for_literal_equality() {
+        let mut db = test_db();
+        let index_id = db
+            .write(|db| db.create_node_index("name", Some("Person"), false))
+            .expect("index");
+        let prepared = prepare(&mut db, "MATCH (n:Person {name: 'alice'}) RETURN n");
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::NodeScan { seek, props, .. } = input.as_ref() else {
+            panic!("expected NodeScan, got {input:?}");
+        };
+        let seek = seek.as_ref().expect("seek");
+        assert_eq!(seek.index_id, index_id);
+        assert_eq!(seek.value, Value::from("alice"));
+        assert!(props.is_empty(), "the lookup consumes the literal");
+    }
+
+    #[test]
+    fn index_seek_is_not_used_for_non_literal_properties() {
+        let mut db = test_db();
+        db.write(|db| db.create_node_index("name", Some("Person"), false))
+            .expect("index");
+        let prepared = prepare(
+            &mut db,
+            "WITH 'alice' AS s MATCH (n:Person {name: s}) RETURN n",
+        );
+        assert!(text(&prepared).contains("seek=-"), "{}", text(&prepared));
+    }
+
+    #[test]
+    fn where_clause_becomes_a_filter_above_the_scan() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH (n) WHERE n.age > 30 RETURN n");
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::Filter { input, .. } = input.as_ref() else {
+            panic!("expected Filter, got {input:?}");
+        };
+        assert!(matches!(input.as_ref(), Plan::NodeScan { label: None, .. }));
+    }
+
+    #[test]
+    fn optional_match_wraps_an_inner_plan() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "OPTIONAL MATCH (n) RETURN n");
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::OptionalMatch { vars, .. } = input.as_ref() else {
+            panic!("expected OptionalMatch, got {input:?}");
+        };
+        assert_eq!(vars, &["n".to_owned()]);
+    }
+
+    #[test]
+    fn var_expand_carries_bounds_and_direction() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH (a:A)-[*1..2]->(b) RETURN b");
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::VarExpand {
+            src,
+            edge,
+            dst,
+            direction,
+            min,
+            max,
+            ..
+        } = input.as_ref()
+        else {
+            panic!("expected VarExpand, got {input:?}");
+        };
+        assert_eq!((src.as_str(), dst.as_str()), ("a", "b"));
+        assert!(
+            edge.as_deref()
+                .is_some_and(|name| name.starts_with("  rel"))
+        );
+        assert_eq!(*direction, RelDirection::Outgoing);
+        assert_eq!((*min, *max), (1, Some(2)));
+    }
+
+    #[test]
+    fn var_expand_defaults_to_unbounded_and_binds_edge_list() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH (a:A)-[r*]->(b) RETURN b");
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::VarExpand { edge, min, max, .. } = input.as_ref() else {
+            panic!("expected VarExpand, got {input:?}");
+        };
+        assert_eq!(edge.as_deref(), Some("r"));
+        assert_eq!(*min, 1);
+        assert_eq!(*max, None);
+    }
+
+    #[test]
+    fn shortest_path_plans_a_search_operator() {
+        let mut db = test_db();
+        let prepared = prepare(
+            &mut db,
+            "MATCH (a:A), (b:B) MATCH p = shortestPath((a)-[:R*]->(b)) RETURN p",
+        );
+        assert!(
+            text(&prepared).contains("ShortestPath a -> b"),
+            "{}",
+            text(&prepared)
+        );
+        let all = prepare(
+            &mut db,
+            "MATCH (a:A), (b:B) MATCH p = allShortestPaths((a)-[:R*]->(b)) RETURN p",
+        );
+        assert!(
+            text(&all).contains("ShortestPath a -> b (all)"),
+            "{}",
+            text(&all)
+        );
+    }
+
+    #[test]
+    fn aggregate_splits_groups_and_aggregations() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH (n:Person) RETURN n.age, count(*) AS c");
+        let Plan::Aggregate { groups, aggs, .. } = &prepared.plan else {
+            panic!("expected Aggregate, got {:?}", prepared.plan);
+        };
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1, "n.age");
+        assert_eq!(aggs.len(), 1);
+        assert_eq!(aggs[0].func, AggFn::Count);
+        assert_eq!(aggs[0].name, "c");
+    }
+
+    #[test]
+    fn distinct_wraps_the_projection() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH (n) RETURN DISTINCT n.age");
+        let Plan::Distinct { input } = &prepared.plan else {
+            panic!("expected Distinct, got {:?}", prepared.plan);
+        };
+        assert!(matches!(input.as_ref(), Plan::Project { .. }));
+    }
+
+    #[test]
+    fn order_skip_and_limit_stack_in_order() {
+        let mut db = test_db();
+        let prepared = prepare(
+            &mut db,
+            "MATCH (n) RETURN n ORDER BY n.age DESC SKIP 1 LIMIT 2",
+        );
+        let Plan::Limit { input, .. } = &prepared.plan else {
+            panic!("expected Limit, got {:?}", prepared.plan);
+        };
+        let Plan::Skip { input, .. } = input.as_ref() else {
+            panic!("expected Skip, got {input:?}");
+        };
+        let Plan::Sort { keys, .. } = input.as_ref() else {
+            panic!("expected Sort, got {input:?}");
+        };
+        assert_eq!(keys.len(), 1);
+        assert!(!keys[0].1, "DESC orders descending");
+    }
+
+    #[test]
+    fn union_all_skips_deduplication() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "RETURN 1 AS x UNION RETURN 2 AS x");
+        let Plan::Distinct { input } = &prepared.plan else {
+            panic!("expected Distinct, got {:?}", prepared.plan);
+        };
+        let Plan::Union { parts, all } = input.as_ref() else {
+            panic!("expected Union, got {input:?}");
+        };
+        assert!(!all);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(prepared.columns, vec!["x".to_owned()]);
+
+        let prepared = prepare(&mut db, "RETURN 1 AS x UNION ALL RETURN 2 AS x");
+        let Plan::Union { all, .. } = &prepared.plan else {
+            panic!("expected Union, got {:?}", prepared.plan);
+        };
+        assert!(all);
+    }
+
+    #[test]
+    fn merge_keeps_the_match_plan_and_creation_items() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MERGE (n:Person {name: 'x'})");
+        let Plan::Merge {
+            match_plan, items, ..
+        } = &prepared.plan
+        else {
+            panic!("expected Merge, got {:?}", prepared.plan);
+        };
+        assert_eq!(items.len(), 1);
+        assert!(matches!(match_plan.as_ref(), Plan::NodeScan { .. }));
+        assert!(prepared.mutating);
+    }
+
+    #[test]
+    fn create_items_mark_the_query_as_mutating() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "CREATE (:A)");
+        let Plan::Create { items, .. } = &prepared.plan else {
+            panic!("expected Create, got {:?}", prepared.plan);
+        };
+        assert_eq!(items.len(), 1);
+        assert!(prepared.mutating);
+        assert!(prepared.columns.is_empty());
+    }
+
+    #[test]
+    fn procedure_call_binds_yield_columns() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "CALL db.labels() YIELD label RETURN label");
+        let rendered = text(&prepared);
+        assert!(
+            rendered.contains("ProcedureCall db.labels label AS label"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn load_csv_keeps_headers_and_terminator() {
+        let mut db = test_db();
+        let prepared = prepare(
+            &mut db,
+            "LOAD CSV WITH HEADERS FROM 'x.csv' AS row FIELDTERMINATOR ';' RETURN row",
+        );
+        let Plan::Project { input, .. } = &prepared.plan else {
+            panic!("expected Project, got {:?}", prepared.plan);
+        };
+        let Plan::LoadCsv {
+            alias,
+            with_headers,
+            field_terminator,
+            ..
+        } = input.as_ref()
+        else {
+            panic!("expected LoadCsv, got {input:?}");
+        };
+        assert_eq!(alias, "row");
+        assert!(*with_headers);
+        assert_eq!(*field_terminator, Some(';'));
+    }
+
+    #[test]
+    fn return_aliases_become_output_columns() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "RETURN 1 AS x, 2 AS y");
+        assert_eq!(prepared.columns, vec!["x".to_owned(), "y".to_owned()]);
+        assert!(!prepared.mutating);
+    }
+
+    #[test]
+    fn anonymous_variables_get_stable_names() {
+        let mut db = test_db();
+        let prepared = prepare(&mut db, "MATCH ()-[r]->() RETURN r");
+        let rendered = text(&prepared);
+        assert!(rendered.contains("node1"), "{rendered}");
+        assert!(rendered.contains("node2"), "{rendered}");
+        assert!(rendered.contains("Expand"), "{rendered}");
     }
 }

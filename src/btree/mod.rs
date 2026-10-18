@@ -22,7 +22,8 @@ use crate::pager::{PageHeader, PageNo, PageType, Pager};
 
 use page::{
     build_interior_cell, build_leaf_cell, cell_child, cell_key, cell_pointer, cell_size,
-    insert_cell_bytes, raw_cell_key, read_all_cells, read_cell_value, rebuild_page, remove_cell_at,
+    free_cell_overflow, insert_cell_bytes, raw_cell_key, read_all_cells, read_cell_value,
+    rebuild_page, remove_cell_at,
 };
 
 pub use cursor::Cursor;
@@ -253,6 +254,58 @@ impl Btree {
     /// Create a cursor positioned before the first key.
     pub fn cursor(&self) -> Cursor {
         Cursor::new(self.root, self.kind)
+    }
+
+    /// Free every page of this tree (interior, leaf and overflow pages).
+    /// The tree handle is unusable afterwards.
+    pub fn destroy(&self, pager: &mut Pager) -> Result<()> {
+        if !pager.in_write_txn() {
+            return Err(Error::misuse("Btree::destroy outside a write transaction"));
+        }
+        let mut stack = vec![self.root];
+        while let Some(page_no) = stack.pop() {
+            let (page_type, cell_count, rightmost) = {
+                let page = pager.page(page_no)?;
+                let header = PageHeader::parse(page.data())?;
+                (header.page_type, header.cell_count, header.rightmost)
+            };
+            if page_type == self.kind.interior_type() {
+                let children = {
+                    let page = pager.page(page_no)?;
+                    let data = page.data();
+                    let mut children = Vec::with_capacity(cell_count as usize + 1);
+                    for idx in 0..cell_count as usize {
+                        children.push(cell_child(data, cell_pointer(data, idx)?)?);
+                    }
+                    children
+                };
+                stack.extend(children);
+                if rightmost != 0 {
+                    stack.push(rightmost);
+                }
+            } else if page_type == self.kind.leaf_type() {
+                let cells = {
+                    let page = pager.page(page_no)?;
+                    let data = page.data();
+                    let mut cells = Vec::with_capacity(cell_count as usize);
+                    for idx in 0..cell_count as usize {
+                        cells.push(cell_pointer(data, idx)?);
+                    }
+                    cells
+                };
+                // Overflow chains are read through the page, so they must be
+                // freed before the page joins the freelist.
+                for ptr in cells {
+                    free_cell_overflow(pager, page_no, self.kind, ptr)?;
+                }
+            } else {
+                return Err(Error::corrupt(format!(
+                    "tree page {page_no} has unexpected type {page_type:?}"
+                )));
+            }
+            pager.free_page(page_no)?;
+        }
+        Ok(())
     }
 
     /// Walk the whole tree validating structure, ordering and dividers.
@@ -784,6 +837,36 @@ mod tests {
             pages_after <= pages_with_big,
             "overflow pages should be reused ({pages_after} > {pages_with_big})"
         );
+        pager.commit().expect("commit");
+    }
+
+    #[test]
+    fn destroy_frees_every_page_and_overflow() {
+        let mut pager = test_pager();
+        pager.begin_write().expect("begin");
+        let mut tree = Btree::create(&mut pager, TreeKind::Index).expect("create");
+        // Enough keys for interior pages and a value that overflows.
+        for i in 0..200u32 {
+            let key = format!("key{i:04}");
+            tree.insert(&mut pager, key.as_bytes(), &[])
+                .expect("insert");
+        }
+        let big = vec![7u8; 20_000];
+        tree.insert(&mut pager, b"overflow", &big)
+            .expect("insert big");
+        let pages = pager.header().page_count;
+        let before_free = pager.header().freelist_count;
+        tree.destroy(&mut pager).expect("destroy");
+        let freed = pager.header().freelist_count - before_free;
+        assert!(
+            freed >= 3,
+            "expected interior, leaf and overflow pages, freed {freed}"
+        );
+        // Every freed page is reusable without growing the file.
+        for _ in 0..freed {
+            pager.alloc_page().expect("alloc");
+        }
+        assert_eq!(pager.header().page_count, pages);
         pager.commit().expect("commit");
     }
 

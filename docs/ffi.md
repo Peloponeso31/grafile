@@ -10,6 +10,22 @@ The API follows SQLite's shape: `open`/`close`, `prepare`/`step`/`column`,
 JSON helpers, SQLite-compatible numeric result codes, and `grafile_free` for
 library-allocated strings.
 
+## Install
+
+Release tarballs carry the shared and static libraries, the header and a
+pkg-config file; `install.sh` places them under a prefix (default
+`~/.local`):
+
+```console
+$ curl -LsSf https://github.com/Peloponeso31/grafile/releases/latest/download/install.sh | sh
+$ export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig:$PKG_CONFIG_PATH"
+$ cc app.c $(pkg-config --cflags --libs grafile)        # dynamic
+$ cc app.c $(pkg-config --cflags --libs --static grafile)  # static
+```
+
+Linux tarballs ship glibc-linked libraries, so musl-based distros (Alpine)
+get the CLI but should build the library from source for FFI use.
+
 ## Build
 
 ```console
@@ -141,7 +157,12 @@ classes overlap.
 
 `GRAFILE_NULL`, `GRAFILE_INT`, `GRAFILE_FLOAT`, `GRAFILE_TEXT`,
 `GRAFILE_BLOB`, `GRAFILE_BOOL`, `GRAFILE_LIST`, `GRAFILE_MAP`,
-`GRAFILE_NODE`, `GRAFILE_EDGE`.
+`GRAFILE_NODE`, `GRAFILE_EDGE`, plus the temporal and spatial kinds
+`GRAFILE_DATE` (10), `GRAFILE_LOCALTIME` (11), `GRAFILE_TIME` (12),
+`GRAFILE_LOCALDATETIME` (13), `GRAFILE_DATETIME` (14),
+`GRAFILE_DURATION` (15) and `GRAFILE_POINT` (16). Temporal values render
+as ISO 8601 text in both the text and JSON accessors; points render as
+`{"srid", "x", "y"[, "z"]}` objects in JSON.
 
 ### JSON conventions
 

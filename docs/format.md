@@ -1,6 +1,6 @@
 # grafile on-disk format
 
-Version 0.1 (format major 0, minor 1). All multi-byte integers are
+Version 0.3 (format major 0, minor 3). All multi-byte integers are
 little-endian unless stated otherwise. The database is a single file; a
 transient `-journal` sidecar exists only while a write transaction is in
 flight (see [Transactions](#transactions)).
@@ -129,6 +129,44 @@ payload uses the same length/overflow encoding as table leaves.
 
 Usable data per overflow page = `page_size - 24`.
 
+## Catalog entries
+
+The catalog B+tree (a table tree) maps 8-byte keys to per-kind payloads.
+Keys pack `(kind u8, id u32)` big-endian into a `u64`. Kinds:
+
+| Kind | Entries |
+|-----:|---------|
+| 1 | label name (UTF-8) |
+| 2 | edge type name (UTF-8) |
+| 3 | property key name (UTF-8) |
+| 4 | anonymous node index (format minor 2) |
+| 5 | anonymous edge index (format minor 2) |
+| 6 | named node index (format minor 3) |
+| 7 | named edge index (format minor 3) |
+| 8 | node `IS NOT NULL` constraint |
+| 9 | edge `IS NOT NULL` constraint |
+
+Anonymous index payloads (kinds 4 and 5) are the format-minor-2 layout:
+varint key id, varint label (node) or type (edge) id, one byte `unique`,
+4-byte little-endian B+tree root.
+
+Named index payloads (kinds 6 and 7):
+
+| Field | Encoding |
+|-------|----------|
+| key count | varint (at least 1) |
+| key ids | varint each, in key order |
+| label (node) or type (edge) id | varint, 0 = any |
+| kind | 1 byte: 0 plain, 1 unique, 2 node key (nodes only) |
+| name | varint `length + 1` (0 = anonymous) + UTF-8 bytes |
+| B+tree root | 4-byte little-endian page number |
+
+Constraint payloads (kinds 8 and 9): varint label/type id, varint property
+key id, varint name length, name bytes. Constraints have no B+tree.
+
+A build that predates format minor 3 reads kinds 1-5 and rejects any file
+containing the newer kinds; builds from minor 3 read both index encodings.
+
 ## Fragment store
 
 The fragment B+tree (index tree) maps 13-byte keys to serialized fragments:
@@ -172,6 +210,13 @@ Values are encoded with a 1-byte tag followed by payload:
 | 5 | text | varint length + UTF-8 bytes |
 | 6 | bytes | varint length + raw bytes |
 | 7 | list | varint count + encoded elements |
+| 8 | date | zigzag varint days since 1970-01-01 |
+| 9 | local time | varint nanoseconds of day |
+| 10 | time | varint nanoseconds of day + zigzag varint offset seconds |
+| 11 | local datetime | zigzag varint seconds + varint nanoseconds |
+| 12 | datetime | zigzag varint local seconds + varint nanoseconds + zigzag varint offset seconds + varint zone length (+1) and UTF-8 zone name (0 when absent) |
+| 13 | duration | zigzag varint months + days + seconds + nanoseconds |
+| 14 | point | 4-byte LE srid + 8-byte LE `x` + 8-byte LE `y` + 8-byte LE `z` (NaN when the point is 2D) |
 
 Null properties are not stored (Cypher treats them as absent).
 
@@ -182,8 +227,12 @@ Edge record: `[edge type varint][src varint][dst varint][property count varint][
 Index keys are order-preserving: type tag, then for integers the sign-flipped
 big-endian u64, for floats the sign-flipped IEEE bits (negative values
 bitwise-negated), for text the escaped bytes with `0x00` mapped to
-`0x00 0xFF` and terminated by `0x00 0x01`, for null just the tag. Composite
-keys concatenate encoded fields.
+`0x00 0xFF` and terminated by `0x00 0x01`, for null just the tag. Temporal
+values (tags 8-14) are encoded as their comparable components (days since
+epoch, nanoseconds of day, instants as wide sign-flipped integers, the
+normalized duration length, point coordinates as order-preserving floats),
+each field sign-flipped where signed. Composite keys concatenate encoded
+fields.
 
 ## Freelist
 
@@ -220,13 +269,16 @@ Commit protocol:
 
 Crash recovery, performed under an exclusive lock on open:
 
-- No journal, or journal header magic zero/invalid: delete the journal if
-  writable; the database is consistent.
+- No journal, or an invalid journal header (magic zeroed or partially
+  zeroed, or a failed header checksum): delete the journal if writable; the
+  database is consistent.
 - Valid journal header: restore each recorded page image, stopping at the
   first record whose checksum fails; then delete the journal.
 
 Because database pages are only written after a valid, synced journal header,
-a torn journal can never correspond to a partially written database.
+a torn journal can never correspond to a partially written database. An
+invalid header is therefore stale, never `Corrupt`: the transaction either
+never touched the database or was already committed and is being invalidated.
 
 ### Multi-connection behavior
 

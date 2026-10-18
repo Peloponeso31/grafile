@@ -1,0 +1,12 @@
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: grafile
+Description: Single-file graph database with a Cypher query engine
+URL: https://github.com/Peloponeso31/grafile
+Version: ${VERSION}
+Libs: -L${libdir} -Wl,-rpath,${libdir} -lgrafile
+Libs.private: ${STATIC_LIBS}
+Cflags: -I${includedir}

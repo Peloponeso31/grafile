@@ -5,6 +5,10 @@ on:
     branches: [master, main]
   pull_request:
 
+concurrency:
+  group: tck-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   tck:
     runs-on: ubuntu-latest

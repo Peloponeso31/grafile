@@ -17,7 +17,8 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
   `CREATE`, `MERGE` (with `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`,
   `DELETE`, `DETACH DELETE`, `UNION` / `UNION ALL`.
 - Patterns: node and relationship patterns, directions, type disjunction
-  (`:A|B`), inline literal property filters, multiple labels, pre-bound
+  (`:A|B`) and label expressions (`:A|B`, `:A&B`, `:!A`), inline literal
+  property filters, multiple labels, pre-bound
   elements (verified instead of re-bound), variable-length paths (`*`, `*2`,
   `*1..3`, `*0..`) with trail semantics, named paths (`p = …`) with
   `nodes()`, `relationships()` and `length()`.
@@ -26,37 +27,47 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
   `reduce()`, `CASE`, `IS [NOT] NULL`, `STARTS WITH` / `ENDS WITH` /
   `CONTAINS` / `=~`, `IN`, label predicates, three-valued logic, numeric
   cross-type comparison.
-- Aggregations: `count`, `sum`, `avg`, `min`, `max`, `collect`, with
-  `DISTINCT` and expressions over aggregations.
+- Aggregations: `count`, `sum`, `avg`, `min`, `max`, `collect`,
+  `percentileCont`, `percentileDisc`, `stDev`, `stDevP`, with `DISTINCT`,
+  multiple arguments and expressions over aggregations.
 - Scalar functions: `id`, `labels`, `type`, `startNode`, `endNode`,
-  `coalesce`, `toString`, `toInteger`, `toFloat`, `size`, `properties`,
-  `keys`, `nodes`, `relationships`, `length`.
+  `coalesce`, `toString`, `toInteger`, `toFloat`, `toBoolean`, `size`,
+  `properties`, `keys`, `nodes`, `relationships`, `length`; list functions
+  (`range`, `head`, `last`, `tail`, `reverse`, `split`, `substring`); string
+  functions (`toUpper`, `toLower`, `trim`/`ltrim`/`rtrim`, `left`, `right`,
+  `replace`); math functions (`abs`, `sign`, `ceil`, `floor`, `round`,
+  `sqrt`, `exp`, `log`, `log10`, trigonometry, `degrees`/`radians`,
+  `haversin`, `pi`, `e`, `rand`).
+- Temporal and spatial values: `date`, `localtime`, `time`, `localdatetime`,
+  `datetime` (fixed offsets and IANA zones), `duration` and `point`, built
+  from strings, component maps or other temporal values; ISO 8601
+  serialization and parsing (week, ordinal and compact dates, named zones,
+  the alternative duration form); component accessors; calendar and clock
+  arithmetic; `duration.between`/`inMonths`/`inDays`/`inSeconds`;
+  `*.truncate` from millennium to microsecond; `distance()` for cartesian
+  and WGS-84 points; statement clock functions
+  (`date.transaction`/`realtime`/`statement` and friends).
+- Schema DDL: `CREATE INDEX`/`CREATE CONSTRAINT` with `IS UNIQUE`,
+  `IS NOT NULL` and `IS NODE KEY`, `DROP INDEX`/`DROP CONSTRAINT` with
+  `IF [NOT] EXISTS`, and the edge forms; constraints are enforced on every
+  write path (see Phase 5). `LOAD CSV [WITH HEADERS] FROM file AS row` reads
+  local CSVs into the row pipeline.
 
 Explicit gaps (currently clear `Unsupported` errors):
 
 | Gap | Where rejected |
 |-----|----------------|
-| Non-literal property values in `MATCH` patterns (`{key: expr}`) | planner |
-| Pattern predicates and pattern comprehensions | parser |
-| `MERGE` with multiple relationships | planner |
 | `REMOVE n = {…}` | codegen |
 | Map projections (`n{.name}`) | parser |
-| Unknown functions | codegen |
+| Unknown functions | codegen (by design) |
 
-Silently absent areas: most of the built-in function library and
-temporal/spatial value types.
+Silently absent areas: none of the openCypher value types.
 
-Known semantic deviations to close:
+Known limitations:
 
-- A write clause followed by a read clause streams rows instead of
-  buffering: `MATCH (a:A) DELETE a MERGE (a2:A)` can still match a node
-  deleted by an earlier row (Phase 4).
-- `ORDER BY` after aggregation may only reference projected values.
-- Aggregations with multiple arguments are rejected (needed for
-  `percentileCont`/`percentileDisc`, Phase 2).
-- Errors that Neo4j detects statically (for example `NOT {true: true}`) are
-  raised at runtime instead, so their phase differs from the TCK.
-- `+` does not coerce the non-string operand to text, so `'p-' + 1` errors.
+- A pattern comprehension inside a list comprehension is rejected (one
+  allow-listed scenario; a general fix needs nested-plan evaluation, so it is
+  not scheduled).
 
 ## Phases
 
@@ -64,11 +75,10 @@ Status markers: `[done]` implemented and gated, `[partial]` some items
 finished, `[pending]` not started. Items the TCK does not exercise are
 verified by unit and integration tests and must not regress the report.
 
-Current baseline: 2084 of 3897 scenarios passing (53.5%), 1813 allow-listed.
-The remaining list is dominated by temporal types (~1000, Phase 3), the
-error-kind/phase and ordering/comparison sweeps (~690, Phase 4), the function
-library (Phase 2), eager evaluation after writes (Phase 4) and CALL procedure
-registration (52, unreachable: the TCK registers test procedures).
+Current baseline: 3844 of 3897 scenarios passing (98.6%), 53 allow-listed.
+The remaining entries are the CALL procedure registration family (52: the
+TCK registers test procedures, a non-goal) and one nested pattern
+comprehension scenario.
 
 ### Phase 1 — Core language completion (large) [done]
 
@@ -89,8 +99,8 @@ registration (52, unreachable: the TCK registers test procedures).
 - [done] Pattern predicates in `WHERE` (including `NOT`, `AND`, `OR`) and
   `exists()`, plus pattern comprehensions (`[p = (a)-->(b) WHERE … | …]`)
   anywhere an expression is allowed (36 scenarios). Nested pattern
-  expressions inside list comprehensions are rejected: their bodies are
-  evaluated per element without plan nodes (one scenario, Phase 4).
+  expressions inside list comprehensions remain rejected: their bodies are
+  evaluated per element without plan nodes (one allow-listed scenario).
 - [done] `shortestPath()` / `allShortestPaths()`: a breadth-first search over
   simple paths, both as a `MATCH` pattern and as an expression (null when no
   path exists), honouring direction, type filters, bounds and unbound
@@ -117,52 +127,62 @@ registration (52, unreachable: the TCK registers test procedures).
   `db.propertyKeys()` and `db.relationshipTypes()`. TCK-blind: unit and
   integration tests only.
 
-### Phase 2 — Function library (medium) [pending]
+### Phase 2 — Function library (medium) [done]
 
-- String: `substring`, `replace`, `split`, `trim`/`ltrim`/`rtrim`,
+- [done] String: `substring`, `replace`, `split`, `trim`/`ltrim`/`rtrim`,
   `left`/`right`, `toUpper`/`toLower`, `reverse`.
-- Math: `abs`, `ceil`, `floor`, `round`, `sign`, `sqrt`, `exp`, `log`,
-  `log10`, trigonometry, `degrees`/`radians`, `pi`, `e`, `rand`.
-- List: `head`, `last`, `tail`, `range`, `size`, `reverse`, `nodes`,
-  `relationships`.
-- Conversions: `toBoolean`, `toString` for every type.
-- Aggregation: `stDev`, `stDevP`, `percentileCont`, `percentileDisc`.
+- [done] Math: `abs`, `ceil`, `floor`, `round`, `sign`, `sqrt`, `exp`, `log`,
+  `log10`, trigonometry (`sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`,
+  `atan2`, `haversin`), `degrees`/`radians`, `pi`, `e`, `rand` (fastrand).
+- [done] List: `head`, `last`, `tail`, `range` (capped at ten million
+  elements), `reverse` for strings and lists.
+- [done] Conversions: `toBoolean`, and `toInteger`/`toFloat`/`toString`
+  follow the TCK matrix (float strings truncate, invalid types raise a
+  runtime `TypeError`).
+- [done] Aggregation: `stDev`, `stDevP` (Welford, TCK-blind) and
+  `percentileCont`/`percentileDisc`, which required multi-argument
+  aggregation plumbing (value plus percentile in the aggregate window).
 
-### Phase 3 — Temporal and spatial types (large, cross-cutting) [pending]
+### Phase 3 — Temporal and spatial types (large, cross-cutting) [done]
 
-The biggest value-system change:
+- [done] New `Value` variants `Date`, `LocalTime`, `Time`, `LocalDateTime`,
+  `DateTime` (offset plus optional IANA zone name), `Duration` (Neo4j's
+  months/days/seconds/nanoseconds that never fold into each other, with the
+  nanosecond field in `[0, 1e9)`) and `Point`; total ordering and equality.
+- [done] Record encode/decode tags, order-preserving index-key encodings,
+  JSON rendering, FFI column kinds, CLI output; storage stays backward
+  compatible (new tags only) with the format minor bumped to 2.
+- [done] Function surface: `date`, `localtime`, `time`, `localdatetime`,
+  `datetime`, `duration` and `point` constructors (strings, field maps with
+  calendar/week/ordinal/quarter keys, whole-value composition and timezone
+  resolution through the bundled IANA database), `distance`, component
+  accessors, `toString`, statement clocks, `*.truncate` (millennium through
+  microsecond), calendar/clock arithmetic and the
+  `duration.between`/`inMonths`/`inDays`/`inSeconds` family.
 
-- New `Value` variants: `Date`, `Time`, `LocalTime`, `DateTime`,
-  `LocalDateTime`, `Duration`, `Point`.
-- Record encode/decode tags, order-preserving index-key encodings,
-  comparison and arithmetic rules.
-- Function surface: `date()`, `datetime()`, `duration()`, `point()`,
-  `distance()`, component accessors.
-- CLI/JSON rendering.
-
-Storage stays backward compatible (new tags only); the format minor version
-is bumped.
-
-### Phase 4 — Semantic conformance sweep (medium, iterative) [pending]
+### Phase 4 — Semantic conformance sweep (medium, iterative) [done]
 
 TCK-driven fixes: null semantics corners, cross-type comparison and
 ordering, `IN` with nulls, list equality, error-vs-null decisions, scope
 boundaries across `WITH`, `SKIP`/`LIMIT` expression rules, and removal of
 the remaining documented deviations.
 
-- Operator coercion: `+` with a string operand converts the other side to
-  text (`'p-' + 1`), matching openCypher; list concatenation follows the
-  same rules. TCK-blind: unit and integration tests only.
-- Statically detectable errors (for example `NOT {true: true}`,
-  `labels(path)`) are reported at compile time instead of runtime.
-- Eager evaluation between a write clause and a later read clause: rows are
-  buffered so that `MATCH … DELETE a MERGE (a2:A)` cannot match a node
-  deleted by an earlier row, matching Neo4j's eager operators.
+Delivered: comparison and ordering semantics (cross-type equality, map
+equality, NaN, list lexicographic order, Neo4j's type order in `ORDER BY`),
+operator precedence and chained comparisons, hex/octal and extreme number
+literals, relationship distinctness and variable-length pattern rules,
+static kind checks with compile-time type errors, pattern binding and
+aggregation scope rules (`AmbiguousAggregationExpression`, ORDER BY over
+projections), runtime argument checks, deleted-entity semantics, eager
+evaluation of updating clauses, `EXISTS { … }` subqueries and source-text
+column names.
 
-### Phase 5 — Neo4j extensions (medium) [pending]
+Not delivered: pattern comprehensions nested inside list comprehensions
+(evaluated per element without plan nodes; one scenario stays allow-listed).
 
-- Cypher DDL for indexes and constraints (today they exist only through the
-  Rust API, and the shell cannot create or drop them):
+### Phase 5 — Neo4j extensions (medium) [done]
+
+- [done] Cypher DDL for indexes and constraints:
   - `CREATE [CONSTRAINT|INDEX] name [IF NOT EXISTS] FOR (n:Label) …` and the
     edge form `FOR ()-[r:TYPE]-() …`, plus `DROP … name [IF EXISTS]`.
   - Constraint kinds: `IS UNIQUE`, `IS NOT NULL` (existence, enforced on
@@ -172,16 +192,23 @@ the remaining documented deviations.
   - Reject the Neo4j 3.x forms (`CREATE INDEX ON :L(p)`, `… ASSERT …`) with a
     message pointing at the modern syntax; `SHOW INDEXES`/`SHOW CONSTRAINTS`
     remain unsupported.
-  - Storage: index definitions gain a name, key list and kind; the catalog
-    entry encoding changes with a format minor bump and stays readable in
-    both directions. Dropping an index frees its B+tree pages.
+  - Storage: index definitions gained a name, key list and kind. The catalog
+    format minor is 3: named objects use new catalog entry kinds and
+    `IS NOT NULL` constraints take entries of their own, so builds from
+    minor 2 reject files that contain them while minor-3 builds read both
+    encodings. Dropping an index frees its B+tree pages.
   - No TCK coverage (openCypher defines no DDL): verified by unit and
     integration tests, and the conformance gate must not regress.
-- `LOAD CSV [WITH HEADERS] FROM …` for local file paths.
-- Label expressions in patterns: `:A|B`, `:!A`.
-- `EXISTS { … }` subqueries.
+- [done] `LOAD CSV [WITH HEADERS] FROM expr AS var [FIELDTERMINATOR char]`
+  for local paths and `file://` URIs (the `csv` crate parses RFC 4180);
+  HTTP stays a non-goal. Headers bind a string map per row, plain files a
+  list of strings, and short rows fill nulls.
+- [done] Label expressions in patterns: `:A|B`, `:A&B`, `:!A` (negation and
+  conjunction are rejected on variable-length and shortest-path patterns).
 
-These stay allow-listed as `neo4j-extension` until this phase.
+The vendored TCK has no scenarios for these extensions, so none of them is
+allow-listed; the allow-list only holds the CALL procedure non-goal and one
+nested pattern comprehension.
 
 ### Phase 6 — Performance for the new surface (medium, interleaved) [pending]
 
@@ -192,11 +219,19 @@ These stay allow-listed as `neo4j-extension` until this phase.
 
 ## Milestones
 
+The gate keeps the applicable pass rate at 100% by construction (allow-listed
+scenarios are excluded), so milestones are stated against the whole suite.
+
 | Milestone | Target |
 |-----------|--------|
-| After Phases 1–2 | ≥ 80% of applicable TCK scenarios pass |
-| After Phase 4 | ≥ 95% of applicable TCK scenarios pass; deviations closed |
-| After Phase 5 | Allow-list contains only non-goals |
+| After Phases 1–2 | 2301 of 3897 scenarios pass (59.0%) |
+| After Phase 3 | 3370 of 3897 scenarios pass (86.5%) |
+| After Phase 4 | ≥ 93% of the whole suite; deviations closed |
+| After Phase 5 | Allow-list contains only non-goals (e.g. registered procedures) |
+
+Phase 4 achieved 3844 of 3897 scenarios (98.6%); the allow-list holds the
+52 CALL procedure scenarios (non-goal) and one nested pattern
+comprehension.
 
 ## Non-goals
 
@@ -213,6 +248,6 @@ These stay allow-listed as `neo4j-extension` until this phase.
    not regress between phases.
 3. Storage-format changes follow `docs/format.md` and bump the format minor
    version; readers remain backward compatible.
-4. Features the TCK does not exercise (DDL, non-literal pattern properties,
-   operator coercions, `FOREACH`) are planned here explicitly and verified by
-   unit and integration tests; they must not regress the TCK report either.
+4. Features the TCK does not exercise (DDL, operator coercions, `stDev`) are
+   planned here explicitly and verified by unit and integration tests; they
+   must not regress the TCK report either.

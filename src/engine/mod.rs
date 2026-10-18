@@ -10,7 +10,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::btree::{Btree, TreeKind};
-use crate::catalog::{Catalog, Schema};
+use crate::catalog::{Catalog, IndexKind, NodeIndexDef, Schema};
+use crate::cypher::{DdlConstraintKind, DdlEntity, DdlStatement};
 use crate::error::{Error, ErrorCode, Result};
 use crate::matrix::{ANY_TYPE, Direction, FragmentKey, FragmentStore};
 use crate::pager::{DatabaseHeader, Pager};
@@ -24,6 +25,31 @@ pub struct Database {
     nodes: Btree,
     edges: Btree,
     fragments: FragmentStore,
+    /// Nodes deleted by the statement in progress. Their records are gone,
+    /// but accessing their properties or labels is an error rather than a
+    /// miss while the statement still references them.
+    deleted_nodes: std::collections::HashSet<u64>,
+    /// Edges deleted by the statement in progress, with their type so
+    /// `type()` can still answer.
+    deleted_edges: std::collections::HashMap<u64, u32>,
+}
+
+/// One variable-length expansion: the relationships in traversal order and
+/// the nodes they connect (one more node than edges).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Trail {
+    /// Relationships in traversal order.
+    pub edges: Vec<u64>,
+    /// Nodes in traversal order; `nodes[i]` and `nodes[i + 1]` are the
+    /// endpoints of `edges[i]`.
+    pub nodes: Vec<u64>,
+}
+
+impl Trail {
+    /// The final node of the trail.
+    pub fn end(&self) -> u64 {
+        *self.nodes.last().expect("a trail always has a start node")
+    }
 }
 
 impl Database {
@@ -48,6 +74,8 @@ impl Database {
             nodes,
             edges,
             fragments,
+            deleted_nodes: std::collections::HashSet::new(),
+            deleted_edges: std::collections::HashMap::new(),
         })
     }
 
@@ -75,6 +103,8 @@ impl Database {
             nodes,
             edges,
             fragments,
+            deleted_nodes: std::collections::HashSet::new(),
+            deleted_edges: std::collections::HashMap::new(),
         })
     }
 
@@ -232,6 +262,7 @@ impl Database {
         let mut labels = labels.to_vec();
         labels.sort_unstable();
         labels.dedup();
+        check_node_existence(self.schema(), &labels, &props)?;
         let record = NodeRecord {
             labels,
             props: normalize_props(props)?,
@@ -299,6 +330,7 @@ impl Database {
         dst: u64,
         props: Vec<(u32, Value)>,
     ) -> Result<u64> {
+        check_edge_existence(self.schema(), edge_type, &props)?;
         let record = EdgeRecord {
             edge_type,
             src,
@@ -350,6 +382,7 @@ impl Database {
             return Ok(false);
         };
         let record = EdgeRecord::decode(&bytes)?;
+        self.deleted_edges.insert(edge_id, record.edge_type);
         self.edges.delete(&mut self.pager, &edge_id.to_be_bytes())?;
         self.set_incidence(&record, edge_id, false)?;
         self.unindex_edge(&record, edge_id)?;
@@ -382,18 +415,70 @@ impl Database {
                 .clear_bit(&mut self.pager, &key, FragmentKey::label_bit(node_id))?;
         }
         self.unindex_node(&record, node_id)?;
+        self.deleted_nodes.insert(node_id);
         Ok(true)
+    }
+
+    /// Forget the deletions of the previous statement.
+    pub fn clear_deleted(&mut self) {
+        self.deleted_nodes.clear();
+        self.deleted_edges.clear();
+    }
+
+    /// Whether the node was deleted by the statement in progress.
+    pub fn node_deleted(&self, node_id: u64) -> bool {
+        self.deleted_nodes.contains(&node_id)
+    }
+
+    /// The type of an edge deleted by the statement in progress.
+    pub fn deleted_edge_type(&self, edge_id: u64) -> Option<u32> {
+        self.deleted_edges.get(&edge_id).copied()
+    }
+
+    /// Reject property values outside the value model: maps and entities,
+    /// lists of lists and lists containing nulls or entities.
+    fn validate_property_value(value: &Value) -> Result<()> {
+        match value {
+            Value::List(items) => {
+                for item in items.iter() {
+                    match item {
+                        Value::Null
+                        | Value::Map(_)
+                        | Value::List(_)
+                        | Value::Node(_)
+                        | Value::Edge(_) => {
+                            return Err(Error::type_error(
+                                "InvalidPropertyType: a property list may only contain \
+                                 primitive values",
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
+            Value::Map(_) | Value::Node(_) | Value::Edge(_) => Err(Error::type_error(
+                "InvalidPropertyType: a property may not be a map or an entity",
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// Replace a node property (or remove it when `value` is null).
     pub fn set_node_property(&mut self, node_id: u64, key_id: u32, value: Value) -> Result<bool> {
         self.require_write()?;
+        if !value.is_null() {
+            Self::validate_property_value(&value)?;
+        }
         let Some(mut record) = self.get_node(node_id)? else {
             return Err(Error::new(
                 ErrorCode::NotFound,
                 format!("node {node_id} does not exist"),
             ));
         };
+        if value.is_null() {
+            check_node_removal(self.schema(), &record.labels, key_id)?;
+        }
         self.unindex_node_property(&record, node_id, key_id)?;
         if value.is_null() {
             record.remove(key_id);
@@ -411,12 +496,18 @@ impl Database {
     /// Replace an edge property (or remove it when `value` is null).
     pub fn set_edge_property(&mut self, edge_id: u64, key_id: u32, value: Value) -> Result<bool> {
         self.require_write()?;
+        if !value.is_null() {
+            Self::validate_property_value(&value)?;
+        }
         let Some(mut record) = self.get_edge(edge_id)? else {
             return Err(Error::new(
                 ErrorCode::NotFound,
                 format!("edge {edge_id} does not exist"),
             ));
         };
+        if value.is_null() {
+            check_edge_removal(self.schema(), record.edge_type, key_id)?;
+        }
         self.unindex_edge_property(&record, edge_id, key_id)?;
         if value.is_null() {
             record.remove(key_id);
@@ -448,7 +539,7 @@ impl Database {
         props: &[(String, Value)],
         min: u32,
         max: Option<u32>,
-    ) -> Result<Vec<(Vec<u64>, u64)>> {
+    ) -> Result<Vec<Trail>> {
         // Property key names are resolved per call, so keys created by the
         // same statement are seen. An unknown key matches nothing.
         let mut keyed = Vec::with_capacity(props.len());
@@ -460,11 +551,15 @@ impl Database {
         }
         let mut out = Vec::new();
         if min == 0 {
-            out.push((Vec::new(), src));
+            out.push(Trail {
+                edges: Vec::new(),
+                nodes: vec![src],
+            });
         }
         let mut trail = Vec::new();
+        let mut nodes = vec![src];
         self.var_expand_rec(
-            src, directions, types, &keyed, min, max, &mut trail, &mut out,
+            src, directions, types, &keyed, min, max, &mut trail, &mut nodes, &mut out,
         )?;
         Ok(out)
     }
@@ -484,7 +579,7 @@ impl Database {
         min: u32,
         max: Option<u32>,
         all: bool,
-    ) -> Result<Vec<(Vec<u64>, u64)>> {
+    ) -> Result<Vec<Trail>> {
         // Property key names are resolved per call, so keys created by the
         // same statement are seen. An unknown key matches nothing.
         let mut keyed = Vec::with_capacity(props.len());
@@ -496,7 +591,7 @@ impl Database {
         }
         // Shortest paths are simple: a node may not repeat. Each frontier
         // entry carries its edge list and visited nodes.
-        let mut out: Vec<(Vec<u64>, u64)> = Vec::new();
+        let mut out: Vec<Trail> = Vec::new();
         let mut frontier: Vec<(u64, Vec<u64>, Vec<u64>)> = vec![(src, Vec::new(), vec![src])];
         let mut length = 0u32;
         let mut emitted: Vec<u64> = Vec::new();
@@ -504,10 +599,13 @@ impl Database {
             if length >= min {
                 match dst {
                     Some(target) => {
-                        let mut found: Vec<(Vec<u64>, u64)> = frontier
+                        let mut found: Vec<Trail> = frontier
                             .iter()
                             .filter(|(node, _, _)| *node == target)
-                            .map(|(node, trail, _)| (trail.clone(), *node))
+                            .map(|(_, trail, nodes)| Trail {
+                                edges: trail.clone(),
+                                nodes: nodes.clone(),
+                            })
                             .collect();
                         if !found.is_empty() {
                             if !all {
@@ -517,17 +615,20 @@ impl Database {
                         }
                     }
                     None => {
-                        let mut found: Vec<(Vec<u64>, u64)> = frontier
+                        let mut found: Vec<Trail> = frontier
                             .iter()
                             .filter(|(node, _, _)| !emitted.contains(node))
-                            .map(|(node, trail, _)| (trail.clone(), *node))
+                            .map(|(_, trail, nodes)| Trail {
+                                edges: trail.clone(),
+                                nodes: nodes.clone(),
+                            })
                             .collect();
                         if !found.is_empty() {
-                            found.sort_unstable_by_key(|(_, node)| *node);
+                            found.sort_unstable_by_key(Trail::end);
                             if !all {
-                                found.dedup_by_key(|(_, node)| *node);
+                                found.dedup_by_key(|trail| trail.end());
                             }
-                            emitted.extend(found.iter().map(|(_, node)| *node));
+                            emitted.extend(found.iter().map(Trail::end));
                             out.extend(found);
                         }
                     }
@@ -569,7 +670,8 @@ impl Database {
         min: u32,
         max: Option<u32>,
         trail: &mut Vec<u64>,
-        out: &mut Vec<(Vec<u64>, u64)>,
+        nodes: &mut Vec<u64>,
+        out: &mut Vec<Trail>,
     ) -> Result<()> {
         if let Some(max) = max
             && trail.len() as u32 >= max
@@ -587,11 +689,16 @@ impl Database {
                 continue;
             }
             trail.push(edge);
+            nodes.push(next);
             if trail.len() as u32 >= min {
-                out.push((trail.clone(), next));
+                out.push(Trail {
+                    edges: trail.clone(),
+                    nodes: nodes.clone(),
+                });
             }
-            self.var_expand_rec(next, directions, types, props, min, max, trail, out)?;
+            self.var_expand_rec(next, directions, types, props, min, max, trail, nodes, out)?;
             trail.pop();
+            nodes.pop();
         }
         Ok(())
     }
@@ -725,21 +832,7 @@ impl Database {
         let index_id = self
             .catalog
             .create_node_index(&mut self.pager, key_id, label_id, unique)?;
-        // Backfill.
-        let mut cursor = self.nodes.cursor();
-        let mut ok = cursor.first(&mut self.pager)?;
-        while ok {
-            let id_bytes: [u8; 8] = cursor
-                .key()
-                .try_into()
-                .map_err(|_| Error::corrupt("node key is not 8 bytes"))?;
-            let node_id = u64::from_be_bytes(id_bytes);
-            let record = NodeRecord::decode(&cursor.value(&mut self.pager)?)?;
-            if label_id == 0 || record.labels.contains(&label_id) {
-                self.insert_index_entry(index_id, &record, node_id, true)?;
-            }
-            ok = cursor.next(&mut self.pager)?;
-        }
+        self.backfill_node_index(index_id)?;
         Ok(index_id)
     }
 
@@ -761,6 +854,309 @@ impl Database {
         let index_id = self
             .catalog
             .create_edge_index(&mut self.pager, key_id, type_id, unique)?;
+        self.backfill_edge_index(index_id)?;
+        Ok(index_id)
+    }
+
+    /// Execute a schema DDL statement.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Exists` when the name is taken (without `IF NOT EXISTS`),
+    /// `NotFound` when a dropped object is missing (without `IF EXISTS`),
+    /// `Misuse` when `DROP INDEX`/`DROP CONSTRAINT` names the other kind and
+    /// `Constraint` when backfilling a new constraint fails.
+    pub fn execute_ddl(&mut self, ddl: &DdlStatement) -> Result<()> {
+        self.require_write()?;
+        match ddl {
+            DdlStatement::CreateIndex(index) => self.create_index_ddl(index),
+            DdlStatement::CreateConstraint(constraint) => self.create_constraint_ddl(constraint),
+            DdlStatement::DropIndex { name, if_exists } => self.drop_index_ddl(name, *if_exists),
+            DdlStatement::DropConstraint { name, if_exists } => {
+                self.drop_constraint_ddl(name, *if_exists)
+            }
+        }
+    }
+
+    fn ensure_ddl_name(&self, name: &str, if_not_exists: bool) -> Result<bool> {
+        if !self.object_name_taken(name) {
+            return Ok(false);
+        }
+        if if_not_exists {
+            return Ok(true);
+        }
+        Err(Error::new(
+            ErrorCode::Exists,
+            format!("an index or constraint named `{name}` already exists"),
+        ))
+    }
+
+    /// Whether any index or constraint carries this name.
+    fn object_name_taken(&self, name: &str) -> bool {
+        let schema = self.schema();
+        schema
+            .node_indexes
+            .iter()
+            .any(|def| def.name.as_deref() == Some(name))
+            || schema
+                .edge_indexes
+                .iter()
+                .any(|def| def.name.as_deref() == Some(name))
+            || schema.node_constraints.iter().any(|def| def.name == name)
+            || schema.edge_constraints.iter().any(|def| def.name == name)
+    }
+
+    fn ensure_ddl_keys(&mut self, keys: &[String]) -> Result<Vec<u32>> {
+        keys.iter()
+            .map(|key| self.catalog.ensure_property_key(&mut self.pager, key))
+            .collect()
+    }
+
+    fn create_index_ddl(&mut self, index: &crate::cypher::DdlIndex) -> Result<()> {
+        if self.ensure_ddl_name(&index.name, index.if_not_exists)? {
+            return Ok(());
+        }
+        let key_ids = self.ensure_ddl_keys(&index.keys)?;
+        match &index.entity {
+            DdlEntity::Node { label } => {
+                let label_id = self.catalog.ensure_label(&mut self.pager, label)?;
+                let id = self.catalog.create_node_index_named(
+                    &mut self.pager,
+                    &index.name,
+                    IndexKind::Index,
+                    &key_ids,
+                    label_id,
+                )?;
+                self.backfill_node_index(id)?;
+            }
+            DdlEntity::Edge { edge_type } => {
+                let type_id = self.catalog.ensure_edge_type(&mut self.pager, edge_type)?;
+                let id = self.catalog.create_edge_index_named(
+                    &mut self.pager,
+                    &index.name,
+                    IndexKind::Index,
+                    &key_ids,
+                    type_id,
+                )?;
+                self.backfill_edge_index(id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn create_constraint_ddl(&mut self, constraint: &crate::cypher::DdlConstraint) -> Result<()> {
+        if self.ensure_ddl_name(&constraint.name, constraint.if_not_exists)? {
+            return Ok(());
+        }
+        let key_ids = self.ensure_ddl_keys(&constraint.keys)?;
+        let kind = match constraint.kind {
+            DdlConstraintKind::Unique => IndexKind::Unique,
+            DdlConstraintKind::NodeKey => IndexKind::NodeKey,
+            DdlConstraintKind::NotNull => {
+                return self.create_not_null_constraint(constraint, key_ids[0]);
+            }
+        };
+        match &constraint.entity {
+            DdlEntity::Node { label } => {
+                let label_id = self.catalog.ensure_label(&mut self.pager, label)?;
+                let id = self.catalog.create_node_index_named(
+                    &mut self.pager,
+                    &constraint.name,
+                    kind,
+                    &key_ids,
+                    label_id,
+                )?;
+                self.backfill_node_index(id)?;
+            }
+            DdlEntity::Edge { edge_type } => {
+                let type_id = self.catalog.ensure_edge_type(&mut self.pager, edge_type)?;
+                let id = self.catalog.create_edge_index_named(
+                    &mut self.pager,
+                    &constraint.name,
+                    kind,
+                    &key_ids,
+                    type_id,
+                )?;
+                self.backfill_edge_index(id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn create_not_null_constraint(
+        &mut self,
+        constraint: &crate::cypher::DdlConstraint,
+        key_id: u32,
+    ) -> Result<()> {
+        match &constraint.entity {
+            DdlEntity::Node { label } => {
+                let label_id = self.catalog.ensure_label(&mut self.pager, label)?;
+                self.catalog.create_node_constraint(
+                    &mut self.pager,
+                    &constraint.name,
+                    label_id,
+                    key_id,
+                )?;
+            }
+            DdlEntity::Edge { edge_type } => {
+                let type_id = self.catalog.ensure_edge_type(&mut self.pager, edge_type)?;
+                self.catalog.create_edge_constraint(
+                    &mut self.pager,
+                    &constraint.name,
+                    type_id,
+                    key_id,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn drop_index_ddl(&mut self, name: &str, if_exists: bool) -> Result<()> {
+        // Index-backed constraints are dropped through DROP CONSTRAINT.
+        if let Some(def) = self
+            .schema()
+            .node_indexes
+            .iter()
+            .find(|def| def.name.as_deref() == Some(name))
+            .cloned()
+        {
+            if def.kind != IndexKind::Index {
+                return Err(Error::misuse(format!(
+                    "`{name}` is a constraint; use DROP CONSTRAINT"
+                )));
+            }
+            return self.free_node_index(&def);
+        }
+        if let Some(def) = self
+            .schema()
+            .edge_indexes
+            .iter()
+            .find(|def| def.name.as_deref() == Some(name))
+            .cloned()
+        {
+            if def.kind != IndexKind::Index {
+                return Err(Error::misuse(format!(
+                    "`{name}` is a constraint; use DROP CONSTRAINT"
+                )));
+            }
+            return self.free_edge_index(&def);
+        }
+        if if_exists {
+            Ok(())
+        } else {
+            Err(Error::new(
+                ErrorCode::NotFound,
+                format!("index `{name}` does not exist"),
+            ))
+        }
+    }
+
+    fn drop_constraint_ddl(&mut self, name: &str, if_exists: bool) -> Result<()> {
+        if let Some(def) = self
+            .schema()
+            .node_indexes
+            .iter()
+            .find(|def| def.name.as_deref() == Some(name))
+            .cloned()
+        {
+            if def.kind == IndexKind::Index {
+                return Err(Error::misuse(format!(
+                    "`{name}` is an index; use DROP INDEX"
+                )));
+            }
+            return self.free_node_index(&def);
+        }
+        if let Some(def) = self
+            .schema()
+            .edge_indexes
+            .iter()
+            .find(|def| def.name.as_deref() == Some(name))
+            .cloned()
+        {
+            if def.kind == IndexKind::Index {
+                return Err(Error::misuse(format!(
+                    "`{name}` is an index; use DROP INDEX"
+                )));
+            }
+            return self.free_edge_index(&def);
+        }
+        if let Some(def) = self
+            .schema()
+            .node_constraints
+            .iter()
+            .find(|def| def.name == name)
+            .cloned()
+        {
+            return self.catalog.remove_node_constraint(&mut self.pager, def.id);
+        }
+        if let Some(def) = self
+            .schema()
+            .edge_constraints
+            .iter()
+            .find(|def| def.name == name)
+            .cloned()
+        {
+            return self.catalog.remove_edge_constraint(&mut self.pager, def.id);
+        }
+        if if_exists {
+            Ok(())
+        } else {
+            Err(Error::new(
+                ErrorCode::NotFound,
+                format!("constraint `{name}` does not exist"),
+            ))
+        }
+    }
+
+    fn free_node_index(&mut self, def: &NodeIndexDef) -> Result<()> {
+        Btree::from_root(def.root, TreeKind::Index).destroy(&mut self.pager)?;
+        self.catalog.remove_node_index(&mut self.pager, def.id)
+    }
+
+    fn free_edge_index(&mut self, def: &crate::catalog::EdgeIndexDef) -> Result<()> {
+        Btree::from_root(def.root, TreeKind::Index).destroy(&mut self.pager)?;
+        self.catalog.remove_edge_index(&mut self.pager, def.id)
+    }
+
+    /// Index every node matching a node index's label.
+    fn backfill_node_index(&mut self, index_id: u32) -> Result<()> {
+        let Some(def) = self
+            .schema()
+            .node_indexes
+            .iter()
+            .find(|def| def.id == index_id)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let mut cursor = self.nodes.cursor();
+        let mut ok = cursor.first(&mut self.pager)?;
+        while ok {
+            let id_bytes: [u8; 8] = cursor
+                .key()
+                .try_into()
+                .map_err(|_| Error::corrupt("node key is not 8 bytes"))?;
+            let node_id = u64::from_be_bytes(id_bytes);
+            let record = NodeRecord::decode(&cursor.value(&mut self.pager)?)?;
+            if def.label_id == 0 || record.labels.contains(&def.label_id) {
+                self.insert_index_entry(index_id, &record, node_id, true)?;
+            }
+            ok = cursor.next(&mut self.pager)?;
+        }
+        Ok(())
+    }
+
+    /// Index every edge matching an edge index's type.
+    fn backfill_edge_index(&mut self, index_id: u32) -> Result<()> {
+        let Some(def) = self
+            .schema()
+            .edge_indexes
+            .iter()
+            .find(|def| def.id == index_id)
+            .cloned()
+        else {
+            return Ok(());
+        };
         let mut cursor = self.edges.cursor();
         let mut ok = cursor.first(&mut self.pager)?;
         while ok {
@@ -770,12 +1166,12 @@ impl Database {
                 .map_err(|_| Error::corrupt("edge key is not 8 bytes"))?;
             let edge_id = u64::from_be_bytes(id_bytes);
             let record = EdgeRecord::decode(&cursor.value(&mut self.pager)?)?;
-            if type_id == 0 || record.edge_type == type_id {
+            if def.type_id == 0 || record.edge_type == def.type_id {
                 self.insert_edge_index_entry(index_id, &record, edge_id, true)?;
             }
             ok = cursor.next(&mut self.pager)?;
         }
-        Ok(index_id)
+        Ok(())
     }
 
     /// All node ids in ascending order.
@@ -862,7 +1258,8 @@ impl Database {
                 .node_indexes
                 .iter()
                 .find(|index| {
-                    index.key_id == *key_id
+                    index.seekable()
+                        && index.key_id() == *key_id
                         && (index.label_id == 0 || labels.contains(&index.label_id))
                 })
                 .cloned();
@@ -903,6 +1300,11 @@ impl Database {
                 format!("node {node_id} does not exist"),
             ));
         };
+        let mut combined = record.labels.clone();
+        combined.extend_from_slice(labels);
+        combined.sort_unstable();
+        combined.dedup();
+        check_node_existence(self.schema(), &combined, &record.props)?;
         self.unindex_node(&record, node_id)?;
         for label in labels {
             if !record.labels.contains(label) {
@@ -959,6 +1361,7 @@ impl Database {
                 format!("node {node_id} does not exist"),
             ));
         };
+        check_node_existence(self.schema(), &record.labels, &props)?;
         self.unindex_node(&record, node_id)?;
         record.props = normalize_props(props)?;
         let key_bytes = node_id.to_be_bytes();
@@ -985,12 +1388,14 @@ impl Database {
                 format!("edge {edge_id} does not exist"),
             ));
         };
+        check_edge_existence(self.schema(), record.edge_type, &props)?;
+        self.unindex_edge(&record, edge_id)?;
+        record.props = normalize_props(props)?;
         let key_bytes = edge_id.to_be_bytes();
         self.edges.delete(&mut self.pager, &key_bytes)?;
-        record.props = normalize_props(props)?;
         self.edges
             .insert(&mut self.pager, &key_bytes, &record.encode())?;
-        Ok(())
+        self.index_edge(&record, edge_id)
     }
 
     fn require_write(&self) -> Result<()> {
@@ -1015,7 +1420,7 @@ impl Database {
     fn unindex_node(&mut self, record: &NodeRecord, node_id: u64) -> Result<()> {
         let indexes: Vec<_> = self.schema().node_indexes.clone();
         for index in indexes {
-            self.delete_index_entry(&index, record.get(index.key_id), node_id)?;
+            self.delete_index_entry(&index, record, node_id)?;
         }
         Ok(())
     }
@@ -1051,7 +1456,7 @@ impl Database {
             .cloned()
             .collect();
         for index in indexes {
-            self.delete_index_entry(&index, record.get(key_id), node_id)?;
+            self.delete_index_entry(&index, record, node_id)?;
         }
         Ok(())
     }
@@ -1072,15 +1477,13 @@ impl Database {
         let Some(def) = def else {
             return Ok(());
         };
-        let Some(value) = record.get(def.key_id) else {
+        let Some(prefix) = node_index_prefix(record, &def) else {
             return Ok(());
         };
         let mut tree = Btree::from_root(def.root, TreeKind::Index);
-        let key = node_index_key(value, node_id);
-        if def.unique {
+        if def.unique() {
             // Index keys embed the entity id, so key uniqueness cannot
             // enforce value uniqueness: probe the value prefix instead.
-            let prefix = index_value_prefix(value);
             let mut cursor = tree.cursor();
             if cursor.seek_ge(&mut self.pager, &prefix)? && cursor.key().starts_with(&prefix) {
                 // Backfill may re-encounter the entry being created.
@@ -1089,27 +1492,31 @@ impl Database {
                     .map_err(|_| Error::corrupt("index key too short"))?;
                 if u64::from_be_bytes(existing) != node_id || !backfill {
                     return Err(Error::constraint(format!(
-                        "unique index on property {} violated by node {node_id}",
-                        def.key_id
+                        "unique index {} violated by node {node_id}",
+                        def.id
                     )));
                 }
             }
         }
+        let mut key = prefix;
+        key.extend_from_slice(&node_id.to_be_bytes());
         tree.insert(&mut self.pager, &key, &[])?;
         self.replace_node_index_root(index_id, tree.root())
     }
 
     fn delete_index_entry(
         &mut self,
-        def: &crate::catalog::NodeIndexDef,
-        value: Option<&Value>,
+        def: &NodeIndexDef,
+        record: &NodeRecord,
         node_id: u64,
     ) -> Result<()> {
-        let Some(value) = value else {
+        let Some(prefix) = node_index_prefix(record, def) else {
             return Ok(());
         };
+        let mut key = prefix;
+        key.extend_from_slice(&node_id.to_be_bytes());
         let mut tree = Btree::from_root(def.root, TreeKind::Index);
-        tree.delete(&mut self.pager, &node_index_key(value, node_id))?;
+        tree.delete(&mut self.pager, &key)?;
         self.replace_node_index_root(def.id, tree.root())
     }
 
@@ -1160,7 +1567,7 @@ impl Database {
     fn unindex_edge(&mut self, record: &EdgeRecord, edge_id: u64) -> Result<()> {
         let indexes: Vec<_> = self.schema().edge_indexes.clone();
         for index in indexes {
-            self.delete_edge_index_entry(&index, record.get(index.key_id), edge_id)?;
+            self.delete_edge_index_entry(&index, record, edge_id)?;
         }
         Ok(())
     }
@@ -1196,7 +1603,7 @@ impl Database {
             .cloned()
             .collect();
         for index in indexes {
-            self.delete_edge_index_entry(&index, record.get(key_id), edge_id)?;
+            self.delete_edge_index_entry(&index, record, edge_id)?;
         }
         Ok(())
     }
@@ -1217,13 +1624,11 @@ impl Database {
         let Some(def) = def else {
             return Ok(());
         };
-        let Some(value) = record.get(def.key_id) else {
+        let Some(prefix) = edge_index_prefix(record, &def) else {
             return Ok(());
         };
         let mut tree = Btree::from_root(def.root, TreeKind::Index);
-        let key = edge_index_key(value, edge_id);
-        if def.unique {
-            let prefix = index_value_prefix(value);
+        if def.unique() {
             let mut cursor = tree.cursor();
             if cursor.seek_ge(&mut self.pager, &prefix)? && cursor.key().starts_with(&prefix) {
                 let existing: [u8; 8] = cursor.key()[cursor.key().len() - 8..]
@@ -1231,12 +1636,14 @@ impl Database {
                     .map_err(|_| Error::corrupt("index key too short"))?;
                 if u64::from_be_bytes(existing) != edge_id || !backfill {
                     return Err(Error::constraint(format!(
-                        "unique index on property {} violated by edge {edge_id}",
-                        def.key_id
+                        "unique index {} violated by edge {edge_id}",
+                        def.id
                     )));
                 }
             }
         }
+        let mut key = prefix;
+        key.extend_from_slice(&edge_id.to_be_bytes());
         tree.insert(&mut self.pager, &key, &[])?;
         self.replace_edge_index_root(index_id, tree.root())
     }
@@ -1244,14 +1651,16 @@ impl Database {
     fn delete_edge_index_entry(
         &mut self,
         def: &crate::catalog::EdgeIndexDef,
-        value: Option<&Value>,
+        record: &EdgeRecord,
         edge_id: u64,
     ) -> Result<()> {
-        let Some(value) = value else {
+        let Some(prefix) = edge_index_prefix(record, def) else {
             return Ok(());
         };
+        let mut key = prefix;
+        key.extend_from_slice(&edge_id.to_be_bytes());
         let mut tree = Btree::from_root(def.root, TreeKind::Index);
-        tree.delete(&mut self.pager, &edge_index_key(value, edge_id))?;
+        tree.delete(&mut self.pager, &key)?;
         self.replace_edge_index_root(def.id, tree.root())
     }
 
@@ -1287,6 +1696,111 @@ impl Database {
     }
 }
 
+/// Enforce `IS NOT NULL` and NODE KEY existence when a node is written.
+fn check_node_existence(schema: &Schema, labels: &[u32], props: &[(u32, Value)]) -> Result<()> {
+    let has = |key_id: u32| {
+        props
+            .iter()
+            .any(|(key, value)| *key == key_id && !value.is_null())
+    };
+    for constraint in &schema.node_constraints {
+        if constraint.label_id != 0 && !labels.contains(&constraint.label_id) {
+            continue;
+        }
+        if !has(constraint.key_id) {
+            return Err(missing_property(
+                schema,
+                &constraint.name,
+                constraint.key_id,
+            ));
+        }
+    }
+    for index in &schema.node_indexes {
+        if index.kind != IndexKind::NodeKey {
+            continue;
+        }
+        if index.label_id != 0 && !labels.contains(&index.label_id) {
+            continue;
+        }
+        for key_id in &index.key_ids {
+            if !has(*key_id) {
+                return Err(missing_property(
+                    schema,
+                    index.name.as_deref().unwrap_or("-"),
+                    *key_id,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Enforce `IS NOT NULL` and NODE KEY existence when one node property goes
+/// away (`SET n.key = null`, `REMOVE n.key`).
+fn check_node_removal(schema: &Schema, labels: &[u32], key_id: u32) -> Result<()> {
+    for constraint in &schema.node_constraints {
+        if constraint.key_id == key_id
+            && (constraint.label_id == 0 || labels.contains(&constraint.label_id))
+        {
+            return Err(missing_property(schema, &constraint.name, key_id));
+        }
+    }
+    for index in &schema.node_indexes {
+        if index.kind == IndexKind::NodeKey
+            && index.key_ids.contains(&key_id)
+            && (index.label_id == 0 || labels.contains(&index.label_id))
+        {
+            return Err(missing_property(
+                schema,
+                index.name.as_deref().unwrap_or("-"),
+                key_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Enforce `IS NOT NULL` existence when an edge is written.
+fn check_edge_existence(schema: &Schema, edge_type: u32, props: &[(u32, Value)]) -> Result<()> {
+    let has = |key_id: u32| {
+        props
+            .iter()
+            .any(|(key, value)| *key == key_id && !value.is_null())
+    };
+    for constraint in &schema.edge_constraints {
+        if constraint.type_id != 0 && constraint.type_id != edge_type {
+            continue;
+        }
+        if !has(constraint.key_id) {
+            return Err(missing_property(
+                schema,
+                &constraint.name,
+                constraint.key_id,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Enforce `IS NOT NULL` existence when one edge property goes away.
+fn check_edge_removal(schema: &Schema, edge_type: u32, key_id: u32) -> Result<()> {
+    for constraint in &schema.edge_constraints {
+        if constraint.key_id == key_id
+            && (constraint.type_id == 0 || constraint.type_id == edge_type)
+        {
+            return Err(missing_property(schema, &constraint.name, key_id));
+        }
+    }
+    Ok(())
+}
+
+fn missing_property(schema: &Schema, object: &str, key_id: u32) -> Error {
+    Error::constraint(format!(
+        "constraint `{object}` requires the property `{}` to exist",
+        schema.property_key_name(key_id).unwrap_or("?")
+    ))
+}
+
 fn normalize_props(props: Vec<(u32, Value)>) -> Result<Vec<(u32, Value)>> {
     for (_, value) in &props {
         validate_property_value(value)?;
@@ -1308,7 +1822,14 @@ fn validate_property_value(value: &Value) -> Result<()> {
         | Value::Int(_)
         | Value::Float(_)
         | Value::Text(_)
-        | Value::Bytes(_) => Ok(()),
+        | Value::Bytes(_)
+        | Value::Date(_)
+        | Value::LocalTime(_)
+        | Value::Time(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime(_)
+        | Value::Duration(_)
+        | Value::Point(_) => Ok(()),
         Value::List(items) => {
             for item in items.iter() {
                 if matches!(
@@ -1329,20 +1850,23 @@ fn validate_property_value(value: &Value) -> Result<()> {
     }
 }
 
-/// Index key for a node: order-preserving value encoding plus node id.
-fn node_index_key(value: &Value, node_id: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(16);
-    encode_index_key(&mut key, value);
-    key.extend_from_slice(&node_id.to_be_bytes());
-    key
+/// Index key columns for a node: the encoded values of every key column in
+/// order. `None` when a keyed property is missing (the node has no entry).
+fn node_index_prefix(record: &NodeRecord, def: &NodeIndexDef) -> Option<Vec<u8>> {
+    let mut prefix = Vec::with_capacity(16 * def.key_ids.len());
+    for key_id in &def.key_ids {
+        encode_index_key(&mut prefix, record.get(*key_id)?);
+    }
+    Some(prefix)
 }
 
-/// Index key for an edge: order-preserving value encoding plus edge id.
-fn edge_index_key(value: &Value, edge_id: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(16);
-    encode_index_key(&mut key, value);
-    key.extend_from_slice(&edge_id.to_be_bytes());
-    key
+/// Index key columns for an edge.
+fn edge_index_prefix(record: &EdgeRecord, def: &crate::catalog::EdgeIndexDef) -> Option<Vec<u8>> {
+    let mut prefix = Vec::with_capacity(16 * def.key_ids.len());
+    for key_id in &def.key_ids {
+        encode_index_key(&mut prefix, record.get(*key_id)?);
+    }
+    Some(prefix)
 }
 
 /// Prefix shared by all index entries with `value`.
@@ -1562,6 +2086,148 @@ mod tests {
             let mut typed = db.edges_of_type(knows)?;
             typed.sort_unstable();
             assert_eq!(typed, vec![e1, e2]);
+            Ok(())
+        })
+        .expect("write");
+    }
+
+    /// Entity ids recorded in the single edge index of the test schema for a
+    /// property value.
+    fn edge_index_entries(db: &mut Database, value: &Value) -> Vec<u64> {
+        let def = db
+            .schema()
+            .edge_indexes
+            .first()
+            .cloned()
+            .expect("edge index");
+        let tree = Btree::from_root(def.root, TreeKind::Index);
+        let mut cursor = tree.cursor();
+        let prefix = index_value_prefix(value);
+        let mut found = Vec::new();
+        let mut ok = cursor.seek_ge(&mut db.pager, &prefix).expect("seek");
+        while ok && cursor.key().starts_with(&prefix) {
+            let key = cursor.key();
+            found.push(u64::from_be_bytes(
+                key[key.len() - 8..].try_into().expect("id"),
+            ));
+            ok = cursor.next(&mut db.pager).expect("next");
+        }
+        found
+    }
+
+    #[test]
+    fn replace_edge_properties_maintains_indexes() {
+        let mut db = temp_db();
+        let (e2, weight) = db
+            .write(|db| {
+                let person = db.ensure_label("Person")?;
+                let knows = db.ensure_edge_type("KNOWS")?;
+                let weight = db.ensure_property_key("weight")?;
+                let a = db.create_node(&[person], vec![])?;
+                let b = db.create_node(&[person], vec![])?;
+                let e1 = db.create_edge(knows, a, b, vec![(weight, Value::Int(1))])?;
+                let e2 = db.create_edge(knows, a, b, vec![(weight, Value::Int(2))])?;
+                db.create_edge_index("weight", Some("KNOWS"), true)?;
+                assert_eq!(edge_index_entries(db, &Value::Int(1)), vec![e1]);
+                assert_eq!(edge_index_entries(db, &Value::Int(2)), vec![e2]);
+                // Whole-map replacement rewrites the index entries in place.
+                db.replace_edge_properties(e1, vec![(weight, Value::Int(3))])?;
+                assert!(edge_index_entries(db, &Value::Int(1)).is_empty());
+                assert_eq!(edge_index_entries(db, &Value::Int(3)), vec![e1]);
+                Ok((e2, weight))
+            })
+            .expect("write");
+        // Uniqueness is enforced on whole-map replacement too, and the
+        // failure rolls the transaction back.
+        let err = db
+            .write(|db| db.replace_edge_properties(e2, vec![(weight, Value::Int(3))]))
+            .expect_err("duplicate");
+        assert_eq!(err.code(), ErrorCode::Constraint);
+        db.write(|db| {
+            assert_eq!(edge_index_entries(db, &Value::Int(2)), vec![e2]);
+            let record = db.get_edge(e2)?.expect("edge");
+            assert_eq!(record.get(weight), Some(&Value::Int(2)));
+            Ok(())
+        })
+        .expect("verify");
+    }
+
+    #[test]
+    fn label_bitmaps_follow_label_add_and_remove() {
+        let mut db = temp_db();
+        db.write(|db| {
+            let person = db.ensure_label("Person")?;
+            let robot = db.ensure_label("Robot")?;
+            let a = db.create_node(&[person], vec![])?;
+            let b = db.create_node(&[], vec![])?;
+
+            db.add_node_labels(b, &[robot])?;
+            assert_eq!(db.label_nodes(person)?, vec![a]);
+            assert_eq!(db.label_nodes(robot)?, vec![b]);
+
+            db.remove_node_labels(a, &[person])?;
+            assert!(db.label_nodes(person)?.is_empty());
+            assert!(db.node_exists(a)?, "the node survives label removal");
+            assert_eq!(db.get_node(a)?.expect("node").labels, Vec::<u32>::new());
+
+            db.add_node_labels(a, &[person])?;
+            assert_eq!(db.label_nodes(person)?, vec![a]);
+            Ok(())
+        })
+        .expect("write");
+    }
+
+    #[test]
+    fn edge_deletion_removes_its_index_entries() {
+        let mut db = temp_db();
+        db.write(|db| {
+            let person = db.ensure_label("Person")?;
+            let knows = db.ensure_edge_type("KNOWS")?;
+            let weight = db.ensure_property_key("weight")?;
+            let a = db.create_node(&[person], vec![])?;
+            let b = db.create_node(&[person], vec![])?;
+            let e = db.create_edge(knows, a, b, vec![(weight, Value::Int(1))])?;
+            db.create_edge_index("weight", Some("KNOWS"), false)?;
+            assert_eq!(edge_index_entries(db, &Value::Int(1)), vec![e]);
+            assert_eq!(db.node_edges(a, Direction::Out, &[])?.len(), 1);
+
+            assert!(db.delete_edge(e)?);
+            assert!(edge_index_entries(db, &Value::Int(1)).is_empty());
+            assert!(db.edges_of_type(knows)?.is_empty());
+            assert_eq!(db.node_edges(a, Direction::Out, &[])?.len(), 0);
+            assert_eq!(
+                db.node_edges(b, Direction::In, &[])?.len(),
+                0,
+                "the in-side bitmap is cleared too"
+            );
+            Ok(())
+        })
+        .expect("write");
+    }
+
+    #[test]
+    fn node_index_entries_follow_property_changes() {
+        let mut db = temp_db();
+        db.write(|db| {
+            let person = db.ensure_label("Person")?;
+            let age = db.ensure_property_key("age")?;
+            let n = db.create_node(&[person], vec![(age, Value::Int(30))])?;
+            let index = db.create_node_index("age", Some("Person"), false)?;
+            assert_eq!(db.index_lookup(index, &Value::Int(30))?, vec![n]);
+
+            db.set_node_property(n, age, Value::Int(40))?;
+            assert!(db.index_lookup(index, &Value::Int(30))?.is_empty());
+            assert_eq!(db.index_lookup(index, &Value::Int(40))?, vec![n]);
+
+            // Null removes the property and its index entry.
+            db.set_node_property(n, age, Value::Null)?;
+            assert!(db.index_lookup(index, &Value::Int(40))?.is_empty());
+            assert_eq!(db.get_node(n)?.expect("node").get(age), None);
+
+            db.set_node_property(n, age, Value::Int(50))?;
+            assert_eq!(db.index_lookup(index, &Value::Int(50))?, vec![n]);
+            db.replace_node_properties(n, vec![])?;
+            assert!(db.index_lookup(index, &Value::Int(50))?.is_empty());
             Ok(())
         })
         .expect("write");

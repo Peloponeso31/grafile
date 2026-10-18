@@ -158,14 +158,20 @@ pub enum Token {
     /// Floating point literal.
     #[regex(r"([0-9]+\.[0-9]+|\.[0-9]+)([eE][+-]?[0-9]+)?|[0-9]+[eE][+-]?[0-9]+")]
     Float,
+    /// Hexadecimal integer literal.
+    #[regex(r"0[xX][0-9a-fA-F]+")]
+    HexInteger,
+    /// Octal integer literal.
+    #[regex(r"0[oO][0-7]+")]
+    OctalInteger,
     /// Single-quoted string.
     #[regex(r"'([^'\\]|\\.)*'")]
     StringSingle,
     /// Double-quoted string.
     #[regex(r#""([^"\\]|\\.)*""#)]
     StringDouble,
-    /// `$parameter`.
-    #[regex(r"\$[A-Za-z_][A-Za-z0-9_]*")]
+    /// `$parameter` (numeric names such as `$1` occur in the TCK).
+    #[regex(r"\$[A-Za-z0-9_]+")]
     Param,
 
     /// `=~`
@@ -234,6 +240,12 @@ pub enum Token {
     /// `|`
     #[token("|")]
     Pipe,
+    /// `!` (label expression negation)
+    #[token("!")]
+    Bang,
+    /// `&` (label expression conjunction)
+    #[token("&")]
+    Amp,
     /// `(`
     #[token("(")]
     LParen,
@@ -431,7 +443,7 @@ fn classify(token: Token, tokens: &[(usize, usize, Token)], index: usize) -> Tok
     match token {
         LineComment | BlockComment => TokenClass::Comment,
         StringSingle | StringDouble => TokenClass::String,
-        Integer | Float => TokenClass::Number,
+        Integer | Float | HexInteger | OctalInteger => TokenClass::Number,
         Param => TokenClass::Parameter,
         Ident => {
             // `name(` is a function or aggregation call.
@@ -447,7 +459,7 @@ fn classify(token: Token, tokens: &[(usize, usize, Token)], index: usize) -> Tok
             TokenClass::Operator
         }
         LParen | RParen | LBracket | RBracket | LBrace | RBrace | Comma | Semicolon | Colon
-        | Pipe | Dot => TokenClass::Punctuation,
+        | Pipe | Bang | Amp | Dot => TokenClass::Punctuation,
         other => {
             debug_assert!(other.is_keyword());
             TokenClass::Keyword
@@ -461,7 +473,7 @@ fn context_class(tokens: &[(usize, usize, Token)], index: usize) -> TokenClass {
         .and_then(|previous| tokens.get(previous))
         .map(|entry| entry.2)
     {
-        Some(Token::Colon) | Some(Token::Pipe) => TokenClass::Label,
+        Some(Token::Colon) | Some(Token::Pipe) | Some(Token::Bang) => TokenClass::Label,
         Some(Token::Dot) => TokenClass::Property,
         _ => TokenClass::Variable,
     }

@@ -147,6 +147,15 @@ pub fn normalize(db: &mut Database, value: &Value) -> Result<Actual, String> {
             }
             Ok(Actual::Map(out))
         }
+        // Temporal and spatial values compare against the TCK's quoted ISO
+        // forms, so they normalize to text.
+        Value::Date(value) => Ok(Actual::Text(value.to_string())),
+        Value::LocalTime(value) => Ok(Actual::Text(value.to_string())),
+        Value::Time(value) => Ok(Actual::Text(value.to_string())),
+        Value::LocalDateTime(value) => Ok(Actual::Text(value.to_string())),
+        Value::DateTime(value) => Ok(Actual::Text(value.to_string())),
+        Value::Duration(value) => Ok(Actual::Text(value.to_string())),
+        Value::Point(value) => Ok(Actual::Text(value.to_string())),
         Value::Node(id) => {
             let record = db
                 .get_node(*id)
@@ -430,6 +439,10 @@ pub fn canonical_expected(value: &Expected) -> String {
 pub fn canonical_actual(value: &Actual) -> String {
     match value {
         Actual::Float(value) => canonical_float(*value),
+        // Escape text exactly like the expected-value renderer so the
+        // order-insensitive comparison matches for values containing
+        // quotes or backslashes.
+        Actual::Text(value) => format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'")),
         Actual::List(items) => {
             let mut keys: Vec<String> = items.iter().map(canonical_actual).collect();
             keys.sort();
