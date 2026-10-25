@@ -431,6 +431,8 @@ pub enum Op {
         cursor: u32,
         /// Constant index of the procedure name.
         name: u32,
+        /// Argument registers, evaluated for the current input row.
+        args: Vec<u32>,
     },
     /// Read a CSV file, filling a row cursor with one value per row.
     LoadCsvOpen {
@@ -732,6 +734,8 @@ pub mod func {
     pub const DURATION_IN_DAYS: u8 = 71;
     /// `duration.inSeconds(from, to)`
     pub const DURATION_IN_SECONDS: u8 = 72;
+    /// `randomUUID()`
+    pub const RANDOM_UUID: u8 = 73;
 }
 
 /// A compiled VDBE program.
@@ -1536,12 +1540,16 @@ impl<'a> Executor<'a> {
                 };
                 self.cursors[*cursor as usize] = Cursor::Trails { items, pos: 0 };
             }
-            Op::ProcedureCallOpen { cursor, name } => {
+            Op::ProcedureCallOpen { cursor, name, args } => {
                 let name = match &self.program.constants[*name as usize] {
                     Value::Text(name) => name.clone(),
                     _ => return Err(Error::internal("procedure name is not text")),
                 };
-                let rows = self.procedure_rows(&name)?;
+                let values: Vec<Value> = args
+                    .iter()
+                    .map(|reg| self.reg_value(*reg))
+                    .collect::<Result<_>>()?;
+                let rows = self.procedure_rows(&name, &values)?;
                 self.cursors[*cursor as usize] = Cursor::Rows { rows, pos: 0 };
             }
             Op::LoadCsvOpen {
@@ -2041,7 +2049,21 @@ impl<'a> Executor<'a> {
     }
 
     /// Output rows of a supported built-in procedure.
-    fn procedure_rows(&self, name: &str) -> Result<Vec<Vec<Reg>>> {
+    fn procedure_rows(&mut self, name: &str, args: &[Value]) -> Result<Vec<Vec<Reg>>> {
+        if name == "db.awaitIndexes" {
+            // Indexes are backfilled synchronously when they are created, so
+            // waiting is a no-op. The timeout argument is accepted and ignored.
+            return match args {
+                [] | [Value::Null] | [Value::Int(_)] => Ok(Vec::new()),
+                [other] => Err(Error::type_error(format!(
+                    "db.awaitIndexes expects an integer timeout in milliseconds, got {}",
+                    other.type_name()
+                ))),
+                _ => Err(Error::type_error(
+                    "db.awaitIndexes accepts at most one argument",
+                )),
+            };
+        }
         let schema = self.db.schema();
         let mut values = Vec::new();
         let mut id = 1u32;
@@ -2299,6 +2321,9 @@ impl<'a> Executor<'a> {
             func::SPLIT => call_split(args),
             func::SUBSTRING => call_substring(args),
             func::RAND => Ok(Value::Float(fastrand::f64())),
+            func::RANDOM_UUID => Ok(Value::Text(Arc::from(
+                uuid::Uuid::new_v4().to_string().as_str(),
+            ))),
             func::TO_UPPER => text_map(args, "toUpper", |text| text.to_uppercase()),
             func::TO_LOWER => text_map(args, "toLower", |text| text.to_lowercase()),
             func::TRIM => text_map(args, "trim", |text| text.trim().to_owned()),

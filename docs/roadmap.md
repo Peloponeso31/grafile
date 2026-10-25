@@ -32,12 +32,14 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
   multiple arguments and expressions over aggregations.
 - Scalar functions: `id`, `labels`, `type`, `startNode`, `endNode`,
   `coalesce`, `toString`, `toInteger`, `toFloat`, `toBoolean`, `size`,
-  `properties`, `keys`, `nodes`, `relationships`, `length`; list functions
-  (`range`, `head`, `last`, `tail`, `reverse`, `split`, `substring`); string
-  functions (`toUpper`, `toLower`, `trim`/`ltrim`/`rtrim`, `left`, `right`,
-  `replace`); math functions (`abs`, `sign`, `ceil`, `floor`, `round`,
-  `sqrt`, `exp`, `log`, `log10`, trigonometry, `degrees`/`radians`,
-  `haversin`, `pi`, `e`, `rand`).
+  `properties`, `keys`, `nodes`, `relationships`, `length`, `randomUUID`;
+  list functions (`range`, `head`, `last`, `tail`, `reverse`, `split`,
+  `substring`); string functions (`toUpper`, `toLower`, `trim`/`ltrim`/
+  `rtrim`, `left`, `right`, `replace`); math functions (`abs`, `sign`, `ceil`,
+  `floor`, `round`, `sqrt`, `exp`, `log`, `log10`, trigonometry,
+  `degrees`/`radians`, `haversin`, `pi`, `e`, `rand`).
+- Built-in procedures: `db.labels()`, `db.propertyKeys()`,
+  `db.relationshipTypes()` and the `db.awaitIndexes([timeout])` no-op.
 - Temporal and spatial values: `date`, `localtime`, `time`, `localdatetime`,
   `datetime` (fixed offsets and IANA zones), `duration` and `point`, built
   from strings, component maps or other temporal values; ISO 8601
@@ -62,6 +64,11 @@ Explicit gaps (currently clear `Unsupported` errors):
 | Unknown functions | codegen (by design) |
 
 Silently absent areas: none of the openCypher value types.
+
+The remaining Neo4j-only bulk-loading constructs (`CALL { ... }`,
+`IN TRANSACTIONS OF n ROWS`, `CREATE FULLTEXT INDEX` and its query procedure)
+are scheduled in Phase 6. Until then they fail with syntax or `Unsupported`
+errors; the seed-script audit is the acceptance fixture.
 
 Known limitations:
 
@@ -210,12 +217,95 @@ The vendored TCK has no scenarios for these extensions, so none of them is
 allow-listed; the allow-list only holds the CALL procedure non-goal and one
 nested pattern comprehension.
 
-### Phase 6 — Performance for the new surface (medium, interleaved) [pending]
+### Phase 6 — Neo4j bulk-load surface (large) [pending]
 
-- Streaming cursors for `OPTIONAL MATCH` and variable-length expansion
-  (avoid full materialization).
-- Bidirectional shortest-path search with early exit.
-- Memory-bounded sort and aggregation (spill to temporary B-trees).
+The acceptance fixture is the audited `seed_big.cypher` (Neo4j 5 style,
+e-commerce/social seed). It must run end to end through the script runner at
+1/100 scale; full-size loading is a Phase 7 performance target, not a Phase 6
+gate.
+
+- [done] Statement runner: make `split_statements` skip `//` line comments and
+  `/* ... */` block comments when finding top-level semicolons, and drop
+  comment-only statements. The audited script used to abort before its first
+  statement because a commented-out wipe ends in `;`. The runner reports the
+  failing statement number and shows progress with `indicatif`.
+- [done] Procedure ABI and scalar functions: accept typed arguments through a
+  procedure table, implement `db.awaitIndexes([timeout])` as a no-op (indexes
+  backfill synchronously), and add `randomUUID()`.
+- [pending] `CALL { ... }` subqueries: parse and plan unit and returning forms,
+  correlated through the leading `WITH` (and optionally `CALL (x) { ... }`).
+  Returning subqueries compile to a row-returning `Apply` node over the
+  existing nested-plan machinery; nested `CALL {}` stays explicitly
+  unsupported until required.
+- [pending] `IN TRANSACTIONS OF n ROWS`: allowed only after a unit subquery.
+  Materialise the outer rows, run the inner write program in batches, commit
+  each batch, leave earlier batches committed on failure, and reject use inside
+  an explicit transaction.
+- [pending] Fulltext indexes: `CREATE FULLTEXT INDEX name [IF NOT EXISTS] FOR
+  (n:Label) ON EACH [n.prop, ...]` and `DROP INDEX`; a new index kind with
+  inverted B+tree storage; maintenance on create, update, label change and
+  delete; backfill with a progress bar;
+  `db.index.fulltext.queryNodes(index, query)` yielding `node, score`. Query
+  v1 covers terms, phrases and `AND`/`OR`; the analyzer is explicitly not
+  Lucene-compatible. The catalog format minor bumps from 3 to 4
+  (`docs/format.md`), with old-build rejection and new-build compatibility
+  tests.
+- [pending] Acceptance fixture: a checked-in 1/100-size variant of the seed
+  script and an integration test asserting node/relationship counts and the
+  sample fulltext query.
+
+The TCK does not exercise this surface; unit and integration tests are the
+gate, and the report must not regress. Non-goals: Lucene query syntax, a
+general user-procedure registry (TCK non-goal), `SHOW INDEXES`/`SHOW
+CONSTRAINTS`, and `CALL {} IN TRANSACTIONS` inside explicit transactions.
+
+### Phase 7 — Query performance, vectorization and SIMD (large) [pending]
+
+This phase absorbs the former Phase 6 items: streaming `OPTIONAL MATCH` and
+variable-length expansion, bidirectional shortest-path search, and
+memory-bounded sort and aggregation.
+
+- Runtime index seeks (highest ROI): plan a seek for equality values bound
+  before the scan, not just literals (`IndexSeek` currently stores a constant
+  `Value`), and push `WHERE n.key = x` down to the scan. This turns the bulk
+  script's `MATCH (u:User {id: uid})` into a lookup: `docs/benchmarks.md`
+  records 15.52 ms for the label scan versus 6.82 µs for the indexed seek at
+  50k nodes.
+- Bulk write path: batched node and edge creation, amortised constraint,
+  index and matrix updates, bulk index backfill, and group commits. Report
+  nodes/s and edges/s on the 1/100 fixture.
+- Batch/vectorized execution: a 1024-row pipeline for scan, filter, project
+  and aggregate; selection vectors, columnar `Int`/`Float`/`Bool`, null
+  bitmaps, and stable-Rust SIMD kernels (`wide`) for comparison, arithmetic
+  and `sum`/`count`/`avg`/`min`/`max`. Heap values fall back to the scalar
+  VM; differential `proptest` tests must prove identical results before a
+  fast path is enabled.
+- SIMD bitmap engine: bulk `Fragment` `and`/`or`/`and_not`/`xor`,
+  intersection tests, cardinality, rank/select and batch row operations.
+  Dense fragments use `wide`; sparse fragments use sorted merges. Use them
+  for multi-label scans, type intersections and batched expansion.
+  `count_ones` already lowers to hardware `popcnt`, so only claim measured
+  wins.
+- Parallel CPU phases: `rayon` for index and fulltext backfill, decoding and
+  large sorts/aggregations, with a single writer. Morsel-driven parallel read
+  scans are a stretch goal.
+- Benchmark gates: Criterion groups for seek versus scan, bitmap operations,
+  numeric filters and aggregates, expansion, bulk load and fulltext, with
+  before/after numbers recorded in `docs/benchmarks.md`.
+
+| Workload | Baseline | Target |
+|----------|----------|--------|
+| Variable-key point lookup, 50k nodes | 15.5 ms (label scan) | ≤ 10 µs (seek) |
+| Seed load, 1/100 scale | Phase 6 baseline | ≥ 3x throughput |
+| Numeric filter, 1M rows | scalar VM | ≥ 1.5x |
+| `sum`/`count`/`avg`, 1M values | scalar VM | ≥ 2x |
+| Dense 8 KiB bitmap AND/OR/cardinality | scalar words | ≥ 1.5x |
+
+`std::simd` is still unstable on rustc 1.99.1, so kernels use `wide`. Any
+`std::arch` specialisation is isolated, runtime-detected and documented;
+`-C target-cpu=native` is never required. Benchmarks run serially, and a SIMD
+path ships only when it beats the scalar reference on the recorded machine,
+with the scalar path retained as the differential oracle.
 
 ## Milestones
 
@@ -228,6 +318,8 @@ scenarios are excluded), so milestones are stated against the whole suite.
 | After Phase 3 | 3370 of 3897 scenarios pass (86.5%) |
 | After Phase 4 | ≥ 93% of the whole suite; deviations closed |
 | After Phase 5 | Allow-list contains only non-goals (e.g. registered procedures) |
+| After Phase 6 | 1/100 seed script runs end to end; TCK report unchanged |
+| After Phase 7 | Bound equality lookups use index seeks; benchmark targets met |
 
 Phase 4 achieved 3844 of 3897 scenarios (98.6%); the allow-list holds the
 52 CALL procedure scenarios (non-goal) and one nested pattern
@@ -248,6 +340,9 @@ comprehension.
    not regress between phases.
 3. Storage-format changes follow `docs/format.md` and bump the format minor
    version; readers remain backward compatible.
-4. Features the TCK does not exercise (DDL, operator coercions, `stDev`) are
-   planned here explicitly and verified by unit and integration tests; they
-   must not regress the TCK report either.
+4. Features the TCK does not exercise (DDL, fulltext, `CALL {}` subqueries,
+   operator coercions, `stDev`) are planned here explicitly and verified by
+   unit and integration tests; they must not regress the TCK report either.
+5. Performance changes land with Criterion benchmark evidence: a vectorized or
+   SIMD path ships only when it beats the scalar reference on the recorded
+   machine, and the scalar path stays as the differential oracle.

@@ -192,6 +192,8 @@ pub enum Plan {
         input: Box<Plan>,
         /// Dotted procedure name.
         procedure: String,
+        /// Argument expressions, evaluated per input row.
+        args: Vec<Expr>,
         /// Output columns in order.
         columns: Vec<String>,
         /// `(column, alias)` pairs to bind.

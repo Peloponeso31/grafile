@@ -170,12 +170,18 @@ impl<'a> Planner<'a> {
                     args,
                     yields,
                 } => {
-                    if !args.is_empty() {
-                        return Err(Error::unsupported(
-                            "procedures with arguments are not supported",
-                        ));
+                    let spec = procedure_spec(procedure)?;
+                    if args.len() < spec.min_args || args.len() > spec.max_args {
+                        return Err(Error::syntax(format!(
+                            "procedure `{procedure}` {}",
+                            argument_arity(spec.min_args, spec.max_args)
+                        )));
                     }
-                    let outputs = procedure_columns(procedure)?;
+                    for arg in args {
+                        validate_expr(arg, &scope)?;
+                    }
+                    let outputs: Vec<String> =
+                        spec.columns.iter().map(|name| (*name).to_owned()).collect();
                     let yields: Vec<(String, String)> = if yields.is_empty() {
                         outputs
                             .iter()
@@ -202,6 +208,7 @@ impl<'a> Planner<'a> {
                     plan = Plan::ProcedureCall {
                         input: Box::new(plan),
                         procedure: procedure.clone(),
+                        args: args.clone(),
                         columns: outputs,
                         yields: yields.clone(),
                     };
@@ -2425,15 +2432,51 @@ fn flip(direction: RelDirection) -> RelDirection {
     }
 }
 
-/// Output columns of a supported built-in procedure.
-fn procedure_columns(name: &str) -> Result<Vec<String>> {
+/// Shape of a supported built-in procedure.
+struct ProcedureSpec {
+    /// Output columns in order.
+    columns: &'static [&'static str],
+    /// Minimum accepted argument count.
+    min_args: usize,
+    /// Maximum accepted argument count.
+    max_args: usize,
+}
+
+/// Description of a supported built-in procedure.
+fn procedure_spec(name: &str) -> Result<ProcedureSpec> {
     match name {
-        "db.labels" => Ok(vec!["label".to_owned()]),
-        "db.propertyKeys" => Ok(vec!["propertyKey".to_owned()]),
-        "db.relationshipTypes" => Ok(vec!["relationshipType".to_owned()]),
+        "db.labels" => Ok(ProcedureSpec {
+            columns: &["label"],
+            min_args: 0,
+            max_args: 0,
+        }),
+        "db.propertyKeys" => Ok(ProcedureSpec {
+            columns: &["propertyKey"],
+            min_args: 0,
+            max_args: 0,
+        }),
+        "db.relationshipTypes" => Ok(ProcedureSpec {
+            columns: &["relationshipType"],
+            min_args: 0,
+            max_args: 0,
+        }),
+        "db.awaitIndexes" => Ok(ProcedureSpec {
+            columns: &[],
+            min_args: 0,
+            max_args: 1,
+        }),
         _ => Err(Error::unsupported(format!(
             "procedure `{name}` is not supported"
         ))),
+    }
+}
+
+/// Human-readable argument count for an arity error.
+fn argument_arity(min: usize, max: usize) -> String {
+    match (min, max) {
+        (0, 0) => "takes no arguments".to_owned(),
+        (min, max) if min == max => format!("takes {min} arguments"),
+        (min, max) => format!("takes between {min} and {max} arguments"),
     }
 }
 
@@ -2743,7 +2786,7 @@ fn static_function_kind(
         | "reverse" | "split" => Kind::List,
         "properties" => Kind::Map,
         "type" | "tostring" | "substring" | "toupper" | "tolower" | "trim" | "ltrim" | "rtrim"
-        | "left" | "right" | "replace" => Kind::Text,
+        | "left" | "right" | "replace" | "randomuuid" => Kind::Text,
         "toboolean" => Kind::Boolean,
         "startnode" | "endnode" => Kind::Node,
         "date" | "localtime" | "time" | "localdatetime" | "datetime" | "duration" => Kind::Temporal,

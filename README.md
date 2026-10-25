@@ -361,9 +361,9 @@ Scalar functions: the graph accessors (`id`, `labels`, `type`, `startNode`,
 `length`), conversions (`toString`, `toInteger`, `toFloat`, `toBoolean`),
 list functions (`range` with two or three arguments, `head`, `last`, `tail`,
 `reverse`, `split`, `substring`, `coalesce`), string functions (`toUpper`,
-`toLower`, `trim`, `ltrim`, `rtrim`, `left`, `right`, `replace`) and the
-math library (`abs`, `sign`, `ceil`, `floor`, `round`, `sqrt`, `exp`, `log`,
-`log10`, `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`, `atan2`,
+`toLower`, `trim`, `ltrim`, `rtrim`, `left`, `right`, `replace`), `randomUUID`
+and the math library (`abs`, `sign`, `ceil`, `floor`, `round`, `sqrt`, `exp`,
+`log`, `log10`, `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`, `atan2`,
 `haversin`, `degrees`, `radians`, `pi`, `e`, `rand`).
 
 Temporal and spatial values are first class: `date`, `localtime`, `time`,
