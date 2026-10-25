@@ -311,6 +311,8 @@ fn encode_dense(words: &[u64; FRAGMENT_WORDS]) -> Vec<u8> {
 struct Bits<'a> {
     sparse: Option<std::slice::Iter<'a, u16>>,
     row_start: u16,
+    /// Whether this iterator is restricted to one 256-bit row.
+    row_scoped: bool,
     dense: Option<DenseBits<'a>>,
 }
 
@@ -319,6 +321,7 @@ impl<'a> Bits<'a> {
         Self {
             sparse: Some(iter),
             row_start: 0,
+            row_scoped: false,
             dense: None,
         }
     }
@@ -327,6 +330,7 @@ impl<'a> Bits<'a> {
         Self {
             sparse: Some(iter),
             row_start,
+            row_scoped: true,
             dense: None,
         }
     }
@@ -335,6 +339,7 @@ impl<'a> Bits<'a> {
         Self {
             sparse: None,
             row_start: 0,
+            row_scoped: false,
             dense: Some(DenseBits {
                 words,
                 next_index: 0,
@@ -354,7 +359,7 @@ impl Iterator for Bits<'_> {
                 if *bit < self.row_start {
                     continue;
                 }
-                if self.row_start != 0 {
+                if self.row_scoped {
                     // Row iteration: stop at the end of the row.
                     let offset = *bit - self.row_start;
                     if offset >= 256 {
@@ -875,6 +880,18 @@ mod tests {
         other.set(FragmentKey::incidence_bit(9, 7));
         assert!(fragment.row_and_nonempty(3, &other, 9));
         assert!(!fragment.row_and_nonempty(3, &other, 8));
+    }
+
+    #[test]
+    fn sparse_row_zero_stops_at_the_first_row() {
+        let mut fragment = Fragment::new();
+        fragment.set(FragmentKey::incidence_bit(0, 7));
+        fragment.set(FragmentKey::incidence_bit(1, 9));
+        fragment.set(FragmentKey::incidence_bit(2, 5));
+        assert_eq!(fragment.iter_bits().collect::<Vec<_>>(), vec![7, 265, 517]);
+        assert_eq!(fragment.row_bits(0).collect::<Vec<_>>(), vec![7]);
+        assert_eq!(fragment.row_bits(1).collect::<Vec<_>>(), vec![9]);
+        assert_eq!(fragment.row_bits(2).collect::<Vec<_>>(), vec![5]);
     }
 
     #[test]

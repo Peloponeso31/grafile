@@ -41,6 +41,29 @@ fn direction_and_undirected() {
 }
 
 #[test]
+fn expansion_from_a_sparse_fragment_row_zero_is_not_duplicated() {
+    let mut conn = connection();
+    conn.execute("CREATE (:Country {id: 1})").expect("seed");
+    query(
+        &mut conn,
+        "UNWIND range(1, 300) AS i \
+         MATCH (co:Country {id: 1}) \
+         CREATE (c:City {id: i})-[:IN_COUNTRY]->(co)",
+    );
+    let rows = query(
+        &mut conn,
+        "MATCH (:City)-[r:IN_COUNTRY]->(:Country) RETURN count(r) AS c",
+    );
+    assert_eq!(rows, vec![vec!["300"]]);
+    // City 255 is node 256, the first row of its incidence fragment.
+    let rows = query(
+        &mut conn,
+        "MATCH (c:City {id: 255})-[r:IN_COUNTRY]->(co) RETURN count(r) AS c, co.id AS country",
+    );
+    assert_eq!(rows, vec![vec!["1", "1"]]);
+}
+
+#[test]
 fn relationship_properties_and_type_filter() {
     let mut conn = connection();
     seed(&mut conn);
