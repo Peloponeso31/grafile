@@ -513,6 +513,17 @@ pub enum Clause {
         /// Yielded columns with optional aliases.
         yields: Vec<(String, Option<String>)>,
     },
+    /// `CALL { ... }` or `CALL (x, y) { ... }` subquery.
+    CallSubquery {
+        /// Inner query part.
+        part: QueryPart,
+        /// Variables imported by a scope clause, or `None` when the inner
+        /// query imports them through its leading `WITH`.
+        scope: Option<Vec<String>>,
+        /// Rows per transaction for `IN TRANSACTIONS OF n ROWS`; `None`
+        /// without the clause.
+        transactions: Option<u32>,
+    },
 }
 
 /// A parsed query: one or more union parts.

@@ -73,6 +73,21 @@ struct Planner<'a> {
     /// re-binding one of these is an error, while a relationship carried
     /// through `WITH` may constrain a later pattern.
     pattern_rels: std::collections::HashSet<String>,
+    /// Nesting level of `CALL { ... }` subqueries; nested subqueries are
+    /// rejected until their execution semantics are defined.
+    subquery_depth: usize,
+}
+
+/// A planned query part and the scope produced by its last projection.
+struct PlannedPart {
+    /// Root of the part's plan.
+    plan: Plan,
+    /// Output column names.
+    columns: Vec<String>,
+    /// Variables visible after the last projection, with their kinds.
+    scope: FastMap<String, VarKind>,
+    /// Whether the part mutates the graph.
+    mutating: bool,
 }
 
 /// Plan a parsed query with the given parameter values.
@@ -86,6 +101,7 @@ pub fn plan_query(
         db,
         anon_counter: 0,
         pattern_rels: std::collections::HashSet::new(),
+        subquery_depth: 0,
     };
     planner.run(&query)
 }
@@ -132,19 +148,21 @@ impl<'a> Planner<'a> {
 
     /// Plan one query part (a pipeline of clauses) on its own scope.
     fn plan_part(&mut self, clauses: &[Clause]) -> Result<(Plan, Vec<String>, bool)> {
-        self.plan_part_with(clauses, FastMap::new())
+        let part = self.plan_part_with(clauses, FastMap::new())?;
+        Ok((part.plan, part.columns, part.mutating))
     }
 
-    /// Plan one query part on top of an initial scope; used by `EXISTS`
-    /// subqueries, whose clauses see the enclosing variables.
+    /// Plan one query part on top of an initial scope; used by `EXISTS` and
+    /// `CALL { ... }` subqueries, whose clauses see the enclosing variables.
     fn plan_part_with(
         &mut self,
         clauses: &[Clause],
         scope: FastMap<String, VarKind>,
-    ) -> Result<(Plan, Vec<String>, bool)> {
+    ) -> Result<PlannedPart> {
         let mut plan = Plan::Empty;
         let mut scope = scope;
         let mut columns = Vec::new();
+        let mut output_scope = FastMap::new();
         let mut mutating = false;
         for clause in clauses {
             match clause {
@@ -215,6 +233,62 @@ impl<'a> Planner<'a> {
                     columns.clear();
                     columns.extend(yields.iter().map(|(_, alias)| alias.clone()));
                 }
+                Clause::CallSubquery {
+                    part,
+                    scope: imported,
+                    transactions,
+                } => {
+                    if let Some(rows) = transactions {
+                        return Err(Error::unsupported(format!(
+                            "CALL {{ ... }} IN TRANSACTIONS OF {rows} ROWS is not supported yet"
+                        )));
+                    }
+                    if self.subquery_depth > 0 {
+                        return Err(Error::unsupported(
+                            "nested CALL { ... } subqueries are not supported",
+                        ));
+                    }
+                    let inner_scope = match imported {
+                        Some(names) => {
+                            let mut selected = FastMap::new();
+                            for name in names {
+                                let Some(kind) = scope.get(name) else {
+                                    return Err(undefined_variable(name));
+                                };
+                                selected.insert(name.clone(), *kind);
+                            }
+                            selected
+                        }
+                        None => scope.clone(),
+                    };
+                    self.subquery_depth += 1;
+                    let planned = self.plan_part_with(&part.clauses, inner_scope);
+                    self.subquery_depth -= 1;
+                    let planned = planned?;
+                    let inner = planned.plan;
+                    let inner_columns = planned.columns;
+                    let inner_scope = planned.scope;
+                    let inner_mutating = planned.mutating;
+                    let returns = matches!(part.clauses.last(), Some(Clause::Return { .. }));
+                    if returns {
+                        for (name, kind) in &inner_scope {
+                            scope.insert(name.clone(), *kind);
+                        }
+                        columns.clear();
+                        columns.extend(inner_columns.iter().cloned());
+                    } else if !inner_mutating {
+                        return Err(Error::syntax(
+                            "a unit CALL { ... } subquery must end with an updating clause",
+                        ));
+                    }
+                    mutating |= inner_mutating;
+                    plan = Plan::CallSubquery {
+                        input: Box::new(plan),
+                        inner: Box::new(inner),
+                        columns: inner_columns,
+                        returns,
+                    };
+                }
                 Clause::Unwind { expr, alias } => {
                     validate_expr(expr, &scope)?;
                     plan = Plan::Unwind {
@@ -271,17 +345,23 @@ impl<'a> Planner<'a> {
                     skip,
                     limit,
                 } => {
-                    let (new_plan, _, new_columns) = self.plan_projection(
+                    let (new_plan, new_scope, new_columns) = self.plan_projection(
                         plan, items, *distinct, order, skip, limit, None, &scope, false,
                     )?;
                     plan = new_plan;
                     columns = new_columns;
+                    output_scope = new_scope;
                     scope.clear();
                     self.pattern_rels.clear();
                 }
             }
         }
-        Ok((plan, columns, mutating))
+        Ok(PlannedPart {
+            plan,
+            columns,
+            scope: output_scope,
+            mutating,
+        })
     }
 
     /// Plan one updating clause (`CREATE`, `MERGE`, `SET`, `REMOVE`,
@@ -543,7 +623,7 @@ impl<'a> Planner<'a> {
                     }
                 }
             }
-            let (inner, _, _) = self.plan_part_with(&part.clauses, scope.clone())?;
+            let inner = self.plan_part_with(&part.clauses, scope.clone())?.plan;
             let hidden = self.anon_name("exists");
             scope.insert(hidden.clone(), VarKind::Value);
             *plan = Plan::PatternPredicate {
@@ -4366,6 +4446,12 @@ fn substitute_clause(clause: &mut Clause, params: &HashMap<String, Value>) -> Re
         Clause::Call { args, .. } => {
             for arg in args.iter_mut() {
                 substitute_expr(arg, params)?;
+            }
+            Ok(())
+        }
+        Clause::CallSubquery { part, .. } => {
+            for clause in part.clauses.iter_mut() {
+                substitute_clause(clause, params)?;
             }
             Ok(())
         }

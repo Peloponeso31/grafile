@@ -344,8 +344,9 @@ property filters including non-literal values),
 `LOAD CSV [WITH HEADERS] FROM file AS row`, `CREATE`, `MERGE` (with
 `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE` /
 `DETACH DELETE`, `FOREACH`, `CALL` for built-in `db.*` procedures,
-`UNION` / `UNION ALL`, `SET n += {…}`, parameters
-(`$name`), list and map literals, map field access and subscript
+`CALL { ... }` unit and returning subqueries (correlated through `WITH` or a
+`CALL (x, y) { ... }` scope clause), `UNION` / `UNION ALL`, `SET n += {…}`,
+parameters (`$name`), list and map literals, map field access and subscript
 (`m.k`, `m['k']`), list indexing and slicing (`list[1..3]`), list
 comprehensions, pattern predicates and pattern comprehensions,
 quantifiers (`all`, `any`, `none`, `single`), `reduce()`,

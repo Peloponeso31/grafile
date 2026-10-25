@@ -199,6 +199,18 @@ pub enum Plan {
         /// `(column, alias)` pairs to bind.
         yields: Vec<(String, String)>,
     },
+    /// Correlated `CALL { ... }` subquery.
+    CallSubquery {
+        /// Input plan; the subquery runs once per input row.
+        input: Box<Plan>,
+        /// Inner plan.
+        inner: Box<Plan>,
+        /// Output column names; empty for a unit subquery.
+        columns: Vec<String>,
+        /// Whether the inner query returns rows (as opposed to a unit
+        /// subquery that only writes).
+        returns: bool,
+    },
     /// Shortest-path search from one endpoint to the other.
     ShortestPath {
         /// Input plan.
@@ -548,6 +560,20 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
+            explain(input, indent + 1, out);
+        }
+        Plan::CallSubquery {
+            input,
+            inner,
+            columns,
+            returns,
+        } => {
+            out.push_str(&format!(
+                "{pad}CallSubquery {} [{}]\n",
+                if *returns { "return" } else { "unit" },
+                columns.join(", ")
+            ));
+            explain(inner, indent + 1, out);
             explain(input, indent + 1, out);
         }
         Plan::PatternPredicate { input, inner, var } => {

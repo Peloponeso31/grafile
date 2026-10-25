@@ -15,7 +15,8 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
 - Clauses: `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN`, `WITH` (with
   `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`, trailing `WHERE`), `UNWIND`,
   `CREATE`, `MERGE` (with `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`,
-  `DELETE`, `DETACH DELETE`, `UNION` / `UNION ALL`.
+  `DELETE`, `DETACH DELETE`, `CALL` for built-ins, `CALL { ... }` unit and
+  returning subqueries, `UNION` / `UNION ALL`.
 - Patterns: node and relationship patterns, directions, type disjunction
   (`:A|B`) and label expressions (`:A|B`, `:A&B`, `:!A`), inline literal
   property filters, multiple labels, pre-bound
@@ -232,11 +233,11 @@ gate.
 - [done] Procedure ABI and scalar functions: accept typed arguments through a
   procedure table, implement `db.awaitIndexes([timeout])` as a no-op (indexes
   backfill synchronously), and add `randomUUID()`.
-- [pending] `CALL { ... }` subqueries: parse and plan unit and returning forms,
+- [done] `CALL { ... }` subqueries: parse and plan unit and returning forms,
   correlated through the leading `WITH` (and optionally `CALL (x) { ... }`).
-  Returning subqueries compile to a row-returning `Apply` node over the
-  existing nested-plan machinery; nested `CALL {}` stays explicitly
-  unsupported until required.
+  Unit subqueries compile inline per input row; returning subqueries collect
+  the inner rows and join them to the outer row. Nested `CALL {}` stays
+  explicitly unsupported until required.
 - [pending] `IN TRANSACTIONS OF n ROWS`: allowed only after a unit subquery.
   Materialise the outer rows, run the inner write program in batches, commit
   each batch, leave earlier batches committed on failure, and reject use inside
