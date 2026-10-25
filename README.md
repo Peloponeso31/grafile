@@ -75,6 +75,8 @@ Design points worth knowing before changing storage code:
   commit, so the database file is self-contained at rest. Readers take a
   shared file lock, writers an exclusive one. The journal is flushed with a
   full sync; database pages and journal invalidation use a normal `fsync`.
+  `CALL { ... } IN TRANSACTIONS OF n ROWS` commits every batch and opens the
+  next write transaction, so earlier batches survive a later failure.
 - **The adjacency index.** `matrix` keeps fixed-size fragments (256 nodes x
   256 edges of bits) as records in a B+tree: an out-plane and an in-plane per
   edge type, plus label and edge-type bitmaps. Fragments are stored sparse
@@ -345,7 +347,8 @@ property filters including non-literal values),
 `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE` /
 `DETACH DELETE`, `FOREACH`, `CALL` for built-in `db.*` procedures,
 `CALL { ... }` unit and returning subqueries (correlated through `WITH` or a
-`CALL (x, y) { ... }` scope clause), `UNION` / `UNION ALL`, `SET n += {…}`,
+`CALL (x, y) { ... }` scope clause, with `IN TRANSACTIONS OF n ROWS` batch
+commits), `UNION` / `UNION ALL`, `SET n += {…}`,
 parameters (`$name`), list and map literals, map field access and subscript
 (`m.k`, `m['k']`), list indexing and slicing (`list[1..3]`), list
 comprehensions, pattern predicates and pattern comprehensions,

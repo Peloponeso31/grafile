@@ -16,7 +16,8 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
   `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`, trailing `WHERE`), `UNWIND`,
   `CREATE`, `MERGE` (with `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`,
   `DELETE`, `DETACH DELETE`, `CALL` for built-ins, `CALL { ... }` unit and
-  returning subqueries, `UNION` / `UNION ALL`.
+  returning subqueries, `CALL { ... } IN TRANSACTIONS OF n ROWS`,
+  `UNION` / `UNION ALL`.
 - Patterns: node and relationship patterns, directions, type disjunction
   (`:A|B`) and label expressions (`:A|B`, `:A&B`, `:!A`), inline literal
   property filters, multiple labels, pre-bound
@@ -66,10 +67,10 @@ Explicit gaps (currently clear `Unsupported` errors):
 
 Silently absent areas: none of the openCypher value types.
 
-The remaining Neo4j-only bulk-loading constructs (`CALL { ... }`,
-`IN TRANSACTIONS OF n ROWS`, `CREATE FULLTEXT INDEX` and its query procedure)
-are scheduled in Phase 6. Until then they fail with syntax or `Unsupported`
-errors; the seed-script audit is the acceptance fixture.
+The remaining Neo4j-only bulk-loading constructs (`CREATE FULLTEXT INDEX`
+and its query procedure) are scheduled in Phase 6. Until then they fail with
+syntax or `Unsupported` errors; the seed-script audit is the acceptance
+fixture.
 
 Known limitations:
 
@@ -238,10 +239,11 @@ gate.
   Unit subqueries compile inline per input row; returning subqueries collect
   the inner rows and join them to the outer row. Nested `CALL {}` stays
   explicitly unsupported until required.
-- [pending] `IN TRANSACTIONS OF n ROWS`: allowed only after a unit subquery.
-  Materialise the outer rows, run the inner write program in batches, commit
-  each batch, leave earlier batches committed on failure, and reject use inside
-  an explicit transaction.
+- [done] `IN TRANSACTIONS OF n ROWS`: allowed only after a unit subquery.
+  Each input row counts toward the batch; the VM commits and reopens the write
+  transaction at every boundary, so earlier batches survive a later failure.
+  Explicit transactions are rejected, and the parser defaults the batch size
+  to 1000 rows.
 - [pending] Fulltext indexes: `CREATE FULLTEXT INDEX name [IF NOT EXISTS] FOR
   (n:Label) ON EACH [n.prop, ...]` and `DROP INDEX`; a new index kind with
   inverted B+tree storage; maintenance on create, update, label change and

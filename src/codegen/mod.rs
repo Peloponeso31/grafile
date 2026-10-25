@@ -63,6 +63,7 @@ pub fn compile(prepared: &Prepared) -> Result<Program> {
         register_count: cg.next_reg as usize,
         columns: prepared.columns.clone(),
         mutating: prepared.mutating,
+        batch_transactions: prepared.batch_transactions,
     })
 }
 
@@ -485,11 +486,15 @@ impl Codegen {
                 inner,
                 columns,
                 returns,
+                transactions,
             } => self.compile(input, ctx, &mut |cg, outer_ctx| {
                 if !returns {
                     // A unit subquery runs its inner plan once per input row;
                     // the outer row passes through unchanged.
                     cg.compile(inner, outer_ctx, &mut |_cg, _inner_ctx| Ok(()))?;
+                    if let Some(rows) = transactions {
+                        cg.emit(Op::BatchCommit { rows: *rows });
+                    }
                     return out(cg, outer_ctx);
                 }
                 let cursor = cg.alloc_cursor();

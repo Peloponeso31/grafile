@@ -281,6 +281,11 @@ pub enum Op {
         /// Number of registers.
         count: u32,
     },
+    /// Commit the current transaction and begin the next batch.
+    BatchCommit {
+        /// Input rows per transaction.
+        rows: u32,
+    },
     /// Hash-aggregate collected rows.
     HashAggregate {
         /// Cursor slot.
@@ -753,6 +758,8 @@ pub struct Program {
     pub columns: Vec<String>,
     /// Whether the program mutates the graph.
     pub mutating: bool,
+    /// Whether the program commits in batches (`CALL { ... } IN TRANSACTIONS`).
+    pub batch_transactions: bool,
 }
 
 /// Execute a program and return its result rows.
@@ -769,6 +776,7 @@ pub fn execute(db: &mut Database, program: &Program) -> Result<Vec<Vec<Value>>> 
         statement_time: system_local_datetime(),
         pc: 0,
         steps: 0,
+        batch_rows: 0,
     };
     executor.run()?;
     Ok(executor.results)
@@ -815,6 +823,8 @@ struct Executor<'a> {
     statement_time: LocalDateTime,
     pc: usize,
     steps: u64,
+    /// Number of outer rows seen by `IN TRANSACTIONS` batch commits.
+    batch_rows: u64,
 }
 
 impl<'a> Executor<'a> {
@@ -1341,6 +1351,13 @@ impl<'a> Executor<'a> {
                 match &mut self.cursors[*cursor as usize] {
                     Cursor::Rows { rows, .. } => rows.push(row),
                     _ => return Err(Error::internal("CollectRow on a non-row cursor")),
+                }
+            }
+            Op::BatchCommit { rows } => {
+                self.batch_rows += 1;
+                if self.batch_rows.is_multiple_of(u64::from((*rows).max(1))) {
+                    self.db.commit()?;
+                    self.db.begin_write()?;
                 }
             }
             Op::HashAggregate {
@@ -4353,6 +4370,7 @@ mod tests {
             register_count: registers as usize,
             columns: Vec::new(),
             mutating: false,
+            batch_transactions: false,
         }
     }
 

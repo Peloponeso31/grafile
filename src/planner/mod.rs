@@ -34,6 +34,9 @@ pub struct Prepared {
     pub columns: Vec<String>,
     /// Whether the query mutates the graph.
     pub mutating: bool,
+    /// Whether the plan contains `CALL { ... } IN TRANSACTIONS` and therefore
+    /// manages its own commit boundaries.
+    pub batch_transactions: bool,
 }
 
 /// Kind of a variable in scope.
@@ -76,6 +79,8 @@ struct Planner<'a> {
     /// Nesting level of `CALL { ... }` subqueries; nested subqueries are
     /// rejected until their execution semantics are defined.
     subquery_depth: usize,
+    /// Whether a `CALL { ... } IN TRANSACTIONS` clause was planned.
+    batch_transactions: bool,
 }
 
 /// A planned query part and the scope produced by its last projection.
@@ -102,6 +107,7 @@ pub fn plan_query(
         anon_counter: 0,
         pattern_rels: std::collections::HashSet::new(),
         subquery_depth: 0,
+        batch_transactions: false,
     };
     planner.run(&query)
 }
@@ -143,6 +149,7 @@ impl<'a> Planner<'a> {
             plan,
             columns,
             mutating,
+            batch_transactions: self.batch_transactions,
         })
     }
 
@@ -238,11 +245,6 @@ impl<'a> Planner<'a> {
                     scope: imported,
                     transactions,
                 } => {
-                    if let Some(rows) = transactions {
-                        return Err(Error::unsupported(format!(
-                            "CALL {{ ... }} IN TRANSACTIONS OF {rows} ROWS is not supported yet"
-                        )));
-                    }
                     if self.subquery_depth > 0 {
                         return Err(Error::unsupported(
                             "nested CALL { ... } subqueries are not supported",
@@ -281,12 +283,31 @@ impl<'a> Planner<'a> {
                             "a unit CALL { ... } subquery must end with an updating clause",
                         ));
                     }
+                    if let Some(rows) = *transactions {
+                        if rows == 0 {
+                            return Err(Error::syntax(
+                                "CALL { ... } IN TRANSACTIONS requires a positive row count",
+                            ));
+                        }
+                        if returns {
+                            return Err(Error::syntax(
+                                "CALL { ... } IN TRANSACTIONS cannot return rows",
+                            ));
+                        }
+                        if self.batch_transactions {
+                            return Err(Error::syntax(
+                                "only one CALL { ... } IN TRANSACTIONS is allowed per query",
+                            ));
+                        }
+                        self.batch_transactions = true;
+                    }
                     mutating |= inner_mutating;
                     plan = Plan::CallSubquery {
                         input: Box::new(plan),
                         inner: Box::new(inner),
                         columns: inner_columns,
                         returns,
+                        transactions: *transactions,
                     };
                 }
                 Clause::Unwind { expr, alias } => {

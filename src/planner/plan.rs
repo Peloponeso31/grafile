@@ -210,6 +210,8 @@ pub enum Plan {
         /// Whether the inner query returns rows (as opposed to a unit
         /// subquery that only writes).
         returns: bool,
+        /// Rows per transaction for `IN TRANSACTIONS OF n ROWS`.
+        transactions: Option<u32>,
     },
     /// Shortest-path search from one endpoint to the other.
     ShortestPath {
@@ -567,12 +569,17 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
             inner,
             columns,
             returns,
+            transactions,
         } => {
             out.push_str(&format!(
-                "{pad}CallSubquery {} [{}]\n",
+                "{pad}CallSubquery {} [{}]{}",
                 if *returns { "return" } else { "unit" },
-                columns.join(", ")
+                columns.join(", "),
+                transactions
+                    .map(|rows| format!(" in_transactions={rows}"))
+                    .unwrap_or_default()
             ));
+            out.push('\n');
             explain(inner, indent + 1, out);
             explain(input, indent + 1, out);
         }
