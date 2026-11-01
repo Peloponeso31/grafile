@@ -25,6 +25,7 @@ use grafile::cypher::split_statements;
 use grafile::json::{JsonColors, JsonOptions, format_unix_utc, row_object_json, value_json};
 use grafile::record::Value;
 use grafile::vdbe::format_value;
+use indicatif::{ProgressBar, ProgressStyle};
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
 use rustyline::highlight::{CmdKind, Highlighter};
@@ -90,15 +91,38 @@ fn run() -> Result<()> {
     if let Some(script) = script {
         let text = std::fs::read_to_string(&script)
             .with_context(|| format!("cannot read script `{script}`"))?;
-        for statement in split_statements(&text) {
+        let statements = split_statements(&text);
+        let total = statements.len();
+        let progress = script_progress(total);
+        for (index, statement) in statements.iter().enumerate() {
             if statement.trim().is_empty() {
                 continue;
             }
-            run_query(&mut conn, &statement, &settings)?;
+            progress.set_message(format!("statement {}/{}", index + 1, total));
+            if let Err(error) = run_query(&mut conn, statement, &settings) {
+                progress.finish_and_clear();
+                return Err(error.context(format!("statement {} failed", index + 1)));
+            }
+            progress.inc(1);
         }
+        progress.finish_and_clear();
         return Ok(());
     }
     repl(&mut conn)
+}
+
+/// Progress for the script runner; hidden when stderr is not a terminal.
+fn script_progress(total: usize) -> ProgressBar {
+    if !std::io::stderr().is_terminal() {
+        return ProgressBar::hidden();
+    }
+    let style =
+        ProgressStyle::with_template("{spinner:.green} {msg} {pos}/{len} [{elapsed_precise}]")
+            .expect("valid script progress template");
+    let progress = ProgressBar::new(total as u64);
+    progress.set_style(style);
+    progress.set_message("running script");
+    progress
 }
 
 fn open_or_create(path: &str) -> Result<Connection> {

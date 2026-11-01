@@ -192,10 +192,26 @@ pub enum Plan {
         input: Box<Plan>,
         /// Dotted procedure name.
         procedure: String,
+        /// Argument expressions, evaluated per input row.
+        args: Vec<Expr>,
         /// Output columns in order.
         columns: Vec<String>,
         /// `(column, alias)` pairs to bind.
         yields: Vec<(String, String)>,
+    },
+    /// Correlated `CALL { ... }` subquery.
+    CallSubquery {
+        /// Input plan; the subquery runs once per input row.
+        input: Box<Plan>,
+        /// Inner plan.
+        inner: Box<Plan>,
+        /// Output column names; empty for a unit subquery.
+        columns: Vec<String>,
+        /// Whether the inner query returns rows (as opposed to a unit
+        /// subquery that only writes).
+        returns: bool,
+        /// Rows per transaction for `IN TRANSACTIONS OF n ROWS`.
+        transactions: Option<u32>,
     },
     /// Shortest-path search from one endpoint to the other.
     ShortestPath {
@@ -546,6 +562,25 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
                     .collect::<Vec<_>>()
                     .join(", ")
             ));
+            explain(input, indent + 1, out);
+        }
+        Plan::CallSubquery {
+            input,
+            inner,
+            columns,
+            returns,
+            transactions,
+        } => {
+            out.push_str(&format!(
+                "{pad}CallSubquery {} [{}]{}",
+                if *returns { "return" } else { "unit" },
+                columns.join(", "),
+                transactions
+                    .map(|rows| format!(" in_transactions={rows}"))
+                    .unwrap_or_default()
+            ));
+            out.push('\n');
+            explain(inner, indent + 1, out);
             explain(input, indent + 1, out);
         }
         Plan::PatternPredicate { input, inner, var } => {

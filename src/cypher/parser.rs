@@ -825,6 +825,23 @@ impl<'a> Parser<'a> {
 
     fn parse_call_clause(&mut self) -> Result<Clause> {
         self.advance();
+        if self.peek() == Some(Token::LBrace) {
+            return self.parse_call_subquery(None);
+        }
+        if self.peek() == Some(Token::LParen) {
+            self.advance();
+            let mut scope = Vec::new();
+            if self.peek() != Some(Token::RParen) {
+                loop {
+                    scope.push(self.parse_name()?);
+                    if !self.eat(Token::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(Token::RParen, "')' to close the CALL scope")?;
+            return self.parse_call_subquery(Some(scope));
+        }
         let mut procedure = self.parse_name()?;
         while self.eat(Token::Dot) {
             procedure.push('.');
@@ -855,6 +872,37 @@ impl<'a> Parser<'a> {
             procedure,
             args,
             yields,
+        })
+    }
+
+    /// Parse the body of a `CALL { ... }` subquery and its optional
+    /// `IN TRANSACTIONS [OF n ROWS]` suffix.
+    fn parse_call_subquery(&mut self, scope: Option<Vec<String>>) -> Result<Clause> {
+        self.expect(Token::LBrace, "'{' to open the CALL subquery")?;
+        let clauses = self.parse_clauses()?;
+        self.expect(Token::RBrace, "'}' to close the CALL subquery")?;
+        let transactions = if self.eat(Token::In) {
+            self.expect_ident_text("transactions")?;
+            let rows = if self.eat_ident_text("of") {
+                let rows = self.parse_u32("transaction batch size")?;
+                if !self.eat_ident_text("rows") {
+                    self.expect_ident_text("row")?;
+                }
+                rows
+            } else {
+                1000
+            };
+            Some(rows)
+        } else {
+            None
+        };
+        Ok(Clause::CallSubquery {
+            part: QueryPart {
+                union_all: false,
+                clauses,
+            },
+            scope,
+            transactions,
         })
     }
 

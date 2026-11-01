@@ -34,6 +34,9 @@ pub struct Prepared {
     pub columns: Vec<String>,
     /// Whether the query mutates the graph.
     pub mutating: bool,
+    /// Whether the plan contains `CALL { ... } IN TRANSACTIONS` and therefore
+    /// manages its own commit boundaries.
+    pub batch_transactions: bool,
 }
 
 /// Kind of a variable in scope.
@@ -73,6 +76,23 @@ struct Planner<'a> {
     /// re-binding one of these is an error, while a relationship carried
     /// through `WITH` may constrain a later pattern.
     pattern_rels: std::collections::HashSet<String>,
+    /// Nesting level of `CALL { ... }` subqueries; nested subqueries are
+    /// rejected until their execution semantics are defined.
+    subquery_depth: usize,
+    /// Whether a `CALL { ... } IN TRANSACTIONS` clause was planned.
+    batch_transactions: bool,
+}
+
+/// A planned query part and the scope produced by its last projection.
+struct PlannedPart {
+    /// Root of the part's plan.
+    plan: Plan,
+    /// Output column names.
+    columns: Vec<String>,
+    /// Variables visible after the last projection, with their kinds.
+    scope: FastMap<String, VarKind>,
+    /// Whether the part mutates the graph.
+    mutating: bool,
 }
 
 /// Plan a parsed query with the given parameter values.
@@ -86,6 +106,8 @@ pub fn plan_query(
         db,
         anon_counter: 0,
         pattern_rels: std::collections::HashSet::new(),
+        subquery_depth: 0,
+        batch_transactions: false,
     };
     planner.run(&query)
 }
@@ -127,24 +149,27 @@ impl<'a> Planner<'a> {
             plan,
             columns,
             mutating,
+            batch_transactions: self.batch_transactions,
         })
     }
 
     /// Plan one query part (a pipeline of clauses) on its own scope.
     fn plan_part(&mut self, clauses: &[Clause]) -> Result<(Plan, Vec<String>, bool)> {
-        self.plan_part_with(clauses, FastMap::new())
+        let part = self.plan_part_with(clauses, FastMap::new())?;
+        Ok((part.plan, part.columns, part.mutating))
     }
 
-    /// Plan one query part on top of an initial scope; used by `EXISTS`
-    /// subqueries, whose clauses see the enclosing variables.
+    /// Plan one query part on top of an initial scope; used by `EXISTS` and
+    /// `CALL { ... }` subqueries, whose clauses see the enclosing variables.
     fn plan_part_with(
         &mut self,
         clauses: &[Clause],
         scope: FastMap<String, VarKind>,
-    ) -> Result<(Plan, Vec<String>, bool)> {
+    ) -> Result<PlannedPart> {
         let mut plan = Plan::Empty;
         let mut scope = scope;
         let mut columns = Vec::new();
+        let mut output_scope = FastMap::new();
         let mut mutating = false;
         for clause in clauses {
             match clause {
@@ -170,12 +195,18 @@ impl<'a> Planner<'a> {
                     args,
                     yields,
                 } => {
-                    if !args.is_empty() {
-                        return Err(Error::unsupported(
-                            "procedures with arguments are not supported",
-                        ));
+                    let spec = procedure_spec(procedure)?;
+                    if args.len() < spec.min_args || args.len() > spec.max_args {
+                        return Err(Error::syntax(format!(
+                            "procedure `{procedure}` {}",
+                            argument_arity(spec.min_args, spec.max_args)
+                        )));
                     }
-                    let outputs = procedure_columns(procedure)?;
+                    for arg in args {
+                        validate_expr(arg, &scope)?;
+                    }
+                    let outputs: Vec<String> =
+                        spec.columns.iter().map(|name| (*name).to_owned()).collect();
                     let yields: Vec<(String, String)> = if yields.is_empty() {
                         outputs
                             .iter()
@@ -202,11 +233,82 @@ impl<'a> Planner<'a> {
                     plan = Plan::ProcedureCall {
                         input: Box::new(plan),
                         procedure: procedure.clone(),
+                        args: args.clone(),
                         columns: outputs,
                         yields: yields.clone(),
                     };
                     columns.clear();
                     columns.extend(yields.iter().map(|(_, alias)| alias.clone()));
+                }
+                Clause::CallSubquery {
+                    part,
+                    scope: imported,
+                    transactions,
+                } => {
+                    if self.subquery_depth > 0 {
+                        return Err(Error::unsupported(
+                            "nested CALL { ... } subqueries are not supported",
+                        ));
+                    }
+                    let inner_scope = match imported {
+                        Some(names) => {
+                            let mut selected = FastMap::new();
+                            for name in names {
+                                let Some(kind) = scope.get(name) else {
+                                    return Err(undefined_variable(name));
+                                };
+                                selected.insert(name.clone(), *kind);
+                            }
+                            selected
+                        }
+                        None => scope.clone(),
+                    };
+                    self.subquery_depth += 1;
+                    let planned = self.plan_part_with(&part.clauses, inner_scope);
+                    self.subquery_depth -= 1;
+                    let planned = planned?;
+                    let inner = planned.plan;
+                    let inner_columns = planned.columns;
+                    let inner_scope = planned.scope;
+                    let inner_mutating = planned.mutating;
+                    let returns = matches!(part.clauses.last(), Some(Clause::Return { .. }));
+                    if returns {
+                        for (name, kind) in &inner_scope {
+                            scope.insert(name.clone(), *kind);
+                        }
+                        columns.clear();
+                        columns.extend(inner_columns.iter().cloned());
+                    } else if !inner_mutating {
+                        return Err(Error::syntax(
+                            "a unit CALL { ... } subquery must end with an updating clause",
+                        ));
+                    }
+                    if let Some(rows) = *transactions {
+                        if rows == 0 {
+                            return Err(Error::syntax(
+                                "CALL { ... } IN TRANSACTIONS requires a positive row count",
+                            ));
+                        }
+                        if returns {
+                            return Err(Error::syntax(
+                                "CALL { ... } IN TRANSACTIONS cannot return rows",
+                            ));
+                        }
+                        if self.batch_transactions {
+                            return Err(Error::syntax(
+                                "only one CALL { ... } IN TRANSACTIONS is allowed per query",
+                            ));
+                        }
+                        self.batch_transactions = true;
+                    }
+                    mutating |= inner_mutating;
+                    plan = Plan::CallSubquery {
+                        input: Box::new(plan),
+                        inner: Box::new(inner),
+                        columns: inner_columns,
+                        returns,
+                        transactions: *transactions,
+                    };
                 }
                 Clause::Unwind { expr, alias } => {
                     validate_expr(expr, &scope)?;
@@ -264,17 +366,23 @@ impl<'a> Planner<'a> {
                     skip,
                     limit,
                 } => {
-                    let (new_plan, _, new_columns) = self.plan_projection(
+                    let (new_plan, new_scope, new_columns) = self.plan_projection(
                         plan, items, *distinct, order, skip, limit, None, &scope, false,
                     )?;
                     plan = new_plan;
                     columns = new_columns;
+                    output_scope = new_scope;
                     scope.clear();
                     self.pattern_rels.clear();
                 }
             }
         }
-        Ok((plan, columns, mutating))
+        Ok(PlannedPart {
+            plan,
+            columns,
+            scope: output_scope,
+            mutating,
+        })
     }
 
     /// Plan one updating clause (`CREATE`, `MERGE`, `SET`, `REMOVE`,
@@ -536,7 +644,7 @@ impl<'a> Planner<'a> {
                     }
                 }
             }
-            let (inner, _, _) = self.plan_part_with(&part.clauses, scope.clone())?;
+            let inner = self.plan_part_with(&part.clauses, scope.clone())?.plan;
             let hidden = self.anon_name("exists");
             scope.insert(hidden.clone(), VarKind::Value);
             *plan = Plan::PatternPredicate {
@@ -2425,15 +2533,51 @@ fn flip(direction: RelDirection) -> RelDirection {
     }
 }
 
-/// Output columns of a supported built-in procedure.
-fn procedure_columns(name: &str) -> Result<Vec<String>> {
+/// Shape of a supported built-in procedure.
+struct ProcedureSpec {
+    /// Output columns in order.
+    columns: &'static [&'static str],
+    /// Minimum accepted argument count.
+    min_args: usize,
+    /// Maximum accepted argument count.
+    max_args: usize,
+}
+
+/// Description of a supported built-in procedure.
+fn procedure_spec(name: &str) -> Result<ProcedureSpec> {
     match name {
-        "db.labels" => Ok(vec!["label".to_owned()]),
-        "db.propertyKeys" => Ok(vec!["propertyKey".to_owned()]),
-        "db.relationshipTypes" => Ok(vec!["relationshipType".to_owned()]),
+        "db.labels" => Ok(ProcedureSpec {
+            columns: &["label"],
+            min_args: 0,
+            max_args: 0,
+        }),
+        "db.propertyKeys" => Ok(ProcedureSpec {
+            columns: &["propertyKey"],
+            min_args: 0,
+            max_args: 0,
+        }),
+        "db.relationshipTypes" => Ok(ProcedureSpec {
+            columns: &["relationshipType"],
+            min_args: 0,
+            max_args: 0,
+        }),
+        "db.awaitIndexes" => Ok(ProcedureSpec {
+            columns: &[],
+            min_args: 0,
+            max_args: 1,
+        }),
         _ => Err(Error::unsupported(format!(
             "procedure `{name}` is not supported"
         ))),
+    }
+}
+
+/// Human-readable argument count for an arity error.
+fn argument_arity(min: usize, max: usize) -> String {
+    match (min, max) {
+        (0, 0) => "takes no arguments".to_owned(),
+        (min, max) if min == max => format!("takes {min} arguments"),
+        (min, max) => format!("takes between {min} and {max} arguments"),
     }
 }
 
@@ -2743,7 +2887,7 @@ fn static_function_kind(
         | "reverse" | "split" => Kind::List,
         "properties" => Kind::Map,
         "type" | "tostring" | "substring" | "toupper" | "tolower" | "trim" | "ltrim" | "rtrim"
-        | "left" | "right" | "replace" => Kind::Text,
+        | "left" | "right" | "replace" | "randomuuid" => Kind::Text,
         "toboolean" => Kind::Boolean,
         "startnode" | "endnode" => Kind::Node,
         "date" | "localtime" | "time" | "localdatetime" | "datetime" | "duration" => Kind::Temporal,
@@ -4323,6 +4467,12 @@ fn substitute_clause(clause: &mut Clause, params: &HashMap<String, Value>) -> Re
         Clause::Call { args, .. } => {
             for arg in args.iter_mut() {
                 substitute_expr(arg, params)?;
+            }
+            Ok(())
+        }
+        Clause::CallSubquery { part, .. } => {
+            for clause in part.clauses.iter_mut() {
+                substitute_clause(clause, params)?;
             }
             Ok(())
         }
