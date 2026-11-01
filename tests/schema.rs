@@ -264,5 +264,72 @@ fn literal_pattern_properties_still_seek_indexes() {
     let plan = conn
         .explain("WITH 1 AS s MATCH (n:Person {seed: s}) RETURN n")
         .expect("explain");
-    assert!(plan.contains("seek=-"), "{plan}");
+    assert!(!plan.contains("seek=-"), "{plan}");
+    let plan = conn
+        .explain("WITH 1 AS s MATCH (n:Person) WHERE n.seed = s RETURN n")
+        .expect("explain");
+    assert!(!plan.contains("seek=-"), "{plan}");
+}
+
+/// Seeks on bound values answer exactly what the label scan answers.
+#[test]
+fn bound_value_seeks_match_label_scans() {
+    let mut conn = connection();
+    conn.execute(
+        "CREATE (:P {k: 1, i: 'int'}), (:P {k: 1.0, i: 'float'}), (:P {k: -0.0, i: 'negzero'}), \
+         (:P {k: 0, i: 'zero'}), (:P {k: 'x', i: 'text'}), (:P {k: [1, 'a'], i: 'list'}), \
+         (:P {k: [1.0, 'a'], i: 'flist'}), (:P {k: [], i: 'empty'}), \
+         (:P {k: [null, false], i: 'nullfalse'}), (:P {k: 9007199254740993, i: 'big'}), \
+         (:Q {k: 1, i: 'other label'})",
+    )
+    .expect("create");
+    let probes = "[1, 1.0, 0, 0.0, 'x', [1, 'a'], [], 9007199254740992.0, null, 2, 0.0/0.0]";
+    let source = |pattern: &str| {
+        format!(
+            "WITH {probes} AS probes UNWIND range(0, size(probes) - 1) AS p \
+             WITH p, probes[p] AS v {pattern} \
+             WITH p, n.i AS i ORDER BY i RETURN p, collect(i) ORDER BY p"
+        )
+    };
+    let scanned = query(&mut conn, &source("MATCH (n:P) WHERE n.k = v"));
+    conn.create_node_index("k", Some("P"), false)
+        .expect("index");
+    for pattern in ["MATCH (n:P {k: v})", "MATCH (n:P) WHERE v = n.k"] {
+        assert!(
+            !conn
+                .explain(&source(pattern))
+                .expect("explain")
+                .contains("seek=-"),
+            "{pattern}"
+        );
+        assert_eq!(query(&mut conn, &source(pattern)), scanned, "{pattern}");
+    }
+    assert_eq!(
+        scanned
+            .iter()
+            .find(|row| row[0] == "0")
+            .map(|row| row[1].as_str()),
+        Some("[float, int]")
+    );
+}
+
+/// Backfilling a large label builds a multi-level tree whose seeks agree with
+/// label scans (the connection guard also requires a clean checker report).
+#[test]
+fn bulk_backfill_agrees_with_label_scans() {
+    let mut conn = connection();
+    conn.execute(
+        "UNWIND range(1, 6000) AS i \
+         CREATE (:P {k: CASE WHEN i % 7 = 0 THEN null ELSE 'v' + toString(i % 900) END}), \
+         (:Q {k: 'v1'})",
+    )
+    .expect("create");
+    let probe = "UNWIND ['v1', 'v899', 'v0', 'missing'] AS v \
+                 MATCH (n:P) WHERE n.k = v RETURN v, count(n) ORDER BY v";
+    let scanned = query(&mut conn, probe);
+    conn.create_node_index("k", Some("P"), false)
+        .expect("index");
+    assert!(!conn.explain(probe).expect("explain").contains("seek=-"));
+    assert_eq!(query(&mut conn, probe), scanned);
+    assert_eq!(scanned.len(), 3, "{scanned:?}");
 }

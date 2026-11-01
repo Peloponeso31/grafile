@@ -361,7 +361,7 @@ impl<'a> Parser<'a> {
             .peek_ident_text()
             .is_some_and(|text| text.eq_ignore_ascii_case("for"))
         {
-            return Err(Error::syntax(format!("a {what} name is required")));
+            return Err(Error::syntax(format!("{what} name is required")));
         }
         Ok(())
     }
@@ -2097,7 +2097,8 @@ mod tests {
         let err = parse_statement("SHOW INDEXES").expect_err("show");
         assert_eq!(err.code(), crate::error::ErrorCode::Unsupported);
         let err = parse_statement("CREATE INDEX FOR (n:Person) ON (n.name)").expect_err("name");
-        assert!(err.message().contains("name is required"), "{err}");
+        assert!(err.message().contains("an index name is required"), "{err}");
+        assert!(!err.message().contains("a an"), "{err}");
         let err = parse_statement("CREATE CONSTRAINT c FOR ()-[r:T]-() REQUIRE r.p IS NODE KEY")
             .expect_err("edge node key");
         assert!(err.message().contains("NODE KEY"), "{err}");

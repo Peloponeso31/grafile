@@ -134,6 +134,62 @@ fn bench_cypher_unwind_create(c: &mut Criterion) {
     });
 }
 
+/// `CREATE INDEX` over 50 000 existing nodes (backfill), with SQLite's
+/// `CREATE INDEX` over an equivalent table as the baseline.
+fn bench_index_backfill(c: &mut Criterion) {
+    const ROWS: u64 = 50_000;
+    let mut group = c.benchmark_group("index_backfill_50k");
+    group.sample_size(20);
+    for (label, unique) in [("grafile_index", false), ("grafile_unique", true)] {
+        group.bench_function(label, |b| {
+            b.iter_batched(
+                || {
+                    let mut conn = mem_connection("bench-backfill.db");
+                    let ids = create_database(&mut conn);
+                    conn.begin().expect("begin");
+                    insert_nodes(conn.database_mut(), (ids.0, ids.2, ids.3), ROWS);
+                    conn.commit().expect("commit");
+                    conn
+                },
+                |mut conn| {
+                    conn.create_node_index("name", Some("Person"), unique)
+                        .expect("index");
+                    black_box(conn);
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.bench_function("sqlite_index", |b| {
+        b.iter_batched(
+            || {
+                let conn = rusqlite::Connection::open_in_memory().expect("sqlite");
+                conn.execute("CREATE TABLE person (seed INTEGER, name TEXT)", [])
+                    .expect("table");
+                let tx = conn.unchecked_transaction().expect("tx");
+                {
+                    let mut stmt = tx
+                        .prepare("INSERT INTO person (seed, name) VALUES (?1, ?2)")
+                        .expect("prepare");
+                    for index in 0..ROWS {
+                        stmt.execute(rusqlite::params![index as i64, format!("node{index}")])
+                            .expect("insert");
+                    }
+                }
+                tx.commit().expect("commit");
+                conn
+            },
+            |conn| {
+                conn.execute("CREATE INDEX person_name ON person (name)", [])
+                    .expect("index");
+                black_box(conn);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
 fn bench_create_nodes_file(c: &mut Criterion) {
     c.bench_function("grafile_create_nodes_10k_file", |b| {
         b.iter_batched(
@@ -333,6 +389,7 @@ criterion_group!(
     bench_create_nodes,
     bench_create_edges,
     bench_cypher_unwind_create,
+    bench_index_backfill,
     bench_create_nodes_file,
     bench_update_nodes,
     bench_delete_nodes,

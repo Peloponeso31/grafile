@@ -52,8 +52,9 @@ pub struct IndexSeek {
     pub index_id: u32,
     /// Indexed property key id.
     pub key_id: u32,
-    /// Literal lookup value.
-    pub value: crate::record::Value,
+    /// Lookup value: a literal, or an expression over variables bound
+    /// before the scan, evaluated once per input row.
+    pub value: crate::cypher::Expr,
 }
 
 /// One element of a [`Plan::BindPath`] sequence.
@@ -78,15 +79,15 @@ pub enum Plan {
     Empty,
     /// Produces no rows (e.g. a label that does not exist).
     EmptyResult,
-    /// Scan nodes carrying `label`, optionally via an index seek, keeping only
-    /// nodes whose properties match `props`.
+    /// Scan nodes carrying every label in `labels`, optionally via an index
+    /// seek, keeping only nodes whose properties match `props`.
     NodeScan {
         /// Input rows (cross-product nesting).
         input: Box<Plan>,
         /// Variable to bind.
         var: String,
-        /// Label name, or `None` for any label.
-        label: Option<String>,
+        /// Label names the nodes must all carry; empty scans every node.
+        labels: Vec<String>,
         /// Index seek when a usable index exists.
         seek: Option<IndexSeek>,
         /// Residual literal property filters, by key name.
@@ -443,12 +444,12 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
         Plan::NodeScan {
             input,
             var,
-            label,
+            labels,
             seek,
             props,
         } => {
             out.push_str(&format!(
-                "{pad}NodeScan {var} label={label:?} seek={} props={}\n",
+                "{pad}NodeScan {var} labels={labels:?} seek={} props={}\n",
                 seek.as_ref()
                     .map(|s| s.index_id)
                     .map_or("-".to_owned(), |id| id.to_string()),
@@ -732,17 +733,17 @@ mod tests {
         let plan = Plan::NodeScan {
             input: Box::new(Plan::Empty),
             var: "n".to_owned(),
-            label: Some("Person".to_owned()),
+            labels: vec!["Person".to_owned()],
             seek: Some(IndexSeek {
                 index_id: 7,
                 key_id: 1,
-                value: Value::Int(3),
+                value: crate::cypher::Expr::Literal(Value::Int(3)),
             }),
             props: vec![("name".to_owned(), Value::from("x"))],
         };
         assert_eq!(
             render(&plan),
-            "NodeScan n label=Some(\"Person\") seek=7 props=1\n  Empty\n"
+            "NodeScan n labels=[\"Person\"] seek=7 props=1\n  Empty\n"
         );
     }
 

@@ -141,7 +141,7 @@ impl Fragment {
     pub fn test(&self, bit: u16) -> bool {
         match &self.repr {
             Repr::Sparse(bits) => bits.binary_search(&bit).is_ok(),
-            Repr::Dense(words) => words[bit as usize / 64] & (1u64 << (bit as usize % 64)) != 0,
+            Repr::Dense(words) => dense_test(words, bit),
         }
     }
 
@@ -219,6 +219,40 @@ impl Fragment {
         }
     }
 
+    /// Keep only the bits also set in `other` (bitwise AND).
+    ///
+    /// Sparse operands filter their sorted offsets (a merge against another
+    /// sparse fragment, a bit test against a dense one); two dense operands
+    /// AND their words. A result with few bits stays in whichever form it had.
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - The fragment to intersect with
+    pub fn intersect_with(&mut self, other: &Fragment) {
+        match (&mut self.repr, &other.repr) {
+            (Repr::Sparse(bits), Repr::Sparse(others)) => {
+                let mut rest = others.as_slice();
+                bits.retain(|bit| {
+                    let skip = rest.partition_point(|other| other < bit);
+                    rest = &rest[skip..];
+                    rest.first() == Some(bit)
+                });
+            }
+            (Repr::Sparse(bits), Repr::Dense(words)) => {
+                bits.retain(|bit| dense_test(words, *bit));
+            }
+            (Repr::Dense(words), Repr::Sparse(others)) => {
+                let kept = others
+                    .iter()
+                    .copied()
+                    .filter(|bit| dense_test(words, *bit))
+                    .collect();
+                self.repr = Repr::Sparse(kept);
+            }
+            (Repr::Dense(words), Repr::Dense(others)) => and_words(words, others),
+        }
+    }
+
     /// Encode as sparse (tag 0) or dense (tag 1) bytes.
     pub fn encode(&self) -> Vec<u8> {
         match &self.repr {
@@ -283,6 +317,17 @@ impl Fragment {
             }
             other => Err(Error::corrupt(format!("unknown fragment tag {other}"))),
         }
+    }
+}
+
+fn dense_test(words: &[u64; FRAGMENT_WORDS], bit: u16) -> bool {
+    words[bit as usize / 64] & (1u64 << (bit as usize % 64)) != 0
+}
+
+/// `dst &= src` over whole fragments.
+fn and_words(dst: &mut [u64; FRAGMENT_WORDS], src: &[u64; FRAGMENT_WORDS]) {
+    for (left, right) in dst.iter_mut().zip(src.iter()) {
+        *left &= *right;
     }
 }
 
@@ -669,21 +714,71 @@ impl FragmentStore {
 
     /// Node ids carrying a label.
     pub fn label_nodes(&mut self, pager: &mut Pager, label_id: u32) -> Result<Vec<u64>> {
-        let prefix = FragmentKey::prefix(FAMILY_LABEL, label_id, 0);
-        let mut out = Vec::new();
-        for (key, fragment) in self.merged_prefix(pager, &prefix[..5])? {
-            for bit in fragment.iter_bits() {
-                out.push((u64::from(key.band0) << 16) | u64::from(bit));
+        self.nodes_with_labels(pager, &[label_id])
+    }
+
+    /// Node ids carrying every label in `label_ids`, ascending; all nodes
+    /// with a label when the slice holds one id. The label bitmaps are
+    /// intersected band by band, so no node record is read.
+    ///
+    /// # Arguments
+    ///
+    /// * `label_ids` - Labels the nodes must carry; must not be empty
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a fragment cannot be read or decoded
+    pub fn nodes_with_labels(&mut self, pager: &mut Pager, label_ids: &[u32]) -> Result<Vec<u64>> {
+        let Some((first, rest)) = label_ids.split_first() else {
+            return Err(Error::internal("label intersection without labels"));
+        };
+        let mut bands: Vec<(u32, Fragment)> = self
+            .label_fragments(pager, *first)?
+            .into_iter()
+            .map(|(key, fragment)| (key.band0, fragment))
+            .collect();
+        for label_id in rest {
+            if bands.is_empty() {
+                break;
             }
+            let others = self.label_fragments(pager, *label_id)?;
+            let mut others = others.iter().peekable();
+            bands.retain_mut(|(band, fragment)| {
+                while others.next_if(|(key, _)| key.band0 < *band).is_some() {}
+                match others.next_if(|(key, _)| key.band0 == *band) {
+                    Some((_, other)) => {
+                        fragment.intersect_with(other);
+                        !fragment.is_empty()
+                    }
+                    None => false,
+                }
+            });
+        }
+        let mut out = Vec::new();
+        for (band, fragment) in &bands {
+            out.extend(
+                fragment
+                    .iter_bits()
+                    .map(|bit| (u64::from(*band) << 16) | u64::from(bit)),
+            );
         }
         Ok(out)
     }
 
+    /// The non-empty label fragments of `label_id`, ordered by band.
+    fn label_fragments(
+        &mut self,
+        pager: &mut Pager,
+        label_id: u32,
+    ) -> Result<Vec<(FragmentKey, Fragment)>> {
+        let prefix = FragmentKey::prefix(FAMILY_LABEL, label_id, 0);
+        self.merged_prefix(pager, &prefix[..5])
+    }
+
     /// Number of nodes carrying a label (sum of fragment cardinalities).
     pub fn label_count(&mut self, pager: &mut Pager, label_id: u32) -> Result<u64> {
-        let prefix = FragmentKey::prefix(FAMILY_LABEL, label_id, 0);
         Ok(self
-            .merged_prefix(pager, &prefix[..5])?
+            .label_fragments(pager, label_id)?
             .iter()
             .map(|(_, fragment)| u64::from(fragment.cardinality()))
             .sum())
@@ -773,6 +868,28 @@ mod tests {
         let decoded = Fragment::decode(&encoded).expect("decode");
         assert_eq!(decoded.cardinality(), 32768);
         assert!(decoded.test(2) && !decoded.test(3));
+    }
+
+    fn fragment_of(bits: &std::collections::BTreeSet<u16>) -> Fragment {
+        let mut fragment = Fragment::new();
+        for bit in bits {
+            fragment.set(*bit);
+        }
+        fragment
+    }
+
+    proptest::proptest! {
+        /// Every sparse/dense pairing intersects like the set model.
+        #[test]
+        fn intersect_with_matches_set_intersection(
+            left in proptest::collection::btree_set(0u16..12_000, 0..6_000),
+            right in proptest::collection::btree_set(0u16..12_000, 0..6_000),
+        ) {
+            let mut fragment = fragment_of(&left);
+            fragment.intersect_with(&fragment_of(&right));
+            let expected: Vec<u16> = left.intersection(&right).copied().collect();
+            proptest::prop_assert_eq!(fragment.iter_bits().collect::<Vec<_>>(), expected);
+        }
     }
 
     #[test]

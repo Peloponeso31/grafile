@@ -273,6 +273,19 @@ fn verify(db: &mut Database, schema: Schema, model: &Model) {
             "label {label}"
         );
     }
+    for labels in [&[1, 2][..], &[1, 3], &[2, 3], &[1, 2, 3]] {
+        let expected: Vec<u64> = model
+            .nodes
+            .iter()
+            .filter(|(_, node)| labels.iter().all(|label| node.labels.contains(label)))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            db.nodes_with_labels(labels).expect("intersection"),
+            expected,
+            "labels {labels:?}"
+        );
+    }
     for edge_type in 1..=TYPES {
         let expected: Vec<u64> = model
             .edges

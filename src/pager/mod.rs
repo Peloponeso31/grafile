@@ -13,7 +13,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use hashlink::LinkedHashMap;
+use hashbrown::HashMap;
+use hashlink::LinkedHashSet;
 
 use crate::error::{Error, ErrorCode, Result};
 use crate::vfs::{File, LockLevel, OpenMode, Vfs, journal_path};
@@ -93,7 +94,10 @@ pub struct Pager {
     header: DatabaseHeader,
     header_dirty: bool,
     page_size: usize,
-    cache: LinkedHashMap<u32, Frame>,
+    cache: HashMap<u32, Frame>,
+    /// Clean cached pages, least recently used first; dirty pages are pinned
+    /// until the transaction ends, so only these can be evicted.
+    clean_lru: LinkedHashSet<u32>,
     cache_capacity: usize,
     writable: bool,
     txn: Option<WriteTxn>,
@@ -122,16 +126,7 @@ impl Pager {
         write_page_checksum(&mut page_one);
         file.write_at(&page_one, 0)?;
         file.sync_all()?;
-        let mut cache = LinkedHashMap::new();
-        cache.insert(
-            1,
-            Frame {
-                data: page_one.into_boxed_slice(),
-                dirty: false,
-                generation: 1,
-            },
-        );
-        Ok(Self {
+        let mut pager = Self {
             vfs,
             file,
             path: path.to_path_buf(),
@@ -139,14 +134,17 @@ impl Pager {
             page_size: header.page_size as usize,
             header,
             header_dirty: false,
-            cache,
+            cache: HashMap::new(),
+            clean_lru: LinkedHashSet::new(),
             cache_capacity: DEFAULT_CACHE_PAGES,
             writable: true,
             txn: None,
             lock: LockState::None,
             writer_claim: None,
             txn_generation: 0,
-        })
+        };
+        pager.insert_clean(1, page_one.into_boxed_slice());
+        Ok(pager)
     }
 
     /// Open an existing database file, recovering a hot journal if present.
@@ -180,16 +178,7 @@ impl Pager {
         if header.page_count < 1 {
             return Err(Error::corrupt("database header declares zero pages"));
         }
-        let mut cache = LinkedHashMap::new();
-        cache.insert(
-            1,
-            Frame {
-                data: page_one.into_boxed_slice(),
-                dirty: false,
-                generation: 1,
-            },
-        );
-        Ok(Self {
+        let mut pager = Self {
             vfs,
             file,
             path: path.to_path_buf(),
@@ -197,14 +186,17 @@ impl Pager {
             page_size,
             header,
             header_dirty: false,
-            cache,
+            cache: HashMap::new(),
+            clean_lru: LinkedHashSet::new(),
             cache_capacity: DEFAULT_CACHE_PAGES,
             writable: mode.is_writable(),
             txn: None,
             lock: LockState::None,
             writer_claim: None,
             txn_generation: 0,
-        })
+        };
+        pager.insert_clean(1, page_one.into_boxed_slice());
+        Ok(pager)
     }
 
     fn recover_journal(vfs: &dyn Vfs, file: &dyn File, jpath: &Path, mode: OpenMode) -> Result<()> {
@@ -269,7 +261,7 @@ impl Pager {
     /// Configure the page cache capacity in pages.
     pub fn set_cache_capacity(&mut self, pages: usize) {
         self.cache_capacity = pages.max(8);
-        self.evict_if_needed();
+        self.evict_if_needed(None);
     }
 
     /// Acquire the shared lock for a read snapshot (idempotent).
@@ -358,19 +350,13 @@ impl Pager {
     /// Discard every cached page and reload page 1 from disk.
     fn invalidate_cache(&mut self) -> Result<()> {
         self.cache.clear();
+        self.clean_lru.clear();
         self.header_dirty = false;
         let mut page_one = vec![0u8; self.page_size];
         self.file.read_at(&mut page_one, 0)?;
         verify_page_checksum(&page_one, 1)?;
         self.header = DatabaseHeader::parse(&page_one)?;
-        self.cache.insert(
-            1,
-            Frame {
-                data: page_one.into_boxed_slice(),
-                dirty: false,
-                generation: 1,
-            },
-        );
+        self.insert_clean(1, page_one.into_boxed_slice());
         Ok(())
     }
 
@@ -543,14 +529,18 @@ impl Pager {
             }
             self.vfs.remove(&self.journal_path)?;
             if committed {
-                for frame in self.cache.values_mut() {
-                    frame.dirty = false;
+                for (page_no, frame) in self.cache.iter_mut() {
+                    if frame.dirty {
+                        frame.dirty = false;
+                        self.clean_lru.insert(*page_no);
+                    }
                 }
             } else {
                 self.header = txn.header_snapshot;
                 self.cache.retain(|_, frame| !frame.dirty);
                 self.header_dirty = false;
             }
+            self.evict_if_needed(None);
             Ok(())
         })();
         // Release the writer slot and file lock even when cleanup failed.
@@ -566,7 +556,7 @@ impl Pager {
     /// Fetch a page for reading, verifying its checksum.
     pub fn page(&mut self, page_no: u32) -> Result<PageRef<'_>> {
         self.fetch(page_no)?;
-        self.cache.to_back(&page_no);
+        self.clean_lru.to_back(&page_no);
         let frame = self.cache.get(&page_no).expect("fetched");
         Ok(PageRef {
             data: &frame.data,
@@ -578,7 +568,6 @@ impl Pager {
     /// journals the original image on first touch.
     pub fn page_mut(&mut self, page_no: u32) -> Result<&mut [u8]> {
         self.fetch(page_no)?;
-        self.cache.to_back(&page_no);
         let txn = self
             .txn
             .as_mut()
@@ -598,6 +587,7 @@ impl Pager {
             }
             frame.dirty = true;
             frame.generation += 1;
+            self.clean_lru.remove(&page_no);
         }
         Ok(&mut frame.data)
     }
@@ -623,30 +613,37 @@ impl Pager {
                 header.page_no
             )));
         }
+        self.insert_clean(page_no, data.into_boxed_slice());
+        self.evict_if_needed(Some(page_no));
+        Ok(())
+    }
+
+    fn insert_clean(&mut self, page_no: u32, data: Box<[u8]>) {
         self.cache.insert(
             page_no,
             Frame {
-                data: data.into_boxed_slice(),
+                data,
                 dirty: false,
                 generation: 1,
             },
         );
-        self.evict_if_needed();
-        Ok(())
+        self.clean_lru.insert(page_no);
     }
 
-    fn evict_if_needed(&mut self) {
+    /// Evict least recently used clean frames down to the capacity, keeping
+    /// `keep` (the page being fetched). Dirty frames stay until the
+    /// transaction ends, so a large transaction can hold the cache above its
+    /// capacity.
+    fn evict_if_needed(&mut self, keep: Option<u32>) {
         while self.cache.len() > self.cache_capacity {
-            let candidate = self
-                .cache
-                .iter()
-                .find(|(_, frame)| !frame.dirty)
-                .map(|(page_no, _)| *page_no);
-            match candidate {
-                Some(page_no) => {
+            match self.clean_lru.front() {
+                Some(page_no) if Some(*page_no) != keep => {
+                    let page_no = *page_no;
+                    self.clean_lru.pop_front();
                     self.cache.remove(&page_no);
                 }
-                None => break,
+                // Only dirty frames or the requested page remain.
+                _ => break,
             }
         }
     }
@@ -680,7 +677,7 @@ impl Pager {
                 generation: 1,
             },
         );
-        self.evict_if_needed();
+        self.evict_if_needed(Some(page_no));
         Ok(page_no)
     }
 
@@ -1161,6 +1158,59 @@ mod tests {
         assert_eq!(pager.header().user_version, 3);
         assert_eq!(pager.header().change_counter, 1);
     }
+    #[test]
+    fn reading_a_page_when_every_other_frame_is_dirty_keeps_it_cached() {
+        let store = new_store();
+        let path = Path::new("dirty-cache.db");
+        let vfs = Arc::new(MemVfs::from_store(store));
+        let mut pager = create_pager(vfs, path);
+        pager.begin_write().expect("begin");
+        let clean = pager.alloc_page().expect("alloc");
+        init_page(&mut pager, clean, PageType::TableLeaf).expect("init");
+        pager.commit().expect("commit");
+        pager.set_cache_capacity(8);
+        pager.begin_write().expect("begin");
+        for _ in 0..16 {
+            let page = pager.alloc_page().expect("alloc");
+            init_page(&mut pager, page, PageType::TableLeaf).expect("init");
+        }
+        // Evict the committed page, then read it back while only dirty
+        // frames remain to compete with it.
+        pager.cache.remove(&clean);
+        pager.clean_lru.remove(&clean);
+        assert_eq!(pager.page(clean).expect("page").data()[100], 0);
+        pager.rollback().expect("rollback");
+    }
+
+    #[test]
+    fn transactions_end_with_every_frame_clean_and_within_capacity() {
+        let vfs = Arc::new(MemVfs::from_store(new_store()));
+        let mut pager = create_pager(vfs, Path::new("lru.db"));
+        pager.set_cache_capacity(8);
+        for commit in [true, false] {
+            pager.begin_write().expect("begin");
+            for _ in 0..32 {
+                let page = pager.alloc_page().expect("alloc");
+                init_page(&mut pager, page, PageType::TableLeaf).expect("init");
+            }
+            assert!(pager.cache.len() > 8, "dirty frames are pinned");
+            if commit {
+                pager.commit().expect("commit");
+            } else {
+                pager.rollback().expect("rollback");
+            }
+            assert!(pager.cache.len() <= 8);
+            assert_eq!(pager.clean_lru.len(), pager.cache.len());
+            assert!(pager.cache.values().all(|frame| !frame.dirty));
+        }
+        pager.begin_read().expect("read");
+        for page_no in 2..=33 {
+            pager.page(page_no).expect("committed page");
+        }
+        assert!(pager.cache.len() <= 8);
+        pager.end_read().expect("end read");
+    }
+
     #[test]
     fn reader_refreshes_cache_after_other_handle_commits() {
         let store = new_store();

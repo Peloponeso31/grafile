@@ -1,9 +1,9 @@
 //! Phase 6 acceptance: the audited Neo4j 5 seed script at 1/100 scale runs
 //! end to end through the statement splitter.
 //!
-//! The script takes minutes in a debug build (variable-key lookups scan
-//! labels until index seeks land), so it is ignored by default and CI runs it
-//! with `cargo test --release --test seed_fixture -- --ignored`.
+//! The script takes about 20 s in a debug build (under 2 s in release), so it
+//! is ignored by default and CI runs it with
+//! `cargo test --release --test seed_fixture -- --ignored`.
 
 mod support;
 
@@ -17,7 +17,7 @@ fn count(conn: &mut grafile::api::Connection, source: &str) -> i64 {
 }
 
 #[test]
-#[ignore = "runs for minutes; CI runs it in release mode with --ignored"]
+#[ignore = "slow in debug builds; CI runs it in release mode with --ignored"]
 fn seed_script_loads_at_one_hundredth_scale() {
     let mut conn = connection();
     for (index, statement) in split_statements(SEED).iter().enumerate() {

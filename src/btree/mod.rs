@@ -18,7 +18,7 @@ pub mod page;
 use std::collections::HashSet;
 
 use crate::error::{Error, Result};
-use crate::pager::{PageHeader, PageNo, PageType, Pager};
+use crate::pager::{PAGE_HEADER_SIZE, PageHeader, PageNo, PageType, Pager};
 
 use page::{
     OVERFLOW_OVERHEAD, build_interior_cell, build_leaf_cell, cell_child, cell_key, cell_overflow,
@@ -115,6 +115,141 @@ impl Btree {
                 Ok(())
             }
         }
+    }
+
+    /// Fill an empty tree from entries in strictly ascending key order,
+    /// building packed leaves left to right and then each interior level,
+    /// with the top node written into the existing root page (so the root
+    /// does not move). This costs no descents or splits, which makes index
+    /// backfill several times faster than inserting entry by entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `entries` - `(key, value)` pairs in strictly ascending key order
+    ///
+    /// # Errors
+    ///
+    /// Returns a misuse error outside a write transaction, an internal error
+    /// when the tree is not empty or the keys are not strictly ascending, and
+    /// propagates storage errors.
+    pub fn build_sorted<'a>(
+        &mut self,
+        pager: &mut Pager,
+        entries: impl IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    ) -> Result<()> {
+        if !pager.in_write_txn() {
+            return Err(Error::misuse(
+                "Btree::build_sorted outside a write transaction",
+            ));
+        }
+        let header = pager.page(self.root)?.header()?;
+        if header.page_type != self.kind.leaf_type() || header.cell_count != 0 {
+            return Err(Error::internal("bulk build into a non-empty tree"));
+        }
+        let capacity = pager.page_size() - PAGE_HEADER_SIZE;
+        // Leaves stream out as they fill; each finished page is recorded as
+        // `(page, largest key)` for the level above.
+        let mut children: Vec<(PageNo, Vec<u8>)> = Vec::new();
+        let mut cells: Vec<Vec<u8>> = Vec::new();
+        let mut used = 0usize;
+        let mut previous: Option<&[u8]> = None;
+        for (key, value) in entries {
+            if previous.is_some_and(|previous| previous >= key) {
+                return Err(Error::internal(
+                    "bulk build keys are not strictly ascending",
+                ));
+            }
+            previous = Some(key);
+            let cell = build_leaf_cell(pager, self.kind, key, value)?;
+            if used + cell.len() + 2 > capacity {
+                let page = pager.alloc_page()?;
+                rebuild_page(pager, page, self.kind.leaf_type(), 0, &cells)?;
+                children.push((page, last_key(&cells, self.kind, self.kind.leaf_type())?));
+                cells.clear();
+                used = 0;
+            }
+            used += cell.len() + 2;
+            cells.push(cell);
+        }
+        if children.is_empty() {
+            return rebuild_page(pager, self.root, self.kind.leaf_type(), 0, &cells);
+        }
+        if !cells.is_empty() {
+            let page = pager.alloc_page()?;
+            rebuild_page(pager, page, self.kind.leaf_type(), 0, &cells)?;
+            children.push((page, last_key(&cells, self.kind, self.kind.leaf_type())?));
+        }
+        loop {
+            let groups = self.interior_groups(&children, capacity);
+            if groups.len() == 1 {
+                let (cells, rightmost) = self.interior_cells(&children)?;
+                return rebuild_page(
+                    pager,
+                    self.root,
+                    self.kind.interior_type(),
+                    rightmost,
+                    &cells,
+                );
+            }
+            let mut parents = Vec::with_capacity(groups.len());
+            for group in groups {
+                let members = &children[group];
+                let (cells, rightmost) = self.interior_cells(members)?;
+                let page = pager.alloc_page()?;
+                rebuild_page(pager, page, self.kind.interior_type(), rightmost, &cells)?;
+                let largest = members.last().expect("groups are non-empty").1.clone();
+                parents.push((page, largest));
+            }
+            children = parents;
+        }
+    }
+
+    /// Split a level's children into interior nodes that each fit a page
+    /// and hold at least one cell (two children).
+    fn interior_groups(
+        &self,
+        children: &[(PageNo, Vec<u8>)],
+        capacity: usize,
+    ) -> Vec<std::ops::Range<usize>> {
+        let mut groups = Vec::new();
+        let mut start = 0usize;
+        let mut used = 0usize;
+        // Every child but a node's last becomes a cell; the last is its
+        // rightmost pointer and needs no cell. When child `index - 1` does
+        // not fit as a cell, it closes the node as its rightmost child.
+        for index in 1..children.len() {
+            let size = interior_cell_len(self.kind, &children[index - 1].1) + 2;
+            if used + size > capacity {
+                groups.push(start..index);
+                start = index;
+                used = 0;
+            } else {
+                used += size;
+            }
+        }
+        groups.push(start..children.len());
+        // A lone trailing child would make an interior page without cells;
+        // borrow the previous node's last child (full nodes hold at least
+        // four children because keys are capped at a quarter page).
+        let count = groups.len();
+        if count > 1 && groups[count - 1].len() == 1 {
+            groups[count - 2].end -= 1;
+            groups[count - 1].start -= 1;
+        }
+        groups
+    }
+
+    /// Interior cells (every child but the last, keyed by its largest key)
+    /// and the rightmost child of one node.
+    fn interior_cells(&self, members: &[(PageNo, Vec<u8>)]) -> Result<(Vec<Vec<u8>>, PageNo)> {
+        let (last, rest) = members
+            .split_last()
+            .ok_or_else(|| Error::internal("interior node without children"))?;
+        let cells = rest
+            .iter()
+            .map(|(child, key)| build_interior_cell(self.kind, *child, key))
+            .collect::<Result<_>>()?;
+        Ok((cells, last.0))
     }
 
     /// Insert `key`/`value`, replacing any existing value.
@@ -490,6 +625,23 @@ fn descend_leaf(pager: &mut Pager, root: PageNo, kind: TreeKind, key: &[u8]) -> 
 
 /// Find the child to descend into for `key`:
 /// `(child, is_rightmost, cell_index, divider_key)`.
+/// Size of an interior cell for `key` (see `build_interior_cell`): child
+/// page number, plus a length prefix for index keys.
+fn interior_cell_len(kind: TreeKind, key: &[u8]) -> usize {
+    match kind {
+        TreeKind::Table => 4 + key.len(),
+        TreeKind::Index => 6 + key.len(),
+    }
+}
+
+/// Largest key among a finished page's cells.
+fn last_key(cells: &[Vec<u8>], kind: TreeKind, page_type: PageType) -> Result<Vec<u8>> {
+    let last = cells
+        .last()
+        .ok_or_else(|| Error::internal("empty page in bulk build"))?;
+    raw_cell_key(last, kind, page_type)
+}
+
 fn find_child(
     pager: &mut Pager,
     page_no: PageNo,
@@ -740,6 +892,58 @@ mod tests {
             4096,
         )
         .expect("pager")
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        /// A bulk-built tree checks clean, scans back its input in order,
+        /// answers seeks, and keeps working under ordinary inserts.
+        #[test]
+        fn bulk_build_matches_its_sorted_input(
+            keys in proptest::collection::btree_set(
+                proptest::collection::vec(any::<u8>(), 1..=1019), 0..1500),
+            later in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 1..40), 0..50),
+        ) {
+            let mut pager = test_pager();
+            pager.begin_write().expect("begin");
+            let mut tree = Btree::create(&mut pager, TreeKind::Index).expect("create");
+            tree.build_sorted(&mut pager, keys.iter().map(|key| (key.as_slice(), &[][..])))
+                .expect("build");
+            tree.integrity_check(&mut pager).expect("clean after build");
+            let mut cursor = tree.cursor();
+            let mut scanned = Vec::new();
+            let mut ok = cursor.first(&mut pager).expect("first");
+            while ok {
+                scanned.push(cursor.key().to_vec());
+                ok = cursor.next(&mut pager).expect("next");
+            }
+            let expected: Vec<Vec<u8>> = keys.iter().cloned().collect();
+            prop_assert_eq!(&scanned, &expected);
+            for key in keys.iter().step_by(97) {
+                prop_assert!(tree.contains(&mut pager, key).expect("contains"));
+            }
+            for key in &later {
+                if !keys.contains(key) {
+                    tree.insert(&mut pager, key, &[]).expect("insert");
+                }
+            }
+            tree.integrity_check(&mut pager).expect("clean after inserts");
+            pager.commit().expect("commit");
+        }
+    }
+
+    #[test]
+    fn bulk_build_rejects_unsorted_keys_and_non_empty_trees() {
+        let mut pager = test_pager();
+        pager.begin_write().expect("begin");
+        let mut tree = Btree::create(&mut pager, TreeKind::Index).expect("create");
+        let unsorted: [(&[u8], &[u8]); 2] = [(b"b", b""), (b"a", b"")];
+        assert!(tree.build_sorted(&mut pager, unsorted).is_err());
+        let mut filled = Btree::create(&mut pager, TreeKind::Index).expect("create");
+        filled.insert(&mut pager, b"a", &[]).expect("insert");
+        let one: [(&[u8], &[u8]); 1] = [(b"z", b"")];
+        assert!(filled.build_sorted(&mut pager, one).is_err());
     }
 
     #[test]

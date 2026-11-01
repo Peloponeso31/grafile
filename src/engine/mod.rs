@@ -13,8 +13,10 @@ mod model_tests;
 use std::path::Path;
 use std::sync::Arc;
 
-use hashbrown::HashMap;
+use hashbrown::{HashMap, HashSet};
 use indicatif::{ProgressBar, ProgressStyle};
+
+use smallvec::SmallVec;
 
 use crate::btree::{Btree, TreeKind};
 
@@ -57,6 +59,84 @@ pub struct Trail {
     /// Nodes in traversal order; `nodes[i]` and `nodes[i + 1]` are the
     /// endpoints of `edges[i]`.
     pub nodes: Vec<u64>,
+}
+
+/// A depth-first trail enumeration in progress (see
+/// [`Database::var_expansion`]).
+#[derive(Debug, Clone)]
+pub struct VarExpansion {
+    directions: SmallVec<[Direction; 2]>,
+    types: Vec<u32>,
+    props: Vec<(u32, Value)>,
+    min: u32,
+    max: Option<u32>,
+    /// Per depth: the sorted neighbours of that trail node and the index of
+    /// the next one to try.
+    frames: Vec<(Vec<(u64, u64)>, usize)>,
+    edges: Vec<u64>,
+    nodes: Vec<u64>,
+    state: ExpansionState,
+}
+
+impl VarExpansion {
+    /// Relationships of the current trail, in traversal order.
+    pub fn edges(&self) -> &[u64] {
+        &self.edges
+    }
+
+    /// Nodes of the current trail; one more than its relationships.
+    pub fn nodes(&self) -> &[u64] {
+        &self.nodes
+    }
+}
+
+/// The traversal restrictions shared by both directions of a path search.
+#[derive(Debug, Clone, Copy)]
+struct PathSearch<'a> {
+    directions: &'a [Direction],
+    types: &'a [u32],
+    props: &'a [(u32, Value)],
+}
+
+/// Breadth-first distances from one node, kept by layer.
+#[derive(Debug)]
+struct DistanceBall {
+    distances: HashMap<u64, u32>,
+    layers: Vec<Vec<u64>>,
+}
+
+impl DistanceBall {
+    fn new(start: u64) -> Self {
+        Self {
+            distances: HashMap::from([(start, 0)]),
+            layers: vec![vec![start]],
+        }
+    }
+
+    fn radius(&self) -> u32 {
+        self.layers.len() as u32 - 1
+    }
+
+    fn frontier(&self) -> &[u64] {
+        self.layers.last().expect("a ball has its start layer")
+    }
+
+    fn distance(&self, node: u64) -> Option<u32> {
+        self.distances.get(&node).copied()
+    }
+}
+
+/// What [`Database::next_trail`] does next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpansionState {
+    /// Yield the zero-length trail (`min == 0`).
+    EmitStart,
+    /// Push a frame for the current trail's last node.
+    Expand,
+    /// Try the next neighbour of the deepest frame.
+    Advance,
+    /// Every trail was produced.
+    Done,
 }
 
 impl Trail {
@@ -536,52 +616,135 @@ impl Database {
         Ok(true)
     }
 
-    /// Edge ids incident to `node_id` in `direction`, optionally filtered by
-    /// edge types. An empty `types` slice uses the combined "any" plane.
-    /// Enumerate every trail from `src` whose length is within `min..=max`
-    /// (`max` of `None` is unbounded), returning `(edge ids, end node)`.
-    /// Relationships never repeat within a trail; nodes may.
+    /// Start a depth-first enumeration of every trail from `src` whose length
+    /// is within `min..=max` (`max` of `None` is unbounded); advance it with
+    /// [`Database::next_trail`]. Relationships never repeat within a trail;
+    /// nodes may. Memory is bounded by the trail depth times the degree.
     ///
-    /// # Errors
+    /// # Arguments
     ///
-    /// Propagates storage errors while expanding.
-    pub fn var_expand(
+    /// * `src` - Start node
+    /// * `directions` - Directions to follow at every hop
+    /// * `types` - Edge types to follow; empty follows every type
+    /// * `props` - Literal properties every relationship must carry
+    /// * `bounds` - Minimum and optional maximum trail length
+    ///
+    /// # Returns
+    ///
+    /// The expansion, positioned before its first trail
+    pub fn var_expansion(
         &mut self,
         src: u64,
         directions: &[Direction],
         types: &[u32],
         props: &[(String, Value)],
-        min: u32,
-        max: Option<u32>,
-    ) -> Result<Vec<Trail>> {
+        bounds: (u32, Option<u32>),
+    ) -> VarExpansion {
         // Property key names are resolved per call, so keys created by the
         // same statement are seen. An unknown key matches nothing.
-        let mut keyed = Vec::with_capacity(props.len());
-        for (name, value) in props {
-            match self.property_key_id(name) {
-                Some(key_id) => keyed.push((key_id, value.clone())),
-                None => return Ok(Vec::new()),
-            }
+        let keyed: Option<Vec<(u32, Value)>> = props
+            .iter()
+            .map(|(name, value)| Some((self.property_key_id(name)?, value.clone())))
+            .collect();
+        let (min, max) = bounds;
+        let state = match keyed {
+            Some(_) if min == 0 => ExpansionState::EmitStart,
+            Some(_) => ExpansionState::Expand,
+            None => ExpansionState::Done,
+        };
+        VarExpansion {
+            directions: directions.iter().copied().collect(),
+            types: types.to_vec(),
+            props: keyed.unwrap_or_default(),
+            min,
+            max,
+            frames: Vec::new(),
+            edges: Vec::new(),
+            nodes: vec![src],
+            state,
         }
-        let mut out = Vec::new();
-        if min == 0 {
-            out.push(Trail {
-                edges: Vec::new(),
-                nodes: vec![src],
-            });
-        }
-        let mut trail = Vec::new();
-        let mut nodes = vec![src];
-        self.var_expand_rec(
-            src, directions, types, &keyed, min, max, &mut trail, &mut nodes, &mut out,
-        )?;
-        Ok(out)
     }
 
-    /// Shortest trails from `src`, breadth-first by hop count. With a target,
-    /// returns one trail to it (or every trail of minimal length when `all`);
-    /// without a target, returns one trail per reachable node (or every trail
-    /// of minimal length per node).
+    /// Advance `expansion` to its next trail, in the order a recursive
+    /// depth-first search over ascending `(edge, node)` neighbours visits
+    /// them.
+    ///
+    /// # Returns
+    ///
+    /// `true` when [`VarExpansion::edges`] and [`VarExpansion::nodes`] hold
+    /// the next trail, `false` once every trail was produced
+    ///
+    /// # Errors
+    ///
+    /// Propagates storage errors while expanding.
+    pub fn next_trail(&mut self, expansion: &mut VarExpansion) -> Result<bool> {
+        loop {
+            match expansion.state {
+                ExpansionState::Done => return Ok(false),
+                ExpansionState::EmitStart => {
+                    expansion.state = ExpansionState::Expand;
+                    return Ok(true);
+                }
+                ExpansionState::Expand => {
+                    expansion.state = ExpansionState::Advance;
+                    let depth = expansion.edges.len() as u32;
+                    let mut neighbours = Vec::new();
+                    if expansion.max.is_none_or(|max| depth < max) {
+                        let node = *expansion.nodes.last().expect("a trail has a start node");
+                        for direction in &expansion.directions {
+                            neighbours.extend(self.expand(node, *direction, &expansion.types)?);
+                        }
+                        neighbours.sort_unstable();
+                        neighbours.dedup();
+                    }
+                    expansion.frames.push((neighbours, 0));
+                }
+                ExpansionState::Advance => {
+                    let Some((neighbours, next)) = expansion.frames.last_mut() else {
+                        expansion.state = ExpansionState::Done;
+                        return Ok(false);
+                    };
+                    let Some(&(edge, node)) = neighbours.get(*next) else {
+                        // Exhausted: back out of the hop that led here.
+                        expansion.frames.pop();
+                        if expansion.frames.is_empty() {
+                            expansion.state = ExpansionState::Done;
+                            return Ok(false);
+                        }
+                        expansion.edges.pop();
+                        expansion.nodes.pop();
+                        continue;
+                    };
+                    *next += 1;
+                    if expansion.edges.contains(&edge)
+                        || !self.edge_matches(edge, &expansion.props)?
+                    {
+                        continue;
+                    }
+                    expansion.edges.push(edge);
+                    expansion.nodes.push(node);
+                    expansion.state = ExpansionState::Expand;
+                    if expansion.edges.len() as u32 >= expansion.min {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Shortest trails from `src`. With a target, returns one trail to it
+    /// (or every trail of minimal length when `all`); without a target,
+    /// returns one trail per reachable node (or every trail of minimal
+    /// length per node). Trails come in the order a breadth-first
+    /// enumeration over expansion order produces them.
+    ///
+    /// A target is found with a bidirectional search over node distances
+    /// (see [`Self::bidirectional_shortest`]); the path enumeration remains
+    /// for an unbound target and for a minimum length above the distance.
+    ///
+    /// # Errors
+    ///
+    /// Propagates storage errors while expanding.
     #[allow(clippy::too_many_arguments)]
     pub fn var_shortest_paths(
         &mut self,
@@ -603,6 +766,39 @@ impl Database {
                 None => return Ok(Vec::new()),
             }
         }
+        let search = PathSearch {
+            directions,
+            types,
+            props: &keyed,
+        };
+        if let Some(target) = dst {
+            match self.bidirectional_shortest(&search, src, target, max, all)? {
+                None => return Ok(Vec::new()),
+                Some((distance, trails)) if distance >= min => return Ok(trails),
+                Some(_) => {}
+            }
+        }
+        self.shortest_by_enumeration(&search, src, dst, min, max, all)
+    }
+
+    /// Shortest trails by breadth-first enumeration of simple paths. Exact
+    /// for every bound, but the frontier holds every simple path of the
+    /// current length, so it is reserved for the cases the distance search
+    /// cannot answer.
+    fn shortest_by_enumeration(
+        &mut self,
+        search: &PathSearch<'_>,
+        src: u64,
+        dst: Option<u64>,
+        min: u32,
+        max: Option<u32>,
+        all: bool,
+    ) -> Result<Vec<Trail>> {
+        let PathSearch {
+            directions,
+            types,
+            props: keyed,
+        } = *search;
         // Shortest paths are simple: a node may not repeat. Each frontier
         // entry carries its edge list and visited nodes.
         let mut out: Vec<Trail> = Vec::new();
@@ -655,7 +851,7 @@ impl Database {
             for (node, trail, nodes) in &frontier {
                 for direction in directions {
                     for (edge, neighbour) in self.expand(*node, *direction, types)? {
-                        if nodes.contains(&neighbour) || !self.edge_matches(edge, &keyed)? {
+                        if nodes.contains(&neighbour) || !self.edge_matches(edge, keyed)? {
                             continue;
                         }
                         let mut extended = trail.clone();
@@ -674,47 +870,198 @@ impl Database {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn var_expand_rec(
+    /// Shortest trails from `src` to `dst` within `max` hops: the distance
+    /// `D` from a bidirectional breadth-first search over node distances
+    /// (expanding the smaller frontier a layer at a time), then the trails of
+    /// length `D` in enumeration order, found by a depth-first walk that only
+    /// steps onto nodes lying on some shortest path.
+    ///
+    /// # Returns
+    ///
+    /// `None` when no trail of at most `max` hops exists; otherwise `D` and
+    /// the first trail (or all of them when `all`)
+    fn bidirectional_shortest(
         &mut self,
-        node: u64,
-        directions: &[Direction],
-        types: &[u32],
-        props: &[(u32, Value)],
-        min: u32,
+        search: &PathSearch<'_>,
+        src: u64,
+        dst: u64,
         max: Option<u32>,
-        trail: &mut Vec<u64>,
-        nodes: &mut Vec<u64>,
-        out: &mut Vec<Trail>,
-    ) -> Result<()> {
-        if let Some(max) = max
-            && trail.len() as u32 >= max
-        {
-            return Ok(());
-        }
-        let mut neighbours = Vec::new();
-        for direction in directions {
-            neighbours.extend(self.expand(node, *direction, types)?);
-        }
-        neighbours.sort_unstable();
-        neighbours.dedup();
-        for (edge, next) in neighbours {
-            if trail.contains(&edge) || !self.edge_matches(edge, props)? {
-                continue;
+        all: bool,
+    ) -> Result<Option<(u32, Vec<Trail>)>> {
+        let backward: SmallVec<[Direction; 2]> = search
+            .directions
+            .iter()
+            .map(|direction| direction.reverse())
+            .collect();
+        let backward = PathSearch {
+            directions: &backward,
+            ..*search
+        };
+        let mut forward_ball = DistanceBall::new(src);
+        let mut backward_ball = DistanceBall::new(dst);
+        if src != dst {
+            loop {
+                if max.is_some_and(|max| forward_ball.radius() + backward_ball.radius() >= max) {
+                    return Ok(None);
+                }
+                // No node is in both balls yet, so the first one that is
+                // fixes the distance at the sum of the radii.
+                let met = if forward_ball.frontier().len() <= backward_ball.frontier().len() {
+                    self.grow_ball(search, &mut forward_ball, &backward_ball)?
+                } else {
+                    self.grow_ball(&backward, &mut backward_ball, &forward_ball)?
+                };
+                match met {
+                    Some(true) => break,
+                    Some(false) => {}
+                    None => return Ok(None),
+                }
             }
-            trail.push(edge);
-            nodes.push(next);
-            if trail.len() as u32 >= min {
+        }
+        let distance = forward_ball.radius() + backward_ball.radius();
+        let on_path = self.forward_on_path(search, &forward_ball, &backward_ball, distance)?;
+        let trails = self.walk_shortest(search, src, distance, all, |depth, node| {
+            if depth <= forward_ball.radius() {
+                forward_ball.distance(node) == Some(depth) && on_path.contains(&node)
+            } else {
+                backward_ball.distance(node) == Some(distance - depth)
+            }
+        })?;
+        Ok(Some((distance, trails)))
+    }
+
+    /// Expand the frontier of `ball` by one layer. Returns whether a new
+    /// node is also in `other`, or `None` when the frontier died out.
+    fn grow_ball(
+        &mut self,
+        search: &PathSearch<'_>,
+        ball: &mut DistanceBall,
+        other: &DistanceBall,
+    ) -> Result<Option<bool>> {
+        let depth = ball.radius() + 1;
+        let mut layer = Vec::new();
+        let mut met = false;
+        // Borrow the layer list and the distance map separately.
+        let frontier = ball.layers.last().expect("a ball has its start layer");
+        for &node in frontier {
+            for &direction in search.directions {
+                for (edge, next) in self.expand(node, direction, search.types)? {
+                    if ball.distances.contains_key(&next)
+                        || !self.edge_matches(edge, search.props)?
+                    {
+                        continue;
+                    }
+                    ball.distances.insert(next, depth);
+                    met |= other.distances.contains_key(&next);
+                    layer.push(next);
+                }
+            }
+        }
+        if layer.is_empty() {
+            return Ok(None);
+        }
+        ball.layers.push(layer);
+        Ok(Some(met))
+    }
+
+    /// Nodes of the forward ball that start a shortest continuation: those
+    /// whose backward distance completes `distance`, and, layer by layer
+    /// towards the source, those with a successor one layer further that
+    /// does.
+    fn forward_on_path(
+        &mut self,
+        search: &PathSearch<'_>,
+        forward: &DistanceBall,
+        backward: &DistanceBall,
+        distance: u32,
+    ) -> Result<HashSet<u64>> {
+        let mut on_path = HashSet::new();
+        for (depth, layer) in forward.layers.iter().enumerate().rev() {
+            let depth = depth as u32;
+            for &node in layer {
+                let mut good = backward.distance(node) == Some(distance - depth);
+                if !good && depth < forward.radius() {
+                    'search: for &direction in search.directions {
+                        for (edge, next) in self.expand(node, direction, search.types)? {
+                            if forward.distance(next) == Some(depth + 1)
+                                && on_path.contains(&next)
+                                && self.edge_matches(edge, search.props)?
+                            {
+                                good = true;
+                                break 'search;
+                            }
+                        }
+                    }
+                }
+                if good {
+                    on_path.insert(node);
+                }
+            }
+        }
+        Ok(on_path)
+    }
+
+    /// Trails of exactly `distance` hops from `src` whose node at each depth
+    /// satisfies `on_path`, depth first in expansion order (the order a
+    /// breadth-first enumeration lists them). Stops at the first unless
+    /// `all`.
+    fn walk_shortest(
+        &mut self,
+        search: &PathSearch<'_>,
+        src: u64,
+        distance: u32,
+        all: bool,
+        on_path: impl Fn(u32, u64) -> bool,
+    ) -> Result<Vec<Trail>> {
+        let mut out = Vec::new();
+        let mut edges = Vec::new();
+        let mut nodes = vec![src];
+        let mut frames: Vec<(Vec<(u64, u64)>, usize)> = Vec::new();
+        loop {
+            let depth = edges.len() as u32;
+            if depth == distance {
                 out.push(Trail {
-                    edges: trail.clone(),
+                    edges: edges.clone(),
                     nodes: nodes.clone(),
                 });
+                if !all {
+                    return Ok(out);
+                }
+            } else {
+                let node = *nodes.last().expect("a trail has a start node");
+                let mut steps = Vec::new();
+                for &direction in search.directions {
+                    for (edge, next) in self.expand(node, direction, search.types)? {
+                        if on_path(depth + 1, next) && self.edge_matches(edge, search.props)? {
+                            steps.push((edge, next));
+                        }
+                    }
+                }
+                frames.push((steps, 0));
             }
-            self.var_expand_rec(next, directions, types, props, min, max, trail, nodes, out)?;
-            trail.pop();
-            nodes.pop();
+            // Advance to the next untried step, backing out of exhausted
+            // frames (and the trail of a completed one).
+            loop {
+                let Some((steps, next)) = frames.last_mut() else {
+                    return Ok(out);
+                };
+                if let Some(&(edge, node)) = steps.get(*next) {
+                    *next += 1;
+                    if edges.len() as u32 == frames.len() as u32 {
+                        edges.pop();
+                        nodes.pop();
+                    }
+                    edges.push(edge);
+                    nodes.push(node);
+                    break;
+                }
+                frames.pop();
+                if edges.len() as u32 > frames.len() as u32 {
+                    edges.pop();
+                    nodes.pop();
+                }
+            }
         }
-        Ok(())
     }
 
     /// Whether an edge carries all the literal property filters.
@@ -787,6 +1134,16 @@ impl Database {
         self.fragments.label_nodes(&mut self.pager, label_id)
     }
 
+    /// Node ids carrying every label in `label_ids`, ascending (bitmap
+    /// intersection; see [`FragmentStore::nodes_with_labels`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `label_ids` is empty or a fragment is unreadable
+    pub fn nodes_with_labels(&mut self, label_ids: &[u32]) -> Result<Vec<u64>> {
+        self.fragments.nodes_with_labels(&mut self.pager, label_ids)
+    }
+
     /// All edge ids of `edge_type` (bitmap scan).
     pub fn edges_of_type(&mut self, edge_type: u32) -> Result<Vec<u64>> {
         self.fragments.edges_of_type(&mut self.pager, edge_type)
@@ -798,7 +1155,10 @@ impl Database {
             .incidence_exists(&mut self.pager, edge_type, src, dst)
     }
 
-    /// Look up nodes by an exact property value using index `index_id`.
+    /// Ids, ascending, of nodes whose value in index `index_id` equals
+    /// `value` under Cypher equality (see
+    /// [`equality_key_ranges`](crate::record::equality_key_ranges)); list
+    /// values return a superset that callers re-check.
     pub fn index_lookup(&mut self, index_id: u32, value: &Value) -> Result<Vec<u64>> {
         let def = self
             .schema()
@@ -812,18 +1172,26 @@ impl Database {
                     format!("node index {index_id} not found"),
                 )
             })?;
-        let prefix = index_value_prefix(value);
+        let ranges = crate::record::equality_key_ranges(value);
         let tree = Btree::from_root(def.root, TreeKind::Index);
         let mut cursor = tree.cursor();
         let mut out = Vec::new();
-        let mut ok = cursor.seek_ge(&mut self.pager, &prefix)?;
-        while ok && cursor.key().starts_with(&prefix) {
-            let key = cursor.key();
-            let id_bytes: [u8; 8] = key[key.len() - 8..]
-                .try_into()
-                .map_err(|_| Error::corrupt("index key too short"))?;
-            out.push(u64::from_be_bytes(id_bytes));
-            ok = cursor.next(&mut self.pager)?;
+        for (start, end) in &ranges {
+            let mut ok = cursor.seek_ge(&mut self.pager, start)?;
+            while ok && end.as_deref().is_none_or(|end| cursor.key() < end) {
+                let key = cursor.key();
+                let id_bytes: [u8; 8] = key[key.len() - 8..]
+                    .try_into()
+                    .map_err(|_| Error::corrupt("index key too short"))?;
+                out.push(u64::from_be_bytes(id_bytes));
+                ok = cursor.next(&mut self.pager)?;
+            }
+        }
+        // Ids ascend within one stored value only; numeric twins and list
+        // ranges span several values and need a merge.
+        if ranges.len() > 1 || matches!(value, Value::List(_)) {
+            out.sort_unstable();
+            out.dedup();
         }
         Ok(out)
     }
@@ -1298,7 +1666,8 @@ impl Database {
         Ok(())
     }
 
-    /// Index every node matching a node index's label.
+    /// Index every node matching a node index's label: collect the keys,
+    /// sort them in parallel and bulk-build the (empty) index tree.
     fn backfill_node_index(&mut self, index_id: u32) -> Result<()> {
         let Some(def) = self
             .schema()
@@ -1309,24 +1678,33 @@ impl Database {
         else {
             return Ok(());
         };
+        let mut keys = IndexKeys::default();
         let mut cursor = self.nodes.cursor();
         let mut ok = cursor.first(&mut self.pager)?;
         while ok {
-            let id_bytes: [u8; 8] = cursor
-                .key()
-                .try_into()
-                .map_err(|_| Error::corrupt("node key is not 8 bytes"))?;
-            let node_id = u64::from_be_bytes(id_bytes);
+            let node_id = table_key_id(cursor.key(), "node")?;
             let record = NodeRecord::decode(&cursor.value(&mut self.pager)?)?;
-            if def.label_id == 0 || record.labels.contains(&def.label_id) {
-                self.insert_index_entry(index_id, &record, node_id, true)?;
+            if (def.label_id == 0 || record.labels.contains(&def.label_id))
+                && let Some(prefix) = node_index_prefix(&record, &def)
+            {
+                keys.push(&prefix, node_id);
             }
             ok = cursor.next(&mut self.pager)?;
         }
-        Ok(())
+        keys.sort();
+        if def.unique()
+            && let Some(node_id) = keys.first_duplicate()
+        {
+            return Err(Error::constraint(format!(
+                "unique index {} violated by node {node_id}",
+                def.id
+            )));
+        }
+        Btree::from_root(def.root, TreeKind::Index).build_sorted(&mut self.pager, keys.entries())
     }
 
-    /// Index every edge matching an edge index's type.
+    /// Index every edge matching an edge index's type (see
+    /// [`Self::backfill_node_index`]).
     fn backfill_edge_index(&mut self, index_id: u32) -> Result<()> {
         let Some(def) = self
             .schema()
@@ -1337,21 +1715,29 @@ impl Database {
         else {
             return Ok(());
         };
+        let mut keys = IndexKeys::default();
         let mut cursor = self.edges.cursor();
         let mut ok = cursor.first(&mut self.pager)?;
         while ok {
-            let id_bytes: [u8; 8] = cursor
-                .key()
-                .try_into()
-                .map_err(|_| Error::corrupt("edge key is not 8 bytes"))?;
-            let edge_id = u64::from_be_bytes(id_bytes);
+            let edge_id = table_key_id(cursor.key(), "edge")?;
             let record = EdgeRecord::decode(&cursor.value(&mut self.pager)?)?;
-            if def.type_id == 0 || record.edge_type == def.type_id {
-                self.insert_edge_index_entry(index_id, &record, edge_id, true)?;
+            if (def.type_id == 0 || record.edge_type == def.type_id)
+                && let Some(prefix) = edge_index_prefix(&record, &def)
+            {
+                keys.push(&prefix, edge_id);
             }
             ok = cursor.next(&mut self.pager)?;
         }
-        Ok(())
+        keys.sort();
+        if def.unique()
+            && let Some(edge_id) = keys.first_duplicate()
+        {
+            return Err(Error::constraint(format!(
+                "unique index {} violated by edge {edge_id}",
+                def.id
+            )));
+        }
+        Btree::from_root(def.root, TreeKind::Index).build_sorted(&mut self.pager, keys.entries())
     }
 
     /// All node ids in ascending order.
@@ -1592,7 +1978,7 @@ impl Database {
         let indexes: Vec<_> = self.schema().node_indexes.clone();
         for index in indexes {
             if index.label_id == 0 || record.labels.contains(&index.label_id) {
-                self.insert_index_entry(index.id, record, node_id, false)?;
+                self.insert_index_entry(index.id, record, node_id)?;
             }
         }
         Ok(())
@@ -1621,7 +2007,7 @@ impl Database {
             .collect();
         for index in indexes {
             if index.label_id == 0 || record.labels.contains(&index.label_id) {
-                self.insert_index_entry(index.id, record, node_id, false)?;
+                self.insert_index_entry(index.id, record, node_id)?;
             }
         }
         Ok(())
@@ -1650,7 +2036,6 @@ impl Database {
         index_id: u32,
         record: &NodeRecord,
         node_id: u64,
-        backfill: bool,
     ) -> Result<()> {
         let def = self
             .schema()
@@ -1670,16 +2055,10 @@ impl Database {
             // enforce value uniqueness: probe the value prefix instead.
             let mut cursor = tree.cursor();
             if cursor.seek_ge(&mut self.pager, &prefix)? && cursor.key().starts_with(&prefix) {
-                // Backfill may re-encounter the entry being created.
-                let existing: [u8; 8] = cursor.key()[cursor.key().len() - 8..]
-                    .try_into()
-                    .map_err(|_| Error::corrupt("index key too short"))?;
-                if u64::from_be_bytes(existing) != node_id || !backfill {
-                    return Err(Error::constraint(format!(
-                        "unique index {} violated by node {node_id}",
-                        def.id
-                    )));
-                }
+                return Err(Error::constraint(format!(
+                    "unique index {} violated by node {node_id}",
+                    def.id
+                )));
             }
         }
         let mut key = prefix;
@@ -1742,7 +2121,7 @@ impl Database {
         let indexes: Vec<_> = self.schema().edge_indexes.clone();
         for index in indexes {
             if index.type_id == 0 || record.edge_type == index.type_id {
-                self.insert_edge_index_entry(index.id, record, edge_id, false)?;
+                self.insert_edge_index_entry(index.id, record, edge_id)?;
             }
         }
         Ok(())
@@ -1769,7 +2148,7 @@ impl Database {
             .collect();
         for index in indexes {
             if index.type_id == 0 || record.edge_type == index.type_id {
-                self.insert_edge_index_entry(index.id, record, edge_id, false)?;
+                self.insert_edge_index_entry(index.id, record, edge_id)?;
             }
         }
         Ok(())
@@ -1797,7 +2176,6 @@ impl Database {
         index_id: u32,
         record: &EdgeRecord,
         edge_id: u64,
-        backfill: bool,
     ) -> Result<()> {
         let def = self
             .schema()
@@ -1815,15 +2193,10 @@ impl Database {
         if def.unique() {
             let mut cursor = tree.cursor();
             if cursor.seek_ge(&mut self.pager, &prefix)? && cursor.key().starts_with(&prefix) {
-                let existing: [u8; 8] = cursor.key()[cursor.key().len() - 8..]
-                    .try_into()
-                    .map_err(|_| Error::corrupt("index key too short"))?;
-                if u64::from_be_bytes(existing) != edge_id || !backfill {
-                    return Err(Error::constraint(format!(
-                        "unique index {} violated by edge {edge_id}",
-                        def.id
-                    )));
-                }
+                return Err(Error::constraint(format!(
+                    "unique index {} violated by edge {edge_id}",
+                    def.id
+                )));
             }
         }
         let mut key = prefix;
@@ -2054,6 +2427,62 @@ fn edge_index_prefix(record: &EdgeRecord, def: &crate::catalog::EdgeIndexDef) ->
 }
 
 /// Prefix shared by all index entries with `value`.
+/// The id in an 8-byte big-endian record table key.
+fn table_key_id(key: &[u8], what: &str) -> Result<u64> {
+    let bytes: [u8; 8] = key
+        .try_into()
+        .map_err(|_| Error::corrupt(format!("{what} key is not 8 bytes")))?;
+    Ok(u64::from_be_bytes(bytes))
+}
+
+/// Index keys gathered for a bulk build: one flat byte buffer plus the span
+/// of each key, so millions of keys cost two allocations rather than one
+/// each. Every key is a value prefix followed by an 8-byte entity id.
+#[derive(Debug, Default)]
+struct IndexKeys {
+    bytes: Vec<u8>,
+    spans: Vec<std::ops::Range<usize>>,
+}
+
+impl IndexKeys {
+    fn push(&mut self, prefix: &[u8], id: u64) {
+        let start = self.bytes.len();
+        self.bytes.extend_from_slice(prefix);
+        self.bytes.extend_from_slice(&id.to_be_bytes());
+        self.spans.push(start..self.bytes.len());
+    }
+
+    fn key(&self, span: &std::ops::Range<usize>) -> &[u8] {
+        &self.bytes[span.clone()]
+    }
+
+    /// Order the keys, sorting on every core (keys are unique because they
+    /// end in the entity id, so an unstable sort is deterministic).
+    fn sort(&mut self) {
+        use rayon::slice::ParallelSliceMut;
+        let bytes = &self.bytes;
+        self.spans
+            .par_sort_unstable_by(|a, b| bytes[a.clone()].cmp(&bytes[b.clone()]));
+    }
+
+    /// After [`Self::sort`]: the id of the second entity found sharing a
+    /// value with its predecessor.
+    fn first_duplicate(&self) -> Option<u64> {
+        self.spans.windows(2).find_map(|pair| {
+            let (left, right) = (self.key(&pair[0]), self.key(&pair[1]));
+            let (left_value, _) = left.split_at(left.len() - 8);
+            let (right_value, id) = right.split_at(right.len() - 8);
+            (left_value == right_value)
+                .then(|| u64::from_be_bytes(id.try_into().expect("8-byte id suffix")))
+        })
+    }
+
+    fn entries(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        self.spans.iter().map(|span| (self.key(span), &[][..]))
+    }
+}
+
+#[cfg(test)]
 fn index_value_prefix(value: &Value) -> Vec<u8> {
     let mut prefix = Vec::with_capacity(16);
     encode_index_key(&mut prefix, value);
@@ -2096,6 +2525,133 @@ mod tests {
 
     fn temp_db() -> Database {
         Database::create(Arc::new(MemVfs::new()), Path::new("engine.db"), 4096).expect("create db")
+    }
+
+    /// The recursive depth-first enumeration the streaming expansion
+    /// replaced, kept as its oracle.
+    fn reference_trails(
+        db: &mut Database,
+        directions: &[Direction],
+        bounds: (u32, Option<u32>),
+        trail: &mut Vec<u64>,
+        nodes: &mut Vec<u64>,
+        out: &mut Vec<(Vec<u64>, Vec<u64>)>,
+    ) {
+        let (min, max) = bounds;
+        if max.is_some_and(|max| trail.len() as u32 >= max) {
+            return;
+        }
+        let node = *nodes.last().expect("start");
+        let mut neighbours = Vec::new();
+        for direction in directions {
+            neighbours.extend(db.expand(node, *direction, &[]).expect("expand"));
+        }
+        neighbours.sort_unstable();
+        neighbours.dedup();
+        for (edge, next) in neighbours {
+            if trail.contains(&edge) {
+                continue;
+            }
+            trail.push(edge);
+            nodes.push(next);
+            if trail.len() as u32 >= min {
+                out.push((trail.clone(), nodes.clone()));
+            }
+            reference_trails(db, directions, bounds, trail, nodes, out);
+            trail.pop();
+            nodes.pop();
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(48))]
+
+        #[test]
+        fn streaming_expansion_matches_recursive_enumeration(
+            edges in proptest::collection::vec((0usize..6, 0usize..6), 0..10),
+            min in 0u32..3,
+            extra in proptest::option::of(0u32..4),
+            direction in 0usize..3,
+        ) {
+            let mut db = temp_db();
+            let ids = db
+                .write(|db| {
+                    let t = db.ensure_edge_type("T")?;
+                    let ids: Vec<u64> =
+                        (0..6).map(|_| db.create_node(&[], vec![])).collect::<Result<_>>()?;
+                    for (src, dst) in &edges {
+                        db.create_edge(t, ids[*src], ids[*dst], vec![])?;
+                    }
+                    Ok(ids)
+                })
+                .expect("graph");
+            let directions: &[Direction] = match direction {
+                0 => &[Direction::Out],
+                1 => &[Direction::In],
+                _ => &[Direction::Out, Direction::In],
+            };
+            let bounds = (min, extra.map(|extra| min + extra));
+            for start in ids {
+                let mut expected = Vec::new();
+                if min == 0 {
+                    expected.push((Vec::new(), vec![start]));
+                }
+                reference_trails(
+                    &mut db, directions, bounds, &mut Vec::new(), &mut vec![start], &mut expected,
+                );
+                let mut expansion = db.var_expansion(start, directions, &[], &[], bounds);
+                let mut actual = Vec::new();
+                while db.next_trail(&mut expansion).expect("next") {
+                    actual.push((expansion.edges().to_vec(), expansion.nodes().to_vec()));
+                }
+                proptest::prop_assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+        /// The bidirectional search returns exactly the trails, in the same
+        /// order, that the breadth-first path enumeration returns.
+        #[test]
+        fn bidirectional_shortest_matches_enumeration(
+            edges in proptest::collection::vec((0usize..8, 0usize..8), 0..18),
+            min in 0u32..3,
+            max in proptest::option::of(0u32..6),
+            direction in 0usize..3,
+            all: bool,
+        ) {
+            let mut db = temp_db();
+            let ids = db
+                .write(|db| {
+                    let t = db.ensure_edge_type("T")?;
+                    let ids: Vec<u64> =
+                        (0..8).map(|_| db.create_node(&[], vec![])).collect::<Result<_>>()?;
+                    for (src, dst) in &edges {
+                        db.create_edge(t, ids[*src], ids[*dst], vec![])?;
+                    }
+                    Ok(ids)
+                })
+                .expect("graph");
+            let directions: &[Direction] = match direction {
+                0 => &[Direction::Out],
+                1 => &[Direction::In],
+                _ => &[Direction::Out, Direction::In],
+            };
+            let search = PathSearch { directions, types: &[], props: &[] };
+            for &src in &ids[..4] {
+                for &dst in &ids[..4] {
+                    let fast = db
+                        .var_shortest_paths(src, Some(dst), directions, &[], &[], min, max, all)
+                        .expect("fast");
+                    let slow = db
+                        .shortest_by_enumeration(&search, src, Some(dst), min, max, all)
+                        .expect("slow");
+                    proptest::prop_assert_eq!(&fast, &slow, "{} -> {}", src, dst);
+                }
+            }
+        }
     }
 
     fn prop(key: u32, value: &str) -> (u32, Value) {
