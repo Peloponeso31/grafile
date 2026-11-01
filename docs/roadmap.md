@@ -54,8 +54,9 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
 - Schema DDL: `CREATE INDEX`/`CREATE CONSTRAINT` with `IS UNIQUE`,
   `IS NOT NULL` and `IS NODE KEY`, `DROP INDEX`/`DROP CONSTRAINT` with
   `IF [NOT] EXISTS`, and the edge forms; constraints are enforced on every
-  write path (see Phase 5). `LOAD CSV [WITH HEADERS] FROM file AS row` reads
-  local CSVs into the row pipeline.
+  write path (see Phase 5). `CREATE FULLTEXT INDEX … ON EACH [...]` with
+  `db.index.fulltext.queryNodes`. `LOAD CSV [WITH HEADERS] FROM file AS row`
+  reads local CSVs into the row pipeline.
 
 Explicit gaps (currently clear `Unsupported` errors):
 
@@ -66,11 +67,6 @@ Explicit gaps (currently clear `Unsupported` errors):
 | Unknown functions | codegen (by design) |
 
 Silently absent areas: none of the openCypher value types.
-
-The remaining Neo4j-only bulk-loading constructs (`CREATE FULLTEXT INDEX`
-and its query procedure) are scheduled in Phase 6. Until then they fail with
-syntax or `Unsupported` errors; the seed-script audit is the acceptance
-fixture.
 
 Known limitations:
 
@@ -219,7 +215,7 @@ The vendored TCK has no scenarios for these extensions, so none of them is
 allow-listed; the allow-list only holds the CALL procedure non-goal and one
 nested pattern comprehension.
 
-### Phase 6 — Neo4j bulk-load surface (large) [pending]
+### Phase 6 — Neo4j bulk-load surface (large) [done]
 
 The acceptance fixture is the audited `seed_big.cypher` (Neo4j 5 style,
 e-commerce/social seed). It must run end to end through the script runner at
@@ -244,18 +240,22 @@ gate.
   transaction at every boundary, so earlier batches survive a later failure.
   Explicit transactions are rejected, and the parser defaults the batch size
   to 1000 rows.
-- [pending] Fulltext indexes: `CREATE FULLTEXT INDEX name [IF NOT EXISTS] FOR
-  (n:Label) ON EACH [n.prop, ...]` and `DROP INDEX`; a new index kind with
-  inverted B+tree storage; maintenance on create, update, label change and
-  delete; backfill with a progress bar;
-  `db.index.fulltext.queryNodes(index, query)` yielding `node, score`. Query
-  v1 covers terms, phrases and `AND`/`OR`; the analyzer is explicitly not
-  Lucene-compatible. The catalog format minor bumps from 3 to 4
-  (`docs/format.md`), with old-build rejection and new-build compatibility
-  tests.
-- [pending] Acceptance fixture: a checked-in 1/100-size variant of the seed
-  script and an integration test asserting node/relationship counts and the
-  sample fulltext query.
+- [done] Fulltext indexes: `CREATE FULLTEXT INDEX name [IF NOT EXISTS] FOR
+  (n:Label) ON EACH [n.prop, ...]` and `DROP INDEX`; a new catalog entry kind
+  (format minor 4) whose inverted B+tree maps `term 0x00 node id` to token
+  positions; maintenance on create, property set and replacement, label
+  change and delete; backfill with a progress bar;
+  `db.index.fulltext.queryNodes(index, query)` yielding `node, score`
+  (BM25-style idf with square-root term frequency). Queries cover terms,
+  phrases and `AND`/`OR`; the analyzer (split on non-alphanumerics,
+  lowercase) is explicitly not Lucene-compatible. Relationship fulltext
+  indexes are rejected as unsupported.
+- [done] Acceptance fixture: `tests/fixtures/seed_1_100.cypher` is the
+  hardcoded-size seed script divided by 100, and `tests/seed_fixture.rs`
+  asserts every node count, the fixed relationship counts, bounds on the
+  random fan-out and the sample fulltext query. It takes about 150 s in a
+  release build (variable-key lookups still scan labels), so it is ignored
+  by default and CI runs it with `--release --ignored`.
 
 The TCK does not exercise this surface; unit and integration tests are the
 gate, and the report must not regress. Non-goals: Lucene query syntax, a
@@ -344,7 +344,7 @@ verified against the Phase 7 reference model and checker before it ships.
 | Workload | Baseline | Target |
 |----------|----------|--------|
 | Variable-key point lookup, 50k nodes | 15.5 ms (label scan) | ≤ 10 µs (seek) |
-| Seed load, 1/100 scale | Phase 6 baseline | ≥ 3x throughput |
+| Seed load, 1/100 scale | 140 s (release CLI) | ≥ 3x throughput |
 | Numeric filter, 1M rows | scalar VM | ≥ 1.5x |
 | `sum`/`count`/`avg`, 1M values | scalar VM | ≥ 2x |
 | Dense 8 KiB bitmap AND/OR/cardinality | scalar words | ≥ 1.5x |

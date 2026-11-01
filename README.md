@@ -293,8 +293,20 @@ grafile> DROP CONSTRAINT person_email IF EXISTS
 `IS UNIQUE`, `IS NOT NULL` and `REQUIRE (n.a, n.b) IS NODE KEY` are
 enforced on creation, property removal and whole-map replacement, and
 the edge form `FOR ()-[r:TYPE]-()` covers unique and not-null edge
-constraints. `SHOW INDEXES` / `SHOW CONSTRAINTS` are not supported. The
-Rust API keeps the direct constructors:
+constraints. `SHOW INDEXES` / `SHOW CONSTRAINTS` are not supported.
+
+Fulltext indexes cover the text properties of one label and are queried
+through a procedure:
+
+```console
+grafile> CREATE FULLTEXT INDEX post_text FOR (n:Post) ON EACH [n.title, n.body]
+grafile> CALL db.index.fulltext.queryNodes('post_text', '"hot take" OR graphs AND coffee') YIELD node, score RETURN node.title, score
+```
+
+Queries take terms, `"phrases"` and `AND`/`OR` (`AND` binds tighter;
+adjacent terms are alternatives). Text is split at non-alphanumeric
+characters and lowercased; the analyzer and scores are not
+Lucene-compatible. The Rust API keeps the direct constructors:
 
 ```rust
 conn.create_node_index("name", Some("Person"), true)?; // unique index
@@ -345,7 +357,8 @@ property filters including non-literal values),
 `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`), `UNWIND`,
 `LOAD CSV [WITH HEADERS] FROM file AS row`, `CREATE`, `MERGE` (with
 `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE` /
-`DETACH DELETE`, `FOREACH`, `CALL` for built-in `db.*` procedures,
+`DETACH DELETE`, `FOREACH`, `CALL` for built-in `db.*` procedures
+(including `db.index.fulltext.queryNodes`),
 `CALL { ... }` unit and returning subqueries (correlated through `WITH` or a
 `CALL (x, y) { ... }` scope clause, with `IN TRANSACTIONS OF n ROWS` batch
 commits), `UNION` / `UNION ALL`, `SET n += {…}`,

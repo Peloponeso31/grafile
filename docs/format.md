@@ -1,6 +1,6 @@
 # grafile on-disk format
 
-Version 0.3 (format major 0, minor 3). All multi-byte integers are
+Version 0.4 (format major 0, minor 4). All multi-byte integers are
 little-endian unless stated otherwise. The database is a single file; a
 transient `-journal` sidecar exists only while a write transaction is in
 flight (see [Transactions](#transactions)).
@@ -145,6 +145,7 @@ Keys pack `(kind u8, id u32)` big-endian into a `u64`. Kinds:
 | 7 | named edge index (format minor 3) |
 | 8 | node `IS NOT NULL` constraint |
 | 9 | edge `IS NOT NULL` constraint |
+| 10 | node fulltext index (format minor 4) |
 
 Anonymous index payloads (kinds 4 and 5) are the format-minor-2 layout:
 varint key id, varint label (node) or type (edge) id, one byte `unique`,
@@ -164,8 +165,33 @@ Named index payloads (kinds 6 and 7):
 Constraint payloads (kinds 8 and 9): varint label/type id, varint property
 key id, varint name length, name bytes. Constraints have no B+tree.
 
+Fulltext index payloads (kind 10):
+
+| Field | Encoding |
+|-------|----------|
+| key count | varint (at least 1) |
+| key ids | varint each, in declaration order |
+| label id | varint |
+| name | varint length + UTF-8 bytes |
+| B+tree root | 4-byte little-endian page number |
+
 A build that predates format minor 3 reads kinds 1-5 and rejects any file
 containing the newer kinds; builds from minor 3 read both index encodings.
+Minor-3 builds likewise reject files containing kind 10; minor-4 builds read
+every older catalog unchanged.
+
+## Fulltext indexes
+
+Each fulltext index owns an index B+tree holding one entry per
+(term, node) pair. The key is the term's UTF-8 bytes, a `0x00` separator and
+the 8-byte big-endian node id; the value is a varint position count followed
+by delta-encoded varint positions. Terms are lowercase runs of alphanumeric
+characters (at most 255 bytes; longer runs are not indexed), so the separator
+never occurs inside a term and a term's postings are contiguous and ordered
+by node id. Positions run across a node's indexed properties in key order
+with a one-position gap between properties, so phrases never span two
+values. Only string values are indexed. Like fragments, postings are derived
+data and can be rebuilt from node records.
 
 ## Fragment store
 
