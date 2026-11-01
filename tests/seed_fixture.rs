@@ -139,4 +139,8 @@ fn seed_script_loads_at_one_hundredth_scale() {
         ),
         1000
     );
+
+    let report = conn.database_mut().check_integrity().expect("check");
+    assert!(report.is_clean(), "{report}");
+    assert_eq!(report.stats().nodes, total as u64);
 }

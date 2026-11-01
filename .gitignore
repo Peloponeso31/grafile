@@ -1,4 +1,5 @@
 /target
 *.grafile
+!tests/fixtures/versions/*.grafile
 /tck/report.json
 bugs/*
