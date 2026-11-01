@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "grafile"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "crc32c",
@@ -557,7 +557,7 @@ dependencies = [
 
 [[package]]
 name = "grafile-ffi"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "grafile",
  "serde_json",
