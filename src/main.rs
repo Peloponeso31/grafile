@@ -4,6 +4,7 @@
 //! grafile [database]              open (or create) a database and start the REPL
 //! grafile [database] -c "QUERY"   run a single query
 //! grafile [database] script.cypher
+//! grafile check FILE [--rebuild]   verify integrity; exit status 1 on findings
 //! ```
 //!
 //! Dot commands: `.help`, `.schema`, `.indexes`, `.read FILE`, `.timer on|off`,
@@ -16,6 +17,7 @@ use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -25,6 +27,8 @@ use grafile::cypher::split_statements;
 use grafile::json::{JsonColors, JsonOptions, format_unix_utc, row_object_json, value_json};
 use grafile::record::Value;
 use grafile::vdbe::format_value;
+use grafile::vfs::OpenMode;
+use grafile::vfs::StdVfs;
 use indicatif::{ProgressBar, ProgressStyle};
 use rustyline::completion::Completer;
 use rustyline::error::ReadlineError;
@@ -36,7 +40,7 @@ use rustyline::{Config, Editor};
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(err) => {
             eprintln!("error: {err:#}");
             ExitCode::FAILURE
@@ -44,15 +48,18 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<()> {
+fn run() -> Result<ExitCode> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         print_help();
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     if args.iter().any(|arg| arg == "--version" || arg == "-V") {
         println!("grafile {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
+    }
+    if args.first().is_some_and(|arg| arg == "check") {
+        return run_check(&args[1..]);
     }
     let mut path: Option<String> = None;
     let mut command: Option<String> = None;
@@ -86,7 +93,7 @@ fn run() -> Result<()> {
 
     if let Some(query) = command {
         run_query(&mut conn, &query, &settings)?;
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
     if let Some(script) = script {
         let text = std::fs::read_to_string(&script)
@@ -106,9 +113,65 @@ fn run() -> Result<()> {
             progress.inc(1);
         }
         progress.finish_and_clear();
-        return Ok(());
+        return Ok(ExitCode::SUCCESS);
     }
-    repl(&mut conn)
+    repl(&mut conn)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `grafile check FILE [--rebuild]`: print the integrity report and exit
+/// with status 1 when findings remain. `--rebuild` first regenerates the
+/// derived structures from the records.
+fn run_check(args: &[String]) -> Result<ExitCode> {
+    let mut rebuild = false;
+    let mut path: Option<&str> = None;
+    for arg in args {
+        match arg.as_str() {
+            "--rebuild" => rebuild = true,
+            other if path.is_none() => path = Some(other),
+            other => anyhow::bail!("unexpected argument `{other}`"),
+        }
+    }
+    let path = path.context("usage: grafile check FILE [--rebuild]")?;
+    // A plain check opens read-only so it can never modify the file.
+    let mode = if rebuild {
+        OpenMode::ReadWrite
+    } else {
+        OpenMode::ReadOnly
+    };
+    let mut conn = Connection::open_with_vfs(Arc::new(StdVfs), Path::new(path), mode)
+        .with_context(|| format!("cannot open `{path}`"))?;
+    let db = conn.database_mut();
+    if rebuild {
+        let summary = db
+            .rebuild_derived(&record_progress("rebuilding"))
+            .context("rebuild failed; the file is unchanged")?;
+        for abandoned in summary.abandoned() {
+            println!("abandoned damaged {abandoned}");
+        }
+        println!("rebuilt {}", summary.rebuilt().join(", "));
+    }
+    let report = db.check_integrity_with_progress(&record_progress("checking"))?;
+    println!("{report}");
+    Ok(if report.is_clean() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+/// Progress over records for `check`; hidden when stderr is not a terminal.
+fn record_progress(message: &'static str) -> ProgressBar {
+    if !std::io::stderr().is_terminal() {
+        return ProgressBar::hidden();
+    }
+    let style =
+        ProgressStyle::with_template("{spinner:.green} {msg} {pos}/{len} [{elapsed_precise}]")
+            .expect("valid check progress template");
+    let progress = ProgressBar::new(0);
+    progress.set_style(style);
+    progress.set_message(message);
+    progress
 }
 
 /// Progress for the script runner; hidden when stderr is not a terminal.
@@ -1251,6 +1314,8 @@ usage:
   grafile [database]              open or create a database and start the REPL
   grafile [database] -c \"QUERY\"   run one query and exit
   grafile [database] script.cypher
+  grafile check FILE [--rebuild]  verify integrity (exit status 1 on findings);
+                                  --rebuild regenerates bitmaps and indexes
 
 repl:
   queries end with ';' or an empty line
