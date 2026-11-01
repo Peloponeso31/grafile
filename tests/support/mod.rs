@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,9 +13,44 @@ use grafile::api::{Connection, Params};
 use grafile::record::Value;
 use grafile::vfs::mem::MemVfs;
 
-pub fn connection() -> Connection {
-    Connection::create_with_vfs(Arc::new(MemVfs::new()), Path::new("test.db"), 4096)
-        .expect("create connection")
+/// A connection that asserts a clean integrity report when the test that
+/// owns it finishes, so every suite ends with a checker assertion.
+pub struct Checked(Connection);
+
+impl Deref for Checked {
+    type Target = Connection;
+
+    fn deref(&self) -> &Connection {
+        &self.0
+    }
+}
+
+impl DerefMut for Checked {
+    fn deref_mut(&mut self) -> &mut Connection {
+        &mut self.0
+    }
+}
+
+impl Drop for Checked {
+    fn drop(&mut self) {
+        // A failing test already reports its own panic.
+        if std::thread::panicking() {
+            return;
+        }
+        let report = self
+            .0
+            .database_mut()
+            .check_integrity()
+            .expect("integrity check runs");
+        assert!(report.is_clean(), "integrity check failed:\n{report}");
+    }
+}
+
+pub fn connection() -> Checked {
+    Checked(
+        Connection::create_with_vfs(Arc::new(MemVfs::new()), Path::new("test.db"), 4096)
+            .expect("create connection"),
+    )
 }
 
 pub fn rows_to_strings(rows: &mut grafile::api::Rows) -> Vec<Vec<String>> {

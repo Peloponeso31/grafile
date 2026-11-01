@@ -555,7 +555,7 @@ pub enum Statement {
 /// A schema DDL command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DdlStatement {
-    /// `CREATE INDEX name [IF NOT EXISTS] FOR (n:Label) ON (n.key, ...)`
+    /// `CREATE [FULLTEXT] INDEX name [IF NOT EXISTS] FOR (n:Label) ON ...`
     CreateIndex(DdlIndex),
     /// `CREATE CONSTRAINT name [IF NOT EXISTS] FOR ... REQUIRE ...`
     CreateConstraint(DdlConstraint),
@@ -580,7 +580,8 @@ impl DdlStatement {
     pub fn describe(&self) -> String {
         match self {
             Self::CreateIndex(index) => format!(
-                "CreateIndex {} on {} keys=[{}]{}",
+                "Create{}Index {} on {} keys=[{}]{}",
+                if index.fulltext { "Fulltext" } else { "" },
                 index.name,
                 index.entity.describe(),
                 index.keys.join(", "),
@@ -650,6 +651,8 @@ pub struct DdlIndex {
     pub entity: DdlEntity,
     /// Property key names in key order.
     pub keys: Vec<String>,
+    /// Whether this is a fulltext index (`CREATE FULLTEXT INDEX ... ON EACH [...]`).
+    pub fulltext: bool,
 }
 
 /// `CREATE CONSTRAINT` body.

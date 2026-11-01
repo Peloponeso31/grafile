@@ -194,6 +194,27 @@ $ grafile social.grafile -c "RETURN 1 + 'x'"
 error: Type: cannot apply arithmetic to integer and string
 ```
 
+### Checking integrity
+
+`grafile check FILE` verifies a database without modifying it (it opens the
+file read-only): every relationship's incidence and type bits, every label
+bit, property index entry, uniqueness and existence constraint and fulltext
+posting is compared with the node and relationship records it derives from,
+alongside B+tree ordering, page ownership and the freelist. Findings are
+printed one per line with a summary, and the exit status is 1 when any
+remain:
+
+```console
+$ grafile check social.grafile
+0 findings: 2306 pages (0 free), 23845 nodes, 131470 edges, 16433 fragments, 51145 index entries, 57133 postings
+```
+
+`grafile check FILE --rebuild` regenerates the bitmaps and indexes from the
+records inside one write transaction and checks again. Records are never
+modified: damaged primary data is reported, not guessed. From code, use
+`Database::check_integrity()` and `Database::rebuild_derived()`; from C,
+`grafile_check_json()`.
+
 The interactive shell remembers a few conveniences:
 
 | Command | Effect |
@@ -293,8 +314,20 @@ grafile> DROP CONSTRAINT person_email IF EXISTS
 `IS UNIQUE`, `IS NOT NULL` and `REQUIRE (n.a, n.b) IS NODE KEY` are
 enforced on creation, property removal and whole-map replacement, and
 the edge form `FOR ()-[r:TYPE]-()` covers unique and not-null edge
-constraints. `SHOW INDEXES` / `SHOW CONSTRAINTS` are not supported. The
-Rust API keeps the direct constructors:
+constraints. `SHOW INDEXES` / `SHOW CONSTRAINTS` are not supported.
+
+Fulltext indexes cover the text properties of one label and are queried
+through a procedure:
+
+```console
+grafile> CREATE FULLTEXT INDEX post_text FOR (n:Post) ON EACH [n.title, n.body]
+grafile> CALL db.index.fulltext.queryNodes('post_text', '"hot take" OR graphs AND coffee') YIELD node, score RETURN node.title, score
+```
+
+Queries take terms, `"phrases"` and `AND`/`OR` (`AND` binds tighter;
+adjacent terms are alternatives). Text is split at non-alphanumeric
+characters and lowercased; the analyzer and scores are not
+Lucene-compatible. The Rust API keeps the direct constructors:
 
 ```rust
 conn.create_node_index("name", Some("Person"), true)?; // unique index
@@ -345,7 +378,8 @@ property filters including non-literal values),
 `DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`), `UNWIND`,
 `LOAD CSV [WITH HEADERS] FROM file AS row`, `CREATE`, `MERGE` (with
 `ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE` /
-`DETACH DELETE`, `FOREACH`, `CALL` for built-in `db.*` procedures,
+`DETACH DELETE`, `FOREACH`, `CALL` for built-in `db.*` procedures
+(including `db.index.fulltext.queryNodes`),
 `CALL { ... }` unit and returning subqueries (correlated through `WITH` or a
 `CALL (x, y) { ... }` scope clause, with `IN TRANSACTIONS OF n ROWS` batch
 commits), `UNION` / `UNION ALL`, `SET n += {…}`,
@@ -425,6 +459,14 @@ $ cargo bench              # criterion: storage, queries, insert
   `temporal`, `paths`, `writes`, `schema`, `transactions`, ...) sharing
   helpers from `tests/support/`, plus `tests/cli.rs` for the binary's flags,
   scripts, piped input and exit codes.
+- The integrity checker is the oracle for derived data: every suite built on
+  `tests/support::connection()` ends with a clean-report assertion, and
+  model-based proptests (`src/engine/model_tests.rs`) mirror random write
+  sequences, with ids biased toward band boundaries, in an in-memory
+  reference graph, including commits interrupted at random I/O operations.
+- `tests/compat.rs` opens the file written by every release since 0.2.0
+  (`tests/fixtures/versions/`) and requires a clean check and identical
+  snapshot answers.
 - The TCK harness has fixture-based tests for the gate itself plus a parse and
   classification test over every vendored feature file.
 - CI runs formatting, clippy, documentation, the full test suite on macOS and
@@ -456,6 +498,9 @@ Rules of the house:
   fix the runner first.
 - Storage changes follow [docs/format.md](docs/format.md) and bump the format
   minor version; readers stay backward compatible.
+- Each release adds its compatibility fixture: run
+  `scripts/version-fixture.sh` on the release commit and commit
+  `tests/fixtures/versions/<version>.grafile`.
 - Panics on user input are treated as bugs: no `unwrap` in library paths, and
   `unsafe` only with a documented safety invariant.
 - AI use is fine, work will be anaylized and compared with the description of

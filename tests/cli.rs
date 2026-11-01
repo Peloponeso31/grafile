@@ -149,3 +149,66 @@ fn piped_input_is_executed_and_ansi_free() {
         "the database is created on first use"
     );
 }
+
+#[test]
+fn check_reports_a_clean_file_and_rebuilds() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("check.db");
+    let db_arg = db.to_str().expect("utf-8 path");
+    let output = run(
+        &[
+            db_arg,
+            "-c",
+            "UNWIND range(1, 300) AS i CREATE (:N {v: i})-[:R]->(:M)",
+        ],
+        None,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    run(&[db_arg, "-c", "CREATE INDEX n_v FOR (n:N) ON (n.v)"], None);
+
+    let output = run(&["check", db_arg], None);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stdout(&output).starts_with("0 findings:"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(stdout(&output).contains("600 nodes, 300 edges"));
+
+    let output = run(&["check", db_arg, "--rebuild"], None);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.contains("rebuilt fragment store, node index `n_v`"),
+        "{text}"
+    );
+    assert!(text.contains("0 findings:"), "{text}");
+}
+
+#[test]
+fn check_exits_with_status_one_on_damage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("damaged.db");
+    let db_arg = db.to_str().expect("utf-8 path");
+    run(
+        &[
+            db_arg,
+            "-c",
+            "UNWIND range(1, 2000) AS i CREATE (:N {v: i})",
+        ],
+        None,
+    );
+    // Flip a byte in the last page: its checksum no longer verifies.
+    let mut bytes = std::fs::read(&db).expect("read");
+    let last = bytes.len() - 100;
+    bytes[last] ^= 0xFF;
+    std::fs::write(&db, bytes).expect("write");
+
+    let output = run(&["check", db_arg], None);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stdout(&output).contains("checksum"), "{}", stdout(&output));
+
+    let output = run(&["check", "missing.db"], None);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stderr(&output).contains("cannot open `missing.db`"));
+}

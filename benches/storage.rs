@@ -1,11 +1,13 @@
 //! Storage micro-benchmarks: B+tree operations, page cache behavior,
-//! rollback-journal commits, freelist churn and overflow chains.
+//! rollback-journal commits, freelist churn, overflow chains and dense
+//! bitmap fragment kernels.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use grafile::btree::{Btree, TreeKind};
+use grafile::matrix::Fragment;
 use grafile::pager::Pager;
 use grafile::vfs::mem::MemVfs;
 use std::hint::black_box;
@@ -167,6 +169,34 @@ fn bench_btree_overflow(c: &mut Criterion) {
     });
 }
 
+/// A dense fragment with every `stride`-th bit set from `offset`.
+fn dense_fragment(stride: u16, offset: u16) -> Fragment {
+    let mut fragment = Fragment::new();
+    for bit in (offset..u16::MAX).step_by(stride as usize) {
+        fragment.set(bit);
+    }
+    fragment
+}
+
+/// Whole-fragment kernels on two dense 8 KiB bitmaps.
+fn bench_dense_fragment(c: &mut Criterion) {
+    let left = dense_fragment(3, 0);
+    let right = dense_fragment(2, 1);
+    let mut group = c.benchmark_group("fragment_dense");
+    group.bench_function("intersect", |b| {
+        b.iter(|| {
+            let mut result = left.clone();
+            result.intersect_with(black_box(&right));
+            black_box(result)
+        });
+    });
+    group.bench_function("clone", |b| b.iter(|| black_box(left.clone())));
+    group.bench_function("cardinality", |b| {
+        b.iter(|| black_box(black_box(&left).cardinality()))
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_btree_insert,
@@ -175,6 +205,7 @@ criterion_group!(
     bench_btree_scan,
     bench_pager_commit,
     bench_pager_freelist,
-    bench_btree_overflow
+    bench_btree_overflow,
+    bench_dense_fragment
 );
 criterion_main!(benches);

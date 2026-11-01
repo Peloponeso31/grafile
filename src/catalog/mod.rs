@@ -28,6 +28,8 @@ mod kind {
     pub const NODE_CONSTRAINT: u8 = 8;
     /// Edge constraint without a backing index (`IS NOT NULL`).
     pub const EDGE_CONSTRAINT: u8 = 9;
+    /// Node fulltext index (format minor 4).
+    pub const NODE_FULLTEXT_INDEX: u8 = 10;
 }
 
 /// Kinds of index objects. Unique and node-key constraints are index-backed.
@@ -175,6 +177,21 @@ pub struct EdgeConstraintDef {
     pub key_id: u32,
 }
 
+/// Definition of a fulltext index over nodes (an inverted index B+tree).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FulltextIndexDef {
+    /// Index id (its catalog entry id, shared with other schema objects).
+    pub id: u32,
+    /// User-visible name.
+    pub name: String,
+    /// Indexed nodes carry this label id.
+    pub label_id: u32,
+    /// Indexed text property key ids, in declaration order.
+    pub key_ids: Vec<u32>,
+    /// B+tree root page.
+    pub root: PageNo,
+}
+
 /// In-memory schema: registries and index definitions.
 #[derive(Debug, Clone, Default)]
 pub struct Schema {
@@ -198,6 +215,8 @@ pub struct Schema {
     pub node_constraints: Vec<NodeConstraintDef>,
     /// Edge constraints without a backing index.
     pub edge_constraints: Vec<EdgeConstraintDef>,
+    /// Node fulltext indexes.
+    pub fulltext_indexes: Vec<FulltextIndexDef>,
 }
 
 impl Schema {
@@ -328,6 +347,11 @@ impl Catalog {
                     let def = decode_edge_constraint(id, &value)?;
                     next_index_id = next_index_id.max(id + 1);
                     schema.edge_constraints.push(def);
+                }
+                kind::NODE_FULLTEXT_INDEX => {
+                    let def = decode_fulltext_index(id, &value)?;
+                    next_index_id = next_index_id.max(id + 1);
+                    schema.fulltext_indexes.push(def);
                 }
                 other => {
                     return Err(Error::corrupt(format!(
@@ -660,6 +684,82 @@ impl Catalog {
         Ok(())
     }
 
+    /// Create a node fulltext index with an empty inverted-index B+tree.
+    ///
+    /// # Returns
+    ///
+    /// The new index id
+    pub fn create_fulltext_index(
+        &mut self,
+        pager: &mut Pager,
+        name: &str,
+        label_id: u32,
+        key_ids: &[u32],
+    ) -> Result<u32> {
+        let def = FulltextIndexDef {
+            id: self.next_object_id(),
+            name: name.to_owned(),
+            label_id,
+            key_ids: key_ids.to_vec(),
+            root: Btree::create(pager, TreeKind::Index)?.root(),
+        };
+        self.insert_entry(
+            pager,
+            kind::NODE_FULLTEXT_INDEX,
+            def.id,
+            &encode_fulltext_index(&def),
+        )?;
+        let id = def.id;
+        self.schema.fulltext_indexes.push(def);
+        pager.update_header(|header| header.schema_generation += 1);
+        Ok(id)
+    }
+
+    /// Remove a fulltext index entry (the caller frees its B+tree).
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` when no fulltext index has this id.
+    pub fn remove_fulltext_index(&mut self, pager: &mut Pager, id: u32) -> Result<()> {
+        let index = self
+            .schema
+            .fulltext_indexes
+            .iter()
+            .position(|def| def.id == id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::NotFound,
+                    format!("fulltext index {id} does not exist"),
+                )
+            })?;
+        self.schema.fulltext_indexes.remove(index);
+        self.remove_entry(pager, kind::NODE_FULLTEXT_INDEX, id)?;
+        pager.update_header(|header| header.schema_generation += 1);
+        Ok(())
+    }
+
+    /// Move a fulltext index to a new B+tree root, persisting the entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` when no fulltext index has this id.
+    pub fn set_fulltext_root(&mut self, pager: &mut Pager, id: u32, root: PageNo) -> Result<()> {
+        let def = self
+            .schema
+            .fulltext_indexes
+            .iter_mut()
+            .find(|def| def.id == id)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::NotFound,
+                    format!("fulltext index {id} does not exist"),
+                )
+            })?;
+        def.root = root;
+        let value = encode_fulltext_index(def);
+        self.insert_entry(pager, kind::NODE_FULLTEXT_INDEX, id, &value)
+    }
+
     /// Rewrite the catalog entry for a node index (root may have moved).
     pub fn update_node_index(&mut self, pager: &mut Pager, def: &NodeIndexDef) -> Result<()> {
         let (entry_kind, value) = encode_node_index(def);
@@ -986,6 +1086,39 @@ fn decode_constraint(name_kind: &str, value: &[u8]) -> Result<(u32, u32, String)
     Ok((target_id, key_id, name))
 }
 
+fn encode_fulltext_index(def: &FulltextIndexDef) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + def.name.len());
+    encode_key_ids(&mut out, &def.key_ids);
+    encode_varint(&mut out, u64::from(def.label_id));
+    encode_varint(&mut out, def.name.len() as u64);
+    out.extend_from_slice(def.name.as_bytes());
+    out.extend_from_slice(&def.root.to_le_bytes());
+    out
+}
+
+fn decode_fulltext_index(id: u32, value: &[u8]) -> Result<FulltextIndexDef> {
+    let mut pos = 0usize;
+    let key_ids = decode_key_ids(value, &mut pos)?;
+    let label_id = u32::try_from(decode_varint(value, &mut pos)?)
+        .map_err(|_| Error::corrupt("fulltext index label id out of range"))?;
+    let len = usize::try_from(decode_varint(value, &mut pos)?)
+        .map_err(|_| Error::corrupt("fulltext index name length out of range"))?;
+    let bytes = value
+        .get(pos..pos + len)
+        .ok_or_else(|| Error::corrupt("truncated fulltext index name"))?;
+    let name = std::str::from_utf8(bytes)
+        .map_err(|_| Error::corrupt("fulltext index name is not valid UTF-8"))?
+        .to_owned();
+    let root = decode_root(value, pos + len)?;
+    Ok(FulltextIndexDef {
+        id,
+        name,
+        label_id,
+        key_ids,
+        root,
+    })
+}
+
 fn decode_node_constraint(id: u32, value: &[u8]) -> Result<NodeConstraintDef> {
     let (label_id, key_id, name) = decode_constraint("node", value)?;
     Ok(NodeConstraintDef {
@@ -1255,5 +1388,98 @@ mod tests {
         let catalog = Catalog::open(&mut pager, root).expect("open");
         assert!(catalog.schema().node_indexes.is_empty());
         assert!(catalog.schema().node_constraints.is_empty());
+    }
+
+    #[test]
+    fn fulltext_indexes_roundtrip_and_drop() {
+        let store = crate::vfs::mem::new_store();
+        let (root, id);
+        {
+            let vfs = Arc::new(MemVfs::from_store(store.clone()));
+            let mut pager =
+                Pager::create(vfs, std::path::Path::new("cat.db"), 4096).expect("pager");
+            pager.begin_write().expect("begin");
+            let mut catalog = Catalog::create(&mut pager).expect("create");
+            let post = catalog.ensure_label(&mut pager, "Post").expect("label");
+            let title = catalog
+                .ensure_property_key(&mut pager, "title")
+                .expect("key");
+            let body = catalog
+                .ensure_property_key(&mut pager, "body")
+                .expect("key");
+            id = catalog
+                .create_fulltext_index(&mut pager, "post_text", post, &[title, body])
+                .expect("fulltext");
+            catalog
+                .set_fulltext_root(&mut pager, id, 77)
+                .expect("move root");
+            root = catalog.root();
+            pager.update_header(|header| header.catalog_root = root);
+            pager.commit().expect("commit");
+        }
+        let vfs = Arc::new(MemVfs::from_store(store));
+        let mut pager = Pager::open(
+            vfs,
+            std::path::Path::new("cat.db"),
+            crate::vfs::OpenMode::ReadWrite,
+        )
+        .expect("reopen");
+        let mut catalog = Catalog::open(&mut pager, root).expect("open");
+        let def = catalog.schema().fulltext_indexes[0].clone();
+        assert_eq!(
+            def,
+            FulltextIndexDef {
+                id,
+                name: "post_text".to_owned(),
+                label_id: 1,
+                key_ids: vec![1, 2],
+                root: 77,
+            }
+        );
+        pager.begin_write().expect("begin");
+        catalog.remove_fulltext_index(&mut pager, id).expect("drop");
+        assert!(catalog.schema().fulltext_indexes.is_empty());
+        let missing = catalog
+            .remove_fulltext_index(&mut pager, id)
+            .expect_err("already dropped");
+        assert_eq!(missing.code(), ErrorCode::NotFound);
+        pager.commit().expect("commit");
+    }
+
+    #[test]
+    fn unknown_entry_kinds_are_rejected() {
+        // A minor-3 build meets kind 10 the way this build meets kind 11.
+        let mut pager = test_pager();
+        pager.begin_write().expect("begin");
+        let mut catalog = Catalog::create(&mut pager).expect("create");
+        catalog.ensure_label(&mut pager, "Post").expect("label");
+        catalog
+            .insert_entry(&mut pager, kind::NODE_FULLTEXT_INDEX + 1, 1, &[])
+            .expect("future entry");
+        let root = catalog.root();
+        let err = Catalog::open(&mut pager, root)
+            .err()
+            .expect("unknown kind must fail");
+        assert!(
+            err.message().contains("unknown catalog entry kind 11"),
+            "{err}"
+        );
+        pager.commit().expect("commit");
+    }
+
+    #[test]
+    fn truncated_fulltext_entries_are_corrupt() {
+        let def = FulltextIndexDef {
+            id: 3,
+            name: "ft".to_owned(),
+            label_id: 2,
+            key_ids: vec![5],
+            root: 9,
+        };
+        let value = encode_fulltext_index(&def);
+        assert_eq!(decode_fulltext_index(3, &value).expect("decode"), def);
+        for len in 0..value.len() {
+            assert!(decode_fulltext_index(3, &value[..len]).is_err(), "{len}");
+        }
     }
 }
