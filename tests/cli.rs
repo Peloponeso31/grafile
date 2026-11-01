@@ -94,6 +94,43 @@ fn script_files_run_every_statement() {
 }
 
 #[test]
+fn script_files_ignore_semicolons_inside_comments() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("comments.db");
+    let script = dir.path().join("comments.cypher");
+    std::fs::write(
+        &script,
+        "// MATCH (n) CALL { WITH n DETACH DELETE n } IN TRANSACTIONS OF 10000 ROWS;\n\
+         CREATE (:Person {name: 'alice'});\n\
+         /* block; comment; */\n\
+         MATCH (n:Person) RETURN n.name AS name;\n",
+    )
+    .expect("write script");
+    let output = run(
+        &[db.to_str().expect("path"), script.to_str().expect("path")],
+        None,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains("alice"), "{}", stdout(&output));
+}
+
+#[test]
+fn script_errors_name_the_failing_statement() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("failing.db");
+    let script = dir.path().join("failing.cypher");
+    std::fs::write(&script, "RETURN 1;\nMATCH (n RETURN n;\n").expect("write script");
+    let output = run(
+        &[db.to_str().expect("path"), script.to_str().expect("path")],
+        None,
+    );
+    assert!(!output.status.success());
+    let message = stderr(&output);
+    assert!(message.contains("statement 2 failed"), "{message}");
+    assert!(message.contains("Syntax"), "{message}");
+}
+
+#[test]
 fn piped_input_is_executed_and_ansi_free() {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = dir.path().join("piped.db");

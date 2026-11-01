@@ -164,16 +164,16 @@ impl Fragment {
     /// Iterate the set bit positions in ascending order.
     pub fn iter_bits(&self) -> impl Iterator<Item = u16> + '_ {
         match &self.repr {
-            Repr::Sparse(bits) => Bits::sparse(bits.iter()),
+            Repr::Sparse(bits) => Bits::sparse(bits.iter(), u16::MAX),
             Repr::Dense(words) => Bits::dense(&words[..]),
         }
     }
 
     /// Iterate set bit positions within a 256-bit row, as offsets `0..=255`.
     pub fn row_bits(&self, row: u8) -> impl Iterator<Item = u16> + '_ {
-        let row_start = row as u16 * 256;
         match &self.repr {
-            Repr::Sparse(bits) => Bits::sparse_row(bits.iter(), row_start),
+            // Masking with 0xFF turns a row's bit positions into column offsets.
+            Repr::Sparse(bits) => Bits::sparse(sparse_row(bits, row).iter(), 0x00FF),
             Repr::Dense(words) => {
                 let base = row as usize * 4;
                 Bits::dense(&words[base..base + 4])
@@ -184,12 +184,7 @@ impl Fragment {
     /// Whether the 256-bit row has any bit set.
     pub fn row_nonempty(&self, row: u8) -> bool {
         match &self.repr {
-            Repr::Sparse(bits) => {
-                let start = row as u16 * 256;
-                let end = start + 256;
-                let index = bits.partition_point(|bit| *bit < start);
-                bits.get(index).is_some_and(|bit| *bit < end)
-            }
+            Repr::Sparse(bits) => !sparse_row(bits, row).is_empty(),
             Repr::Dense(words) => {
                 let base = row as usize * 4;
                 words[base..base + 4].iter().any(|word| *word != 0)
@@ -211,16 +206,9 @@ impl Fragment {
         match &self.repr {
             Repr::Sparse(bits) => {
                 let mut words = [0u64; 4];
-                let start = row as u16 * 256;
-                let end = start + 256;
-                let mut index = bits.partition_point(|bit| *bit < start);
-                while let Some(bit) = bits.get(index) {
-                    if *bit >= end {
-                        break;
-                    }
-                    let offset = (*bit - start) as usize;
+                for bit in sparse_row(bits, row) {
+                    let offset = usize::from(*bit & 0x00FF);
                     words[offset / 64] |= 1u64 << (offset % 64);
-                    index += 1;
                 }
                 words
             }
@@ -307,26 +295,31 @@ fn encode_dense(words: &[u64; FRAGMENT_WORDS]) -> Vec<u8> {
     out
 }
 
+/// The contiguous run of sorted sparse bits that falls in 256-bit `row`.
+///
+/// Bit `b` belongs to row `b >> 8`. Comparing row numbers instead of
+/// computing `row * 256 + 256` keeps row 255 from overflowing `u16`.
+fn sparse_row(bits: &[u16], row: u8) -> &[u16] {
+    let row = u16::from(row);
+    let start = bits.partition_point(|bit| bit >> 8 < row);
+    let len = bits[start..].partition_point(|bit| bit >> 8 == row);
+    &bits[start..start + len]
+}
+
 /// Iterator over set bit positions, handling both fragment representations.
 struct Bits<'a> {
     sparse: Option<std::slice::Iter<'a, u16>>,
-    row_start: u16,
+    /// Applied to each sparse bit: `u16::MAX` keeps fragment positions,
+    /// `0x00FF` turns row bits into column offsets.
+    sparse_mask: u16,
     dense: Option<DenseBits<'a>>,
 }
 
 impl<'a> Bits<'a> {
-    fn sparse(iter: std::slice::Iter<'a, u16>) -> Self {
+    fn sparse(iter: std::slice::Iter<'a, u16>, sparse_mask: u16) -> Self {
         Self {
             sparse: Some(iter),
-            row_start: 0,
-            dense: None,
-        }
-    }
-
-    fn sparse_row(iter: std::slice::Iter<'a, u16>, row_start: u16) -> Self {
-        Self {
-            sparse: Some(iter),
-            row_start,
+            sparse_mask,
             dense: None,
         }
     }
@@ -334,7 +327,7 @@ impl<'a> Bits<'a> {
     fn dense(words: &'a [u64]) -> Self {
         Self {
             sparse: None,
-            row_start: 0,
+            sparse_mask: u16::MAX,
             dense: Some(DenseBits {
                 words,
                 next_index: 0,
@@ -350,21 +343,7 @@ impl Iterator for Bits<'_> {
 
     fn next(&mut self) -> Option<u16> {
         if let Some(sparse) = &mut self.sparse {
-            for bit in sparse.by_ref() {
-                if *bit < self.row_start {
-                    continue;
-                }
-                if self.row_start != 0 {
-                    // Row iteration: stop at the end of the row.
-                    let offset = *bit - self.row_start;
-                    if offset >= 256 {
-                        return None;
-                    }
-                    return Some(offset);
-                }
-                return Some(*bit);
-            }
-            return None;
+            return sparse.next().map(|bit| bit & self.sparse_mask);
         }
         self.dense.as_mut()?.next()
     }
@@ -875,6 +854,95 @@ mod tests {
         other.set(FragmentKey::incidence_bit(9, 7));
         assert!(fragment.row_and_nonempty(3, &other, 9));
         assert!(!fragment.row_and_nonempty(3, &other, 8));
+    }
+
+    #[test]
+    fn sparse_row_zero_stops_at_the_first_row() {
+        let mut fragment = Fragment::new();
+        fragment.set(FragmentKey::incidence_bit(0, 7));
+        fragment.set(FragmentKey::incidence_bit(1, 9));
+        fragment.set(FragmentKey::incidence_bit(2, 5));
+        assert_eq!(fragment.iter_bits().collect::<Vec<_>>(), vec![7, 265, 517]);
+        assert_eq!(fragment.row_bits(0).collect::<Vec<_>>(), vec![7]);
+        assert_eq!(fragment.row_bits(1).collect::<Vec<_>>(), vec![9]);
+        assert_eq!(fragment.row_bits(2).collect::<Vec<_>>(), vec![5]);
+    }
+
+    #[test]
+    fn edge_rows_agree_in_sparse_and_dense_forms() {
+        let row_bits: [(u64, &[u64]); 4] = [
+            (0, &[0, 255]),
+            (1, &[9]),
+            (254, &[3]),
+            (255, &[0, 128, 255]),
+        ];
+        let mut sparse = Fragment::new();
+        for (row, columns) in row_bits {
+            for column in columns {
+                sparse.set(FragmentKey::incidence_bit(row, *column));
+            }
+        }
+        // Filling rows 50..=66 pushes a copy past SPARSE_MAX into dense form.
+        let mut dense = sparse.clone();
+        for bit in 50 * 256..67 * 256 {
+            dense.set(bit as u16);
+        }
+        assert_eq!(dense.encode()[0], 1, "dense copy");
+
+        for fragment in [&sparse, &dense] {
+            for (row, columns) in row_bits {
+                let row = row as u8;
+                let expected: Vec<u16> = columns.iter().map(|column| *column as u16).collect();
+                assert_eq!(fragment.row_bits(row).collect::<Vec<_>>(), expected);
+                assert!(fragment.row_nonempty(row));
+            }
+            assert!(!fragment.row_nonempty(2));
+            assert!(!fragment.row_nonempty(253));
+            assert!(fragment.row_and_nonempty(255, &sparse, 0));
+            assert!(!fragment.row_and_nonempty(255, &sparse, 1));
+        }
+    }
+
+    #[test]
+    fn incidence_exists_across_band_boundaries() {
+        let mut pager = test_pager();
+        pager.begin_write().expect("begin");
+        let mut store = FragmentStore::create(&mut pager).expect("store");
+        let edges = [(255u64, 256u64, 255u64), (256, 257, 256), (511, 512, 511)];
+        let bits: Vec<_> = edges
+            .iter()
+            .flat_map(|&(src, dst, edge)| {
+                [
+                    (
+                        FragmentKey::incidence(Direction::Out, 1, src, edge),
+                        FragmentKey::incidence_bit(src, edge),
+                    ),
+                    (
+                        FragmentKey::incidence(Direction::In, 1, dst, edge),
+                        FragmentKey::incidence_bit(dst, edge),
+                    ),
+                ]
+            })
+            .collect();
+        store.set_bits(&mut pager, &bits).expect("set");
+        for (src, dst, _) in edges {
+            assert!(
+                store
+                    .incidence_exists(&mut pager, 1, src, dst)
+                    .expect("exists")
+            );
+            assert!(
+                !store
+                    .incidence_exists(&mut pager, 1, dst, src)
+                    .expect("reverse")
+            );
+        }
+        assert!(
+            !store
+                .incidence_exists(&mut pager, 1, 256, 258)
+                .expect("foreign")
+        );
+        pager.commit().expect("commit");
     }
 
     #[test]

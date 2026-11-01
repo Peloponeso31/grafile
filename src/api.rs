@@ -269,6 +269,11 @@ impl Connection {
             planner::plan_query(&mut self.db, &parsed, params.values()).map_err(compile)?;
         let program = codegen::compile(&prepared).map_err(compile)?;
         let started = self.db.in_write_txn();
+        if program.batch_transactions && (started || !self.auto_commit) {
+            return Err(runtime(Error::misuse(
+                "CALL { ... } IN TRANSACTIONS cannot run inside an explicit transaction",
+            )));
+        }
         let read_lock = !program.mutating && !started;
         if read_lock {
             self.db.begin_read().map_err(runtime)?;

@@ -63,6 +63,7 @@ pub fn compile(prepared: &Prepared) -> Result<Program> {
         register_count: cg.next_reg as usize,
         columns: prepared.columns.clone(),
         mutating: prepared.mutating,
+        batch_transactions: prepared.batch_transactions,
     })
 }
 
@@ -433,12 +434,25 @@ impl Codegen {
             Plan::ProcedureCall {
                 input,
                 procedure,
+                args,
                 columns,
                 yields,
             } => self.compile(input, ctx, &mut |cg, ctx| {
                 let cursor = cg.alloc_cursor();
                 let name = cg.const_index(Value::from(procedure.as_str()));
-                cg.emit(Op::ProcedureCallOpen { cursor, name });
+                let arg_regs: Vec<u32> = args
+                    .iter()
+                    .map(|arg| cg.compile_expr(arg, ctx))
+                    .collect::<Result<_>>()?;
+                cg.emit(Op::ProcedureCallOpen {
+                    cursor,
+                    name,
+                    args: arg_regs,
+                });
+                // A unit call (no output columns) passes the input row through.
+                if columns.is_empty() {
+                    return out(cg, ctx);
+                }
                 let base = cg.next_reg;
                 for _ in columns {
                     cg.alloc_reg();
@@ -449,6 +463,57 @@ impl Codegen {
                         return Err(Error::internal("procedure yield column is missing"));
                     };
                     inner_ctx.vars.insert(alias.clone(), base + index as u32);
+                }
+                inner_ctx.window_start = base;
+                inner_ctx.window_len = columns.len() as u32;
+                let empty = cg.emit(Op::CtxRewind { cursor, target: 0 });
+                let loop_start = cg.ops.len() as u32;
+                cg.emit(Op::CtxData {
+                    cursor,
+                    start: base,
+                    count: columns.len() as u32,
+                });
+                out(cg, &mut inner_ctx)?;
+                let next = cg.emit(Op::CtxNext { cursor, target: 0 });
+                cg.emit(Op::Goto { target: loop_start });
+                let end = cg.ops.len() as u32;
+                cg.patch(empty, end)?;
+                cg.patch(next, end)?;
+                Ok(())
+            }),
+            Plan::CallSubquery {
+                input,
+                inner,
+                columns,
+                returns,
+                transactions,
+            } => self.compile(input, ctx, &mut |cg, outer_ctx| {
+                if !returns {
+                    // A unit subquery runs its inner plan once per input row;
+                    // the outer row passes through unchanged.
+                    cg.compile(inner, outer_ctx, &mut |_cg, _inner_ctx| Ok(()))?;
+                    if let Some(rows) = transactions {
+                        cg.emit(Op::BatchCommit { rows: *rows });
+                    }
+                    return out(cg, outer_ctx);
+                }
+                let cursor = cg.alloc_cursor();
+                cg.emit(Op::CollectOpen { cursor });
+                cg.compile(inner, outer_ctx, &mut |cg, inner_ctx| {
+                    cg.emit(Op::CollectRow {
+                        cursor,
+                        start: inner_ctx.window_start,
+                        count: inner_ctx.window_len,
+                    });
+                    Ok(())
+                })?;
+                let base = cg.next_reg;
+                for _ in columns {
+                    cg.alloc_reg();
+                }
+                let mut inner_ctx = outer_ctx.clone();
+                for (index, name) in columns.iter().enumerate() {
+                    inner_ctx.vars.insert(name.clone(), base + index as u32);
                 }
                 inner_ctx.window_start = base;
                 inner_ctx.window_len = columns.len() as u32;
@@ -1848,6 +1913,9 @@ impl Codegen {
                     ));
                 }
                 let func_code = scalar_function(name)?;
+                if func_code == func::RANDOM_UUID && !args.is_empty() {
+                    return Err(Error::syntax("randomUUID() takes no arguments"));
+                }
                 let arg_regs: Vec<u32> = args
                     .iter()
                     .map(|arg| self.compile_expr(arg, ctx))
@@ -2004,6 +2072,7 @@ fn scalar_function(name: &str) -> Result<u8> {
         "split" => Ok(func::SPLIT),
         "substring" => Ok(func::SUBSTRING),
         "rand" => Ok(func::RAND),
+        "randomuuid" => Ok(func::RANDOM_UUID),
         "toupper" => Ok(func::TO_UPPER),
         "tolower" => Ok(func::TO_LOWER),
         "trim" => Ok(func::TRIM),

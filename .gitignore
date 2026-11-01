@@ -1,3 +1,4 @@
 /target
 *.grafile
 /tck/report.json
+bugs/*
