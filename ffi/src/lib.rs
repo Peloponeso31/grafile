@@ -328,7 +328,7 @@ fn current_value(stmt: &GrafileStmt, index: c_int) -> Option<&Value> {
 /// Library version as an integer: major * 1_000_000 + minor * 1_000 + patch.
 #[unsafe(no_mangle)]
 pub extern "C" fn grafile_libversion() -> c_int {
-    1_000
+    2_000
 }
 
 /// Library version as a static string.
@@ -1140,7 +1140,7 @@ mod tests {
 
     #[test]
     fn version_reports_expected_values() {
-        assert_eq!(grafile_libversion(), 1_000);
+        assert_eq!(grafile_libversion(), 2_000);
         let version = unsafe { CStr::from_ptr(grafile_version()) };
         assert_eq!(version.to_str().expect("utf8"), env!("CARGO_PKG_VERSION"));
     }

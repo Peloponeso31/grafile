@@ -323,7 +323,7 @@ derived from node and edge records, so the records serve as the oracle.
   level instead.
 - [done] Cross-version fixtures: `scripts/version-fixture.sh` runs
   `tests/fixtures/versions/fixture.cypher` with a release CLI; the files
-  written by 0.2.0, 0.2.1 and 0.2.2 are checked in, and `tests/compat.rs`
+  written by 0.2.0, 0.2.1, 0.2.2 and 0.3.0 are checked in, and `tests/compat.rs`
   requires a clean report and identical snapshot answers from each. The
   0.2.0 and 0.2.1 binaries themselves answer two snapshot queries wrongly
   on their own clean files (750 instead of 742 relationships): the band

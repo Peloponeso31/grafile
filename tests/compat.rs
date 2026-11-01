@@ -15,7 +15,7 @@ use grafile::vfs::{OpenMode, StdVfs};
 use support::query;
 
 /// Releases whose fixture must be present.
-const RELEASES: [&str; 3] = ["0.2.0", "0.2.1", "0.2.2"];
+const RELEASES: [&str; 4] = ["0.2.0", "0.2.1", "0.2.2", "0.3.0"];
 
 /// `(query, rows)` pairs every fixture must reproduce.
 const SNAPSHOT: &[(&str, &[&[&str]])] = &[

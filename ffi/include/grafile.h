@@ -22,9 +22,9 @@ extern "C" {
 
 /* Version of this header and of the linked library. */
 #define GRAFILE_VERSION_MAJOR 0
-#define GRAFILE_VERSION_MINOR 1
+#define GRAFILE_VERSION_MINOR 2
 #define GRAFILE_VERSION_PATCH 0
-#define GRAFILE_VERSION_NUMBER 1000 /* major*1000000 + minor*1000 + patch */
+#define GRAFILE_VERSION_NUMBER 2000 /* major*1000000 + minor*1000 + patch */
 
 /* Result codes (SQLite-compatible numbering where the classes overlap). */
 #define GRAFILE_OK          0
