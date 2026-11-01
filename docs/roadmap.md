@@ -54,8 +54,16 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
 - Schema DDL: `CREATE INDEX`/`CREATE CONSTRAINT` with `IS UNIQUE`,
   `IS NOT NULL` and `IS NODE KEY`, `DROP INDEX`/`DROP CONSTRAINT` with
   `IF [NOT] EXISTS`, and the edge forms; constraints are enforced on every
-  write path (see Phase 5). `LOAD CSV [WITH HEADERS] FROM file AS row` reads
-  local CSVs into the row pipeline.
+  write path (see Phase 5). `CREATE FULLTEXT INDEX … ON EACH [...]` with
+  `db.index.fulltext.queryNodes`. `LOAD CSV [WITH HEADERS] FROM file AS row`
+  reads local CSVs into the row pipeline.
+- Integrity: `grafile check FILE [--rebuild]` verifies every derived
+  structure against the records and the page layout (see Phase 7).
+- Execution: index seeks on bound values and pushed-down `WHERE`
+  equalities, label-bitmap intersection for multi-label scans, streaming
+  aggregation, `OPTIONAL MATCH` and variable-length expansion, bounded
+  top-k sorts, bidirectional shortest paths and bulk-built index backfill
+  (see Phase 8).
 
 Explicit gaps (currently clear `Unsupported` errors):
 
@@ -66,11 +74,6 @@ Explicit gaps (currently clear `Unsupported` errors):
 | Unknown functions | codegen (by design) |
 
 Silently absent areas: none of the openCypher value types.
-
-The remaining Neo4j-only bulk-loading constructs (`CREATE FULLTEXT INDEX`
-and its query procedure) are scheduled in Phase 6. Until then they fail with
-syntax or `Unsupported` errors; the seed-script audit is the acceptance
-fixture.
 
 Known limitations:
 
@@ -219,11 +222,11 @@ The vendored TCK has no scenarios for these extensions, so none of them is
 allow-listed; the allow-list only holds the CALL procedure non-goal and one
 nested pattern comprehension.
 
-### Phase 6 — Neo4j bulk-load surface (large) [pending]
+### Phase 6 — Neo4j bulk-load surface (large) [done]
 
 The acceptance fixture is the audited `seed_big.cypher` (Neo4j 5 style,
 e-commerce/social seed). It must run end to end through the script runner at
-1/100 scale; full-size loading is a Phase 7 performance target, not a Phase 6
+1/100 scale; full-size loading is a Phase 8 performance target, not a Phase 6
 gate.
 
 - [done] Statement runner: make `split_statements` skip `//` line comments and
@@ -244,71 +247,180 @@ gate.
   transaction at every boundary, so earlier batches survive a later failure.
   Explicit transactions are rejected, and the parser defaults the batch size
   to 1000 rows.
-- [pending] Fulltext indexes: `CREATE FULLTEXT INDEX name [IF NOT EXISTS] FOR
-  (n:Label) ON EACH [n.prop, ...]` and `DROP INDEX`; a new index kind with
-  inverted B+tree storage; maintenance on create, update, label change and
-  delete; backfill with a progress bar;
-  `db.index.fulltext.queryNodes(index, query)` yielding `node, score`. Query
-  v1 covers terms, phrases and `AND`/`OR`; the analyzer is explicitly not
-  Lucene-compatible. The catalog format minor bumps from 3 to 4
-  (`docs/format.md`), with old-build rejection and new-build compatibility
-  tests.
-- [pending] Acceptance fixture: a checked-in 1/100-size variant of the seed
-  script and an integration test asserting node/relationship counts and the
-  sample fulltext query.
+- [done] Fulltext indexes: `CREATE FULLTEXT INDEX name [IF NOT EXISTS] FOR
+  (n:Label) ON EACH [n.prop, ...]` and `DROP INDEX`; a new catalog entry kind
+  (format minor 4) whose inverted B+tree maps `term 0x00 node id` to token
+  positions; maintenance on create, property set and replacement, label
+  change and delete; backfill with a progress bar;
+  `db.index.fulltext.queryNodes(index, query)` yielding `node, score`
+  (BM25-style idf with square-root term frequency). Queries cover terms,
+  phrases and `AND`/`OR`; the analyzer (split on non-alphanumerics,
+  lowercase) is explicitly not Lucene-compatible. Relationship fulltext
+  indexes are rejected as unsupported.
+- [done] Acceptance fixture: `tests/fixtures/seed_1_100.cypher` is the
+  hardcoded-size seed script divided by 100, and `tests/seed_fixture.rs`
+  asserts every node count, the fixed relationship counts, bounds on the
+  random fan-out and the sample fulltext query. It takes about 150 s in a
+  release build (variable-key lookups still scan labels), so it is ignored
+  by default and CI runs it with `--release --ignored` (Phase 8 brought it
+  to 1.6 s).
 
 The TCK does not exercise this surface; unit and integration tests are the
 gate, and the report must not regress. Non-goals: Lucene query syntax, a
 general user-procedure registry (TCK non-goal), `SHOW INDEXES`/`SHOW
 CONSTRAINTS`, and `CALL {} IN TRANSACTIONS` inside explicit transactions.
 
-### Phase 7 — Query performance, vectorization and SIMD (large) [pending]
+### Phase 7 — Data integrity verification (medium) [done]
+
+The 0.2.1 band-boundary bug (expanding node ids divisible by 256 returned
+neighbors' relationships) went unnoticed because no test compared the derived
+structures with the records they derive from. The stored bitmaps were
+correct and only the reads were wrong, but `DETACH DELETE` read through the
+same path and deleted relationships that belonged to other nodes. Incidence,
+label and type fragments, property indexes and constraint state are all
+derived from node and edge records, so the records serve as the oracle.
+
+- [done] Integrity checker: read-only `Database::check_integrity()` returns
+  an `IntegrityReport` (findings by kind, capped at 100 per kind, plus
+  sizes), exposed as `grafile check FILE` (read-only open, `indicatif`
+  progress, exit status 1 on findings) and `grafile_check_json()` in the
+  FFI. Every implied bit and entry must be present and every stored total
+  must equal the record-implied total, which proves set equality without
+  materialising the expected sets; a mismatch triggers a targeted scan
+  that names the stray bits or stale entries. Covered: out/in bits in the
+  typed and any-type planes, edge-type and label bitmaps, node and edge
+  property indexes, uniqueness (adjacent equal values), `IS NOT NULL` and
+  NODE KEY existence, fulltext postings and positions, record decoding and
+  dangling endpoints, header id counters, B+tree ordering and dividers,
+  overflow chains, page ownership across all trees (a page claimed twice,
+  leaked, or both free and owned) and freelist structure. The 1/100 seed
+  (23 845 nodes, 131 470 relationships) checks clean in 0.09 s.
+- [done] Derived-structure rebuild: `grafile check --rebuild` /
+  `Database::rebuild_derived()` regenerates fragments, property indexes and
+  fulltext indexes from records in one write transaction, then re-checks.
+  It refuses when the catalog, a record table or the freelist is damaged,
+  and abandons (rather than frees) a derived tree whose pages fail
+  verification, so a shared page is never freed under a live tree.
+- [done] Model-based property tests (`src/engine/model_tests.rs`): create,
+  delete, detach delete, set/remove label and property, each committed or
+  rolled back, mirrored in a reference graph. After every step outgoing,
+  incoming and per-type expansion, label and type scans, index seeks,
+  `edge_exists` over every ordered pair, and a clean checker report must
+  hold. Start ids are drawn from band boundaries (254, 511, 65 534,
+  131 070, 2^24 - 2).
+- [done] Boundary sweeps: ids straddling 256, 512, 65 536 + 256, 65 536,
+  131 072 and 2^24; label and edge-type fragments crossing `SPARSE_MAX`
+  into dense form and back; multi-level trees with deletes that leave stale
+  dividers and empty leaves. B+tree merges do not exist yet (deletes never
+  rebalance), so there is nothing to sweep there.
+- [done] Durability: an engine-level proptest interrupts a commit at a
+  random I/O operation (optionally tearing the write), reopens, and requires
+  the old or the new state exactly with a clean checker; `tests/integrity.rs`
+  checks after a failed `IN TRANSACTIONS` batch, after explicit rollback of
+  index, label and detach-delete changes, and after reopening a file with
+  freed record, index and overflow pages. The pager-level interrupted-commit
+  test writes raw pages outside any tree, so the checker runs at engine
+  level instead.
+- [done] Cross-version fixtures: `scripts/version-fixture.sh` runs
+  `tests/fixtures/versions/fixture.cypher` with a release CLI; the files
+  written by 0.2.0, 0.2.1 and 0.2.2 are checked in, and `tests/compat.rs`
+  requires a clean report and identical snapshot answers from each. The
+  0.2.0 and 0.2.1 binaries themselves answer two snapshot queries wrongly
+  on their own clean files (750 instead of 742 relationships): the band
+  bug, reproduced. Each release adds its fixture.
+- [done] Suite and CI wiring: `tests/support::connection()` returns a guard
+  that asserts a clean report when each test ends, the seed acceptance test
+  asserts a clean report, the model tests run with a fixed case count (48)
+  under `cargo test --workspace`, and `proptest-regressions/` stays checked
+  in.
+
+Non-goals: online or incremental checking during normal writes, and repairing
+primary records.
+
+### Phase 8 — Query performance, vectorization and SIMD (large) [partial]
 
 This phase absorbs the former Phase 6 items: streaming `OPTIONAL MATCH` and
 variable-length expansion, bidirectional shortest-path search, and
-memory-bounded sort and aggregation.
+memory-bounded sort and aggregation. Every storage or bitmap fast path is
+verified against the Phase 7 reference model and checker before it ships.
+Every benchmark target below is met; numbers are in `docs/benchmarks.md`.
 
-- Runtime index seeks (highest ROI): plan a seek for equality values bound
-  before the scan, not just literals (`IndexSeek` currently stores a constant
-  `Value`), and push `WHERE n.key = x` down to the scan. This turns the bulk
-  script's `MATCH (u:User {id: uid})` into a lookup: `docs/benchmarks.md`
-  records 15.52 ms for the label scan versus 6.82 µs for the indexed seek at
-  50k nodes.
-- Bulk write path: batched node and edge creation, amortised constraint,
-  index and matrix updates, bulk index backfill, and group commits. Report
-  nodes/s and edges/s on the 1/100 fixture.
-- Batch/vectorized execution: a 1024-row pipeline for scan, filter, project
-  and aggregate; selection vectors, columnar `Int`/`Float`/`Bool`, null
-  bitmaps, and stable-Rust SIMD kernels (`wide`) for comparison, arithmetic
-  and `sum`/`count`/`avg`/`min`/`max`. Heap values fall back to the scalar
-  VM; differential `proptest` tests must prove identical results before a
-  fast path is enabled.
-- SIMD bitmap engine: bulk `Fragment` `and`/`or`/`and_not`/`xor`,
-  intersection tests, cardinality, rank/select and batch row operations.
-  Dense fragments use `wide`; sparse fragments use sorted merges. Use them
-  for multi-label scans, type intersections and batched expansion.
-  `count_ones` already lowers to hardware `popcnt`, so only claim measured
-  wins.
-- Parallel CPU phases: `rayon` for index and fulltext backfill, decoding and
-  large sorts/aggregations, with a single writer. Morsel-driven parallel read
-  scans are a stretch goal.
-- Benchmark gates: Criterion groups for seek versus scan, bitmap operations,
-  numeric filters and aggregates, expansion, bulk load and fulltext, with
-  before/after numbers recorded in `docs/benchmarks.md`.
+- [done] Runtime index seeks: `IndexSeek` carries an expression evaluated
+  once per input row, so `{id: uid}` seeks the index, and `WHERE n.key =
+  expr` moves into the pattern when `n` is introduced by the clause and
+  `expr` reads only earlier variables (non-deterministic and pattern
+  expressions stay in `WHERE`). Lookups follow Cypher equality: numeric
+  twins (both float zeros, every integer that rounds to a large float),
+  nothing for null and NaN, and a re-checked superset for lists. B+tree
+  descents now binary-search interior pages in place instead of copying
+  every divider, halving point lookups.
+- [done] Bulk write path: the full-size seed script loads (it used to
+  panic: eviction could drop the page just fetched) in 460 s, and the
+  1/100 fixture in 1.6 s instead of 140–153 s. Page eviction uses a
+  clean-page LRU instead of scanning dirty frames, which cost 92% of the
+  full load. The run is now I/O-bound. Literal lists and maps compile to a
+  single constant, so `UNWIND [...] AS x CREATE ...` no longer copies the
+  list's item registers into every row (76.1 ms to 7.3 ms for 10 000
+  rows). Batched node and edge creation and group commits were not needed
+  for the target and are not built.
+- [partial] Batch/vectorized execution: the targets were met without a
+  columnar pipeline. The VM borrows instructions and operands instead of
+  cloning them each step, aggregation folds rows into per-group
+  accumulators as they arrive (memory bounded by the number of groups, no
+  per-row allocation), and `ORDER BY … [SKIP] LIMIT` keeps only the best
+  `skip + limit` rows, rejecting candidates before copying them. A
+  1024-row columnar pipeline with `wide` kernels is not built: per-row
+  cost is interpretation and record access, not arithmetic.
+- [done] Bitmap set operations: `Fragment::intersect_with` (sorted merge,
+  bit tests or word AND by representation) and band-wise label
+  intersection serve multi-label scans, so `(n:A:B)` reads no records
+  (33 ms to 93 µs at 50k nodes). The word loops already compile to NEON; a
+  `wide` version tied on AND and lost 30% on cardinality, so no SIMD
+  dependency ships. OR, XOR, rank/select and batched expansion have no
+  caller yet and are not built.
+- [done] Streaming `OPTIONAL MATCH`: inner matches feed one copy of the
+  downstream code through a `Gosub`/`Return` subroutine, and the
+  null-extended row takes the same path, so no rows are buffered.
+- [done] Streaming variable-length expansion: an explicit depth-first
+  stack (`Database::var_expansion`/`next_trail`) yields trails in the
+  former order, with memory bounded by depth times degree; a property test
+  compares it with the recursive enumeration.
+- [done] Bidirectional shortest paths: with a bound target, a
+  bidirectional breadth-first search over node distances finds the
+  distance, and a depth-first walk over nodes on shortest paths lists the
+  trails in the order the old path enumeration did (that enumeration, which
+  kept every simple path in its frontier, remains for an unbound target and
+  for a minimum above the distance, and is the property-test oracle).
+  `shortestPath` across a 10x10 grid: 87.4 ms to 102 µs.
+- [pending] An external merge sort for unbounded `ORDER BY`: no workload
+  sorts more rows than fit in memory yet, and spilling needs temporary
+  files through the VFS.
+- [done] Parallel index backfill: backfills gather keys into one buffer,
+  sort them with `rayon`, detect unique violations as adjacent equal
+  values and fill the empty tree with `Btree::build_sorted` (packed leaves,
+  then interior levels). 50k nodes: 25.0 ms to 7.0 ms (unique 35.0 ms to
+  7.1 ms); the parallel sort is about 10% of the gain. Record decoding
+  stays serial because every page read goes through the single pager;
+  fulltext backfill and morsel-driven parallel scans are not built.
+- [done] Benchmark gates: Criterion groups for seek versus scan,
+  variable-key lookups, multi-label counts, one-million-row aggregates and
+  filters, and dense fragment kernels; results recorded in
+  `docs/benchmarks.md`.
 
-| Workload | Baseline | Target |
-|----------|----------|--------|
-| Variable-key point lookup, 50k nodes | 15.5 ms (label scan) | ≤ 10 µs (seek) |
-| Seed load, 1/100 scale | Phase 6 baseline | ≥ 3x throughput |
-| Numeric filter, 1M rows | scalar VM | ≥ 1.5x |
-| `sum`/`count`/`avg`, 1M values | scalar VM | ≥ 2x |
-| Dense 8 KiB bitmap AND/OR/cardinality | scalar words | ≥ 1.5x |
+| Workload | Baseline | Target | Result |
+|----------|----------|--------|--------|
+| Variable-key point lookup, 50k nodes | 17.2 ms (label scan) | ≤ 10 µs (seek) | 4.97 µs |
+| Seed load, 1/100 scale | 140–153 s (release CLI) | ≥ 3x throughput | 1.6 s (~90x) |
+| Numeric filter, 1M rows | 90.8 ms | ≥ 1.5x | 55.2 ms (1.64x) |
+| `sum`/`count`/`avg`, 1M values | 138 ms | ≥ 2x | 36.1 ms (3.8x) |
+| Dense 8 KiB bitmap AND/OR/cardinality | scalar words | ≥ 1.5x | not met by SIMD; scalar already vectorized |
 
-`std::simd` is still unstable on rustc 1.99.1, so kernels use `wide`. Any
-`std::arch` specialisation is isolated, runtime-detected and documented;
-`-C target-cpu=native` is never required. Benchmarks run serially, and a SIMD
-path ships only when it beats the scalar reference on the recorded machine,
-with the scalar path retained as the differential oracle.
+`std::simd` is still unstable on rustc 1.99.1, so kernels would use `wide`.
+Any `std::arch` specialisation is isolated, runtime-detected and
+documented; `-C target-cpu=native` is never required. Benchmarks run
+serially, and a SIMD path ships only when it beats the scalar reference on
+the recorded machine, with the scalar path retained as the differential
+oracle.
 
 ## Milestones
 
@@ -322,7 +434,8 @@ scenarios are excluded), so milestones are stated against the whole suite.
 | After Phase 4 | ≥ 93% of the whole suite; deviations closed |
 | After Phase 5 | Allow-list contains only non-goals (e.g. registered procedures) |
 | After Phase 6 | 1/100 seed script runs end to end; TCK report unchanged |
-| After Phase 7 | Bound equality lookups use index seeks; benchmark targets met |
+| After Phase 7 | Checker clean on every suite, fixture and release file |
+| After Phase 8 | Bound equality lookups use index seeks; benchmark targets met (bitmap SIMD target withdrawn: scalar is already vectorized) |
 
 Phase 4 achieved 3844 of 3897 scenarios (98.6%); the allow-list holds the
 52 CALL procedure scenarios (non-goal) and one nested pattern
@@ -349,3 +462,7 @@ comprehension.
 5. Performance changes land with Criterion benchmark evidence: a vectorized or
    SIMD path ships only when it beats the scalar reference on the recorded
    machine, and the scalar path stays as the differential oracle.
+6. Changes to storage, the incidence matrix or write paths land with
+   checker coverage and a boundary case in the Phase 7 model tests. A
+   release is cut only when every cross-version fixture opens with a clean
+   checker report, and it adds its own fixture.

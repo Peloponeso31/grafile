@@ -92,6 +92,20 @@ int main(int argc, char **argv) {
     printf("meta: %s\n", meta);
     grafile_free(meta);
 
+    char *check = NULL;
+    rc = grafile_check_json(db, &check);
+    if (rc != GRAFILE_OK) {
+        return fail(db, "grafile_check_json", rc);
+    }
+    int clean = strstr(check, "\"findings\":[]") != NULL;
+    printf("check: %s\n", check);
+    grafile_free(check);
+    if (!clean) {
+        fprintf(stderr, "integrity check reported findings\n");
+        grafile_close(db);
+        return 1;
+    }
+
     grafile_close(db);
 
     if (rows != 2) {

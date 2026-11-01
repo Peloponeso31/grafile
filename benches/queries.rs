@@ -162,6 +162,115 @@ fn bench_index_vs_scan(c: &mut Criterion) {
     group.finish();
 }
 
+/// Lookups whose key is a variable bound earlier in the query, in pattern
+/// and `WHERE` form; before runtime seeks both scanned the label.
+fn bench_variable_key_lookup(c: &mut Criterion) {
+    let nodes = 50_000;
+    let mut conn = seeded_connection(nodes, true);
+    let mut group = c.benchmark_group("cypher_variable_key_50k");
+    for (label, pattern) in [
+        ("pattern", "MATCH (n:Person {seed: id})"),
+        ("where", "MATCH (n:Person) WHERE n.seed = id"),
+    ] {
+        group.bench_function(label, |b| {
+            let mut state = 0u64;
+            b.iter(|| {
+                let id = next_probe(&mut state) % nodes;
+                let query = format!("WITH {id} AS id {pattern} RETURN n.name");
+                let rows = conn.query(&query, &Params::new()).expect("query");
+                black_box(rows.len());
+            });
+        });
+    }
+    group.finish();
+}
+
+/// Counting a two-label conjunction: one label holds every node, the other
+/// every tenth. The scan intersects the label bitmaps instead of reading
+/// each node's labels.
+fn bench_multi_label_count(c: &mut Criterion) {
+    let nodes = 50_000;
+    let mut conn = seeded_connection(nodes, false);
+    conn.execute("MATCH (n:Person) WHERE n.seed % 10 = 0 SET n:Tenth")
+        .expect("label");
+    c.bench_function("cypher_multi_label_count_50k", |b| {
+        b.iter(|| {
+            let rows = conn
+                .query("MATCH (n:Person:Tenth) RETURN count(*)", &Params::new())
+                .expect("query");
+            black_box(rows.len());
+        });
+    });
+}
+
+/// One million generated rows through the scalar VM: an ungrouped
+/// aggregate, a grouped one, and a numeric filter.
+fn bench_million_rows(c: &mut Criterion) {
+    let mut conn =
+        Connection::create_with_vfs(Arc::new(MemVfs::new()), Path::new("bench-rows.db"), 8192)
+            .expect("connection");
+    let mut group = c.benchmark_group("cypher_1m_rows");
+    group.throughput(Throughput::Elements(1_000_000));
+    group.sample_size(10);
+    for (label, query) in [
+        (
+            "sum_count_avg",
+            "UNWIND range(1, 1000000) AS x RETURN sum(x), count(x), avg(x)",
+        ),
+        (
+            "grouped_sum",
+            "UNWIND range(1, 1000000) AS x RETURN x % 16 AS k, sum(x)",
+        ),
+        (
+            "numeric_filter",
+            "UNWIND range(1, 1000000) AS x WITH x WHERE x % 7 = 3 RETURN count(*)",
+        ),
+    ] {
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                let rows = conn.query(query, &Params::new()).expect("query");
+                black_box(rows.len());
+            });
+        });
+    }
+    group.finish();
+}
+
+/// `shortestPath` and `allShortestPaths` corner to corner across a directed
+/// 10x10 grid (edges right and down): 48 620 shortest paths of 18 hops.
+fn bench_shortest_path(c: &mut Criterion) {
+    let mut conn =
+        Connection::create_with_vfs(Arc::new(MemVfs::new()), Path::new("bench-grid.db"), 8192)
+            .expect("connection");
+    conn.execute(
+        "UNWIND range(0, 99) AS i CREATE (:Cell {id: i}) \
+         WITH count(*) AS created \
+         MATCH (a:Cell), (b:Cell) \
+         WHERE (b.id = a.id + 1 AND b.id % 10 <> 0) OR b.id = a.id + 10 \
+         CREATE (a)-[:R]->(b)",
+    )
+    .expect("grid");
+    conn.create_node_index("id", Some("Cell"), true)
+        .expect("index");
+    let mut group = c.benchmark_group("cypher_shortest_path_grid10");
+    for (label, function, output) in [
+        ("shortest", "shortestPath", "length(p)"),
+        ("all_shortest", "allShortestPaths", "count(p)"),
+    ] {
+        let query = format!(
+            "MATCH (a:Cell {{id: 0}}), (b:Cell {{id: 99}}) \
+             MATCH p = {function}((a)-[:R*]->(b)) RETURN {output}"
+        );
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                let rows = conn.query(&query, &Params::new()).expect("query");
+                black_box(rows.len());
+            });
+        });
+    }
+    group.finish();
+}
+
 /// A single-property update through the unique index, autocommitted.
 fn bench_update(c: &mut Criterion) {
     let nodes = 10_000;
@@ -184,6 +293,10 @@ criterion_group!(
     bench_label_count,
     bench_top_k,
     bench_index_vs_scan,
+    bench_variable_key_lookup,
+    bench_multi_label_count,
+    bench_million_rows,
+    bench_shortest_path,
     bench_update
 );
 criterion_main!(benches);

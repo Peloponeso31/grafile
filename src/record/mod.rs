@@ -923,6 +923,113 @@ pub fn encode_index_key(out: &mut Vec<u8>, value: &Value) {
     }
 }
 
+/// A half-open range `[start, end)` of encoded index keys; `None` is unbounded.
+pub type KeyRange = (Vec<u8>, Option<Vec<u8>>);
+
+/// Index key ranges that hold every stored value equal to `value` under
+/// Cypher equality.
+///
+/// Numbers match across `Int` and `Float` (and both float zeros). List keys
+/// are not prefix-free and lists compare equal across numeric types, so list
+/// lookups return a superset that callers must re-check; every other lookup
+/// is exact.
+///
+/// # Arguments
+///
+/// * `value` - The value an indexed property must equal
+///
+/// # Returns
+///
+/// The ranges to scan, empty when nothing can be equal (null, NaN, or a
+/// value that cannot be stored as a property)
+pub fn equality_key_ranges(value: &Value) -> smallvec::SmallVec<[KeyRange; 2]> {
+    let mut ranges = smallvec::SmallVec::new();
+    match value {
+        Value::Null | Value::Map(_) | Value::Node(_) | Value::Edge(_) => {}
+        Value::Float(float) if float.is_nan() => {}
+        Value::Int(int) => {
+            ranges.push(exact_key_range(value));
+            ranges.push(exact_key_range(&Value::Float(*int as f64)));
+            if *int == 0 {
+                ranges.push(exact_key_range(&Value::Float(-0.0)));
+            }
+        }
+        Value::Float(float) => {
+            ranges.push(exact_key_range(value));
+            if *float == 0.0 {
+                ranges.push(exact_key_range(&Value::Float(-float)));
+            }
+            if let Some((first, last)) = ints_equal_to(*float) {
+                let (start, _) = exact_key_range(&Value::Int(first));
+                let (_, end) = exact_key_range(&Value::Int(last));
+                ranges.push((start, end));
+            }
+        }
+        Value::List(items) if items.iter().any(contains_number) => {
+            ranges.push((vec![index_tag::LIST], Some(vec![index_tag::LIST + 1])));
+        }
+        Value::Bool(_)
+        | Value::Text(_)
+        | Value::Bytes(_)
+        | Value::List(_)
+        | Value::Date(_)
+        | Value::LocalTime(_)
+        | Value::Time(_)
+        | Value::LocalDateTime(_)
+        | Value::DateTime(_)
+        | Value::Duration(_)
+        | Value::Point(_) => ranges.push(exact_key_range(value)),
+    }
+    ranges
+}
+
+/// The range of keys that start with the encoding of `value`.
+fn exact_key_range(value: &Value) -> KeyRange {
+    let mut start = Vec::with_capacity(16);
+    encode_index_key(&mut start, value);
+    let end = prefix_successor(&start);
+    (start, end)
+}
+
+/// The smallest byte string greater than every string starting with
+/// `prefix`, or `None` when no such string exists (all bytes `0xFF`).
+fn prefix_successor(prefix: &[u8]) -> Option<Vec<u8>> {
+    let last = prefix.iter().rposition(|byte| *byte != 0xFF)?;
+    let mut end = prefix[..=last].to_vec();
+    end[last] += 1;
+    Some(end)
+}
+
+/// The inclusive range of integers `i` with `i as f64 == value`, if any.
+fn ints_equal_to(value: f64) -> Option<(i64, i64)> {
+    const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+    const TWO_POW_53: f64 = 9_007_199_254_740_992.0;
+    if value.fract() != 0.0 || !(-TWO_POW_63..=TWO_POW_63).contains(&value) {
+        return None;
+    }
+    // `as` saturates for out-of-range floats, so 2^63 maps to `i64::MAX`.
+    let center = value as i64;
+    if value.abs() < TWO_POW_53 {
+        return Some((center, center));
+    }
+    // From 2^53 on, neighbouring integers round to the same float; adjacent
+    // floats are at most 2^11 apart below 2^63.
+    let first = (center.saturating_sub(2048)..=center).find(|int| *int as f64 == value)?;
+    let last = (center..=center.saturating_add(2048))
+        .rev()
+        .find(|int| *int as f64 == value)?;
+    Some((first, last))
+}
+
+/// Whether a value is a number or a list that contains one at any depth.
+fn contains_number(value: &Value) -> bool {
+    match value {
+        Value::Int(_) | Value::Float(_) => true,
+        Value::List(items) => items.iter().any(contains_number),
+        _ => false,
+    }
+}
+
 /// Encode a signed integer so that byte order matches numeric order.
 fn encode_ordered_i128(out: &mut Vec<u8>, value: i128) {
     let flipped = (value as u128) ^ (1u128 << 127);
@@ -963,6 +1070,42 @@ fn encode_escaped(out: &mut Vec<u8>, bytes: &[u8]) {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn ints_equal_to_covers_rounding_neighbours() {
+        assert_eq!(ints_equal_to(3.0), Some((3, 3)));
+        assert_eq!(ints_equal_to(-0.0), Some((0, 0)));
+        assert_eq!(ints_equal_to(0.5), None);
+        assert_eq!(ints_equal_to(f64::INFINITY), None);
+        let two_pow_53 = 1i64 << 53;
+        assert_eq!(
+            ints_equal_to(two_pow_53 as f64),
+            Some((two_pow_53, two_pow_53 + 1))
+        );
+        let (_, last) = ints_equal_to(9_223_372_036_854_775_808.0).expect("2^63");
+        assert_eq!(last, i64::MAX);
+    }
+
+    #[test]
+    fn equality_ranges_skip_values_equal_to_nothing() {
+        assert!(equality_key_ranges(&Value::Null).is_empty());
+        assert!(equality_key_ranges(&Value::Float(f64::NAN)).is_empty());
+        assert!(equality_key_ranges(&Value::Node(1)).is_empty());
+        assert_eq!(equality_key_ranges(&Value::from("x")).len(), 1);
+        assert_eq!(equality_key_ranges(&Value::Int(0)).len(), 3);
+    }
+
+    proptest! {
+        #[test]
+        fn ints_equal_to_contains_every_rounding_int(int in any::<i64>()) {
+            let (first, last) = ints_equal_to(int as f64).expect("integral");
+            prop_assert!(first <= int && int <= last);
+            prop_assert_eq!(first as f64, int as f64);
+            prop_assert_eq!(last as f64, int as f64);
+            prop_assert!(first == i64::MIN || (first - 1) as f64 != int as f64);
+            prop_assert!(last == i64::MAX || (last + 1) as f64 != int as f64);
+        }
+    }
 
     fn value_strategy() -> impl Strategy<Value = Value> {
         let leaf = prop_oneof![

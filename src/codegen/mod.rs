@@ -30,6 +30,9 @@ struct Codegen {
     constants: Vec<Value>,
     next_reg: u32,
     next_cursor: u32,
+    /// `(skip register, limit register)` set by a `LIMIT` whose input is a
+    /// sort (directly or under `SKIP`), consumed by that sort.
+    sort_bound: Option<(Option<u32>, u32)>,
 }
 
 /// Compile a prepared query into a VDBE program.
@@ -39,6 +42,7 @@ pub fn compile(prepared: &Prepared) -> Result<Program> {
         constants: Vec::new(),
         next_reg: 0,
         next_cursor: 0,
+        sort_bound: None,
     };
     let mut ctx = Ctx {
         vars: HashMap::new(),
@@ -79,6 +83,7 @@ impl Codegen {
             | Op::Next { target: t, .. }
             | Op::IfNot { target: t, .. }
             | Op::Goto { target: t }
+            | Op::Gosub { target: t, .. }
             | Op::CtxRewind { target: t, .. }
             | Op::CtxNext { target: t, .. }
             | Op::UnwindNext { target: t, .. }
@@ -152,52 +157,53 @@ impl Codegen {
             Plan::NodeScan {
                 input,
                 var,
-                label,
+                labels,
                 seek,
                 props,
             } => {
                 self.compile(input, ctx, &mut |cg, ctx| {
                     let cursor = cg.alloc_cursor();
-                    let rewind;
-                    if let Some(seek) = seek {
-                        let value_reg = cg.const_reg(seek.value.clone());
-                        cg.emit(Op::OpenIndexScan {
-                            cursor,
-                            index: seek.index_id,
-                            value: value_reg,
-                        });
-                        rewind = cg.emit(Op::Rewind { cursor, target: 0 });
-                    } else {
-                        let label_reg = label
-                            .as_ref()
-                            .map(|name| cg.const_index(Value::from(name.as_str())));
-                        cg.emit(Op::OpenNodeScan {
-                            cursor,
-                            label: label_reg,
-                        });
-                        rewind = cg.emit(Op::Rewind { cursor, target: 0 });
+                    let label_names: Vec<u32> = labels
+                        .iter()
+                        .map(|name| cg.const_index(Value::from(name.as_str())))
+                        .collect();
+                    match seek {
+                        Some(seek) => {
+                            let value_reg = cg.compile_expr(&seek.value, ctx)?;
+                            cg.emit(Op::OpenIndexScan {
+                                cursor,
+                                index: seek.index_id,
+                                value: value_reg,
+                            });
+                        }
+                        None => {
+                            cg.emit(Op::OpenNodeScan {
+                                cursor,
+                                labels: label_names.clone(),
+                            });
+                        }
                     }
+                    let rewind = cg.emit(Op::Rewind { cursor, target: 0 });
                     let loop_start = cg.ops.len() as u32;
                     let dest = cg.alloc_reg();
                     cg.emit(Op::Bind { cursor, dest });
                     ctx.vars.insert(var.clone(), dest);
                     ctx.window_len = cg.next_reg - ctx.window_start;
                     let mut skip_jumps = Vec::new();
-                    // Index scans must re-check the label.
-                    if seek.is_some()
-                        && let Some(label) = label
-                    {
-                        let check = cg.alloc_reg();
-                        let label_reg = cg.const_index(Value::from(label.as_str()));
-                        cg.emit(Op::HasLabel {
-                            node: dest,
-                            label: label_reg,
-                            dest: check,
-                        });
-                        skip_jumps.push(cg.emit(Op::IfNot {
-                            reg: check,
-                            target: 0,
-                        }));
+                    // Index scans must re-check the labels.
+                    if seek.is_some() {
+                        for label in label_names {
+                            let check = cg.alloc_reg();
+                            cg.emit(Op::HasLabel {
+                                node: dest,
+                                label,
+                                dest: check,
+                            });
+                            skip_jumps.push(cg.emit(Op::IfNot {
+                                reg: check,
+                                target: 0,
+                            }));
+                        }
                     }
                     cg.emit_property_filters(dest, props, &mut skip_jumps)?;
                     out(cg, ctx)?;
@@ -217,7 +223,7 @@ impl Codegen {
                 let rewritten = Plan::NodeScan {
                     input: input.clone(),
                     var: var.clone(),
-                    label: None,
+                    labels: Vec::new(),
                     seek: None,
                     props: Vec::new(),
                 };
@@ -648,16 +654,26 @@ impl Codegen {
             }),
             Plan::OptionalMatch { input, inner, vars } => {
                 self.compile(input, ctx, &mut |cg, outer_ctx| {
-                    let cursor = cg.alloc_cursor();
-                    cg.emit(Op::CollectOpen { cursor });
+                    // Stream the inner matches into one copy of the downstream
+                    // code, called as a subroutine; when nothing matched, call
+                    // it once more with the new variables nulled.
+                    let matched = cg.alloc_reg();
+                    let ret = cg.alloc_reg();
+                    let no = cg.const_index(Value::Bool(false));
+                    let yes = cg.const_index(Value::Bool(true));
+                    cg.emit(Op::Constant {
+                        dest: matched,
+                        value: no,
+                    });
                     let mut produced: Option<Ctx> = None;
+                    let mut calls = Vec::new();
                     cg.compile(inner, outer_ctx, &mut |cg, ctx| {
                         produced = Some(ctx.clone());
-                        cg.emit(Op::CollectRow {
-                            cursor,
-                            start: ctx.window_start,
-                            count: ctx.window_len,
+                        cg.emit(Op::Constant {
+                            dest: matched,
+                            value: yes,
                         });
+                        calls.push(cg.emit(Op::Gosub { ret, target: 0 }));
                         Ok(())
                     })?;
                     let Some(inner_ctx) = produced else {
@@ -671,38 +687,31 @@ impl Codegen {
                         null_ctx.window_len = cg.next_reg - null_ctx.window_start;
                         return out(cg, &mut null_ctx);
                     };
-                    // When the pattern missed, append one row with the new
-                    // variables nulled so the replay below sees a row.
-                    let empty_jump = cg.emit(Op::CtxRewind { cursor, target: 0 });
-                    let skip_null = cg.emit(Op::Goto { target: 0 });
+                    let missed = cg.emit(Op::IfNot {
+                        reg: matched,
+                        target: 0,
+                    });
+                    let mut done_jumps = vec![cg.emit(Op::Goto { target: 0 })];
                     let null_start = cg.ops.len() as u32;
+                    cg.patch(missed, null_start)?;
                     for var in vars {
                         let Some(reg) = inner_ctx.vars.get(var).copied() else {
                             return Err(Error::internal("optional variable is not bound"));
                         };
                         cg.emit(Op::Null { dest: reg });
                     }
-                    cg.emit(Op::CollectRow {
-                        cursor,
-                        start: inner_ctx.window_start,
-                        count: inner_ctx.window_len,
-                    });
-                    let replay_start = cg.ops.len() as u32;
-                    cg.patch(empty_jump, null_start)?;
-                    cg.patch(skip_null, replay_start)?;
-                    // Replay the collected (or null-extended) rows once.
-                    let loop_start = cg.ops.len() as u32;
-                    cg.emit(Op::CtxData {
-                        cursor,
-                        start: inner_ctx.window_start,
-                        count: inner_ctx.window_len,
-                    });
-                    let mut replay_ctx = inner_ctx.clone();
-                    out(cg, &mut replay_ctx)?;
-                    let next = cg.emit(Op::CtxNext { cursor, target: 0 });
-                    cg.emit(Op::Goto { target: loop_start });
-                    let end = cg.ops.len() as u32;
-                    cg.patch(next, end)?;
+                    calls.push(cg.emit(Op::Gosub { ret, target: 0 }));
+                    done_jumps.push(cg.emit(Op::Goto { target: 0 }));
+                    let body = cg.ops.len() as u32;
+                    for call in calls {
+                        cg.patch(call, body)?;
+                    }
+                    out(cg, &mut inner_ctx.clone())?;
+                    cg.emit(Op::Return { ret });
+                    let done = cg.ops.len() as u32;
+                    for jump in done_jumps {
+                        cg.patch(jump, done)?;
+                    }
                     Ok(())
                 })
             }
@@ -737,46 +746,7 @@ impl Codegen {
                 aggs,
             } => {
                 let cursor = self.alloc_cursor();
-                self.emit(Op::CollectOpen { cursor });
-                let mut layout: Option<(u32, u32, u32)> = None;
-                self.compile(input, ctx, &mut |cg, in_ctx| {
-                    let mut group_values = Vec::with_capacity(groups.len());
-                    for (expr, _) in groups {
-                        group_values.push(cg.compile_expr(expr, in_ctx)?);
-                    }
-                    let arg_count: usize = aggs.iter().map(|item| item.arguments.len()).sum();
-                    let mut agg_values = Vec::with_capacity(arg_count);
-                    for item in aggs {
-                        for argument in &item.arguments {
-                            agg_values.push(cg.compile_expr(argument, in_ctx)?);
-                        }
-                    }
-                    let prefix = cg.next_reg - in_ctx.window_start;
-                    let group_base = cg.next_reg;
-                    for value in group_values {
-                        let slot = cg.alloc_reg();
-                        cg.emit(Op::Copy {
-                            dest: slot,
-                            src: value,
-                        });
-                    }
-                    for value in agg_values {
-                        let slot = cg.alloc_reg();
-                        cg.emit(Op::Copy {
-                            dest: slot,
-                            src: value,
-                        });
-                    }
-                    layout = Some((in_ctx.window_start, prefix, group_base));
-                    cg.emit(Op::CollectRow {
-                        cursor,
-                        start: in_ctx.window_start,
-                        count: prefix + (groups.len() + arg_count) as u32,
-                    });
-                    Ok(())
-                })?;
-                let (_, prefix, group_base) =
-                    layout.ok_or_else(|| Error::internal("empty aggregate input"))?;
+                self.emit(Op::AggregateOpen { cursor });
                 let specs: Vec<AggSpec> = aggs
                     .iter()
                     .map(|item| AggSpec {
@@ -786,9 +756,35 @@ impl Codegen {
                         distinct: item.distinct,
                     })
                     .collect();
-                self.emit(Op::HashAggregate {
+                let mut group_base: Option<u32> = None;
+                self.compile(input, ctx, &mut |cg, in_ctx| {
+                    let inputs: Vec<&Expr> = groups
+                        .iter()
+                        .map(|(expr, _)| expr)
+                        .chain(aggs.iter().flat_map(|item| &item.arguments))
+                        .collect();
+                    // Evaluate straight into one contiguous window that the
+                    // step reads in place.
+                    let base = cg.next_reg;
+                    for _ in &inputs {
+                        cg.alloc_reg();
+                    }
+                    for (offset, expr) in inputs.into_iter().enumerate() {
+                        cg.compile_expr_into(expr, in_ctx, base + offset as u32)?;
+                    }
+                    cg.emit(Op::AggregateStep {
+                        cursor,
+                        start: base,
+                        groups: groups.len() as u32,
+                        aggs: specs.clone(),
+                    });
+                    group_base = Some(base);
+                    Ok(())
+                })?;
+                let group_base =
+                    group_base.ok_or_else(|| Error::internal("empty aggregate input"))?;
+                self.emit(Op::AggregateFinish {
                     cursor,
-                    prefix,
                     groups: groups.len() as u32,
                     aggs: specs,
                 });
@@ -859,7 +855,16 @@ impl Codegen {
             }
             Plan::Sort { input, keys } => {
                 let cursor = self.alloc_cursor();
-                self.emit(Op::CollectOpen { cursor });
+                let bound = self.sort_bound.take();
+                let ascending: Vec<bool> = keys.iter().map(|(_, ascending)| *ascending).collect();
+                match bound {
+                    Some((skip, limit)) => self.emit(Op::TopKOpen {
+                        cursor,
+                        skip,
+                        limit,
+                    }),
+                    None => self.emit(Op::CollectOpen { cursor }),
+                };
                 let mut produced: Option<(Ctx, u32)> = None;
                 self.compile(input, ctx, &mut |cg, in_ctx| {
                     let mut key_values = Vec::with_capacity(keys.len());
@@ -875,11 +880,22 @@ impl Codegen {
                         });
                     }
                     produced = Some((in_ctx.clone(), prefix));
-                    cg.emit(Op::CollectRow {
-                        cursor,
-                        start: in_ctx.window_start,
-                        count: prefix + keys.len() as u32,
-                    });
+                    let start = in_ctx.window_start;
+                    let count = prefix + keys.len() as u32;
+                    match bound {
+                        Some(_) => cg.emit(Op::TopKRow {
+                            cursor,
+                            start,
+                            count,
+                            prefix,
+                            ascending: ascending.clone(),
+                        }),
+                        None => cg.emit(Op::CollectRow {
+                            cursor,
+                            start,
+                            count,
+                        }),
+                    };
                     Ok(())
                 })?;
                 let (mut row_ctx, prefix) =
@@ -888,7 +904,7 @@ impl Codegen {
                     cursor,
                     prefix,
                     keys: keys.len() as u32,
-                    ascending: keys.iter().map(|(_, ascending)| *ascending).collect(),
+                    ascending,
                 });
                 let rewind = self.emit(Op::CtxRewind { cursor, target: 0 });
                 let loop_start = self.ops.len() as u32;
@@ -907,10 +923,21 @@ impl Codegen {
             }
             Plan::Skip { input, count } => {
                 let count_reg = self.compile_expr(count, ctx)?;
+                if let Some((skip, _)) = &mut self.sort_bound {
+                    *skip = Some(count_reg);
+                }
                 self.compile_truncated(input, ctx, out, Some(count_reg), None)
             }
             Plan::Limit { input, count } => {
                 let count_reg = self.compile_expr(count, ctx)?;
+                let sorted = match input.as_ref() {
+                    Plan::Sort { .. } => true,
+                    Plan::Skip { input, .. } => matches!(input.as_ref(), Plan::Sort { .. }),
+                    _ => false,
+                };
+                if sorted {
+                    self.sort_bound = Some((None, count_reg));
+                }
                 self.compile_truncated(input, ctx, out, None, Some(count_reg))
             }
             Plan::Unwind { input, expr, alias } => self.compile(input, ctx, &mut |cg, ctx| {
@@ -1926,6 +1953,14 @@ impl Codegen {
                     dest,
                 });
             }
+            Expr::List(_) | Expr::Map(_) if let Some(value) = constant_value(expr) => {
+                // Literal collections become one constant: no per-item
+                // registers, which would otherwise widen every row window
+                // that follows (an `UNWIND` of a 500-item literal list
+                // copied 500 registers per row).
+                let index = self.const_index(value);
+                self.emit(Op::Constant { dest, value: index });
+            }
             Expr::List(items) => {
                 let item_regs: Vec<u32> = items
                     .iter()
@@ -2137,6 +2172,30 @@ fn scalar_function(name: &str) -> Result<u8> {
     }
 }
 
+/// The value of a literal, or of a list or map built only from literals,
+/// exactly as `BuildList`/`BuildMap` would build it at runtime.
+fn constant_value(expr: &Expr) -> Option<Value> {
+    match expr {
+        Expr::Literal(value) => Some(value.clone()),
+        Expr::List(items) => items
+            .iter()
+            .map(constant_value)
+            .collect::<Option<Vec<Value>>>()
+            .map(|values| Value::List(values.into())),
+        Expr::Map(entries) => entries
+            .iter()
+            .map(|(key, value)| {
+                Some((
+                    std::sync::Arc::<str>::from(key.as_str()),
+                    constant_value(value)?,
+                ))
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|entries| Value::Map(entries.into())),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -2168,7 +2227,7 @@ mod tests {
         let program = compile_source(&mut db, "MATCH (n) RETURN n");
         assert!(has_op(&program, |op| matches!(
             op,
-            Op::OpenNodeScan { label: None, .. }
+            Op::OpenNodeScan { labels, .. } if labels.is_empty()
         )));
         assert!(has_op(&program, |op| matches!(op, Op::Rewind { .. })));
         assert!(has_op(&program, |op| matches!(op, Op::Next { .. })));
@@ -2205,9 +2264,9 @@ mod tests {
             .ops
             .iter()
             .find_map(|op| match op {
-                Op::OpenNodeScan {
-                    label: Some(reg), ..
-                } => Some(program.constants[*reg as usize].clone()),
+                Op::OpenNodeScan { labels, .. } => labels
+                    .first()
+                    .map(|reg| program.constants[*reg as usize].clone()),
                 _ => None,
             })
             .expect("labeled scan");
@@ -2280,13 +2339,59 @@ mod tests {
             .ops
             .iter()
             .find_map(|op| match op {
-                Op::HashAggregate { aggs, .. } => Some(aggs),
+                Op::AggregateStep { aggs, .. } => Some(aggs),
                 _ => None,
             })
-            .expect("HashAggregate");
+            .expect("AggregateStep");
         assert_eq!(aggregate.len(), 2);
         assert_eq!(aggregate[0].func, AggFn::Count);
         assert_eq!(aggregate[1].func, AggFn::Sum);
+    }
+
+    #[test]
+    fn literal_collections_compile_to_one_constant() {
+        let mut db = test_db();
+        let program = compile_source(&mut db, "UNWIND [1, [2, 'x'], {a: 3}] AS v RETURN v");
+        assert!(!has_op(&program, |op| matches!(op, Op::BuildList { .. })));
+        assert!(!has_op(&program, |op| matches!(op, Op::BuildMap { .. })));
+        let dynamic = compile_source(&mut db, "UNWIND [1, 2] AS v RETURN [v, 1] AS l");
+        assert!(has_op(&dynamic, |op| matches!(op, Op::BuildList { .. })));
+    }
+
+    #[test]
+    fn optional_match_streams_through_one_subroutine() {
+        let mut db = test_db();
+        db.write(|db| db.ensure_edge_type("K")).expect("schema");
+        let program = compile_source(
+            &mut db,
+            "MATCH (n) OPTIONAL MATCH (n)-[:K]->(m) RETURN n, m",
+        );
+        assert!(!has_op(&program, |op| matches!(op, Op::CollectOpen { .. })));
+        let calls = program
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::Gosub { .. }))
+            .count();
+        assert_eq!(calls, 2, "a matched call and a null-extended call");
+        let results = program
+            .ops
+            .iter()
+            .filter(|op| matches!(op, Op::ResultRow { .. }))
+            .count();
+        assert_eq!(results, 1, "the downstream code is emitted once");
+    }
+
+    #[test]
+    fn order_by_with_limit_compiles_to_a_bounded_sort() {
+        let mut db = test_db();
+        let bounded = compile_source(&mut db, "MATCH (n) RETURN n ORDER BY id(n) SKIP 2 LIMIT 3");
+        assert!(has_op(&bounded, |op| matches!(
+            op,
+            Op::TopKOpen { skip: Some(_), .. }
+        )));
+        assert!(has_op(&bounded, |op| matches!(op, Op::TopKRow { .. })));
+        let unbounded = compile_source(&mut db, "MATCH (n) RETURN n ORDER BY id(n)");
+        assert!(!has_op(&unbounded, |op| matches!(op, Op::TopKOpen { .. })));
     }
 
     #[test]

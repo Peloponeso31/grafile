@@ -41,10 +41,15 @@ impl Reg {
     /// Convert to a plain value for comparisons and output (entities become
     /// entity values).
     pub fn to_value(&self) -> Value {
+        self.as_value().into_owned()
+    }
+
+    /// The register as a value, borrowed unless it holds an entity.
+    pub fn as_value(&self) -> Cow<'_, Value> {
         match self {
-            Self::Value(value) => value.clone(),
-            Self::Node(id) => Value::Node(*id),
-            Self::Edge(id) => Value::Edge(*id),
+            Self::Value(value) => Cow::Borrowed(value),
+            Self::Node(id) => Cow::Owned(Value::Node(*id)),
+            Self::Edge(id) => Cow::Owned(Value::Edge(*id)),
         }
     }
 }
@@ -84,12 +89,13 @@ pub struct AggSpec {
 /// A VDBE instruction.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Op {
-    /// Open a node scan (all nodes, or a label bitmap).
+    /// Open a node scan: all nodes, or the intersection of label bitmaps.
     OpenNodeScan {
         /// Cursor slot.
         cursor: u32,
-        /// Constant index of the label name to filter by.
-        label: Option<u32>,
+        /// Constant indices of the label names every node must carry; empty
+        /// scans all nodes.
+        labels: Vec<u32>,
     },
     /// Open an edge scan (all edges, or a type bitmap).
     OpenEdgeScan {
@@ -258,6 +264,18 @@ pub enum Op {
         /// Jump target.
         target: u32,
     },
+    /// Call a subroutine: store the return address in `ret`, then jump.
+    Gosub {
+        /// Register receiving the return address.
+        ret: u32,
+        /// Subroutine start.
+        target: u32,
+    },
+    /// Return from a subroutine to the address stored in `ret`.
+    Return {
+        /// Register holding the return address.
+        ret: u32,
+    },
     /// Emit a result row from a register window.
     ResultRow {
         /// First register.
@@ -281,20 +299,61 @@ pub enum Op {
         /// Number of registers.
         count: u32,
     },
+    /// Open a bounded sort cursor for `ORDER BY ... [SKIP s] LIMIT l`: it
+    /// keeps only the `s + l` best rows. Invalid counts leave it unbounded so
+    /// `TruncateRows` reports them.
+    TopKOpen {
+        /// Cursor slot.
+        cursor: u32,
+        /// Register holding the `SKIP` count, if any.
+        skip: Option<u32>,
+        /// Register holding the `LIMIT` count.
+        limit: u32,
+    },
+    /// Offer a register window to a bounded sort cursor; rows that cannot
+    /// make the cut are rejected before they are copied.
+    TopKRow {
+        /// Cursor slot.
+        cursor: u32,
+        /// First register.
+        start: u32,
+        /// Number of registers.
+        count: u32,
+        /// Number of leading row columns before the sort keys.
+        prefix: u32,
+        /// Per-key sort direction.
+        ascending: Vec<bool>,
+    },
     /// Commit the current transaction and begin the next batch.
     BatchCommit {
         /// Input rows per transaction.
         rows: u32,
     },
-    /// Hash-aggregate collected rows.
-    HashAggregate {
+    /// Open an aggregation cursor with no groups yet.
+    AggregateOpen {
         /// Cursor slot.
         cursor: u32,
-        /// Number of leading row columns to ignore.
-        prefix: u32,
-        /// Number of grouping columns.
+    },
+    /// Fold the current row into its group: registers `start..` hold the
+    /// grouping values followed by every aggregation's arguments. Only a new
+    /// group allocates, so memory is bounded by the number of groups.
+    AggregateStep {
+        /// Cursor slot.
+        cursor: u32,
+        /// First grouping register.
+        start: u32,
+        /// Number of grouping registers.
         groups: u32,
-        /// Aggregations (one input column each, after the groups).
+        /// Aggregations, in argument order.
+        aggs: Vec<AggSpec>,
+    },
+    /// Turn the groups into rows of grouping values then results.
+    AggregateFinish {
+        /// Cursor slot.
+        cursor: u32,
+        /// Number of grouping registers.
+        groups: u32,
+        /// Aggregations, in argument order.
         aggs: Vec<AggSpec>,
     },
     /// Sort collected rows by their trailing key columns.
@@ -805,9 +864,117 @@ enum Cursor {
         pos: usize,
     },
     Unwind {
-        items: Vec<Value>,
+        /// The unwound list, shared with the value it came from.
+        items: Arc<[Value]>,
         pos: usize,
     },
+    /// Aggregation groups keyed by their grouping values.
+    Aggregate {
+        groups: BTreeMap<Vec<Reg>, Vec<AggState>>,
+    },
+    /// Rows of a bounded sort.
+    TopK(TopK),
+    /// A streaming variable-length expansion.
+    VarExpand(Box<crate::engine::VarExpansion>),
+}
+
+/// Register values for a trail: the relationship list and node list (in
+/// pattern order when `reverse`), and the traversal's end node, which stays
+/// the last node visited even when the lists are reversed.
+fn trail_values(edges: &[u64], nodes: &[u64], reverse: bool) -> (Value, Value, u64) {
+    let end = *nodes.last().expect("a trail has a start node");
+    let mut edge_values: Vec<Value> = edges.iter().map(|id| Value::Edge(*id)).collect();
+    let mut node_values: Vec<Value> = nodes.iter().map(|id| Value::Node(*id)).collect();
+    if reverse {
+        edge_values.reverse();
+        node_values.reverse();
+    }
+    (
+        Value::List(edge_values.into()),
+        Value::List(node_values.into()),
+        end,
+    )
+}
+
+/// Compare rows by their leading sort keys, one direction per key.
+fn compare_keys(left: &[Reg], right: &[Reg], ascending: &[bool]) -> std::cmp::Ordering {
+    left.iter()
+        .zip(right)
+        .zip(ascending)
+        .map(|((left, right), ascending)| {
+            let ordering = left.cmp(right);
+            if *ascending {
+                ordering
+            } else {
+                ordering.reverse()
+            }
+        })
+        .find(|ordering| ordering.is_ne())
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+/// The best `limit` rows of a sort seen so far, buffered up to `2 * limit`
+/// rows between compactions. Rows carry their arrival order so ties keep
+/// input order, as the full stable sort does.
+struct TopK {
+    limit: usize,
+    rows: Vec<(Vec<Reg>, u64)>,
+    arrivals: u64,
+    /// Sort keys of the `limit`-th row at the last compaction; a row that
+    /// does not sort before them cannot be among the best `limit`.
+    cutoff: Option<Vec<Reg>>,
+}
+
+impl TopK {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            rows: Vec::new(),
+            arrivals: 0,
+            cutoff: None,
+        }
+    }
+
+    fn offer(&mut self, row: &[Reg], prefix: usize, ascending: &[bool]) {
+        if self.limit == 0 {
+            return;
+        }
+        if let Some(cutoff) = &self.cutoff
+            && compare_keys(&row[prefix..], cutoff, ascending).is_ge()
+        {
+            return;
+        }
+        self.rows.push((row.to_vec(), self.arrivals));
+        self.arrivals += 1;
+        if self.rows.len() >= self.limit.saturating_mul(2) {
+            self.compact(prefix, ascending);
+        }
+    }
+
+    /// Keep the best `limit` rows and remember the cutoff.
+    fn compact(&mut self, prefix: usize, ascending: &[bool]) {
+        let nth = self.limit - 1;
+        self.rows
+            .select_nth_unstable_by(nth, |a, b| Self::order(a, b, prefix, ascending));
+        self.rows.truncate(self.limit);
+        self.cutoff = Some(self.rows[nth].0[prefix..].to_vec());
+    }
+
+    fn finish(mut self, prefix: usize, ascending: &[bool]) -> Vec<Vec<Reg>> {
+        self.rows
+            .sort_unstable_by(|a, b| Self::order(a, b, prefix, ascending));
+        self.rows.truncate(self.limit);
+        self.rows.into_iter().map(|(row, _)| row).collect()
+    }
+
+    fn order(
+        a: &(Vec<Reg>, u64),
+        b: &(Vec<Reg>, u64),
+        prefix: usize,
+        ascending: &[bool],
+    ) -> std::cmp::Ordering {
+        compare_keys(&a.0[prefix..], &b.0[prefix..], ascending).then(a.1.cmp(&b.1))
+    }
 }
 
 struct Executor<'a> {
@@ -837,22 +1004,35 @@ impl<'a> Executor<'a> {
                     "query exceeded the execution step limit",
                 ));
             }
-            let op = self.program.ops[self.pc].clone();
+            // `program` is a shared reference that outlives `self`, so the
+            // instruction is borrowed rather than cloned per step.
+            let program: &'a Program = self.program;
+            let op = &program.ops[self.pc];
             self.pc += 1;
-            self.step(&op)?;
+            self.step(op)?;
         }
         Ok(())
     }
 
     fn step(&mut self, op: &Op) -> Result<()> {
         match op {
-            Op::OpenNodeScan { cursor, label } => {
-                let ids = match label {
-                    Some(label) => match self.resolve_label(*label)? {
-                        Some(label) => self.db.label_nodes(label)?,
-                        None => Vec::new(),
-                    },
-                    None => self.db.all_node_ids()?,
+            Op::OpenNodeScan { cursor, labels } => {
+                let ids = if labels.is_empty() {
+                    self.db.all_node_ids()?
+                } else {
+                    let mut label_ids = smallvec::SmallVec::<[u32; 4]>::with_capacity(labels.len());
+                    for label in labels {
+                        match self.resolve_label(*label)? {
+                            Some(id) => label_ids.push(id),
+                            None => break,
+                        }
+                    }
+                    // A label missing from the catalog matches no node.
+                    if label_ids.len() == labels.len() {
+                        self.db.nodes_with_labels(&label_ids)?
+                    } else {
+                        Vec::new()
+                    }
                 };
                 self.cursors[*cursor as usize] = Cursor::Ids {
                     ids,
@@ -1042,9 +1222,11 @@ impl<'a> Executor<'a> {
                 right,
                 dest,
             } => {
-                let a = self.reg_value(*left)?;
-                let b = self.reg_value(*right)?;
-                let result = binary_op(*op, &a, &b)?;
+                let result = binary_op(
+                    *op,
+                    &self.regs[*left as usize].as_value(),
+                    &self.regs[*right as usize].as_value(),
+                )?;
                 self.regs[*dest as usize] = Reg::Value(result);
             }
             Op::Subscript { base, index, dest } => {
@@ -1308,22 +1490,27 @@ impl<'a> Executor<'a> {
                 }
                 self.regs[*dest as usize] = Reg::Value(Value::Map(entries.into()));
             }
-            Op::IfNot { reg, target } => {
-                let value = self.reg_value(*reg)?;
-                match value {
-                    Value::Bool(true) => {}
-                    Value::Bool(false) | Value::Null => self.pc = *target as usize,
-                    other => {
-                        return Err(Error::type_error(format!(
-                            "predicate must be a boolean, got {}",
-                            other.type_name()
-                        )));
-                    }
+            Op::IfNot { reg, target } => match self.regs[*reg as usize].as_value().as_ref() {
+                Value::Bool(true) => {}
+                Value::Bool(false) | Value::Null => self.pc = *target as usize,
+                other => {
+                    return Err(Error::type_error(format!(
+                        "predicate must be a boolean, got {}",
+                        other.type_name()
+                    )));
                 }
-            }
+            },
             Op::Goto { target } => {
                 self.pc = *target as usize;
             }
+            Op::Gosub { ret, target } => {
+                self.regs[*ret as usize] = Reg::Value(Value::Int(self.pc as i64));
+                self.pc = *target as usize;
+            }
+            Op::Return { ret } => match &self.regs[*ret as usize] {
+                Reg::Value(Value::Int(address)) => self.pc = *address as usize,
+                _ => return Err(Error::internal("Return without a Gosub")),
+            },
             Op::ResultRow { start, count } => {
                 let mut row = Vec::with_capacity(*count as usize);
                 for idx in 0..*count {
@@ -1360,39 +1547,105 @@ impl<'a> Executor<'a> {
                     self.db.begin_write()?;
                 }
             }
-            Op::HashAggregate {
+            Op::AggregateOpen { cursor } => {
+                self.cursors[*cursor as usize] = Cursor::Aggregate {
+                    groups: BTreeMap::new(),
+                };
+            }
+            Op::AggregateStep {
                 cursor,
-                prefix,
+                start,
                 groups,
                 aggs,
             } => {
-                self.hash_aggregate(*cursor, *prefix, *groups, aggs)?;
+                let start = *start as usize;
+                let split = start + *groups as usize;
+                let Cursor::Aggregate { groups: table } = &mut self.cursors[*cursor as usize]
+                else {
+                    return Err(Error::internal("AggregateStep on a non-aggregate cursor"));
+                };
+                let key = &self.regs[start..split];
+                let states = match table.get_mut(key) {
+                    Some(states) => states,
+                    None => table
+                        .entry(key.to_vec())
+                        .or_insert_with(|| aggs.iter().map(|spec| AggState::new(*spec)).collect()),
+                };
+                let mut offset = split;
+                for (state, spec) in states.iter_mut().zip(aggs) {
+                    let args = spec.args as usize;
+                    state.step(spec, &self.regs[offset..offset + args])?;
+                    offset += args;
+                }
+            }
+            Op::AggregateFinish {
+                cursor,
+                groups,
+                aggs,
+            } => {
+                let slot = &mut self.cursors[*cursor as usize];
+                let Cursor::Aggregate { groups: table } = std::mem::replace(slot, Cursor::Empty)
+                else {
+                    return Err(Error::internal("AggregateFinish on a non-aggregate cursor"));
+                };
+                *slot = Cursor::Rows {
+                    rows: finish_groups(table, *groups == 0, aggs),
+                    pos: 0,
+                };
+            }
+            Op::TopKOpen {
+                cursor,
+                skip,
+                limit,
+            } => {
+                let count = |value: Value| match value {
+                    Value::Int(count) => usize::try_from(count).ok(),
+                    _ => None,
+                };
+                let skip = match skip {
+                    Some(reg) => count(self.reg_value(*reg)?),
+                    None => Some(0),
+                };
+                let limit = count(self.reg_value(*limit)?);
+                let bound = skip
+                    .zip(limit)
+                    .map(|(skip, limit)| skip.saturating_add(limit));
+                self.cursors[*cursor as usize] =
+                    Cursor::TopK(TopK::new(bound.unwrap_or(usize::MAX)));
+            }
+            Op::TopKRow {
+                cursor,
+                start,
+                count,
+                prefix,
+                ascending,
+            } => {
+                let Cursor::TopK(top) = &mut self.cursors[*cursor as usize] else {
+                    return Err(Error::internal("TopKRow on a non-bounded cursor"));
+                };
+                let row = &self.regs[*start as usize..(*start + *count) as usize];
+                top.offer(row, *prefix as usize, ascending);
             }
             Op::SortRows {
                 cursor,
                 prefix,
-                keys,
                 ascending,
+                ..
             } => {
-                let (rows, _) = self.rows_mut(*cursor)?;
                 let prefix = *prefix as usize;
-                let keys = *keys as usize;
-                let ascending = ascending.clone();
-                rows.sort_by(|a, b| {
-                    for key in 0..keys {
-                        let left = &a[prefix + key];
-                        let right = &b[prefix + key];
-                        let ordering = left.cmp(right);
-                        if ordering != std::cmp::Ordering::Equal {
-                            return if ascending[key] {
-                                ordering
-                            } else {
-                                ordering.reverse()
-                            };
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
+                let slot = &mut self.cursors[*cursor as usize];
+                if let Cursor::TopK(_) = slot {
+                    let Cursor::TopK(top) = std::mem::replace(slot, Cursor::Empty) else {
+                        unreachable!("matched a bounded cursor above");
+                    };
+                    *slot = Cursor::Rows {
+                        rows: top.finish(prefix, ascending),
+                        pos: 0,
+                    };
+                } else {
+                    let (rows, _) = self.rows_mut(*cursor)?;
+                    rows.sort_by(|a, b| compare_keys(&a[prefix..], &b[prefix..], ascending));
+                }
             }
             Op::DedupRows {
                 cursor,
@@ -1498,17 +1751,14 @@ impl<'a> Executor<'a> {
                 let row = match &self.cursors[*cursor as usize] {
                     Cursor::Rows { rows, pos } => rows
                         .get(*pos)
-                        .ok_or_else(|| Error::internal("CtxData on exhausted cursor"))?
-                        .clone(),
+                        .ok_or_else(|| Error::internal("CtxData on exhausted cursor"))?,
                     _ => return Err(Error::internal("CtxData on a non-row cursor")),
                 };
-                for idx in 0..*count as usize {
-                    let value = row
-                        .get(idx)
-                        .ok_or_else(|| Error::internal("row shorter than window"))?
-                        .clone();
-                    self.regs[(*start as usize) + idx] = value;
-                }
+                let values = row
+                    .get(..*count as usize)
+                    .ok_or_else(|| Error::internal("row shorter than window"))?;
+                let start = *start as usize;
+                self.regs[start..start + values.len()].clone_from_slice(values);
             }
             Op::CtxStore {
                 cursor,
@@ -1540,22 +1790,33 @@ impl<'a> Executor<'a> {
             } => {
                 let types = self.resolve_types(types, *any_type)?;
                 // Expanding from a null binding matches nothing.
-                let items = match (&types, &self.regs[*src as usize]) {
-                    (Some(types), _) if types.is_empty() => Vec::new(),
-                    (_, Reg::Value(Value::Null)) => Vec::new(),
+                let expansion = match (&types, &self.regs[*src as usize]) {
+                    (Some(types), _) if types.is_empty() => None,
+                    (_, Reg::Value(Value::Null)) => None,
                     _ => {
                         let node = self.reg_node(*src)?;
-                        let directions: Vec<Direction> = match direction {
-                            0 => vec![Direction::Out],
-                            1 => vec![Direction::In],
-                            _ => vec![Direction::Out, Direction::In],
+                        let directions: &[Direction] = match direction {
+                            0 => &[Direction::Out],
+                            1 => &[Direction::In],
+                            _ => &[Direction::Out, Direction::In],
                         };
                         let filter: &[u32] = types.as_deref().unwrap_or(&[]);
-                        self.db
-                            .var_expand(node, &directions, filter, props, *min, *max)?
+                        Some(Box::new(self.db.var_expansion(
+                            node,
+                            directions,
+                            filter,
+                            props,
+                            (*min, *max),
+                        )))
                     }
                 };
-                self.cursors[*cursor as usize] = Cursor::Trails { items, pos: 0 };
+                self.cursors[*cursor as usize] = match expansion {
+                    Some(expansion) => Cursor::VarExpand(expansion),
+                    None => Cursor::Trails {
+                        items: Vec::new(),
+                        pos: 0,
+                    },
+                };
             }
             Op::ProcedureCallOpen { cursor, name, args } => {
                 let name = match &self.program.constants[*name as usize] {
@@ -1640,31 +1901,27 @@ impl<'a> Executor<'a> {
                 reverse,
                 target,
             } => {
-                let next = match &mut self.cursors[*cursor as usize] {
+                let slot = &mut self.cursors[*cursor as usize];
+                let next = match slot {
                     Cursor::Trails { items, pos } => {
-                        let next = items.get(*pos).cloned();
+                        let next = items.get(*pos).map(|trail| {
+                            trail_values(trail.edges.as_slice(), trail.nodes.as_slice(), *reverse)
+                        });
                         if next.is_some() {
                             *pos += 1;
                         }
                         next
                     }
+                    Cursor::VarExpand(expansion) => self
+                        .db
+                        .next_trail(expansion)?
+                        .then(|| trail_values(expansion.edges(), expansion.nodes(), *reverse)),
                     _ => return Err(Error::internal("VarExpandNext on a non-trail cursor")),
                 };
                 match next {
-                    Some(trail) => {
-                        // The end node stays the traversal's last node even
-                        // when the lists are read from the pattern's start.
-                        let end = trail.end();
-                        let mut values: Vec<Value> =
-                            trail.edges.iter().map(|id| Value::Edge(*id)).collect();
-                        let mut node_values: Vec<Value> =
-                            trail.nodes.iter().map(|id| Value::Node(*id)).collect();
-                        if *reverse {
-                            values.reverse();
-                            node_values.reverse();
-                        }
-                        self.regs[*edges as usize] = Reg::Value(Value::List(values.into()));
-                        self.regs[*nodes as usize] = Reg::Value(Value::List(node_values.into()));
+                    Some((edge_list, node_list, end)) => {
+                        self.regs[*edges as usize] = Reg::Value(edge_list);
+                        self.regs[*nodes as usize] = Reg::Value(node_list);
                         self.regs[*node as usize] = Reg::Node(end);
                     }
                     None => self.pc = *target as usize,
@@ -1723,8 +1980,8 @@ impl<'a> Executor<'a> {
             Op::UnwindInit { cursor, list } => {
                 let value = self.reg_value(*list)?;
                 let items = match value {
-                    Value::Null => Vec::new(),
-                    Value::List(items) => items.to_vec(),
+                    Value::Null => Arc::from([]),
+                    Value::List(items) => items,
                     other => {
                         return Err(Error::type_error(format!(
                             "UNWIND expects a list, got {}",
@@ -2081,6 +2338,19 @@ impl<'a> Executor<'a> {
                 )),
             };
         }
+        if name == "db.index.fulltext.queryNodes" {
+            let [Value::Text(index), Value::Text(query)] = args else {
+                return Err(Error::type_error(
+                    "db.index.fulltext.queryNodes expects an index name and a query string",
+                ));
+            };
+            return Ok(self
+                .db
+                .fulltext_query(index, query)?
+                .into_iter()
+                .map(|(node_id, score)| vec![Reg::Node(node_id), Reg::Value(Value::Float(score))])
+                .collect());
+        }
         let schema = self.db.schema();
         let mut values = Vec::new();
         let mut id = 1u32;
@@ -2111,54 +2381,6 @@ impl<'a> Executor<'a> {
             Cursor::Rows { rows, pos } => Ok((rows, *pos)),
             _ => Err(Error::internal("operation on a non-row cursor")),
         }
-    }
-
-    fn hash_aggregate(
-        &mut self,
-        cursor: u32,
-        prefix: u32,
-        groups: u32,
-        aggs: &[AggSpec],
-    ) -> Result<()> {
-        let (rows, _) = self.rows_mut(cursor)?;
-        let rows = std::mem::take(rows);
-        let prefix = prefix as usize;
-        let group_count = groups as usize;
-        let mut table: BTreeMap<Vec<Reg>, Vec<AggState>> = BTreeMap::new();
-        for row in &rows {
-            let key: Vec<Reg> = row[prefix..prefix + group_count].to_vec();
-            let accumulators = table
-                .entry(key)
-                .or_insert_with(|| aggs.iter().map(|spec| AggState::new(*spec)).collect());
-            let mut offset = prefix + group_count;
-            for (idx, spec) in aggs.iter().enumerate() {
-                let inputs = &row[offset..offset + spec.args as usize];
-                accumulators[idx].step(spec, inputs)?;
-                offset += spec.args as usize;
-            }
-        }
-        if table.is_empty() && group_count == 0 {
-            // Aggregation without grouping over zero rows yields one row with
-            // the aggregations' default values (e.g. count(*) = 0).
-            table.insert(
-                Vec::new(),
-                aggs.iter().map(|spec| AggState::new(*spec)).collect(),
-            );
-        }
-        let mut output = Vec::with_capacity(table.len());
-        for (key, mut accumulators) in table {
-            let mut row = key;
-            for (idx, spec) in aggs.iter().enumerate() {
-                let state = std::mem::replace(&mut accumulators[idx], AggState::new(*spec));
-                row.push(Reg::Value(state.finish(spec)));
-            }
-            output.push(row);
-        }
-        if let Cursor::Rows { rows, pos } = &mut self.cursors[cursor as usize] {
-            *rows = output;
-            *pos = 0;
-        }
-        Ok(())
     }
 
     fn call_function(&mut self, func: u8, args: &[Value]) -> Result<Value> {
@@ -2501,6 +2723,35 @@ impl<'a> Executor<'a> {
             })
             .collect()
     }
+}
+
+/// Output rows (grouping values, then results) for aggregation groups.
+/// Aggregating without grouping over zero rows still yields one row of the
+/// aggregations' defaults (e.g. `count(*) = 0`).
+fn finish_groups(
+    mut table: BTreeMap<Vec<Reg>, Vec<AggState>>,
+    ungrouped: bool,
+    aggs: &[AggSpec],
+) -> Vec<Vec<Reg>> {
+    if table.is_empty() && ungrouped {
+        table.insert(
+            Vec::new(),
+            aggs.iter().map(|spec| AggState::new(*spec)).collect(),
+        );
+    }
+    table
+        .into_iter()
+        .map(|(mut row, states)| {
+            row.reserve(states.len());
+            row.extend(
+                states
+                    .into_iter()
+                    .zip(aggs)
+                    .map(|(state, spec)| Reg::Value(state.finish(spec))),
+            );
+            row
+        })
+        .collect()
 }
 
 /// One group's aggregation state: the accumulator plus, for `DISTINCT`
@@ -4388,7 +4639,7 @@ mod tests {
             vec![
                 Op::OpenNodeScan {
                     cursor: 0,
-                    label: None,
+                    labels: Vec::new(),
                 },
                 Op::Rewind {
                     cursor: 0,
@@ -4418,7 +4669,7 @@ mod tests {
             vec![
                 Op::OpenNodeScan {
                     cursor: 0,
-                    label: None,
+                    labels: Vec::new(),
                 },
                 Op::Rewind {
                     cursor: 0,
@@ -4444,7 +4695,7 @@ mod tests {
             vec![
                 Op::OpenNodeScan {
                     cursor: 0,
-                    label: None,
+                    labels: Vec::new(),
                 },
                 Op::Bind { cursor: 0, dest: 0 },
             ],
@@ -4462,7 +4713,7 @@ mod tests {
             vec![
                 Op::OpenNodeScan {
                     cursor: 0,
-                    label: None,
+                    labels: Vec::new(),
                 },
                 Op::Rewind {
                     cursor: 0,
@@ -4513,7 +4764,7 @@ mod tests {
             vec![
                 Op::OpenNodeScan {
                     cursor: 0,
-                    label: None,
+                    labels: Vec::new(),
                 },
                 Op::Rewind {
                     cursor: 0,
@@ -4724,42 +4975,36 @@ mod tests {
     }
 
     #[test]
-    fn hash_aggregate_groups_and_sums() {
+    fn streaming_aggregate_groups_and_sums() {
         let mut db = test_db();
+        let sum = vec![AggSpec {
+            func: AggFn::Sum,
+            args: 1,
+            star: false,
+            distinct: false,
+        }];
+        let step = Op::AggregateStep {
+            cursor: 0,
+            start: 0,
+            groups: 1,
+            aggs: sum.clone(),
+        };
         let program = program(
             vec![
-                Op::CollectOpen { cursor: 0 },
+                Op::AggregateOpen { cursor: 0 },
                 Op::Constant { dest: 0, value: 0 },
                 Op::Constant { dest: 1, value: 1 },
-                Op::CollectRow {
-                    cursor: 0,
-                    start: 0,
-                    count: 2,
-                },
+                step.clone(),
                 Op::Constant { dest: 0, value: 2 },
                 Op::Constant { dest: 1, value: 3 },
-                Op::CollectRow {
-                    cursor: 0,
-                    start: 0,
-                    count: 2,
-                },
+                step.clone(),
                 Op::Constant { dest: 0, value: 4 },
                 Op::Constant { dest: 1, value: 5 },
-                Op::CollectRow {
+                step,
+                Op::AggregateFinish {
                     cursor: 0,
-                    start: 0,
-                    count: 2,
-                },
-                Op::HashAggregate {
-                    cursor: 0,
-                    prefix: 0,
                     groups: 1,
-                    aggs: vec![AggSpec {
-                        func: AggFn::Sum,
-                        args: 1,
-                        star: false,
-                        distinct: false,
-                    }],
+                    aggs: sum,
                 },
                 Op::CtxRewind {
                     cursor: 0,

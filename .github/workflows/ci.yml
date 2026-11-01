@@ -37,6 +37,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Tests
         run: cargo test --workspace
+      - name: Seed script acceptance fixture
+        run: cargo test --release --test seed_fixture -- --ignored
 
   bench-smoke:
     runs-on: ubuntu-latest

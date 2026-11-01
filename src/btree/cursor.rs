@@ -1,7 +1,7 @@
 //! B+tree cursors: forward/backward iteration and range seeks.
 //!
 //! A cursor remembers its `(page, cell index)` position plus a copy of the
-//! current key. Page transitions re-descend from the root (`find_gt`/`find_lt`),
+//! current key. Page transitions re-descend from the root (`find_after`/`find_before`),
 //! which costs O(log n) once per page instead of once per row, and avoids
 //! parent-pointer bookkeeping in the tree.
 
@@ -75,13 +75,13 @@ impl Cursor {
 
     /// Position on the first key `>= key`.
     pub fn seek_ge(&mut self, pager: &mut Pager, key: &[u8]) -> Result<bool> {
-        let found = find_ge(pager, self.root, self.kind, key)?;
+        let found = find_after(pager, self.root, self.kind, key, true)?;
         self.position(pager, found)
     }
 
     /// Position on the last key `<= key`.
     pub fn seek_le(&mut self, pager: &mut Pager, key: &[u8]) -> Result<bool> {
-        let found = find_le(pager, self.root, self.kind, key)?;
+        let found = find_before(pager, self.root, self.kind, key, true)?;
         self.position(pager, found)
     }
 
@@ -96,7 +96,7 @@ impl Cursor {
             return self.position(pager, Some((page_no, index)));
         }
         let key = self.key.clone();
-        let found = find_gt(pager, self.root, self.kind, &key)?;
+        let found = find_after(pager, self.root, self.kind, &key, false)?;
         self.position(pager, found)
     }
 
@@ -110,7 +110,7 @@ impl Cursor {
             return self.position(pager, Some((page_no, index)));
         }
         let key = self.key.clone();
-        let found = find_lt(pager, self.root, self.kind, &key)?;
+        let found = find_before(pager, self.root, self.kind, &key, false)?;
         self.position(pager, found)
     }
 
@@ -164,59 +164,44 @@ impl Cursor {
 }
 
 /// Interior layout for searches: children and their upper-bound dividers.
-struct Interior {
-    rightmost: PageNo,
-    children: Vec<PageNo>,
-    dividers: Vec<Vec<u8>>,
-}
+/// A cursor position: page number and cell index.
+type Position = Option<(PageNo, usize)>;
 
-/// Fetch a page and classify it; interior layouts gather children/dividers.
+/// A page classified without copying its cells: descents binary-search the
+/// page in place and read only the children they visit.
 enum Node {
     Leaf { count: usize },
-    Interior(Interior),
+    Interior { count: usize, rightmost: PageNo },
 }
 
 fn fetch_node(pager: &mut Pager, page_no: PageNo, kind: TreeKind) -> Result<Node> {
     let page = pager.page(page_no)?;
-    let data = page.data();
-    let header = PageHeader::parse(data)?;
+    let header = PageHeader::parse(page.data())?;
+    let count = header.cell_count as usize;
     match header.page_type {
-        t if t == kind.leaf_type() => Ok(Node::Leaf {
-            count: header.cell_count as usize,
+        t if t == kind.leaf_type() => Ok(Node::Leaf { count }),
+        t if t == kind.interior_type() => Ok(Node::Interior {
+            count,
+            rightmost: header.rightmost,
         }),
-        t if t == kind.interior_type() => {
-            let count = header.cell_count as usize;
-            let mut children = Vec::with_capacity(count);
-            let mut dividers = Vec::with_capacity(count);
-            for idx in 0..count {
-                let ptr = cell_pointer(data, idx)?;
-                dividers.push(cell_key(data, kind, ptr)?.to_vec());
-                children.push(cell_child(data, ptr)?);
-            }
-            Ok(Node::Interior(Interior {
-                rightmost: header.rightmost,
-                children,
-                dividers,
-            }))
-        }
         other => Err(Error::corrupt(format!(
             "page {page_no}: unexpected page type {other:?}"
         ))),
     }
 }
 
-/// Binary search within a leaf: first index whose key satisfies `pred`
-/// (keys are ascending, so the predicate must be monotone false-then-true).
-fn leaf_bound<F>(pager: &mut Pager, page_no: PageNo, kind: TreeKind, pred: F) -> Result<usize>
+/// Binary search over a page's cell keys (leaf keys or interior dividers):
+/// the first index whose key satisfies `pred` (keys are ascending, so the
+/// predicate must be monotone false-then-true).
+fn cell_bound<F>(pager: &mut Pager, page_no: PageNo, kind: TreeKind, pred: F) -> Result<usize>
 where
     F: Fn(&[u8]) -> bool,
 {
     let page = pager.page(page_no)?;
     let data = page.data();
     let header = PageHeader::parse(data)?;
-    let count = header.cell_count as usize;
     let mut lo = 0usize;
-    let mut hi = count;
+    let mut hi = header.cell_count as usize;
     while lo < hi {
         let mid = (lo + hi) / 2;
         let ptr = cell_pointer(data, mid)?;
@@ -229,163 +214,137 @@ where
     Ok(lo)
 }
 
-fn find_first(
+/// Child page of interior cell `index`.
+fn child_at(pager: &mut Pager, page_no: PageNo, index: usize) -> Result<PageNo> {
+    let page = pager.page(page_no)?;
+    let data = page.data();
+    cell_child(data, cell_pointer(data, index)?)
+}
+
+/// The first hit of `find` over interior children `range` in order, then
+/// (when `rightmost` is set) the rightmost child. Later children are only
+/// read when an earlier subtree has no match (empty leaves, stale dividers).
+fn first_in_children(
     pager: &mut Pager,
     page_no: PageNo,
-    kind: TreeKind,
-) -> Result<Option<(PageNo, usize)>> {
-    match fetch_node(pager, page_no, kind)? {
-        Node::Leaf { count } => Ok(if count > 0 { Some((page_no, 0)) } else { None }),
-        Node::Interior(interior) => {
-            for child in &interior.children {
-                if let Some(found) = find_first(pager, *child, kind)? {
-                    return Ok(Some(found));
-                }
-            }
-            find_first(pager, interior.rightmost, kind)
+    range: impl Iterator<Item = usize>,
+    rightmost: Option<PageNo>,
+    find: &mut dyn FnMut(&mut Pager, PageNo) -> Result<Position>,
+) -> Result<Position> {
+    for index in range {
+        let child = child_at(pager, page_no, index)?;
+        if let Some(found) = find(pager, child)? {
+            return Ok(Some(found));
         }
+    }
+    match rightmost {
+        Some(child) => find(pager, child),
+        None => Ok(None),
     }
 }
 
-fn find_last(
-    pager: &mut Pager,
-    page_no: PageNo,
-    kind: TreeKind,
-) -> Result<Option<(PageNo, usize)>> {
+fn find_first(pager: &mut Pager, page_no: PageNo, kind: TreeKind) -> Result<Position> {
     match fetch_node(pager, page_no, kind)? {
-        Node::Leaf { count } => Ok(if count > 0 {
-            Some((page_no, count - 1))
-        } else {
-            None
-        }),
-        Node::Interior(interior) => {
-            if let Some(found) = find_last(pager, interior.rightmost, kind)? {
+        Node::Leaf { count } => Ok((count > 0).then_some((page_no, 0))),
+        Node::Interior { count, rightmost } => first_in_children(
+            pager,
+            page_no,
+            0..count,
+            Some(rightmost),
+            &mut |pager, child| find_first(pager, child, kind),
+        ),
+    }
+}
+
+fn find_last(pager: &mut Pager, page_no: PageNo, kind: TreeKind) -> Result<Position> {
+    match fetch_node(pager, page_no, kind)? {
+        Node::Leaf { count } => Ok(count.checked_sub(1).map(|last| (page_no, last))),
+        Node::Interior { count, rightmost } => {
+            if let Some(found) = find_last(pager, rightmost, kind)? {
                 return Ok(Some(found));
             }
-            for child in interior.children.iter().rev() {
-                if let Some(found) = find_last(pager, *child, kind)? {
-                    return Ok(Some(found));
-                }
-            }
-            Ok(None)
+            first_in_children(
+                pager,
+                page_no,
+                (0..count).rev(),
+                None,
+                &mut |pager, child| find_last(pager, child, kind),
+            )
         }
     }
 }
 
-fn find_ge(
+/// First key after `target` (`>=` when `inclusive`, `>` otherwise).
+fn find_after(
     pager: &mut Pager,
     page_no: PageNo,
     kind: TreeKind,
     target: &[u8],
-) -> Result<Option<(PageNo, usize)>> {
+    inclusive: bool,
+) -> Result<Position> {
     match fetch_node(pager, page_no, kind)? {
         Node::Leaf { count } => {
-            let pos = leaf_bound(pager, page_no, kind, |key| key >= target)?;
-            Ok(if pos < count {
-                Some((page_no, pos))
-            } else {
-                None
-            })
-        }
-        Node::Interior(interior) => {
-            let start = interior.dividers.partition_point(|d| d.as_slice() < target);
-            for child in interior.children.iter().skip(start) {
-                if let Some(found) = find_ge(pager, *child, kind, target)? {
-                    return Ok(Some(found));
+            let pos = cell_bound(pager, page_no, kind, |key| {
+                if inclusive {
+                    key >= target
+                } else {
+                    key > target
                 }
-            }
-            find_ge(pager, interior.rightmost, kind, target)
+            })?;
+            Ok((pos < count).then_some((page_no, pos)))
+        }
+        Node::Interior { count, rightmost } => {
+            let start = cell_bound(pager, page_no, kind, |divider| divider >= target)?;
+            first_in_children(
+                pager,
+                page_no,
+                start..count,
+                Some(rightmost),
+                &mut |pager, child| find_after(pager, child, kind, target, inclusive),
+            )
         }
     }
 }
 
-fn find_gt(
+/// Last key before `target` (`<=` when `inclusive`, `<` otherwise).
+fn find_before(
     pager: &mut Pager,
     page_no: PageNo,
     kind: TreeKind,
     target: &[u8],
-) -> Result<Option<(PageNo, usize)>> {
+    inclusive: bool,
+) -> Result<Position> {
     match fetch_node(pager, page_no, kind)? {
-        Node::Leaf { count } => {
-            let pos = leaf_bound(pager, page_no, kind, |key| key > target)?;
-            Ok(if pos < count {
-                Some((page_no, pos))
-            } else {
-                None
-            })
-        }
-        Node::Interior(interior) => {
-            let start = interior.dividers.partition_point(|d| d.as_slice() < target);
-            for child in interior.children.iter().skip(start) {
-                if let Some(found) = find_gt(pager, *child, kind, target)? {
-                    return Ok(Some(found));
+        Node::Leaf { .. } => {
+            let pos = cell_bound(pager, page_no, kind, |key| {
+                if inclusive {
+                    key > target
+                } else {
+                    key >= target
                 }
-            }
-            find_gt(pager, interior.rightmost, kind, target)
+            })?;
+            Ok(pos.checked_sub(1).map(|last| (page_no, last)))
         }
-    }
-}
-
-fn find_lt(
-    pager: &mut Pager,
-    page_no: PageNo,
-    kind: TreeKind,
-    target: &[u8],
-) -> Result<Option<(PageNo, usize)>> {
-    match fetch_node(pager, page_no, kind)? {
-        Node::Leaf { count } => {
-            let pos = leaf_bound(pager, page_no, kind, |key| key >= target)?;
-            Ok(if pos > 0 && count > 0 {
-                Some((page_no, pos - 1))
-            } else {
-                None
-            })
-        }
-        Node::Interior(interior) => {
-            let start = interior.dividers.partition_point(|d| d.as_slice() < target);
-            if start == interior.children.len()
-                && let Some(found) = find_lt(pager, interior.rightmost, kind, target)?
+        Node::Interior { count, rightmost } => {
+            let start = cell_bound(pager, page_no, kind, |divider| divider >= target)?;
+            if start == count
+                && let Some(found) = find_before(pager, rightmost, kind, target, inclusive)?
             {
                 return Ok(Some(found));
             }
-            for child in interior.children.iter().take(start).rev() {
-                if let Some(found) = find_lt(pager, *child, kind, target)? {
-                    return Ok(Some(found));
-                }
-            }
-            Ok(None)
-        }
-    }
-}
-
-fn find_le(
-    pager: &mut Pager,
-    page_no: PageNo,
-    kind: TreeKind,
-    target: &[u8],
-) -> Result<Option<(PageNo, usize)>> {
-    match fetch_node(pager, page_no, kind)? {
-        Node::Leaf { count } => {
-            let pos = leaf_bound(pager, page_no, kind, |key| key > target)?;
-            Ok(if pos > 0 && count > 0 {
-                Some((page_no, pos - 1))
+            // A `<=` search may also end in the child left of an equal divider.
+            let last = if inclusive {
+                (start + 1).min(count)
             } else {
-                None
-            })
-        }
-        Node::Interior(interior) => {
-            let start = interior.dividers.partition_point(|d| d.as_slice() < target);
-            if start == interior.children.len()
-                && let Some(found) = find_le(pager, interior.rightmost, kind, target)?
-            {
-                return Ok(Some(found));
-            }
-            for child in interior.children.iter().take(start + 1).rev() {
-                if let Some(found) = find_le(pager, *child, kind, target)? {
-                    return Ok(Some(found));
-                }
-            }
-            Ok(None)
+                start
+            };
+            first_in_children(
+                pager,
+                page_no,
+                (0..last).rev(),
+                None,
+                &mut |pager, child| find_before(pager, child, kind, target, inclusive),
+            )
         }
     }
 }

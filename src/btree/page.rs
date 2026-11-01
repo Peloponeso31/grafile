@@ -352,6 +352,36 @@ pub(crate) fn free_overflow_chain(pager: &mut Pager, first: PageNo) -> Result<()
     Ok(())
 }
 
+/// The overflow chain of the leaf cell at `ptr`: `(first page, bytes stored
+/// off-page)`, or `None` when the value is stored inline.
+pub(crate) fn cell_overflow(
+    data: &[u8],
+    kind: TreeKind,
+    ptr: usize,
+) -> Result<Option<(PageNo, usize)>> {
+    let page_type = PageHeader::parse(data)?.page_type;
+    let value_base = match (kind, page_type) {
+        (TreeKind::Table, PageType::TableLeaf) => ptr + TABLE_KEY_LEN,
+        (TreeKind::Index, PageType::IndexLeaf) => {
+            let key_len = read_u16(data, ptr)? as usize;
+            ptr + 2 + key_len
+        }
+        _ => return Err(Error::internal("cell_overflow on a non-leaf cell")),
+    };
+    let len = read_u32(data, value_base)?;
+    if len & OVERFLOW_FLAG == 0 {
+        return Ok(None);
+    }
+    let total = (len & !OVERFLOW_FLAG) as usize;
+    let local = read_u16(data, value_base + 4)? as usize;
+    let first = read_u32(data, value_base + 6)?;
+    let remote = total
+        .checked_sub(local)
+        .filter(|remote| *remote > 0)
+        .ok_or_else(|| Error::corrupt("overflow cell stores its whole value locally"))?;
+    Ok(Some((first, remote)))
+}
+
 /// Free the overflow chain referenced by a leaf cell, if any.
 pub(crate) fn free_cell_overflow(
     pager: &mut Pager,
@@ -359,26 +389,11 @@ pub(crate) fn free_cell_overflow(
     kind: TreeKind,
     ptr: usize,
 ) -> Result<()> {
-    let first = {
+    let overflow = {
         let page = pager.page(page_no)?;
-        let data = page.data();
-        let page_type = PageHeader::parse(data)?.page_type;
-        let value_base = match (kind, page_type) {
-            (TreeKind::Table, PageType::TableLeaf) => ptr + TABLE_KEY_LEN,
-            (TreeKind::Index, PageType::IndexLeaf) => {
-                let key_len = read_u16(data, ptr)? as usize;
-                ptr + 2 + key_len
-            }
-            _ => return Err(Error::internal("free_cell_overflow on non-leaf cell")),
-        };
-        let len = read_u32(data, value_base)?;
-        if len & OVERFLOW_FLAG != 0 {
-            read_u32(data, value_base + 6)?
-        } else {
-            0
-        }
+        cell_overflow(page.data(), kind, ptr)?
     };
-    if first != 0 {
+    if let Some((first, _)) = overflow {
         free_overflow_chain(pager, first)?;
     }
     Ok(())
