@@ -739,7 +739,7 @@ impl Database {
     /// enumeration over expansion order produces them.
     ///
     /// A target is found with a bidirectional search over node distances
-    /// (see [`Self::bidirectional_shortest`]); the path enumeration remains
+    /// (`bidirectional_shortest`); the path enumeration remains
     /// for an unbound target and for a minimum length above the distance.
     ///
     /// # Errors
