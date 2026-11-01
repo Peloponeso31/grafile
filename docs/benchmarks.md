@@ -82,6 +82,34 @@ timings.
 | 30 KB overflow value read | 992 ns |
 | 30 KB overflow value rewrite | 25.3 µs |
 
+### Bulk load: `benches/fixtures/seed_big_hardcoded.cypher`
+
+The audited Neo4j 5 seed script (e-commerce, social, jobs, groups and
+events), kept verbatim as the bulk-load workload. At full size it creates
+about 2.3 million nodes and 13 million relationships; the sizes are
+hardcoded literals listed in its header. `tests/fixtures/seed_1_100.cypher`
+is the same script at 1/100 scale and is the CI acceptance fixture.
+
+```sh
+cargo build --release
+./target/release/grafile seed.db benches/fixtures/seed_big_hardcoded.cypher
+./target/release/grafile check seed.db
+```
+
+| Scale | Nodes | Relationships | Load (release CLI) | `grafile check` |
+|---|---:|---:|---:|---:|
+| 1/100 | 23 845 | 131 470 | 140–153 s | 0.09 s, 0 findings |
+| 1/1 | ~2.3 M | ~13 M | not yet practical | - |
+
+Relationship counts vary between runs because the script uses `rand()`.
+Most of the load time goes to statements such as
+`MATCH (u:User {id: uid})` where `uid` is a variable: they scan the label
+instead of seeking the index (Phase 8), so the cost per lookup grows with
+the label and the full script's load time grows roughly quadratically with
+its scale. The full-size run becomes the Phase 8 throughput gate once bound
+equality lookups use index seeks; until then the 1/100 fixture is the
+measured baseline, and the integrity checker is the oracle for both.
+
 ## Notes
 
 - Reads go through the bitmap adjacency index and the B+tree, never scans;
