@@ -1136,6 +1136,7 @@ fn print_indexes(conn: &Connection) {
         && schema.edge_indexes.is_empty()
         && schema.node_constraints.is_empty()
         && schema.edge_constraints.is_empty()
+        && schema.fulltext_indexes.is_empty()
     {
         println!("(no indexes)");
         return;
@@ -1157,6 +1158,16 @@ fn print_indexes(conn: &Connection) {
             index.kind_name(),
             index.name.as_deref().unwrap_or("-"),
         );
+    }
+    for index in &schema.fulltext_indexes {
+        let keys = index
+            .key_ids
+            .iter()
+            .map(|key_id| schema.property_key_name(*key_id).unwrap_or("?"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let label = schema.label_name(index.label_id).unwrap_or("?");
+        println!("node fulltext {} on {label}({keys})", index.name);
     }
     for index in &schema.edge_indexes {
         let keys = index

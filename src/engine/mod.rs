@@ -10,9 +10,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::btree::{Btree, TreeKind};
-use crate::catalog::{Catalog, IndexKind, NodeIndexDef, Schema};
+use hashbrown::HashMap;
+use indicatif::{ProgressBar, ProgressStyle};
+
+use crate::catalog::{Catalog, FulltextIndexDef, IndexKind, NodeIndexDef, Schema};
 use crate::cypher::{DdlConstraintKind, DdlEntity, DdlStatement};
 use crate::error::{Error, ErrorCode, Result};
+use crate::fulltext::{
+    FulltextQuery, Posting, decode_positions, document_terms, encode_positions, posting_key,
+    posting_node, term_prefix,
+};
 use crate::matrix::{ANY_TYPE, Direction, FragmentKey, FragmentStore};
 use crate::pager::{DatabaseHeader, Pager};
 use crate::record::{EdgeRecord, NodeRecord, Value, encode_index_key};
@@ -904,6 +911,7 @@ impl Database {
                 .any(|def| def.name.as_deref() == Some(name))
             || schema.node_constraints.iter().any(|def| def.name == name)
             || schema.edge_constraints.iter().any(|def| def.name == name)
+            || schema.fulltext_indexes.iter().any(|def| def.name == name)
     }
 
     fn ensure_ddl_keys(&mut self, keys: &[String]) -> Result<Vec<u32>> {
@@ -918,6 +926,21 @@ impl Database {
         }
         let key_ids = self.ensure_ddl_keys(&index.keys)?;
         match &index.entity {
+            DdlEntity::Node { label } if index.fulltext => {
+                let label_id = self.catalog.ensure_label(&mut self.pager, label)?;
+                let id = self.catalog.create_fulltext_index(
+                    &mut self.pager,
+                    &index.name,
+                    label_id,
+                    &key_ids,
+                )?;
+                self.backfill_fulltext_index(id)?;
+            }
+            DdlEntity::Edge { .. } if index.fulltext => {
+                return Err(Error::unsupported(
+                    "fulltext indexes on relationships are not supported",
+                ));
+            }
             DdlEntity::Node { label } => {
                 let label_id = self.catalog.ensure_label(&mut self.pager, label)?;
                 let id = self.catalog.create_node_index_named(
@@ -1041,6 +1064,10 @@ impl Database {
             }
             return self.free_edge_index(&def);
         }
+        if let Some(def) = self.fulltext_index_named(name) {
+            Btree::from_root(def.root, TreeKind::Index).destroy(&mut self.pager)?;
+            return self.catalog.remove_fulltext_index(&mut self.pager, def.id);
+        }
         if if_exists {
             Ok(())
         } else {
@@ -1098,6 +1125,11 @@ impl Database {
         {
             return self.catalog.remove_edge_constraint(&mut self.pager, def.id);
         }
+        if self.fulltext_index_named(name).is_some() {
+            return Err(Error::misuse(format!(
+                "`{name}` is an index; use DROP INDEX"
+            )));
+        }
         if if_exists {
             Ok(())
         } else {
@@ -1116,6 +1148,147 @@ impl Database {
     fn free_edge_index(&mut self, def: &crate::catalog::EdgeIndexDef) -> Result<()> {
         Btree::from_root(def.root, TreeKind::Index).destroy(&mut self.pager)?;
         self.catalog.remove_edge_index(&mut self.pager, def.id)
+    }
+
+    fn fulltext_index_named(&self, name: &str) -> Option<FulltextIndexDef> {
+        self.schema()
+            .fulltext_indexes
+            .iter()
+            .find(|def| def.name == name)
+            .cloned()
+    }
+
+    /// Index every node carrying a new fulltext index's label.
+    fn backfill_fulltext_index(&mut self, index_id: u32) -> Result<()> {
+        let Some(def) = self
+            .schema()
+            .fulltext_indexes
+            .iter()
+            .find(|def| def.id == index_id)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let node_ids = self.label_nodes(def.label_id)?;
+        let progress = ProgressBar::new(node_ids.len() as u64);
+        progress.set_style(
+            ProgressStyle::with_template("{spinner:.green} {msg} {pos}/{len} [{elapsed_precise}]")
+                .expect("valid fulltext backfill template"),
+        );
+        progress.set_message(format!("backfilling fulltext index `{}`", def.name));
+        for node_id in node_ids {
+            if let Some(record) = self.get_node(node_id)? {
+                self.fulltext_update(index_id, &record, node_id, true)?;
+            }
+            progress.inc(1);
+        }
+        progress.finish_and_clear();
+        Ok(())
+    }
+
+    /// Search a fulltext index.
+    ///
+    /// # Arguments
+    ///
+    /// * `index_name` - Name of the fulltext index
+    /// * `query` - Query text: terms, `"phrases"`, `AND` and `OR`
+    ///
+    /// # Returns
+    ///
+    /// `(node id, score)` pairs ordered by descending score, then node id
+    ///
+    /// # Errors
+    ///
+    /// Returns `NotFound` when no fulltext index has that name and a syntax
+    /// error when the query is malformed.
+    pub fn fulltext_query(&mut self, index_name: &str, query: &str) -> Result<Vec<(u64, f64)>> {
+        let def = self.fulltext_index_named(index_name).ok_or_else(|| {
+            Error::new(
+                ErrorCode::NotFound,
+                format!("fulltext index `{index_name}` does not exist"),
+            )
+        })?;
+        let parsed = FulltextQuery::parse(query)?;
+        let tree = Btree::from_root(def.root, TreeKind::Index);
+        let mut postings: HashMap<String, Vec<Posting>> = HashMap::new();
+        for term in parsed.terms() {
+            let prefix = term_prefix(term);
+            let mut list = Vec::new();
+            let mut cursor = tree.cursor();
+            let mut ok = cursor.seek_ge(&mut self.pager, &prefix)?;
+            while ok && cursor.key().starts_with(&prefix) {
+                let node_id = posting_node(cursor.key())?;
+                let positions = decode_positions(&cursor.value(&mut self.pager)?)?;
+                list.push(Posting { node_id, positions });
+                ok = cursor.next(&mut self.pager)?;
+            }
+            postings.insert(term.to_owned(), list);
+        }
+        let doc_count = self.fragments.label_count(&mut self.pager, def.label_id)?;
+        Ok(parsed.search(&postings, doc_count))
+    }
+
+    /// Insert (`add`) or delete the postings of one node in a fulltext index.
+    fn fulltext_update(
+        &mut self,
+        index_id: u32,
+        record: &NodeRecord,
+        node_id: u64,
+        add: bool,
+    ) -> Result<()> {
+        let Some(def) = self
+            .schema()
+            .fulltext_indexes
+            .iter()
+            .find(|def| def.id == index_id)
+        else {
+            return Ok(());
+        };
+        let terms = document_terms(
+            def.key_ids
+                .iter()
+                .filter_map(|key_id| record.get(*key_id).and_then(Value::as_text)),
+        );
+        let old_root = def.root;
+        let mut tree = Btree::from_root(old_root, TreeKind::Index);
+        for (term, positions) in &terms {
+            let key = posting_key(term, node_id);
+            if add {
+                tree.insert(&mut self.pager, &key, &encode_positions(positions))?;
+            } else {
+                tree.delete(&mut self.pager, &key)?;
+            }
+        }
+        if tree.root() != old_root {
+            self.catalog
+                .set_fulltext_root(&mut self.pager, index_id, tree.root())?;
+        }
+        Ok(())
+    }
+
+    /// Update every fulltext index covering `record`; with `key_id`, only
+    /// those indexing that property.
+    fn fulltext_sync(
+        &mut self,
+        record: &NodeRecord,
+        node_id: u64,
+        key_id: Option<u32>,
+        add: bool,
+    ) -> Result<()> {
+        let ids: Vec<u32> = self
+            .schema()
+            .fulltext_indexes
+            .iter()
+            .filter(|def| {
+                record.labels.contains(&def.label_id)
+                    && key_id.is_none_or(|key_id| def.key_ids.contains(&key_id))
+            })
+            .map(|def| def.id)
+            .collect();
+        for id in ids {
+            self.fulltext_update(id, record, node_id, add)?;
+        }
+        Ok(())
     }
 
     /// Index every node matching a node index's label.
@@ -1408,6 +1581,7 @@ impl Database {
     }
 
     fn index_node(&mut self, record: &NodeRecord, node_id: u64) -> Result<()> {
+        self.fulltext_sync(record, node_id, None, true)?;
         let indexes: Vec<_> = self.schema().node_indexes.clone();
         for index in indexes {
             if index.label_id == 0 || record.labels.contains(&index.label_id) {
@@ -1418,6 +1592,7 @@ impl Database {
     }
 
     fn unindex_node(&mut self, record: &NodeRecord, node_id: u64) -> Result<()> {
+        self.fulltext_sync(record, node_id, None, false)?;
         let indexes: Vec<_> = self.schema().node_indexes.clone();
         for index in indexes {
             self.delete_index_entry(&index, record, node_id)?;
@@ -1431,6 +1606,7 @@ impl Database {
         node_id: u64,
         key_id: u32,
     ) -> Result<()> {
+        self.fulltext_sync(record, node_id, Some(key_id), true)?;
         let indexes: Vec<_> = self
             .schema()
             .node_indexes_for_key(key_id)
@@ -1450,6 +1626,7 @@ impl Database {
         node_id: u64,
         key_id: u32,
     ) -> Result<()> {
+        self.fulltext_sync(record, node_id, Some(key_id), false)?;
         let indexes: Vec<_> = self
             .schema()
             .node_indexes_for_key(key_id)

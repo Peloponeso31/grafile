@@ -2081,6 +2081,19 @@ impl<'a> Executor<'a> {
                 )),
             };
         }
+        if name == "db.index.fulltext.queryNodes" {
+            let [Value::Text(index), Value::Text(query)] = args else {
+                return Err(Error::type_error(
+                    "db.index.fulltext.queryNodes expects an index name and a query string",
+                ));
+            };
+            return Ok(self
+                .db
+                .fulltext_query(index, query)?
+                .into_iter()
+                .map(|(node_id, score)| vec![Reg::Node(node_id), Reg::Value(Value::Float(score))])
+                .collect());
+        }
         let schema = self.db.schema();
         let mut values = Vec::new();
         let mut id = 1u32;

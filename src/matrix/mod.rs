@@ -679,6 +679,16 @@ impl FragmentStore {
         Ok(out)
     }
 
+    /// Number of nodes carrying a label (sum of fragment cardinalities).
+    pub fn label_count(&mut self, pager: &mut Pager, label_id: u32) -> Result<u64> {
+        let prefix = FragmentKey::prefix(FAMILY_LABEL, label_id, 0);
+        Ok(self
+            .merged_prefix(pager, &prefix[..5])?
+            .iter()
+            .map(|(_, fragment)| u64::from(fragment.cardinality()))
+            .sum())
+    }
+
     /// Edge ids of a given type.
     pub fn edges_of_type(&mut self, pager: &mut Pager, type_id: u32) -> Result<Vec<u64>> {
         let prefix = FragmentKey::prefix(FAMILY_EDGE_TYPE, type_id, 0);

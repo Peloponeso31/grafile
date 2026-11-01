@@ -227,8 +227,13 @@ impl<'a> Planner<'a> {
                         }
                         out
                     };
-                    for (_, alias) in &yields {
-                        scope.insert(alias.clone(), VarKind::Value);
+                    for (column, alias) in &yields {
+                        let kind = if spec.node_columns.contains(&column.as_str()) {
+                            VarKind::Node
+                        } else {
+                            VarKind::Value
+                        };
+                        scope.insert(alias.clone(), kind);
                     }
                     plan = Plan::ProcedureCall {
                         input: Box::new(plan),
@@ -2541,6 +2546,8 @@ struct ProcedureSpec {
     min_args: usize,
     /// Maximum accepted argument count.
     max_args: usize,
+    /// Output columns that hold nodes.
+    node_columns: &'static [&'static str],
 }
 
 /// Description of a supported built-in procedure.
@@ -2550,21 +2557,31 @@ fn procedure_spec(name: &str) -> Result<ProcedureSpec> {
             columns: &["label"],
             min_args: 0,
             max_args: 0,
+            node_columns: &[],
         }),
         "db.propertyKeys" => Ok(ProcedureSpec {
             columns: &["propertyKey"],
             min_args: 0,
             max_args: 0,
+            node_columns: &[],
         }),
         "db.relationshipTypes" => Ok(ProcedureSpec {
             columns: &["relationshipType"],
             min_args: 0,
             max_args: 0,
+            node_columns: &[],
         }),
         "db.awaitIndexes" => Ok(ProcedureSpec {
             columns: &[],
             min_args: 0,
             max_args: 1,
+            node_columns: &[],
+        }),
+        "db.index.fulltext.queryNodes" => Ok(ProcedureSpec {
+            columns: &["node", "score"],
+            min_args: 2,
+            max_args: 2,
+            node_columns: &["node"],
         }),
         _ => Err(Error::unsupported(format!(
             "procedure `{name}` is not supported"
