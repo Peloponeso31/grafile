@@ -223,7 +223,7 @@ nested pattern comprehension.
 
 The acceptance fixture is the audited `seed_big.cypher` (Neo4j 5 style,
 e-commerce/social seed). It must run end to end through the script runner at
-1/100 scale; full-size loading is a Phase 7 performance target, not a Phase 6
+1/100 scale; full-size loading is a Phase 8 performance target, not a Phase 6
 gate.
 
 - [done] Statement runner: make `split_statements` skip `//` line comments and
@@ -262,11 +262,56 @@ gate, and the report must not regress. Non-goals: Lucene query syntax, a
 general user-procedure registry (TCK non-goal), `SHOW INDEXES`/`SHOW
 CONSTRAINTS`, and `CALL {} IN TRANSACTIONS` inside explicit transactions.
 
-### Phase 7 — Query performance, vectorization and SIMD (large) [pending]
+### Phase 7 — Data integrity verification (medium) [pending]
+
+The 0.2.1 band-boundary bug (expanding node ids divisible by 256 returned
+neighbors' relationships) went unnoticed because no test compared the derived
+structures with the records they derive from. The stored bitmaps were
+correct and only the reads were wrong, but `DETACH DELETE` read through the
+same path and deleted relationships that belonged to other nodes. Incidence,
+label and type fragments, property indexes and constraint state are all
+derived from node and edge records, so the records can serve as the oracle.
+
+- Integrity checker: a read-only `Engine::check_integrity()` returning a
+  structured report, exposed as `grafile check FILE` (non-zero exit on
+  findings, `indicatif` progress) and through the FFI. It verifies that every
+  edge has its out/in bits in the any-type and typed planes and in the
+  edge-type bitmap, that every set incidence bit maps to an existing edge
+  with that endpoint, that label bitmaps match node labels, that property
+  indexes and uniqueness/existence constraints match the records, and that
+  B+tree ordering, page ownership and the free list are consistent.
+- Derived-structure rebuild: `grafile check --rebuild` regenerates fragments
+  and indexes from records inside one write transaction, then re-runs the
+  checker. Records are never modified; lost primary data cannot be recovered
+  and is reported, not guessed.
+- Model-based property tests: `proptest` sequences of create, delete, detach
+  delete, set/remove label and property, mirrored in an in-memory reference
+  graph. After each step, outgoing, incoming and undirected expansion, label
+  and type scans, index seeks and `edge_exists` must match the model, and the
+  checker must report nothing. Id strategies are biased toward boundaries.
+- Boundary sweeps: deterministic tests at each structural edge: node and edge
+  ids at `256·k - 1`, `256·k` and `256·k + 1` (incidence bands),
+  `65536·k ± 1` (label and type bands), fragments crossing the sparse-to-dense
+  threshold (`SPARSE_MAX`), and B+tree page splits and merges.
+- Durability: run the checker after every simulated crash in the pager's
+  interrupted-commit property test, after a failed `IN TRANSACTIONS` batch,
+  after explicit rollback, and after reopen.
+- Cross-version fixtures: small checked-in files written by each release
+  from 0.2.0 on, opened by the current build with a clean checker report and
+  snapshotted query results. Each release adds its fixture.
+- Suite and CI wiring: integration suites that write and the Phase 6
+  acceptance fixture end with a checker assertion; CI runs the model tests
+  with a fixed case count and keeps `proptest-regressions` checked in.
+
+Non-goals: online or incremental checking during normal writes, and repairing
+primary records.
+
+### Phase 8 — Query performance, vectorization and SIMD (large) [pending]
 
 This phase absorbs the former Phase 6 items: streaming `OPTIONAL MATCH` and
 variable-length expansion, bidirectional shortest-path search, and
-memory-bounded sort and aggregation.
+memory-bounded sort and aggregation. Every storage or bitmap fast path is
+verified against the Phase 7 reference model and checker before it ships.
 
 - Runtime index seeks (highest ROI): plan a seek for equality values bound
   before the scan, not just literals (`IndexSeek` currently stores a constant
@@ -322,7 +367,8 @@ scenarios are excluded), so milestones are stated against the whole suite.
 | After Phase 4 | ≥ 93% of the whole suite; deviations closed |
 | After Phase 5 | Allow-list contains only non-goals (e.g. registered procedures) |
 | After Phase 6 | 1/100 seed script runs end to end; TCK report unchanged |
-| After Phase 7 | Bound equality lookups use index seeks; benchmark targets met |
+| After Phase 7 | Checker clean on every suite, fixture and release file |
+| After Phase 8 | Bound equality lookups use index seeks; benchmark targets met |
 
 Phase 4 achieved 3844 of 3897 scenarios (98.6%); the allow-list holds the
 52 CALL procedure scenarios (non-goal) and one nested pattern
@@ -349,3 +395,7 @@ comprehension.
 5. Performance changes land with Criterion benchmark evidence: a vectorized or
    SIMD path ships only when it beats the scalar reference on the recorded
    machine, and the scalar path stays as the differential oracle.
+6. Changes to storage, the incidence matrix or write paths land with
+   checker coverage and a boundary case in the Phase 7 model tests; once
+   Phase 7 ships, a release is cut only when every cross-version fixture
+   opens with a clean checker report.
