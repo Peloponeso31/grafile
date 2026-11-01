@@ -134,6 +134,7 @@ See `ffi/examples/example.dart` (requires `dart pub add ffi`).
 | `grafile_exec` | run a statement, discard rows |
 | `grafile_query_json` | run a query, JSON array of row objects |
 | `grafile_meta_json` | database header as JSON (`raw` flag) |
+| `grafile_check_json` | integrity report as JSON (`findings`, `suppressed`, `stats`) |
 | `grafile_begin` / `grafile_commit` / `grafile_rollback` | transactions |
 | `grafile_prepare` | compile a statement |
 | `grafile_bind_params_json` | bind `$params` from a JSON object |
