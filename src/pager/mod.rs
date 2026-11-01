@@ -787,6 +787,71 @@ impl Pager {
         Ok(())
     }
 
+    /// Every page on the freelist, trunks and leaves, in chain order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Corrupt` error when a trunk or leaf has the wrong page
+    /// type, a trunk overflows its capacity, the chain revisits a page, or
+    /// the total disagrees with the header's `freelist_count`.
+    pub fn freelist_pages(&mut self) -> Result<Vec<PageNo>> {
+        let capacity = (self.page_size - FREELIST_ENTRIES_OFFSET) / 4;
+        let mut pages = Vec::with_capacity(self.header.freelist_count as usize);
+        let mut seen = HashSet::new();
+        let mut trunk = self.header.freelist_trunk;
+        while trunk != INVALID_PAGE {
+            if !seen.insert(trunk) {
+                return Err(Error::corrupt(format!(
+                    "freelist revisits trunk page {trunk}"
+                )));
+            }
+            let (next, entries) = {
+                let page = self.page(trunk)?;
+                let data = page.data();
+                if page.header()?.page_type != PageType::FreelistTrunk {
+                    return Err(Error::corrupt(format!(
+                        "freelist trunk {trunk} has type {:?}",
+                        page.header()?.page_type
+                    )));
+                }
+                let read = |offset: usize| {
+                    u32::from_le_bytes(data[offset..offset + 4].try_into().expect("slice length"))
+                };
+                let count = read(FREELIST_COUNT_OFFSET) as usize;
+                if count > capacity {
+                    return Err(Error::corrupt(format!(
+                        "freelist trunk {trunk} lists {count} pages (capacity {capacity})"
+                    )));
+                }
+                let entries: Vec<PageNo> = (0..count)
+                    .map(|index| read(FREELIST_ENTRIES_OFFSET + index * 4))
+                    .collect();
+                (read(FREELIST_NEXT_OFFSET), entries)
+            };
+            pages.push(trunk);
+            for leaf in entries {
+                if !seen.insert(leaf) {
+                    return Err(Error::corrupt(format!("freelist lists page {leaf} twice")));
+                }
+                if self.page(leaf)?.header()?.page_type != PageType::FreelistLeaf {
+                    return Err(Error::corrupt(format!(
+                        "freelist leaf {leaf} is not marked free"
+                    )));
+                }
+                pages.push(leaf);
+            }
+            trunk = next;
+        }
+        if pages.len() != self.header.freelist_count as usize {
+            return Err(Error::corrupt(format!(
+                "freelist holds {} pages but the header counts {}",
+                pages.len(),
+                self.header.freelist_count
+            )));
+        }
+        Ok(pages)
+    }
+
     fn mark_freelist_leaf(&mut self, page_no: u32) -> Result<()> {
         let page_size = self.page_size;
         let data = self.page_mut(page_no)?;

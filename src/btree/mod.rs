@@ -21,9 +21,9 @@ use crate::error::{Error, Result};
 use crate::pager::{PageHeader, PageNo, PageType, Pager};
 
 use page::{
-    build_interior_cell, build_leaf_cell, cell_child, cell_key, cell_pointer, cell_size,
-    free_cell_overflow, insert_cell_bytes, raw_cell_key, read_all_cells, read_cell_value,
-    rebuild_page, remove_cell_at,
+    OVERFLOW_OVERHEAD, build_interior_cell, build_leaf_cell, cell_child, cell_key, cell_overflow,
+    cell_pointer, cell_size, free_cell_overflow, insert_cell_bytes, raw_cell_key, read_all_cells,
+    read_cell_value, read_u32, rebuild_page, remove_cell_at,
 };
 
 pub use cursor::Cursor;
@@ -308,11 +308,33 @@ impl Btree {
         Ok(())
     }
 
-    /// Walk the whole tree validating structure, ordering and dividers.
+    /// Walk the whole tree validating structure, ordering, dividers and
+    /// overflow chains.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Corrupt` error describing the first violation found.
     pub fn integrity_check(&self, pager: &mut Pager) -> Result<CheckStats> {
-        let mut visited = HashSet::new();
+        self.integrity_check_into(pager, &mut HashSet::new())
+    }
+
+    /// [`Self::integrity_check`] that records every page the tree owns
+    /// (interior, leaf and overflow) in `owned`.
+    ///
+    /// Sharing one set between several trees makes a page claimed by two
+    /// trees an error, which is how page ownership is verified file-wide.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `Corrupt` error describing the first violation found,
+    /// including a page that `owned` already contains.
+    pub fn integrity_check_into(
+        &self,
+        pager: &mut Pager,
+        owned: &mut HashSet<PageNo>,
+    ) -> Result<CheckStats> {
         let mut stats = CheckStats::default();
-        let bounds = check_node(pager, self.root, self.kind, 0, &mut visited, &mut stats)?;
+        let bounds = check_node(pager, self.root, self.kind, 0, owned, &mut stats)?;
         stats.root_min = bounds.0;
         stats.root_max = bounds.1;
         Ok(stats)
@@ -324,6 +346,8 @@ impl Btree {
 pub struct CheckStats {
     /// Number of B+tree pages reachable from the root.
     pub pages: u64,
+    /// Number of overflow pages referenced by leaf cells.
+    pub overflow_pages: u64,
     /// Number of leaf cells.
     pub keys: u64,
     /// Tree height (leaf level = 0).
@@ -568,6 +592,7 @@ fn check_node(
         t if t == kind.leaf_type() => {
             let mut min = None;
             let mut max: Option<Vec<u8>> = None;
+            let mut chains = Vec::new();
             for idx in 0..count {
                 let ptr = cell_pointer(data, idx)?;
                 let key = cell_key(data, kind, ptr)?.to_vec();
@@ -583,8 +608,14 @@ fn check_node(
                 }
                 max = Some(key);
                 stats.keys += 1;
+                if let Some(chain) = cell_overflow(data, kind, ptr)? {
+                    chains.push(chain);
+                }
             }
             stats.height = stats.height.max(depth);
+            for (first, remote) in chains {
+                check_overflow_chain(pager, page_no, first, remote, visited, stats)?;
+            }
             Ok((min, max))
         }
         t if t == kind.interior_type() => {
@@ -650,6 +681,48 @@ fn check_node(
             "page {page_no}: unexpected page type {other:?} in B+tree"
         ))),
     }
+}
+
+/// Verify an overflow chain holds exactly the pages needed for `remote`
+/// bytes, each typed as overflow and owned by nothing else.
+fn check_overflow_chain(
+    pager: &mut Pager,
+    leaf: PageNo,
+    first: PageNo,
+    remote: usize,
+    visited: &mut HashSet<PageNo>,
+    stats: &mut CheckStats,
+) -> Result<()> {
+    let capacity = pager.page_size() - OVERFLOW_OVERHEAD;
+    let expected = remote.div_ceil(capacity);
+    let mut page_no = first;
+    for _ in 0..expected {
+        if page_no == 0 {
+            return Err(Error::corrupt(format!(
+                "page {leaf}: overflow chain ends before its {remote} bytes"
+            )));
+        }
+        if !visited.insert(page_no) {
+            return Err(Error::corrupt(format!(
+                "overflow page {page_no} reachable more than once"
+            )));
+        }
+        let page = pager.page(page_no)?;
+        let data = page.data();
+        if PageHeader::parse(data)?.page_type != PageType::Overflow {
+            return Err(Error::corrupt(format!(
+                "page {leaf}: overflow chain reaches non-overflow page {page_no}"
+            )));
+        }
+        stats.overflow_pages += 1;
+        page_no = read_u32(data, crate::pager::PAGE_HEADER_SIZE)?;
+    }
+    if page_no != 0 {
+        return Err(Error::corrupt(format!(
+            "page {leaf}: overflow chain continues past its {remote} bytes"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
