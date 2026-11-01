@@ -57,6 +57,8 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
   write path (see Phase 5). `CREATE FULLTEXT INDEX … ON EACH [...]` with
   `db.index.fulltext.queryNodes`. `LOAD CSV [WITH HEADERS] FROM file AS row`
   reads local CSVs into the row pipeline.
+- Integrity: `grafile check FILE [--rebuild]` verifies every derived
+  structure against the records and the page layout (see Phase 7).
 
 Explicit gaps (currently clear `Unsupported` errors):
 
@@ -262,7 +264,7 @@ gate, and the report must not regress. Non-goals: Lucene query syntax, a
 general user-procedure registry (TCK non-goal), `SHOW INDEXES`/`SHOW
 CONSTRAINTS`, and `CALL {} IN TRANSACTIONS` inside explicit transactions.
 
-### Phase 7 — Data integrity verification (medium) [pending]
+### Phase 7 — Data integrity verification (medium) [done]
 
 The 0.2.1 band-boundary bug (expanding node ids divisible by 256 returned
 neighbors' relationships) went unnoticed because no test compared the derived
@@ -270,38 +272,61 @@ structures with the records they derive from. The stored bitmaps were
 correct and only the reads were wrong, but `DETACH DELETE` read through the
 same path and deleted relationships that belonged to other nodes. Incidence,
 label and type fragments, property indexes and constraint state are all
-derived from node and edge records, so the records can serve as the oracle.
+derived from node and edge records, so the records serve as the oracle.
 
-- Integrity checker: a read-only `Engine::check_integrity()` returning a
-  structured report, exposed as `grafile check FILE` (non-zero exit on
-  findings, `indicatif` progress) and through the FFI. It verifies that every
-  edge has its out/in bits in the any-type and typed planes and in the
-  edge-type bitmap, that every set incidence bit maps to an existing edge
-  with that endpoint, that label bitmaps match node labels, that property
-  indexes and uniqueness/existence constraints match the records, and that
-  B+tree ordering, page ownership and the free list are consistent.
-- Derived-structure rebuild: `grafile check --rebuild` regenerates fragments
-  and indexes from records inside one write transaction, then re-runs the
-  checker. Records are never modified; lost primary data cannot be recovered
-  and is reported, not guessed.
-- Model-based property tests: `proptest` sequences of create, delete, detach
-  delete, set/remove label and property, mirrored in an in-memory reference
-  graph. After each step, outgoing, incoming and undirected expansion, label
-  and type scans, index seeks and `edge_exists` must match the model, and the
-  checker must report nothing. Id strategies are biased toward boundaries.
-- Boundary sweeps: deterministic tests at each structural edge: node and edge
-  ids at `256·k - 1`, `256·k` and `256·k + 1` (incidence bands),
-  `65536·k ± 1` (label and type bands), fragments crossing the sparse-to-dense
-  threshold (`SPARSE_MAX`), and B+tree page splits and merges.
-- Durability: run the checker after every simulated crash in the pager's
-  interrupted-commit property test, after a failed `IN TRANSACTIONS` batch,
-  after explicit rollback, and after reopen.
-- Cross-version fixtures: small checked-in files written by each release
-  from 0.2.0 on, opened by the current build with a clean checker report and
-  snapshotted query results. Each release adds its fixture.
-- Suite and CI wiring: integration suites that write and the Phase 6
-  acceptance fixture end with a checker assertion; CI runs the model tests
-  with a fixed case count and keeps `proptest-regressions` checked in.
+- [done] Integrity checker: read-only `Database::check_integrity()` returns
+  an `IntegrityReport` (findings by kind, capped at 100 per kind, plus
+  sizes), exposed as `grafile check FILE` (read-only open, `indicatif`
+  progress, exit status 1 on findings) and `grafile_check_json()` in the
+  FFI. Every implied bit and entry must be present and every stored total
+  must equal the record-implied total, which proves set equality without
+  materialising the expected sets; a mismatch triggers a targeted scan
+  that names the stray bits or stale entries. Covered: out/in bits in the
+  typed and any-type planes, edge-type and label bitmaps, node and edge
+  property indexes, uniqueness (adjacent equal values), `IS NOT NULL` and
+  NODE KEY existence, fulltext postings and positions, record decoding and
+  dangling endpoints, header id counters, B+tree ordering and dividers,
+  overflow chains, page ownership across all trees (a page claimed twice,
+  leaked, or both free and owned) and freelist structure. The 1/100 seed
+  (23 845 nodes, 131 470 relationships) checks clean in 0.09 s.
+- [done] Derived-structure rebuild: `grafile check --rebuild` /
+  `Database::rebuild_derived()` regenerates fragments, property indexes and
+  fulltext indexes from records in one write transaction, then re-checks.
+  It refuses when the catalog, a record table or the freelist is damaged,
+  and abandons (rather than frees) a derived tree whose pages fail
+  verification, so a shared page is never freed under a live tree.
+- [done] Model-based property tests (`src/engine/model_tests.rs`): create,
+  delete, detach delete, set/remove label and property, each committed or
+  rolled back, mirrored in a reference graph. After every step outgoing,
+  incoming and per-type expansion, label and type scans, index seeks,
+  `edge_exists` over every ordered pair, and a clean checker report must
+  hold. Start ids are drawn from band boundaries (254, 511, 65 534,
+  131 070, 2^24 - 2).
+- [done] Boundary sweeps: ids straddling 256, 512, 65 536 + 256, 65 536,
+  131 072 and 2^24; label and edge-type fragments crossing `SPARSE_MAX`
+  into dense form and back; multi-level trees with deletes that leave stale
+  dividers and empty leaves. B+tree merges do not exist yet (deletes never
+  rebalance), so there is nothing to sweep there.
+- [done] Durability: an engine-level proptest interrupts a commit at a
+  random I/O operation (optionally tearing the write), reopens, and requires
+  the old or the new state exactly with a clean checker; `tests/integrity.rs`
+  checks after a failed `IN TRANSACTIONS` batch, after explicit rollback of
+  index, label and detach-delete changes, and after reopening a file with
+  freed record, index and overflow pages. The pager-level interrupted-commit
+  test writes raw pages outside any tree, so the checker runs at engine
+  level instead.
+- [done] Cross-version fixtures: `scripts/version-fixture.sh` runs
+  `tests/fixtures/versions/fixture.cypher` with a release CLI; the files
+  written by 0.2.0, 0.2.1 and 0.2.2 are checked in, and `tests/compat.rs`
+  requires a clean report and identical snapshot answers from each. The
+  0.2.0 and 0.2.1 binaries themselves answer two snapshot queries wrongly
+  on their own clean files (750 instead of 742 relationships): the band
+  bug, reproduced. Each release adds its fixture.
+- [done] Suite and CI wiring: `tests/support::connection()` returns a guard
+  that asserts a clean report when each test ends, the seed acceptance test
+  asserts a clean report, the model tests run with a fixed case count (48)
+  under `cargo test --workspace`, and `proptest-regressions/` stays checked
+  in.
 
 Non-goals: online or incremental checking during normal writes, and repairing
 primary records.
@@ -344,7 +369,7 @@ verified against the Phase 7 reference model and checker before it ships.
 | Workload | Baseline | Target |
 |----------|----------|--------|
 | Variable-key point lookup, 50k nodes | 15.5 ms (label scan) | ≤ 10 µs (seek) |
-| Seed load, 1/100 scale | 140 s (release CLI) | ≥ 3x throughput |
+| Seed load, 1/100 scale | 140–153 s (release CLI) | ≥ 3x throughput |
 | Numeric filter, 1M rows | scalar VM | ≥ 1.5x |
 | `sum`/`count`/`avg`, 1M values | scalar VM | ≥ 2x |
 | Dense 8 KiB bitmap AND/OR/cardinality | scalar words | ≥ 1.5x |
@@ -396,6 +421,6 @@ comprehension.
    SIMD path ships only when it beats the scalar reference on the recorded
    machine, and the scalar path stays as the differential oracle.
 6. Changes to storage, the incidence matrix or write paths land with
-   checker coverage and a boundary case in the Phase 7 model tests; once
-   Phase 7 ships, a release is cut only when every cross-version fixture
-   opens with a clean checker report.
+   checker coverage and a boundary case in the Phase 7 model tests. A
+   release is cut only when every cross-version fixture opens with a clean
+   checker report, and it adds its own fixture.
