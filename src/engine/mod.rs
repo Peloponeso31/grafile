@@ -6,12 +6,17 @@
 //! All mutations must run inside a write transaction; [`Database::write`]
 //! wraps a closure in begin/commit with automatic rollback on error.
 
+mod integrity;
+#[cfg(test)]
+mod model_tests;
+
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::btree::{Btree, TreeKind};
 use hashbrown::HashMap;
 use indicatif::{ProgressBar, ProgressStyle};
+
+use crate::btree::{Btree, TreeKind};
 
 use crate::catalog::{Catalog, FulltextIndexDef, IndexKind, NodeIndexDef, Schema};
 use crate::cypher::{DdlConstraintKind, DdlEntity, DdlStatement};
@@ -24,6 +29,8 @@ use crate::matrix::{ANY_TYPE, Direction, FragmentKey, FragmentStore};
 use crate::pager::{DatabaseHeader, Pager};
 use crate::record::{EdgeRecord, NodeRecord, Value, encode_index_key};
 use crate::vfs::{OpenMode, Vfs};
+
+pub use integrity::{Finding, FindingKind, IntegrityReport, IntegrityStats, RebuildSummary};
 
 /// An embedded graph database.
 pub struct Database {
