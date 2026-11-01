@@ -3,6 +3,12 @@
 
 mod support;
 
+use std::path::Path;
+use std::sync::Arc;
+
+use grafile::api::Connection;
+use grafile::vfs::OpenMode;
+use grafile::vfs::mem::MemVfs;
 use support::{connection, query, seed};
 
 #[test]
@@ -61,6 +67,102 @@ fn expansion_from_a_sparse_fragment_row_zero_is_not_duplicated() {
         "MATCH (c:City {id: 255})-[r:IN_COUNTRY]->(co) RETURN count(r) AS c, co.id AS country",
     );
     assert_eq!(rows, vec![vec!["1", "1"]]);
+}
+
+/// Relationships returned by an expansion that touch neither endpoint.
+const FOREIGN_EDGES: &str = "MATCH (n)-[e]-(x) \
+     WHERE id(startNode(e)) <> id(n) AND id(endNode(e)) <> id(n) \
+     RETURN id(n), count(e)";
+
+/// Nodes 1..=600 linked `i -[:NEXT]-> i + 1`; node 256 and 512 open a band.
+fn seed_chain(conn: &mut Connection) {
+    query(conn, "UNWIND range(1, 600) AS i CREATE (:N {i: i})");
+    query(
+        conn,
+        "MATCH (a:N), (b:N) WHERE a.i = b.i - 1 CREATE (a)-[:NEXT]->(b)",
+    );
+}
+
+fn assert_chain_expansions(conn: &mut Connection) {
+    assert!(query(conn, FOREIGN_EDGES).is_empty());
+    for node in [255, 256, 511, 512] {
+        let outgoing = query(
+            conn,
+            &format!(
+                "MATCH (n) WHERE id(n) = {node} \
+                 MATCH (n)-[e]->(x) RETURN id(startNode(e)), id(x)"
+            ),
+        );
+        assert_eq!(
+            outgoing,
+            vec![vec![node.to_string(), (node + 1).to_string()]]
+        );
+        let incoming = query(
+            conn,
+            &format!(
+                "MATCH (n) WHERE id(n) = {node} \
+                 MATCH (n)<-[e]-(x) RETURN id(x), id(endNode(e))"
+            ),
+        );
+        assert_eq!(
+            incoming,
+            vec![vec![(node - 1).to_string(), node.to_string()]]
+        );
+        let undirected = query(
+            conn,
+            &format!("MATCH (n) WHERE id(n) = {node} MATCH (n)-[e]-() RETURN count(e)"),
+        );
+        assert_eq!(undirected, vec![vec!["2"]]);
+    }
+}
+
+#[test]
+fn expansion_from_band_boundary_nodes_stays_incident() {
+    let mut conn = connection();
+    seed_chain(&mut conn);
+    assert_chain_expansions(&mut conn);
+}
+
+#[test]
+fn band_boundary_expansion_survives_reopen() {
+    let store = grafile::vfs::mem::new_store();
+    {
+        let vfs = Arc::new(MemVfs::from_store(store.clone()));
+        let mut conn =
+            Connection::create_with_vfs(vfs, Path::new("chain.db"), 4096).expect("create");
+        seed_chain(&mut conn);
+    }
+    let vfs = Arc::new(MemVfs::from_store(store));
+    let mut conn =
+        Connection::open_with_vfs(vfs, Path::new("chain.db"), OpenMode::ReadWrite).expect("reopen");
+    assert_chain_expansions(&mut conn);
+}
+
+#[test]
+fn detach_delete_at_band_boundary_keeps_foreign_edges() {
+    let mut conn = connection();
+    seed_chain(&mut conn);
+    query(&mut conn, "MATCH (n) WHERE id(n) = 256 DETACH DELETE n");
+    let rows = query(&mut conn, "MATCH ()-[e:NEXT]->() RETURN count(e)");
+    assert_eq!(rows, vec![vec!["597"]]);
+    let rows = query(
+        &mut conn,
+        "MATCH (n) WHERE id(n) = 257 MATCH (n)-[:NEXT]->(x) RETURN id(x)",
+    );
+    assert_eq!(rows, vec![vec!["258"]]);
+}
+
+#[test]
+fn delete_of_an_isolated_band_boundary_node_succeeds() {
+    let mut conn = connection();
+    query(&mut conn, "UNWIND range(1, 300) AS i CREATE (:N {i: i})");
+    query(
+        &mut conn,
+        "MATCH (a), (b) WHERE id(a) = 257 AND id(b) = 258 CREATE (a)-[:NEXT]->(b)",
+    );
+    query(&mut conn, "MATCH (n) WHERE id(n) = 256 DELETE n");
+    let rows = query(&mut conn, "MATCH (n:N) RETURN count(n)");
+    assert_eq!(rows, vec![vec!["299"]]);
 }
 
 #[test]
