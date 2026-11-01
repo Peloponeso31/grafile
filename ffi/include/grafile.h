@@ -120,6 +120,15 @@ int grafile_query_json(GrafileDb *db, const char *cypher, const char *params_jso
 */
 int grafile_meta_json(GrafileDb *db, int raw, char **out_json);
 
+/*
+** Verify integrity: derived bitmaps and indexes against records, B+tree
+** structure, page ownership and the freelist. *out_json receives an object
+** with "findings" ([{"kind", "message"}]), "suppressed" and "stats". Findings
+** are not an error: GRAFILE_OK is returned and the caller inspects
+** "findings". *out_json must be released with grafile_free().
+*/
+int grafile_check_json(GrafileDb *db, char **out_json);
+
 /* --- transactions ------------------------------------------------------- */
 
 /* Begin a write transaction (acquires the exclusive writer slot). */

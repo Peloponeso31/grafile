@@ -348,3 +348,56 @@ fn standard_deviations() {
         vec![vec!["1.2909944487358056", "1.118033988749895", "null"]]
     );
 }
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig::with_cases(64))]
+
+    /// A bounded `ORDER BY ... SKIP ... LIMIT` returns exactly the slice of a
+    /// stable full sort, ties included, in both directions.
+    #[test]
+    fn bounded_sort_matches_a_stable_full_sort(
+        keys in proptest::collection::vec(0i64..8, 0..300),
+        skip in 0usize..20,
+        limit in 0usize..40,
+        descending: bool,
+    ) {
+        let mut conn = connection();
+        let list = format!("{keys:?}");
+        let direction = if descending { "DESC" } else { "" };
+        let source = format!(
+            "WITH {list} AS keys UNWIND range(0, size(keys) - 1) AS i \
+             WITH i, keys[i] AS k ORDER BY k {direction} SKIP {skip} LIMIT {limit} \
+             RETURN k, i"
+        );
+        let mut expected: Vec<(i64, usize)> =
+            keys.iter().copied().enumerate().map(|(i, k)| (k, i)).collect();
+        expected.sort_by(|a, b| if descending { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) });
+        let expected: Vec<Vec<String>> = expected
+            .into_iter()
+            .skip(skip)
+            .take(limit)
+            .map(|(k, i)| vec![k.to_string(), i.to_string()])
+            .collect();
+        proptest::prop_assert_eq!(query(&mut conn, &source), expected);
+    }
+}
+
+#[test]
+fn bounded_sort_reports_invalid_counts() {
+    let mut conn = connection();
+    let err = conn
+        .query(
+            "UNWIND [3, 1, 2] AS x RETURN x ORDER BY x LIMIT -1",
+            &Params::new(),
+        )
+        .map(|_| ())
+        .expect_err("negative limit");
+    assert!(err.to_string().contains("NegativeIntegerArgument"), "{err}");
+    assert_eq!(
+        query(
+            &mut conn,
+            "UNWIND [3, 1, 2] AS x RETURN x ORDER BY x DESC LIMIT 2"
+        ),
+        vec![vec!["3"], vec!["2"]]
+    );
+}

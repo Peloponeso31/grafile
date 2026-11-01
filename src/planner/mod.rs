@@ -9,6 +9,7 @@
 
 pub mod plan;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use hashlink::LinkedHashMap as FastMap;
@@ -227,8 +228,13 @@ impl<'a> Planner<'a> {
                         }
                         out
                     };
-                    for (_, alias) in &yields {
-                        scope.insert(alias.clone(), VarKind::Value);
+                    for (column, alias) in &yields {
+                        let kind = if spec.node_columns.contains(&column.as_str()) {
+                            VarKind::Node
+                        } else {
+                            VarKind::Value
+                        };
+                        scope.insert(alias.clone(), kind);
                     }
                     plan = Plan::ProcedureCall {
                         input: Box::new(plan),
@@ -486,6 +492,8 @@ impl<'a> Planner<'a> {
         plan: &mut Plan,
         scope: &mut FastMap<String, VarKind>,
     ) -> Result<()> {
+        let clause = push_down_equalities(clause, scope);
+        let clause = clause.as_ref();
         if clause.optional {
             return self.plan_optional_match(clause, plan, scope);
         }
@@ -959,11 +967,11 @@ impl<'a> Planner<'a> {
             (&start, &end, rel.direction)
         };
         if !scope.contains_key(&src_node.var) {
-            let (label, seek, scan_props) = self.anchor_plan(src_node)?;
+            let (labels, seek, scan_props) = self.anchor_plan(src_node)?;
             *plan = Plan::NodeScan {
                 input: Box::new(plan.clone()),
                 var: src_node.var.clone(),
-                label,
+                labels,
                 seek,
                 props: scan_props,
             };
@@ -1280,14 +1288,14 @@ impl<'a> Planner<'a> {
             // New anchor: choose the most selective unbound node.
             let idx = self.best_anchor(&nodes, &bound);
             let node = &nodes[idx];
-            let (label, seek, props) = self.anchor_plan(node)?;
+            let (labels, seek, props) = self.anchor_plan(node)?;
             if !scope.contains_key(&node.var) {
                 scope.insert(node.var.clone(), VarKind::Node);
             }
             *plan = Plan::NodeScan {
                 input: Box::new(plan.clone()),
                 var: node.var.clone(),
-                label,
+                labels,
                 seek,
                 props,
             };
@@ -1462,57 +1470,75 @@ impl<'a> Planner<'a> {
         best.0
     }
 
-    /// Whether a literal property of this node can be served by an index.
-    fn has_usable_index(&self, node: &PlannedNode) -> bool {
-        let schema = self.db.schema();
-        node.props.iter().any(|(_, key_id, _)| {
-            schema.node_indexes.iter().any(|index| {
+    /// The first seekable node index on `key_id` that applies to `node`.
+    fn seek_index(&self, node: &PlannedNode, key_id: u32) -> Option<u32> {
+        self.db
+            .schema()
+            .node_indexes
+            .iter()
+            .find(|index| {
                 index.seekable()
-                    && index.key_id() == *key_id
+                    && index.key_id() == key_id
                     && (index.label_id == 0 || node.label_ids.contains(&index.label_id))
             })
-        })
+            .map(|index| index.id)
     }
 
+    /// Whether a property of this node can be served by an index.
+    fn has_usable_index(&self, node: &PlannedNode) -> bool {
+        node.props
+            .iter()
+            .map(|(_, key_id, _)| *key_id)
+            .chain(
+                node.prop_exprs
+                    .iter()
+                    .map(|(key, _)| self.db.property_key_id(key).unwrap_or(NO_KEY)),
+            )
+            .any(|key_id| self.seek_index(node, key_id).is_some())
+    }
+
+    /// Choose how to scan an anchor node: an index seek on a literal
+    /// property, else on an expression property (whose variables are all
+    /// bound before the pattern), else a label scan. Returns the label, the
+    /// seek, and the literal properties the scan must still check.
     #[allow(clippy::type_complexity)]
     fn anchor_plan(
         &self,
         node: &PlannedNode,
-    ) -> Result<(Option<String>, Option<IndexSeek>, Vec<(String, Value)>)> {
-        let schema = self.db.schema();
-        // Prefer an index seek on a literal property.
-        for (_, key_id, value) in &node.props {
-            let index = schema.node_indexes.iter().find(|index| {
-                index.seekable()
-                    && index.key_id() == *key_id
-                    && (index.label_id == 0 || node.label_ids.contains(&index.label_id))
-            });
-            if let Some(index) = index {
-                let remaining: Vec<(String, Value)> = node
-                    .props
-                    .iter()
-                    .filter(|(_, key, _)| *key != *key_id)
-                    .map(|(name, _, value)| (name.clone(), value.clone()))
-                    .collect();
-                return Ok((
-                    node.anchor.clone(),
-                    Some(IndexSeek {
-                        index_id: index.id,
-                        key_id: *key_id,
-                        value: value.clone(),
-                    }),
-                    remaining,
-                ));
-            }
-        }
-        Ok((
-            node.anchor.clone(),
-            None,
+    ) -> Result<(Vec<String>, Option<IndexSeek>, Vec<(String, Value)>)> {
+        let residual = |skip: Option<u32>| -> Vec<(String, Value)> {
             node.props
                 .iter()
+                .filter(|(_, key, _)| Some(*key) != skip)
                 .map(|(name, _, value)| (name.clone(), value.clone()))
-                .collect(),
-        ))
+                .collect()
+        };
+        for (_, key_id, value) in &node.props {
+            if let Some(index_id) = self.seek_index(node, *key_id) {
+                // List lookups return a superset, so lists keep their check.
+                let consumed = (!matches!(value, Value::List(_))).then_some(*key_id);
+                let seek = IndexSeek {
+                    index_id,
+                    key_id: *key_id,
+                    value: Expr::Literal(value.clone()),
+                };
+                return Ok((node.scan_labels.clone(), Some(seek), residual(consumed)));
+            }
+        }
+        // Expression properties stay as runtime filters (`node_constraints`),
+        // which also re-check list supersets.
+        for (key, value) in &node.prop_exprs {
+            let key_id = self.db.property_key_id(key).unwrap_or(NO_KEY);
+            if let Some(index_id) = self.seek_index(node, key_id) {
+                let seek = IndexSeek {
+                    index_id,
+                    key_id,
+                    value: value.clone(),
+                };
+                return Ok((node.scan_labels.clone(), Some(seek), residual(None)));
+            }
+        }
+        Ok((node.scan_labels.clone(), None, residual(None)))
     }
 
     /// Lower a type expression for an expansion: positive disjunctions keep
@@ -1567,22 +1593,21 @@ impl<'a> Planner<'a> {
             }
             None => self.anon_name("node"),
         };
-        let mut label_ids = Vec::new();
-        let mut anchor = None;
-        if !pattern.labels.is_empty() {
-            for label in pattern.labels.guaranteed_labels() {
-                // A missing label yields an impossible id so the scan is empty
-                // but the variable is still bound.
-                label_ids.push(self.db.label_id(&label).unwrap_or(u32::MAX));
-            }
-            anchor = pattern.labels.guaranteed_labels().into_iter().next();
-        }
+        let mut scan_labels = pattern.labels.guaranteed_labels();
+        scan_labels.sort_unstable();
+        scan_labels.dedup();
+        // A missing label yields an impossible id so the scan is empty but
+        // the variable is still bound.
+        let label_ids = scan_labels
+            .iter()
+            .map(|label| self.db.label_id(label).unwrap_or(u32::MAX))
+            .collect();
         let (props, prop_exprs) = self.pattern_props(pattern.properties.as_ref(), "node", scope)?;
         Ok(PlannedNode {
             var,
             label_ids,
             labels: pattern.labels.clone(),
-            anchor,
+            scan_labels,
             props,
             prop_exprs,
         })
@@ -2364,11 +2389,147 @@ struct PlannedNode {
     label_ids: Vec<u32>,
     /// The pattern's label expression.
     labels: LabelExpr,
-    /// Label the scan can anchor on, if the expression guarantees one.
-    anchor: Option<String>,
+    /// Labels the expression guarantees, sorted and unique; a scan
+    /// intersects all of them.
+    scan_labels: Vec<String>,
     /// Literal properties as `(name, key id, value)`.
     props: Vec<(String, u32, Value)>,
     prop_exprs: Vec<(String, Expr)>,
+}
+
+/// Move `WHERE n.key = expr` conjuncts into the pattern as `{key: expr}`
+/// when `n` is a node this clause introduces and `expr` only reads variables
+/// bound before the clause, so the anchor scan can seek an index on them.
+///
+/// Inline properties and `WHERE` equality filter identically. Non-
+/// deterministic and pattern expressions stay in `WHERE` because a seek
+/// evaluates its value once per input row, not once per candidate.
+fn push_down_equalities<'a>(
+    clause: &'a MatchClause,
+    scope: &FastMap<String, VarKind>,
+) -> Cow<'a, MatchClause> {
+    let Some(predicate) = &clause.where_clause else {
+        return Cow::Borrowed(clause);
+    };
+    let mut conjuncts = Vec::new();
+    split_conjuncts(predicate, &mut conjuncts);
+    let mut pushed: Vec<(usize, String, String, Expr)> = Vec::new();
+    for (index, conjunct) in conjuncts.iter().enumerate() {
+        let Expr::Binary {
+            op: BinaryOp::Eq,
+            left,
+            right,
+        } = conjunct
+        else {
+            continue;
+        };
+        let candidate = [(left, right), (right, left)]
+            .into_iter()
+            .find_map(|(prop, other)| {
+                let Expr::Property { base, key } = prop.as_ref() else {
+                    return None;
+                };
+                let Expr::Variable(var) = base.as_ref() else {
+                    return None;
+                };
+                let target = (!scope.contains_key(var)).then(|| introduced_node(clause, var))??;
+                let has_key = matches!(&target.properties,
+                Some(Expr::Map(entries)) if entries.iter().any(|(name, _)| name == key));
+                let already_pushed = pushed.iter().any(|(_, v, k, _)| v == var && k == key);
+                (!has_key && !already_pushed && seekable_value(other, scope))
+                    .then(|| (var.clone(), key.clone(), other.as_ref().clone()))
+            });
+        if let Some((var, key, value)) = candidate {
+            pushed.push((index, var, key, value));
+        }
+    }
+    if pushed.is_empty() {
+        return Cow::Borrowed(clause);
+    }
+    let mut rewritten = clause.clone();
+    let consumed: Vec<usize> = pushed.iter().map(|(index, ..)| *index).collect();
+    for (_, var, key, value) in pushed {
+        let node = introduced_node_mut(&mut rewritten, &var)
+            .expect("pushed variables name a node of the clause");
+        match &mut node.properties {
+            Some(Expr::Map(entries)) => entries.push((key, value)),
+            properties => *properties = Some(Expr::Map(vec![(key, value)])),
+        }
+    }
+    rewritten.where_clause = conjuncts
+        .into_iter()
+        .enumerate()
+        .filter(|(index, _)| !consumed.contains(index))
+        .map(|(_, conjunct)| conjunct.clone())
+        .reduce(|left, right| Expr::Binary {
+            op: BinaryOp::And,
+            left: Box::new(left),
+            right: Box::new(right),
+        });
+    Cow::Owned(rewritten)
+}
+
+/// Flatten nested `AND`s into their operands.
+fn split_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            split_conjuncts(left, out);
+            split_conjuncts(right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+/// Whether `expr` can serve as an index seek value: it reads only bound
+/// variables, is deterministic and is not a null literal (which inline
+/// property maps ignore).
+fn seekable_value(expr: &Expr, scope: &FastMap<String, VarKind>) -> bool {
+    !matches!(expr, Expr::Literal(Value::Null))
+        && validate_expr(expr, scope).is_ok()
+        && !contains_function(expr, &["rand", "randomuuid"])
+        && !contains_aggregation(expr)
+        && !any_subexpr(expr, &mut |sub| {
+            matches!(
+                sub,
+                Expr::Pattern(_) | Expr::ExistsSubquery(_) | Expr::PatternComprehension { .. }
+            )
+        })
+}
+
+/// The first node pattern named `var` in a plain (non-shortest) path whose
+/// inline properties, if any, are a map literal.
+fn introduced_node<'a>(clause: &'a MatchClause, var: &str) -> Option<&'a NodePattern> {
+    plain_nodes(clause).find(|node| is_extendable_node(node, var))
+}
+
+fn introduced_node_mut<'a>(clause: &'a mut MatchClause, var: &str) -> Option<&'a mut NodePattern> {
+    clause
+        .patterns
+        .iter_mut()
+        .filter(|path| path.shortest == Shortest::Plain)
+        .flat_map(|path| {
+            std::iter::once(&mut path.start)
+                .chain(path.segments.iter_mut().map(|segment| &mut segment.node))
+        })
+        .find(|node| is_extendable_node(node, var))
+}
+
+fn plain_nodes(clause: &MatchClause) -> impl Iterator<Item = &NodePattern> {
+    clause
+        .patterns
+        .iter()
+        .filter(|path| path.shortest == Shortest::Plain)
+        .flat_map(|path| {
+            std::iter::once(&path.start).chain(path.segments.iter().map(|segment| &segment.node))
+        })
+}
+
+fn is_extendable_node(node: &NodePattern, var: &str) -> bool {
+    node.variable.as_deref() == Some(var) && matches!(node.properties, None | Some(Expr::Map(_)))
 }
 
 /// `expr = expr`, used to constrain expansions to pre-bound elements.
@@ -2445,15 +2606,14 @@ fn constrain_edge(plan: &mut Plan, edge_var: &str, rel_var: &str, edge_bound: bo
     };
 }
 
-/// Predicates for node constraints a scan did not apply. A scan enforces the
-/// anchor label alone, so only that exact single-label pattern is skipped;
-/// everything else is checked (cheap and always correct). Bound nodes need
-/// their label expression and literal properties checked as well.
+/// Predicates for node constraints a scan did not apply. A scan enforces its
+/// guaranteed labels, so a plain label conjunction is skipped; disjunctions
+/// and negations are checked. Bound nodes need their label expression and
+/// literal properties checked as well.
 fn node_constraints(node: &PlannedNode, scanned: bool) -> Option<Expr> {
     let mut predicates: Vec<Expr> = Vec::new();
     if !node.labels.is_empty() {
-        let enforced_by_scan = scanned
-            && matches!(&node.labels, LabelExpr::Label(label) if node.anchor.as_deref() == Some(label));
+        let enforced_by_scan = scanned && node.labels.plain_labels().is_some();
         if !enforced_by_scan {
             predicates.push(label_expr_filter(&node.var, &node.labels));
         }
@@ -2541,6 +2701,8 @@ struct ProcedureSpec {
     min_args: usize,
     /// Maximum accepted argument count.
     max_args: usize,
+    /// Output columns that hold nodes.
+    node_columns: &'static [&'static str],
 }
 
 /// Description of a supported built-in procedure.
@@ -2550,21 +2712,31 @@ fn procedure_spec(name: &str) -> Result<ProcedureSpec> {
             columns: &["label"],
             min_args: 0,
             max_args: 0,
+            node_columns: &[],
         }),
         "db.propertyKeys" => Ok(ProcedureSpec {
             columns: &["propertyKey"],
             min_args: 0,
             max_args: 0,
+            node_columns: &[],
         }),
         "db.relationshipTypes" => Ok(ProcedureSpec {
             columns: &["relationshipType"],
             min_args: 0,
             max_args: 0,
+            node_columns: &[],
         }),
         "db.awaitIndexes" => Ok(ProcedureSpec {
             columns: &[],
             min_args: 0,
             max_args: 1,
+            node_columns: &[],
+        }),
+        "db.index.fulltext.queryNodes" => Ok(ProcedureSpec {
+            columns: &["node", "score"],
+            min_args: 2,
+            max_args: 2,
+            node_columns: &["node"],
         }),
         _ => Err(Error::unsupported(format!(
             "procedure `{name}` is not supported"
@@ -4756,11 +4928,11 @@ mod tests {
         let Plan::Project { input, .. } = &prepared.plan else {
             panic!("expected Project, got {:?}", prepared.plan);
         };
-        let Plan::NodeScan { var, label, .. } = input.as_ref() else {
+        let Plan::NodeScan { var, labels, .. } = input.as_ref() else {
             panic!("expected NodeScan, got {input:?}");
         };
         assert_eq!(var, "n");
-        assert!(label.is_none());
+        assert!(labels.is_empty());
     }
 
     #[test]
@@ -4772,7 +4944,7 @@ mod tests {
         };
         let Plan::NodeScan {
             var,
-            label,
+            labels,
             seek,
             props,
             ..
@@ -4781,7 +4953,7 @@ mod tests {
             panic!("expected NodeScan, got {input:?}");
         };
         assert_eq!(var, "n");
-        assert_eq!(label.as_deref(), Some("Person"));
+        assert_eq!(labels, &["Person"]);
         assert!(seek.is_none());
         assert_eq!(props.len(), 1);
         assert_eq!(props[0].0, "name");
@@ -4802,19 +4974,84 @@ mod tests {
         };
         let seek = seek.as_ref().expect("seek");
         assert_eq!(seek.index_id, index_id);
-        assert_eq!(seek.value, Value::from("alice"));
+        assert_eq!(seek.value, Expr::Literal(Value::from("alice")));
         assert!(props.is_empty(), "the lookup consumes the literal");
     }
 
+    /// The seek of the first `NodeScan` binding `var` in a plan.
+    fn scan_seek(plan: &Plan, var: &str) -> Option<IndexSeek> {
+        let rendered = format!("{plan:?}");
+        assert!(rendered.contains("NodeScan"), "{rendered}");
+        fn walk(plan: &Plan, var: &str) -> Option<Option<IndexSeek>> {
+            if let Plan::NodeScan {
+                var: bound,
+                seek,
+                input,
+                ..
+            } = plan
+            {
+                if bound == var {
+                    return Some(seek.clone());
+                }
+                return walk(input, var);
+            }
+            match plan {
+                Plan::Project { input, .. }
+                | Plan::Filter { input, .. }
+                | Plan::Unwind { input, .. }
+                | Plan::Expand { input, .. } => walk(input, var),
+                _ => None,
+            }
+        }
+        walk(plan, var).expect("scan for variable")
+    }
+
     #[test]
-    fn index_seek_is_not_used_for_non_literal_properties() {
+    fn index_seek_uses_bound_expression_properties() {
         let mut db = test_db();
         db.write(|db| db.create_node_index("name", Some("Person"), false))
             .expect("index");
         let prepared = prepare(
             &mut db,
-            "WITH 'alice' AS s MATCH (n:Person {name: s}) RETURN n",
+            "UNWIND ['alice', 'bob'] AS s MATCH (n:Person {name: s}) RETURN n",
         );
+        let seek = scan_seek(&prepared.plan, "n").expect("seek");
+        assert_eq!(seek.value, Expr::Variable("s".to_owned()));
+    }
+
+    #[test]
+    fn where_equality_on_bound_value_is_pushed_into_the_seek() {
+        let mut db = test_db();
+        db.write(|db| db.create_node_index("name", Some("Person"), false))
+            .expect("index");
+        let prepared = prepare(
+            &mut db,
+            "UNWIND ['alice'] AS s MATCH (n:Person) WHERE s = n.name AND n.age > 3 RETURN n",
+        );
+        let seek = scan_seek(&prepared.plan, "n").expect("seek");
+        assert_eq!(seek.value, Expr::Variable("s".to_owned()));
+        let rendered = format!("{:?}", prepared.plan);
+        assert!(rendered.contains("key: \"age\""), "{rendered}");
+    }
+
+    #[test]
+    fn where_equality_on_same_clause_variable_is_not_pushed() {
+        let mut db = test_db();
+        db.write(|db| db.create_node_index("name", Some("Person"), false))
+            .expect("index");
+        let prepared = prepare(
+            &mut db,
+            "MATCH (m:Person), (n:Person) WHERE n.name = m.nick RETURN n",
+        );
+        assert!(text(&prepared).contains("seek=-"), "{}", text(&prepared));
+    }
+
+    #[test]
+    fn where_equality_with_rand_is_not_pushed() {
+        let mut db = test_db();
+        db.write(|db| db.create_node_index("name", Some("Person"), false))
+            .expect("index");
+        let prepared = prepare(&mut db, "MATCH (n:Person) WHERE n.name = rand() RETURN n");
         assert!(text(&prepared).contains("seek=-"), "{}", text(&prepared));
     }
 
@@ -4828,7 +5065,7 @@ mod tests {
         let Plan::Filter { input, .. } = input.as_ref() else {
             panic!("expected Filter, got {input:?}");
         };
-        assert!(matches!(input.as_ref(), Plan::NodeScan { label: None, .. }));
+        assert!(matches!(input.as_ref(), Plan::NodeScan { labels, .. } if labels.is_empty()));
     }
 
     #[test]

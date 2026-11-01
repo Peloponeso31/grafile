@@ -630,6 +630,44 @@ pub unsafe extern "C" fn grafile_meta_json(
     })
 }
 
+/// Verify the database's integrity and return the report as JSON: an object
+/// with `findings` (`{"kind", "message"}` objects), `suppressed` (per-kind
+/// counts beyond the stored findings) and `stats`. Findings are not an
+/// error: the call returns `GRAFILE_OK` and the caller inspects `findings`.
+///
+/// # Safety
+///
+/// Pointer arguments must be valid; `out_json` receives an allocated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn grafile_check_json(
+    db: *mut GrafileDb,
+    out_json: *mut *mut c_char,
+) -> c_int {
+    let Some(db_ref) = (unsafe { db.as_ref() }) else {
+        return GRAFILE_MISUSE;
+    };
+    let inner = &db_ref.inner;
+    guarded(Some(inner), || {
+        if out_json.is_null() {
+            return set_error(inner, GRAFILE_MISUSE, "out_json is NULL");
+        }
+        let mut conn = match inner.conn.lock() {
+            Ok(conn) => conn,
+            Err(_) => return set_error(inner, GRAFILE_INTERNAL, "connection mutex poisoned"),
+        };
+        match conn.database_mut().check_integrity() {
+            Ok(report) => {
+                if let Err(message) = unsafe { write_string(out_json, &report.to_json()) } {
+                    return set_error(inner, GRAFILE_MISUSE, &message);
+                }
+                clear_error(inner);
+                GRAFILE_OK
+            }
+            Err(err) => report(inner, &err),
+        }
+    })
+}
+
 /// Begin a write transaction.
 ///
 /// # Safety
@@ -1265,6 +1303,24 @@ mod tests {
             }
             unsafe { grafile_free(out as *mut c_void) };
         }
+    }
+
+    #[test]
+    fn check_json_reports_a_clean_database() {
+        let db = TestDb::new("check.db");
+        assert_eq!(db.exec("CREATE (:A)-[:R]->(:B)"), GRAFILE_OK);
+        let mut out: *mut c_char = std::ptr::null_mut();
+        assert_eq!(unsafe { grafile_check_json(db.db, &mut out) }, GRAFILE_OK);
+        let json = unsafe { CStr::from_ptr(out) }.to_str().expect("utf8");
+        let parsed: serde_json::Value = serde_json::from_str(json).expect("json");
+        assert_eq!(parsed["findings"], serde_json::json!([]));
+        assert_eq!(parsed["stats"]["nodes"], 2);
+        assert_eq!(parsed["stats"]["edges"], 1);
+        unsafe { grafile_free(out as *mut c_void) };
+        assert_eq!(
+            unsafe { grafile_check_json(db.db, std::ptr::null_mut()) },
+            GRAFILE_MISUSE
+        );
     }
 
     #[test]

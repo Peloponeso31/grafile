@@ -163,7 +163,9 @@ impl<'a> Parser<'a> {
                 .get(self.pos + 1)
                 .and_then(|spanned| self.source.get(spanned.start..spanned.end))
                 .is_some_and(|text| {
-                    text.eq_ignore_ascii_case("index") || text.eq_ignore_ascii_case("constraint")
+                    text.eq_ignore_ascii_case("index")
+                        || text.eq_ignore_ascii_case("constraint")
+                        || text.eq_ignore_ascii_case("fulltext")
                 })
         {
             let ddl = self.parse_create_ddl()?;
@@ -183,9 +185,43 @@ impl<'a> Parser<'a> {
             self.parse_create_index()
         } else if self.eat_ident_text("constraint") {
             self.parse_create_constraint()
+        } else if self.eat_ident_text("fulltext") {
+            self.expect_ident_text("index")?;
+            self.parse_create_fulltext_index()
         } else {
-            self.fail("expected INDEX or CONSTRAINT after CREATE")
+            self.fail("expected INDEX, FULLTEXT INDEX or CONSTRAINT after CREATE")
         }
+    }
+
+    /// `CREATE FULLTEXT INDEX name [IF NOT EXISTS] FOR (n:Label) ON EACH [n.a, ...]`
+    fn parse_create_fulltext_index(&mut self) -> Result<Statement> {
+        self.reject_missing_name("a fulltext index")?;
+        let name = self.parse_name()?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let (entity, var) = self.parse_ddl_entity()?;
+        if matches!(entity, DdlEntity::Edge { .. }) {
+            return Err(Error::unsupported(
+                "fulltext indexes on relationships are not supported",
+            ));
+        }
+        self.expect(Token::On, "ON after the pattern")?;
+        self.expect_ident_text("each")?;
+        self.expect(Token::LBracket, "'[' to open the property list")?;
+        let mut keys = Vec::new();
+        loop {
+            keys.push(self.parse_ddl_property(&var)?);
+            if !self.eat(Token::Comma) {
+                break;
+            }
+        }
+        self.expect(Token::RBracket, "']' to close the property list")?;
+        Ok(Statement::Ddl(DdlStatement::CreateIndex(DdlIndex {
+            name,
+            if_not_exists,
+            entity,
+            keys,
+            fulltext: true,
+        })))
     }
 
     fn parse_create_index(&mut self) -> Result<Statement> {
@@ -206,6 +242,7 @@ impl<'a> Parser<'a> {
             if_not_exists,
             entity,
             keys,
+            fulltext: false,
         })))
     }
 
@@ -324,7 +361,7 @@ impl<'a> Parser<'a> {
             .peek_ident_text()
             .is_some_and(|text| text.eq_ignore_ascii_case("for"))
         {
-            return Err(Error::syntax(format!("a {what} name is required")));
+            return Err(Error::syntax(format!("{what} name is required")));
         }
         Ok(())
     }
@@ -1957,6 +1994,29 @@ mod tests {
     }
 
     #[test]
+    fn parses_fulltext_index_ddl() {
+        let statement = parse_statement(
+            "CREATE FULLTEXT INDEX product_text IF NOT EXISTS FOR (n:Product) \
+             ON EACH [n.name, n.description];",
+        )
+        .expect("parse");
+        let Statement::Ddl(DdlStatement::CreateIndex(index)) = statement else {
+            panic!("expected CREATE FULLTEXT INDEX");
+        };
+        assert!(index.fulltext);
+        assert!(index.if_not_exists);
+        assert_eq!(index.name, "product_text");
+        assert_eq!(index.keys, vec!["name", "description"]);
+
+        let err = parse_statement("CREATE FULLTEXT INDEX t FOR ()-[r:R]-() ON EACH [r.text]")
+            .expect_err("relationship fulltext");
+        assert!(err.message().contains("relationships"), "{err}");
+        let err = parse_statement("CREATE FULLTEXT INDEX t FOR (n:P) ON EACH [m.text]")
+            .expect_err("wrong variable");
+        assert!(err.message().contains("must use `n`"), "{err}");
+    }
+
+    #[test]
     fn parses_ddl_statements() {
         let statement = parse_statement(
             "CREATE INDEX person_name IF NOT EXISTS FOR (n:Person) ON (n.name, n.age)",
@@ -2037,7 +2097,8 @@ mod tests {
         let err = parse_statement("SHOW INDEXES").expect_err("show");
         assert_eq!(err.code(), crate::error::ErrorCode::Unsupported);
         let err = parse_statement("CREATE INDEX FOR (n:Person) ON (n.name)").expect_err("name");
-        assert!(err.message().contains("name is required"), "{err}");
+        assert!(err.message().contains("an index name is required"), "{err}");
+        assert!(!err.message().contains("a an"), "{err}");
         let err = parse_statement("CREATE CONSTRAINT c FOR ()-[r:T]-() REQUIRE r.p IS NODE KEY")
             .expect_err("edge node key");
         assert!(err.message().contains("NODE KEY"), "{err}");
