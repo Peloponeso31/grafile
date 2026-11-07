@@ -547,7 +547,10 @@ fn run_dot_command(
             other => println!("unknown option `{other}`; usage: .meta [raw|human]"),
         },
         ".schema" => print_schema(conn),
-        ".indexes" => print_indexes(conn),
+        ".indexes" => {
+            run_query(conn, "SHOW INDEXES", settings)?;
+            run_query(conn, "SHOW CONSTRAINTS", settings)?;
+        }
         ".clear" | ".cls" => clear_screen(),
         ".read" => {
             let text = std::fs::read_to_string(argument)
@@ -1191,98 +1194,6 @@ fn print_schema(conn: &Connection) {
         "property keys: {}",
         join_or_dash(schema.property_keys.iter().map(String::as_str))
     );
-}
-
-fn print_indexes(conn: &Connection) {
-    let schema = conn.schema();
-    if schema.node_indexes.is_empty()
-        && schema.edge_indexes.is_empty()
-        && schema.node_constraints.is_empty()
-        && schema.edge_constraints.is_empty()
-        && schema.fulltext_indexes.is_empty()
-    {
-        println!("(no indexes)");
-        return;
-    }
-    for index in &schema.node_indexes {
-        let keys = index
-            .key_ids
-            .iter()
-            .map(|key_id| schema.property_key_name(*key_id).unwrap_or("?"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let label = if index.label_id == 0 {
-            "*".to_owned()
-        } else {
-            schema.label_name(index.label_id).unwrap_or("?").to_owned()
-        };
-        println!(
-            "node {:<8} {} on {label}({keys})",
-            index.kind_name(),
-            index.name.as_deref().unwrap_or("-"),
-        );
-    }
-    for index in &schema.fulltext_indexes {
-        let keys = index
-            .key_ids
-            .iter()
-            .map(|key_id| schema.property_key_name(*key_id).unwrap_or("?"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let label = schema.label_name(index.label_id).unwrap_or("?");
-        println!("node fulltext {} on {label}({keys})", index.name);
-    }
-    for index in &schema.edge_indexes {
-        let keys = index
-            .key_ids
-            .iter()
-            .map(|key_id| schema.property_key_name(*key_id).unwrap_or("?"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let edge_type = if index.type_id == 0 {
-            "*".to_owned()
-        } else {
-            schema
-                .edge_type_name(index.type_id)
-                .unwrap_or("?")
-                .to_owned()
-        };
-        println!(
-            "edge {:<8} {} on {edge_type}({keys})",
-            index.kind_name(),
-            index.name.as_deref().unwrap_or("-"),
-        );
-    }
-    for constraint in &schema.node_constraints {
-        let key = schema.property_key_name(constraint.key_id).unwrap_or("?");
-        let label = if constraint.label_id == 0 {
-            "*".to_owned()
-        } else {
-            schema
-                .label_name(constraint.label_id)
-                .unwrap_or("?")
-                .to_owned()
-        };
-        println!(
-            "node constraint {} on {label}({key}) not null",
-            constraint.name
-        );
-    }
-    for constraint in &schema.edge_constraints {
-        let key = schema.property_key_name(constraint.key_id).unwrap_or("?");
-        let edge_type = if constraint.type_id == 0 {
-            "*".to_owned()
-        } else {
-            schema
-                .edge_type_name(constraint.type_id)
-                .unwrap_or("?")
-                .to_owned()
-        };
-        println!(
-            "edge constraint {} on {edge_type}({key}) not null",
-            constraint.name
-        );
-    }
 }
 
 fn join_or_dash<'a>(items: impl Iterator<Item = &'a str>) -> String {

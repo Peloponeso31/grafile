@@ -2531,6 +2531,41 @@ impl<'a> Executor<'a> {
                 .map(|(node_id, score)| vec![Reg::Node(node_id), Reg::Value(Value::Float(score))])
                 .collect());
         }
+        match name {
+            "db.indexes" => return Ok(self.schema_object_rows(true)),
+            "db.constraints" => return Ok(self.schema_object_rows(false)),
+            "db.schema.nodeTypeProperties" => {
+                return Ok(self
+                    .db
+                    .node_type_properties()?
+                    .into_iter()
+                    .map(|row| {
+                        let node_type: String = row
+                            .type_names
+                            .iter()
+                            .map(|label| format!(":`{label}`"))
+                            .collect();
+                        let mut cells = vec![text_reg(&node_type), text_list_reg(&row.type_names)];
+                        cells.extend(property_cells(row));
+                        cells
+                    })
+                    .collect());
+            }
+            "db.schema.relTypeProperties" => {
+                return Ok(self
+                    .db
+                    .rel_type_properties()?
+                    .into_iter()
+                    .map(|row| {
+                        let rel_type = format!(":`{}`", row.type_names.concat());
+                        let mut cells = vec![text_reg(&rel_type)];
+                        cells.extend(property_cells(row));
+                        cells
+                    })
+                    .collect());
+            }
+            _ => {}
+        }
         let schema = self.db.schema();
         let mut values = Vec::new();
         let mut id = 1u32;
@@ -2554,6 +2589,43 @@ impl<'a> Executor<'a> {
             }
         }
         Ok(values.into_iter().map(|value| vec![value]).collect())
+    }
+
+    /// Rows of `db.indexes()` (`indexes`) or `db.constraints()`, in the
+    /// planner's `INDEX_COLUMNS` / `CONSTRAINT_COLUMNS` order.
+    fn schema_object_rows(&self, indexes: bool) -> Vec<Vec<Reg>> {
+        let schema = self.db.schema();
+        let objects = if indexes {
+            schema.index_objects()
+        } else {
+            schema.constraint_objects()
+        };
+        objects
+            .into_iter()
+            .map(|object| {
+                let mut cells = vec![
+                    Reg::Value(Value::Int(i64::from(object.id))),
+                    text_reg(&object.name),
+                ];
+                if indexes {
+                    cells.push(text_reg("ONLINE"));
+                }
+                cells.extend([
+                    text_reg(object.kind),
+                    text_reg(object.entity_type()),
+                    object
+                        .labels_or_types
+                        .as_deref()
+                        .map_or(Reg::Value(Value::Null), text_list_reg),
+                    text_list_reg(&object.properties),
+                    object
+                        .companion
+                        .as_deref()
+                        .map_or(Reg::Value(Value::Null), text_reg),
+                ]);
+                cells
+            })
+            .collect()
     }
 
     /// Finish a bounded or spilling sort cursor into a row cursor or merge.
@@ -4648,6 +4720,36 @@ fn float_map(args: &[Value], name: &str, f: impl FnOnce(f64) -> f64) -> Result<V
 
 /// Apply a string transformation, propagating nulls and rejecting other
 /// types.
+fn text_reg(text: &str) -> Reg {
+    Reg::Value(Value::Text(Arc::from(text)))
+}
+
+fn text_list_reg(items: &[String]) -> Reg {
+    Reg::Value(Value::List(
+        items
+            .iter()
+            .map(|item| Value::Text(Arc::from(item.as_str())))
+            .collect(),
+    ))
+}
+
+/// The `propertyName`, `propertyTypes` and `mandatory` cells of a schema
+/// properties row.
+fn property_cells(row: crate::engine::TypeProperty) -> [Reg; 3] {
+    let types = if row.property.is_some() {
+        text_list_reg(&row.types)
+    } else {
+        Reg::Value(Value::Null)
+    };
+    [
+        row.property
+            .as_deref()
+            .map_or(Reg::Value(Value::Null), text_reg),
+        types,
+        Reg::Value(Value::Bool(row.mandatory)),
+    ]
+}
+
 /// Which ends `trim`, `ltrim`, `rtrim` and `btrim` strip.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Trim {

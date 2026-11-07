@@ -27,7 +27,7 @@ fn missing_parameter_is_rejected() {
 #[test]
 fn ddl_is_rejected_where_unsupported() {
     let mut conn = connection();
-    let err = conn.execute("SHOW INDEXES").expect_err("show");
+    let err = conn.execute("SHOW FUNCTIONS").expect_err("show");
     assert_eq!(err.code(), grafile::ErrorCode::Unsupported);
     let err = conn
         .execute("CREATE INDEX ON :Person(name)")

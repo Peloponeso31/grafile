@@ -44,7 +44,11 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
   `floor`, `round`, `sqrt`, `exp`, `log`, `log10`, trigonometry,
   `degrees`/`radians`, `haversin`, `pi`, `e`, `rand`).
 - Built-in procedures: `db.labels()`, `db.propertyKeys()`,
-  `db.relationshipTypes()` and the `db.awaitIndexes([timeout])` no-op.
+  `db.relationshipTypes()`, `db.indexes()`, `db.constraints()`,
+  `db.schema.nodeTypeProperties()`, `db.schema.relTypeProperties()` and the
+  `db.awaitIndexes([timeout])` no-op; `CALL … YIELD … WHERE` filters the
+  yielded columns, and `SHOW [ALL] INDEXES|CONSTRAINTS [YIELD …] [WHERE …]`
+  calls the first two.
 - Temporal and spatial values: `date`, `localtime`, `time`, `localdatetime`,
   `datetime` (fixed offsets and IANA zones), `duration` and `point`, built
   from strings, component maps or other temporal values; ISO 8601
@@ -207,8 +211,8 @@ Not delivered: pattern comprehensions nested inside list comprehensions
     `REQUIRE (n.a, n.b) IS NODE KEY` (existence plus tuple uniqueness over
     composite index keys). Composite indexes stay non-seekable initially.
   - Reject the Neo4j 3.x forms (`CREATE INDEX ON :L(p)`, `… ASSERT …`) with a
-    message pointing at the modern syntax; `SHOW INDEXES`/`SHOW CONSTRAINTS`
-    remain unsupported.
+    message pointing at the modern syntax. `SHOW INDEXES`/`SHOW CONSTRAINTS`
+    came later, as calls of `db.indexes()`/`db.constraints()`.
   - Storage: index definitions gained a name, key list and kind. The catalog
     format minor is 3: named objects use new catalog entry kinds and
     `IS NOT NULL` constraints take entries of their own, so builds from
@@ -272,8 +276,8 @@ gate.
 
 The TCK does not exercise this surface; unit and integration tests are the
 gate, and the report must not regress. Non-goals: Lucene query syntax, a
-general user-procedure registry (TCK non-goal), `SHOW INDEXES`/`SHOW
-CONSTRAINTS`, and `CALL {} IN TRANSACTIONS` inside explicit transactions.
+general user-procedure registry (TCK non-goal), and `CALL {} IN
+TRANSACTIONS` inside explicit transactions.
 
 ### Phase 7 — Data integrity verification (medium) [done]
 
@@ -470,6 +474,8 @@ comprehension.
 - User-defined procedures and functions beyond built-ins.
 - Remote `LOAD CSV` over HTTP (local files first; revisit on demand).
 - GQL-only syntax beyond what openCypher 9 specifies.
+- `db.schema.visualization()`: it returns virtual nodes and relationships,
+  and grafile values can only reference stored entities.
 - The Phase 8 items declined for lack of a workload: a columnar pipeline,
   pager-parallel scans, bitmap OR/XOR/rank/select, batched expansion and
   group commits. A workload that needs one reopens it with a benchmark.
@@ -506,12 +512,6 @@ Syntax:
 - `trim(BOTH 'x' FROM s)`, the `||` string operator and `x IS :: TYPE`
   type predicates.
 - `REMOVE n = {}`.
-
-Introspection:
-
-- `SHOW INDEXES` and `SHOW CONSTRAINTS` returning rows (the data already
-  backs `.indexes`).
-- `db.schema.visualization()` and `db.schema.nodeTypeProperties()`.
 
 Errors:
 

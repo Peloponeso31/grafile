@@ -97,15 +97,6 @@ impl NodeIndexDef {
     pub fn seekable(&self) -> bool {
         self.key_ids.len() == 1
     }
-
-    /// Human-readable kind for introspection.
-    pub fn kind_name(&self) -> &'static str {
-        match self.kind {
-            IndexKind::Index => "index",
-            IndexKind::Unique => "unique",
-            IndexKind::NodeKey => "node key",
-        }
-    }
 }
 
 /// Definition of a property index over edges.
@@ -139,15 +130,6 @@ impl EdgeIndexDef {
     /// Whether the index can serve property seeks (single-key only).
     pub fn seekable(&self) -> bool {
         self.key_ids.len() == 1
-    }
-
-    /// Human-readable kind for introspection.
-    pub fn kind_name(&self) -> &'static str {
-        match self.kind {
-            IndexKind::Index => "index",
-            IndexKind::Unique => "unique",
-            IndexKind::NodeKey => "node key",
-        }
     }
 }
 
@@ -254,6 +236,181 @@ impl Schema {
             .iter()
             .filter(move |index| index.key_ids.contains(&key_id))
     }
+
+    /// Every index, as `SHOW INDEXES` reports them, ordered by name.
+    pub fn index_objects(&self) -> Vec<SchemaObject> {
+        let node = self.node_indexes.iter().map(|index| {
+            let name = index_name(index.id, index.name.as_deref());
+            self.object(
+                index.id,
+                &name,
+                "RANGE",
+                Target::Label(index.label_id),
+                &index.key_ids,
+            )
+            .with_companion((index.kind != IndexKind::Index).then(|| name.clone()))
+        });
+        let edge = self.edge_indexes.iter().map(|index| {
+            let name = index_name(index.id, index.name.as_deref());
+            self.object(
+                index.id,
+                &name,
+                "RANGE",
+                Target::Type(index.type_id),
+                &index.key_ids,
+            )
+            .with_companion((index.kind != IndexKind::Index).then(|| name.clone()))
+        });
+        let fulltext = self.fulltext_indexes.iter().map(|index| {
+            self.object(
+                index.id,
+                &index.name,
+                "FULLTEXT",
+                Target::Label(index.label_id),
+                &index.key_ids,
+            )
+        });
+        sorted_by_name(node.chain(edge).chain(fulltext).collect())
+    }
+
+    /// Every constraint, as `SHOW CONSTRAINTS` reports them, ordered by
+    /// name. Uniqueness and node key constraints own the index of the same
+    /// name.
+    pub fn constraint_objects(&self) -> Vec<SchemaObject> {
+        let node = self
+            .node_indexes
+            .iter()
+            .filter(|index| index.kind != IndexKind::Index)
+            .map(|index| {
+                let name = index_name(index.id, index.name.as_deref());
+                let kind = match index.kind {
+                    IndexKind::NodeKey => "NODE_KEY",
+                    IndexKind::Index | IndexKind::Unique => "NODE_PROPERTY_UNIQUENESS",
+                };
+                self.object(
+                    index.id,
+                    &name,
+                    kind,
+                    Target::Label(index.label_id),
+                    &index.key_ids,
+                )
+                .with_companion(Some(name.clone()))
+            });
+        let edge = self
+            .edge_indexes
+            .iter()
+            .filter(|index| index.kind != IndexKind::Index)
+            .map(|index| {
+                let name = index_name(index.id, index.name.as_deref());
+                let kind = "RELATIONSHIP_PROPERTY_UNIQUENESS";
+                self.object(
+                    index.id,
+                    &name,
+                    kind,
+                    Target::Type(index.type_id),
+                    &index.key_ids,
+                )
+                .with_companion(Some(name.clone()))
+            });
+        let node_existence = self.node_constraints.iter().map(|constraint| {
+            let kind = "NODE_PROPERTY_EXISTENCE";
+            let keys = [constraint.key_id];
+            let target = Target::Label(constraint.label_id);
+            self.object(constraint.id, &constraint.name, kind, target, &keys)
+        });
+        let edge_existence = self.edge_constraints.iter().map(|constraint| {
+            let kind = "RELATIONSHIP_PROPERTY_EXISTENCE";
+            let keys = [constraint.key_id];
+            let target = Target::Type(constraint.type_id);
+            self.object(constraint.id, &constraint.name, kind, target, &keys)
+        });
+        sorted_by_name(
+            node.chain(edge)
+                .chain(node_existence)
+                .chain(edge_existence)
+                .collect(),
+        )
+    }
+
+    /// Resolve ids into a [`SchemaObject`] without a companion.
+    fn object(
+        &self,
+        id: u32,
+        name: &str,
+        kind: &'static str,
+        target: Target,
+        key_ids: &[u32],
+    ) -> SchemaObject {
+        let (relationship, target_id, target_name) = match target {
+            Target::Label(id) => (false, id, self.label_name(id)),
+            Target::Type(id) => (true, id, self.edge_type_name(id)),
+        };
+        SchemaObject {
+            id,
+            name: name.to_owned(),
+            kind,
+            relationship,
+            labels_or_types: (target_id != 0).then(|| vec![target_name.unwrap_or("?").to_owned()]),
+            properties: key_ids
+                .iter()
+                .map(|key_id| self.property_key_name(*key_id).unwrap_or("?").to_owned())
+                .collect(),
+            companion: None,
+        }
+    }
+}
+
+/// An index or constraint as `SHOW INDEXES` / `SHOW CONSTRAINTS` describe it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaObject {
+    /// Catalog entry id.
+    pub id: u32,
+    /// Name (`index_<id>` for anonymous legacy indexes).
+    pub name: String,
+    /// `RANGE` or `FULLTEXT` for indexes; the Neo4j constraint type
+    /// (`NODE_PROPERTY_UNIQUENESS`, `NODE_KEY`, ...) for constraints.
+    pub kind: &'static str,
+    /// Whether it covers relationships rather than nodes.
+    pub relationship: bool,
+    /// The label or relationship type, or `None` when it covers all.
+    pub labels_or_types: Option<Vec<String>>,
+    /// Property keys, in key order.
+    pub properties: Vec<String>,
+    /// The constraint an index backs, or the index a constraint owns.
+    pub companion: Option<String>,
+}
+
+impl SchemaObject {
+    fn with_companion(mut self, companion: Option<String>) -> Self {
+        self.companion = companion;
+        self
+    }
+
+    /// `NODE` or `RELATIONSHIP`.
+    pub fn entity_type(&self) -> &'static str {
+        if self.relationship {
+            "RELATIONSHIP"
+        } else {
+            "NODE"
+        }
+    }
+}
+
+/// What a schema object covers: a label or relationship type id (0 for
+/// every node or relationship).
+#[derive(Debug, Clone, Copy)]
+enum Target {
+    Label(u32),
+    Type(u32),
+}
+
+fn index_name(id: u32, name: Option<&str>) -> String {
+    name.map_or_else(|| format!("index_{id}"), str::to_owned)
+}
+
+fn sorted_by_name(mut objects: Vec<SchemaObject>) -> Vec<SchemaObject> {
+    objects.sort_by(|a, b| a.name.cmp(&b.name));
+    objects
 }
 
 /// The catalog: a B+tree of schema entries plus the decoded schema.

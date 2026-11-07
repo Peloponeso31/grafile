@@ -106,6 +106,12 @@ impl CypherType {
         Self::new(vec![base], false)
     }
 
+    /// The same union with null admitted (spelled without `NOT NULL`).
+    pub fn nullable(mut self) -> Self {
+        self.nullable = true;
+        self
+    }
+
     /// Whether `value` belongs to this type (`value IS :: self`).
     pub fn accepts(&self, value: &Value) -> bool {
         if value.is_null() {

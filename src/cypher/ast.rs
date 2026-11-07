@@ -512,6 +512,8 @@ pub enum Clause {
         args: Vec<Expr>,
         /// Yielded columns with optional aliases.
         yields: Vec<(String, Option<String>)>,
+        /// `WHERE` after `YIELD`, over the yielded columns.
+        where_clause: Option<Expr>,
     },
     /// `CALL { ... }` or `CALL (x, y) { ... }` subquery.
     CallSubquery {

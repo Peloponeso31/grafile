@@ -149,9 +149,20 @@ impl<'a> Parser<'a> {
     fn parse_statement(&mut self) -> Result<Statement> {
         if let Some(text) = self.peek_ident_text() {
             if text.eq_ignore_ascii_case("show") {
-                return Err(Error::unsupported(
-                    "SHOW statements are not supported (only CREATE/DROP INDEX and CONSTRAINT)",
-                ));
+                let mut clauses = vec![self.parse_show()?];
+                if !matches!(self.peek(), None | Some(Token::Semicolon)) {
+                    clauses.extend(self.parse_clauses()?);
+                }
+                self.eat(Token::Semicolon);
+                if self.peek().is_some() {
+                    return self.fail("unexpected input after the SHOW statement");
+                }
+                return Ok(Statement::Query(Query {
+                    parts: vec![QueryPart {
+                        union_all: false,
+                        clauses,
+                    }],
+                }));
             }
             if text.eq_ignore_ascii_case("drop") {
                 return self.parse_drop();
@@ -177,6 +188,42 @@ impl<'a> Parser<'a> {
         }
         let query = self.parse_query()?;
         Ok(Statement::Query(query))
+    }
+
+    /// `SHOW [ALL] INDEX[ES] | SHOW [ALL] CONSTRAINT[S]` with an optional
+    /// `YIELD columns | YIELD *` and `WHERE`: a call of `db.indexes()` or
+    /// `db.constraints()`, so any clauses may follow.
+    fn parse_show(&mut self) -> Result<Clause> {
+        self.expect_ident_text("show")?;
+        self.eat(Token::All);
+        let procedure = if self.eat_ident_text("index") || self.eat_ident_text("indexes") {
+            "db.indexes"
+        } else if self.eat_ident_text("constraint") || self.eat_ident_text("constraints") {
+            "db.constraints"
+        } else if let Some(kind) = self.peek_ident_text() {
+            return Err(Error::unsupported(format!(
+                "SHOW {kind} is not supported; use SHOW INDEXES or SHOW CONSTRAINTS \
+                 with WHERE type = ..."
+            )));
+        } else {
+            return self.fail("expected INDEXES or CONSTRAINTS after SHOW");
+        };
+        let yields = if self.eat(Token::Yield) && !self.eat(Token::Star) {
+            self.parse_yield_items()?
+        } else {
+            Vec::new()
+        };
+        let where_clause = if self.eat(Token::Where) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Clause::Call {
+            procedure: procedure.to_owned(),
+            args: Vec::new(),
+            yields,
+            where_clause,
+        })
     }
 
     fn parse_create_ddl(&mut self) -> Result<Statement> {
@@ -890,26 +937,40 @@ impl<'a> Parser<'a> {
             args = self.parse_expr_list()?;
         }
         self.expect(Token::RParen, "')' to close the procedure call")?;
-        let mut yields = Vec::new();
-        if self.eat(Token::Yield) {
-            loop {
-                let column = self.parse_name()?;
-                let alias = if self.eat(Token::As) {
-                    Some(self.parse_name()?)
-                } else {
-                    None
-                };
-                yields.push((column, alias));
-                if !self.eat(Token::Comma) {
-                    break;
-                }
-            }
-        }
+        let yields = if self.eat(Token::Yield) {
+            self.parse_yield_items()?
+        } else {
+            Vec::new()
+        };
+        let where_clause = if !yields.is_empty() && self.eat(Token::Where) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
         Ok(Clause::Call {
             procedure,
             args,
             yields,
+            where_clause,
         })
+    }
+
+    /// `column [AS alias], ...` after `YIELD`.
+    fn parse_yield_items(&mut self) -> Result<Vec<(String, Option<String>)>> {
+        let mut yields = Vec::new();
+        loop {
+            let column = self.parse_name()?;
+            let alias = if self.eat(Token::As) {
+                Some(self.parse_name()?)
+            } else {
+                None
+            };
+            yields.push((column, alias));
+            if !self.eat(Token::Comma) {
+                break;
+            }
+        }
+        Ok(yields)
     }
 
     /// Parse the body of a `CALL { ... }` subquery and its optional
@@ -2094,7 +2155,7 @@ mod tests {
         let err = parse_statement("CREATE CONSTRAINT ON (n:Person) ASSERT n.name IS UNIQUE")
             .expect_err("old form");
         assert!(err.message().contains("REQUIRE"), "{err}");
-        let err = parse_statement("SHOW INDEXES").expect_err("show");
+        let err = parse_statement("SHOW FUNCTIONS").expect_err("show");
         assert_eq!(err.code(), crate::error::ErrorCode::Unsupported);
         let err = parse_statement("CREATE INDEX FOR (n:Person) ON (n.name)").expect_err("name");
         assert!(err.message().contains("an index name is required"), "{err}");

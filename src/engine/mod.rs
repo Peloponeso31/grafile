@@ -10,6 +10,7 @@ mod integrity;
 #[cfg(test)]
 mod model_tests;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -29,6 +30,7 @@ use crate::fulltext::{
 };
 use crate::matrix::{ANY_TYPE, Direction, FragmentKey, FragmentStore};
 use crate::pager::{DatabaseHeader, Pager};
+use crate::record::types::CypherType;
 use crate::record::{EdgeRecord, NodeRecord, Value, encode_index_key};
 use crate::vfs::{OpenMode, Vfs};
 
@@ -1812,6 +1814,65 @@ impl Database {
         Ok(ids)
     }
 
+    /// Property statistics per label set, for
+    /// `db.schema.nodeTypeProperties()`: one scan of the node table.
+    ///
+    /// # Errors
+    ///
+    /// Propagates storage and record decoding errors.
+    pub fn node_type_properties(&mut self) -> Result<Vec<TypeProperty>> {
+        let mut groups: BTreeMap<Vec<u32>, PropertyStats> = BTreeMap::new();
+        let mut cursor = self.nodes.cursor();
+        let mut ok = cursor.first(&mut self.pager)?;
+        while ok {
+            let record = NodeRecord::decode(&cursor.value(&mut self.pager)?)?;
+            groups
+                .entry(record.labels)
+                .or_default()
+                .observe(&record.props);
+            ok = cursor.next(&mut self.pager)?;
+        }
+        let schema = self.schema();
+        Ok(groups
+            .into_iter()
+            .flat_map(|(labels, stats)| {
+                let names = labels
+                    .iter()
+                    .map(|label| schema.label_name(*label).unwrap_or("?").to_owned())
+                    .collect();
+                stats.rows(names, schema)
+            })
+            .collect())
+    }
+
+    /// Property statistics per relationship type, for
+    /// `db.schema.relTypeProperties()`: one scan of the edge table.
+    ///
+    /// # Errors
+    ///
+    /// Propagates storage and record decoding errors.
+    pub fn rel_type_properties(&mut self) -> Result<Vec<TypeProperty>> {
+        let mut groups: BTreeMap<u32, PropertyStats> = BTreeMap::new();
+        let mut cursor = self.edges.cursor();
+        let mut ok = cursor.first(&mut self.pager)?;
+        while ok {
+            let record = EdgeRecord::decode(&cursor.value(&mut self.pager)?)?;
+            groups
+                .entry(record.edge_type)
+                .or_default()
+                .observe(&record.props);
+            ok = cursor.next(&mut self.pager)?;
+        }
+        let schema = self.schema();
+        Ok(groups
+            .into_iter()
+            .flat_map(|(edge_type, stats)| {
+                let name = schema.edge_type_name(edge_type).unwrap_or("?").to_owned();
+                stats.rows(vec![name], schema)
+            })
+            .collect())
+    }
+
     /// All edge ids in ascending order.
     pub fn all_edge_ids(&mut self) -> Result<Vec<u64>> {
         let mut cursor = self.edges.cursor();
@@ -2489,6 +2550,60 @@ fn table_key_id(key: &[u8], what: &str) -> Result<u64> {
         .try_into()
         .map_err(|_| Error::corrupt(format!("{what} key is not 8 bytes")))?;
     Ok(u64::from_be_bytes(bytes))
+}
+
+/// One row of `db.schema.nodeTypeProperties()` or `relTypeProperties()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeProperty {
+    /// Sorted label names, or the relationship type name.
+    pub type_names: Vec<String>,
+    /// The property, or `None` for a label set or type without properties.
+    pub property: Option<String>,
+    /// Types the property's values have (`STRING`, `LIST<INTEGER>`, ...).
+    pub types: Vec<String>,
+    /// Whether every node or relationship of the group has the property.
+    pub mandatory: bool,
+}
+
+/// Running property statistics for one label set or relationship type.
+#[derive(Debug, Default)]
+struct PropertyStats {
+    entities: u64,
+    /// Key id to (entities with the key, the value types seen).
+    keys: BTreeMap<u32, (u64, std::collections::BTreeSet<String>)>,
+}
+
+impl PropertyStats {
+    fn observe(&mut self, props: &[(u32, Value)]) {
+        self.entities += 1;
+        for (key_id, value) in props {
+            let (count, types) = self.keys.entry(*key_id).or_default();
+            *count += 1;
+            // Stored values are never null, so the nullable spelling drops
+            // the redundant `NOT NULL` (`mandatory` says it instead).
+            types.insert(CypherType::of(value).nullable().to_string());
+        }
+    }
+
+    fn rows(self, type_names: Vec<String>, schema: &Schema) -> Vec<TypeProperty> {
+        if self.keys.is_empty() {
+            return vec![TypeProperty {
+                type_names,
+                property: None,
+                types: Vec::new(),
+                mandatory: false,
+            }];
+        }
+        self.keys
+            .into_iter()
+            .map(|(key_id, (count, types))| TypeProperty {
+                type_names: type_names.clone(),
+                property: Some(schema.property_key_name(key_id).unwrap_or("?").to_owned()),
+                types: types.into_iter().collect(),
+                mandatory: count == self.entities,
+            })
+            .collect()
+    }
 }
 
 /// Index entries gathered for a bulk build: one flat byte buffer plus the

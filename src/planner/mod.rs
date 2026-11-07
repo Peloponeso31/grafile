@@ -195,6 +195,7 @@ impl<'a> Planner<'a> {
                     procedure,
                     args,
                     yields,
+                    where_clause,
                 } => {
                     let spec = procedure_spec(procedure)?;
                     if args.len() < spec.min_args || args.len() > spec.max_args {
@@ -243,6 +244,21 @@ impl<'a> Planner<'a> {
                         columns: outputs,
                         yields: yields.clone(),
                     };
+                    if let Some(predicate) = where_clause {
+                        let mut predicate = predicate.clone();
+                        self.extract_patterns(
+                            &mut predicate,
+                            &mut plan,
+                            &mut scope,
+                            PatternContext::Predicate,
+                        )?;
+                        validate_expr(&predicate, &scope)?;
+                        check_predicate_kind(&predicate, &scope)?;
+                        plan = Plan::Filter {
+                            input: Box::new(plan),
+                            predicate,
+                        };
+                    }
                     columns.clear();
                     columns.extend(yields.iter().map(|(_, alias)| alias.clone()));
                 }
@@ -382,6 +398,19 @@ impl<'a> Planner<'a> {
                     self.pattern_rels.clear();
                 }
             }
+        }
+        // A trailing `CALL ... YIELD a, b` returns only the yielded columns,
+        // not every procedure column the row window holds.
+        if let Some(Clause::Call { yields, .. }) = clauses.last()
+            && !yields.is_empty()
+        {
+            plan = Plan::Project {
+                input: Box::new(plan),
+                items: columns
+                    .iter()
+                    .map(|name| (Expr::Variable(name.clone()), name.clone()))
+                    .collect(),
+            };
         }
         Ok(PlannedPart {
             plan,
@@ -2705,43 +2734,92 @@ struct ProcedureSpec {
     node_columns: &'static [&'static str],
 }
 
-/// Description of a supported built-in procedure.
-fn procedure_spec(name: &str) -> Result<ProcedureSpec> {
-    match name {
-        "db.labels" => Ok(ProcedureSpec {
-            columns: &["label"],
-            min_args: 0,
-            max_args: 0,
-            node_columns: &[],
-        }),
-        "db.propertyKeys" => Ok(ProcedureSpec {
-            columns: &["propertyKey"],
-            min_args: 0,
-            max_args: 0,
-            node_columns: &[],
-        }),
-        "db.relationshipTypes" => Ok(ProcedureSpec {
-            columns: &["relationshipType"],
-            min_args: 0,
-            max_args: 0,
-            node_columns: &[],
-        }),
-        "db.awaitIndexes" => Ok(ProcedureSpec {
+/// Columns of `db.indexes()`, the procedure behind `SHOW INDEXES`.
+const INDEX_COLUMNS: &[&str] = &[
+    "id",
+    "name",
+    "state",
+    "type",
+    "entityType",
+    "labelsOrTypes",
+    "properties",
+    "owningConstraint",
+];
+
+/// Columns of `db.constraints()`, the procedure behind `SHOW CONSTRAINTS`.
+const CONSTRAINT_COLUMNS: &[&str] = &[
+    "id",
+    "name",
+    "type",
+    "entityType",
+    "labelsOrTypes",
+    "properties",
+    "ownedIndex",
+];
+
+/// A procedure without arguments that yields plain values.
+const fn listing(columns: &'static [&'static str]) -> ProcedureSpec {
+    ProcedureSpec {
+        columns,
+        min_args: 0,
+        max_args: 0,
+        node_columns: &[],
+    }
+}
+
+/// Every built-in procedure by its exact (case-sensitive) name.
+const PROCEDURES: &[(&str, ProcedureSpec)] = &[
+    ("db.labels", listing(&["label"])),
+    ("db.propertyKeys", listing(&["propertyKey"])),
+    ("db.relationshipTypes", listing(&["relationshipType"])),
+    ("db.indexes", listing(INDEX_COLUMNS)),
+    ("db.constraints", listing(CONSTRAINT_COLUMNS)),
+    (
+        "db.schema.nodeTypeProperties",
+        listing(&[
+            "nodeType",
+            "nodeLabels",
+            "propertyName",
+            "propertyTypes",
+            "mandatory",
+        ]),
+    ),
+    (
+        "db.schema.relTypeProperties",
+        listing(&["relType", "propertyName", "propertyTypes", "mandatory"]),
+    ),
+    (
+        "db.awaitIndexes",
+        ProcedureSpec {
             columns: &[],
             min_args: 0,
             max_args: 1,
             node_columns: &[],
-        }),
-        "db.index.fulltext.queryNodes" => Ok(ProcedureSpec {
+        },
+    ),
+    (
+        "db.index.fulltext.queryNodes",
+        ProcedureSpec {
             columns: &["node", "score"],
             min_args: 2,
             max_args: 2,
             node_columns: &["node"],
-        }),
-        _ => Err(Error::unsupported(format!(
-            "procedure `{name}` is not supported"
-        ))),
-    }
+        },
+    ),
+];
+
+/// Names of every built-in procedure, for completion and suggestions.
+pub fn procedure_names() -> impl Iterator<Item = &'static str> {
+    PROCEDURES.iter().map(|(name, _)| *name)
+}
+
+/// Description of a supported built-in procedure.
+fn procedure_spec(name: &str) -> Result<&'static ProcedureSpec> {
+    PROCEDURES
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, spec)| spec)
+        .ok_or_else(|| Error::unsupported(format!("procedure `{name}` is not supported")))
 }
 
 /// Human-readable argument count for an arity error.
@@ -4642,9 +4720,14 @@ fn substitute_clause(clause: &mut Clause, params: &HashMap<String, Value>) -> Re
             }
             Ok(())
         }
-        Clause::Call { args, .. } => {
+        Clause::Call {
+            args, where_clause, ..
+        } => {
             for arg in args.iter_mut() {
                 substitute_expr(arg, params)?;
+            }
+            if let Some(predicate) = where_clause {
+                substitute_expr(predicate, params)?;
             }
             Ok(())
         }
