@@ -18,6 +18,7 @@ use crate::engine::Database;
 use crate::error::{Error, ErrorCode, Result};
 use crate::matrix::Direction;
 use crate::planner::plan::AggFn;
+use crate::record::types::CypherType;
 use crate::record::{Value, value_equals};
 use crate::temporal::between;
 use crate::temporal::civil::Date;
@@ -826,6 +827,157 @@ pub mod func {
     pub const DURATION_IN_SECONDS: u8 = 72;
     /// `randomUUID()`
     pub const RANDOM_UUID: u8 = 73;
+    /// `toStringOrNull(x)`
+    pub const TO_STRING_OR_NULL: u8 = 74;
+    /// `toIntegerOrNull(x)`
+    pub const TO_INTEGER_OR_NULL: u8 = 75;
+    /// `toFloatOrNull(x)`
+    pub const TO_FLOAT_OR_NULL: u8 = 76;
+    /// `toBooleanOrNull(x)`
+    pub const TO_BOOLEAN_OR_NULL: u8 = 77;
+    /// `toStringList(list)`
+    pub const TO_STRING_LIST: u8 = 78;
+    /// `toIntegerList(list)`
+    pub const TO_INTEGER_LIST: u8 = 79;
+    /// `toFloatList(list)`
+    pub const TO_FLOAT_LIST: u8 = 80;
+    /// `toBooleanList(list)`
+    pub const TO_BOOLEAN_LIST: u8 = 81;
+    /// `isEmpty(string|list|map)`
+    pub const IS_EMPTY: u8 = 82;
+    /// `isNaN(number)`
+    pub const IS_NAN: u8 = 83;
+    /// `nullIf(value, other)`
+    pub const NULL_IF: u8 = 84;
+    /// `valueType(x)`
+    pub const VALUE_TYPE: u8 = 85;
+    /// `btrim(string [, characters])`
+    pub const BTRIM: u8 = 86;
+    /// `elementId(entity)`
+    pub const ELEMENT_ID: u8 = 87;
+
+    /// Every scalar function by its canonical name. Lookups ignore ASCII
+    /// case; aliases share a code, and the clock variants of the temporal
+    /// constructors (`date.statement()`) evaluate like the constructors
+    /// because the statement time is fixed per statement.
+    pub const FUNCTIONS: &[(&str, u8)] = &[
+        ("id", ID),
+        ("elementId", ELEMENT_ID),
+        ("labels", LABELS),
+        ("type", TYPE),
+        ("startNode", START_NODE),
+        ("endNode", END_NODE),
+        ("coalesce", COALESCE),
+        ("nullIf", NULL_IF),
+        ("valueType", VALUE_TYPE),
+        ("toString", TO_STRING),
+        ("toInteger", TO_INTEGER),
+        ("toFloat", TO_FLOAT),
+        ("toBoolean", TO_BOOLEAN),
+        ("toStringOrNull", TO_STRING_OR_NULL),
+        ("toIntegerOrNull", TO_INTEGER_OR_NULL),
+        ("toFloatOrNull", TO_FLOAT_OR_NULL),
+        ("toBooleanOrNull", TO_BOOLEAN_OR_NULL),
+        ("toStringList", TO_STRING_LIST),
+        ("toIntegerList", TO_INTEGER_LIST),
+        ("toFloatList", TO_FLOAT_LIST),
+        ("toBooleanList", TO_BOOLEAN_LIST),
+        ("size", SIZE),
+        ("char_length", SIZE),
+        ("character_length", SIZE),
+        ("isEmpty", IS_EMPTY),
+        ("isNaN", IS_NAN),
+        ("properties", PROPERTIES),
+        ("keys", KEYS),
+        ("nodes", NODES),
+        ("relationships", RELATIONSHIPS),
+        ("length", LENGTH),
+        ("range", RANGE),
+        ("head", HEAD),
+        ("last", LAST),
+        ("tail", TAIL),
+        ("reverse", REVERSE),
+        ("split", SPLIT),
+        ("substring", SUBSTRING),
+        ("rand", RAND),
+        ("randomUUID", RANDOM_UUID),
+        ("toUpper", TO_UPPER),
+        ("upper", TO_UPPER),
+        ("toLower", TO_LOWER),
+        ("lower", TO_LOWER),
+        ("trim", TRIM),
+        ("btrim", BTRIM),
+        ("ltrim", LTRIM),
+        ("rtrim", RTRIM),
+        ("left", LEFT),
+        ("right", RIGHT),
+        ("replace", REPLACE),
+        ("abs", ABS),
+        ("ceil", CEIL),
+        ("floor", FLOOR),
+        ("round", ROUND),
+        ("sign", SIGN),
+        ("sqrt", SQRT),
+        ("exp", EXP),
+        ("log", LOG),
+        ("log10", LOG10),
+        ("sin", SIN),
+        ("cos", COS),
+        ("tan", TAN),
+        ("cot", COT),
+        ("asin", ASIN),
+        ("acos", ACOS),
+        ("atan", ATAN),
+        ("atan2", ATAN2),
+        ("degrees", DEGREES),
+        ("radians", RADIANS),
+        ("haversin", HAVERSIN),
+        ("pi", PI),
+        ("e", E),
+        ("date", DATE),
+        ("localtime", LOCALTIME),
+        ("time", TIME),
+        ("localdatetime", LOCAL_DATETIME),
+        ("datetime", DATETIME),
+        ("duration", DURATION),
+        ("point", POINT),
+        ("distance", DISTANCE),
+        ("point.distance", DISTANCE),
+        ("date.truncate", DATE_TRUNCATE),
+        ("localtime.truncate", LOCALTIME_TRUNCATE),
+        ("time.truncate", TIME_TRUNCATE),
+        ("localdatetime.truncate", LOCAL_DATETIME_TRUNCATE),
+        ("datetime.truncate", DATETIME_TRUNCATE),
+        ("datetime.fromEpoch", DATETIME_FROM_EPOCH),
+        ("datetime.fromEpochMillis", DATETIME_FROM_EPOCH_MILLIS),
+        ("duration.between", DURATION_BETWEEN),
+        ("duration.inMonths", DURATION_IN_MONTHS),
+        ("duration.inDays", DURATION_IN_DAYS),
+        ("duration.inSeconds", DURATION_IN_SECONDS),
+        ("date.transaction", DATE),
+        ("date.statement", DATE),
+        ("date.realtime", DATE),
+        ("localtime.transaction", LOCALTIME),
+        ("localtime.statement", LOCALTIME),
+        ("localtime.realtime", LOCALTIME),
+        ("time.transaction", TIME),
+        ("time.statement", TIME),
+        ("time.realtime", TIME),
+        ("localdatetime.transaction", LOCAL_DATETIME),
+        ("localdatetime.statement", LOCAL_DATETIME),
+        ("localdatetime.realtime", LOCAL_DATETIME),
+        ("datetime.transaction", DATETIME),
+        ("datetime.statement", DATETIME),
+        ("datetime.realtime", DATETIME),
+    ];
+
+    /// The code of the scalar function called `name`, ignoring ASCII case.
+    pub fn lookup(name: &str) -> Option<u8> {
+        FUNCTIONS
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, code)| *code)
+    }
 }
 
 /// A compiled VDBE program.
@@ -2498,46 +2650,61 @@ impl<'a> Executor<'a> {
                 .find(|value| !value.is_null())
                 .cloned()
                 .unwrap_or(Value::Null)),
-            func::TO_STRING => match args.first() {
+            func::TO_STRING | func::TO_INTEGER | func::TO_FLOAT | func::TO_BOOLEAN => {
+                convert(func, args.first().unwrap_or(&Value::Null))
+            }
+            func::TO_STRING_OR_NULL
+            | func::TO_INTEGER_OR_NULL
+            | func::TO_FLOAT_OR_NULL
+            | func::TO_BOOLEAN_OR_NULL => Ok(convert_or_null(
+                strict_conversion(func),
+                args.first().unwrap_or(&Value::Null),
+            )),
+            func::TO_STRING_LIST
+            | func::TO_INTEGER_LIST
+            | func::TO_FLOAT_LIST
+            | func::TO_BOOLEAN_LIST => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
-                Some(Value::Text(value)) => Ok(Value::Text(value.clone())),
-                Some(value) => match scalar_text(value) {
-                    Some(text) => Ok(Value::Text(Arc::from(text.into_owned()))),
-                    None => Err(invalid_argument("toString", value)),
-                },
-            },
-            func::TO_INTEGER => match args.first() {
-                Some(Value::Null) | None => Ok(Value::Null),
-                Some(Value::Int(value)) => Ok(Value::Int(*value)),
-                Some(Value::Float(value)) => Ok(truncate_to_int(*value)
-                    .map(Value::Int)
-                    .unwrap_or(Value::Null)),
-                Some(Value::Bool(value)) => Ok(Value::Int(i64::from(*value))),
-                Some(Value::Text(text)) => {
-                    Ok(text_to_integer(text).map(Value::Int).unwrap_or(Value::Null))
+                Some(Value::List(items)) => {
+                    let code = strict_conversion(func);
+                    Ok(Value::List(
+                        items
+                            .iter()
+                            .map(|item| convert_or_null(code, item))
+                            .collect(),
+                    ))
                 }
-                Some(other) => Err(invalid_argument("toInteger", other)),
+                Some(other) => Err(invalid_argument(conversion_name(func), other)),
             },
-            func::TO_FLOAT => match args.first() {
+            func::IS_EMPTY => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
-                Some(Value::Int(value)) => Ok(Value::Float(*value as f64)),
-                Some(Value::Float(value)) => Ok(Value::Float(*value)),
-                Some(Value::Text(text)) => Ok(text
-                    .trim()
-                    .parse::<f64>()
-                    .map(Value::Float)
-                    .unwrap_or(Value::Null)),
-                Some(other) => Err(invalid_argument("toFloat", other)),
+                Some(Value::Text(text)) => Ok(Value::Bool(text.is_empty())),
+                Some(Value::List(items)) => Ok(Value::Bool(items.is_empty())),
+                Some(Value::Map(entries)) => Ok(Value::Bool(entries.is_empty())),
+                Some(other) => Err(invalid_argument("isEmpty", other)),
             },
-            func::TO_BOOLEAN => match args.first() {
+            func::IS_NAN => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
-                Some(Value::Bool(value)) => Ok(Value::Bool(*value)),
-                Some(Value::Text(text)) => Ok(match text.to_ascii_lowercase().as_str() {
-                    "true" => Value::Bool(true),
-                    "false" => Value::Bool(false),
-                    _ => Value::Null,
-                }),
-                Some(other) => Err(invalid_argument("toBoolean", other)),
+                Some(Value::Float(value)) => Ok(Value::Bool(value.is_nan())),
+                Some(Value::Int(_)) => Ok(Value::Bool(false)),
+                Some(other) => Err(invalid_argument("isNaN", other)),
+            },
+            func::NULL_IF => match args {
+                [value, other] if value_equals(value, other) == Some(true) => Ok(Value::Null),
+                [value, _] => Ok(value.clone()),
+                _ => Err(Error::syntax("nullIf() takes two arguments")),
+            },
+            func::VALUE_TYPE => Ok(Value::Text(Arc::from(
+                CypherType::of(args.first().unwrap_or(&Value::Null))
+                    .to_string()
+                    .as_str(),
+            ))),
+            func::ELEMENT_ID => match args.first() {
+                Some(Value::Node(id)) | Some(Value::Edge(id)) => {
+                    Ok(Value::Text(Arc::from(id.to_string().as_str())))
+                }
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(other) => Err(invalid_argument("elementId", other)),
             },
             func::SIZE => Ok(match args.first() {
                 Some(Value::List(items)) => Value::Int(items.len() as i64),
@@ -2610,9 +2777,9 @@ impl<'a> Executor<'a> {
             ))),
             func::TO_UPPER => text_map(args, "toUpper", |text| text.to_uppercase()),
             func::TO_LOWER => text_map(args, "toLower", |text| text.to_lowercase()),
-            func::TRIM => text_map(args, "trim", |text| text.trim().to_owned()),
-            func::LTRIM => text_map(args, "ltrim", |text| text.trim_start().to_owned()),
-            func::RTRIM => text_map(args, "rtrim", |text| text.trim_end().to_owned()),
+            func::TRIM | func::BTRIM => call_trim(args, "btrim", Trim::Both),
+            func::LTRIM => call_trim(args, "ltrim", Trim::Leading),
+            func::RTRIM => call_trim(args, "rtrim", Trim::Trailing),
             func::LEFT | func::RIGHT => call_left_right(func, args),
             func::REPLACE => call_replace(args),
             func::ABS => match args.first() {
@@ -4481,6 +4648,99 @@ fn float_map(args: &[Value], name: &str, f: impl FnOnce(f64) -> f64) -> Result<V
 
 /// Apply a string transformation, propagating nulls and rejecting other
 /// types.
+/// Which ends `trim`, `ltrim`, `rtrim` and `btrim` strip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Trim {
+    Leading,
+    Trailing,
+    Both,
+}
+
+/// Strip whitespace, or with a second argument every character in that
+/// string, from the chosen ends.
+fn call_trim(args: &[Value], name: &str, ends: Trim) -> Result<Value> {
+    let characters = match args.get(1) {
+        None => None,
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Text(characters)) => Some(characters),
+        Some(other) => return Err(invalid_argument(name, other)),
+    };
+    text_map(args, name, |text| {
+        let strip = |c: char| match characters {
+            Some(characters) => characters.contains(c),
+            None => c.is_whitespace(),
+        };
+        let text = match ends {
+            Trim::Leading => text.trim_start_matches(strip),
+            Trim::Trailing => text.trim_end_matches(strip),
+            Trim::Both => text.trim_matches(strip),
+        };
+        text.to_owned()
+    })
+}
+
+/// The strict conversion (`toInteger`, ...) behind an `OrNull` or list
+/// conversion code.
+fn strict_conversion(code: u8) -> u8 {
+    match code {
+        func::TO_STRING_OR_NULL | func::TO_STRING_LIST => func::TO_STRING,
+        func::TO_INTEGER_OR_NULL | func::TO_INTEGER_LIST => func::TO_INTEGER,
+        func::TO_FLOAT_OR_NULL | func::TO_FLOAT_LIST => func::TO_FLOAT,
+        _ => func::TO_BOOLEAN,
+    }
+}
+
+fn conversion_name(code: u8) -> &'static str {
+    match code {
+        func::TO_STRING_LIST => "toStringList",
+        func::TO_INTEGER_LIST => "toIntegerList",
+        func::TO_FLOAT_LIST => "toFloatList",
+        _ => "toBooleanList",
+    }
+}
+
+/// `toString`, `toInteger`, `toFloat` or `toBoolean`: values without a
+/// conversion are a `TypeError`, unparsable strings null.
+fn convert(code: u8, value: &Value) -> Result<Value> {
+    match (code, value) {
+        (_, Value::Null) => Ok(Value::Null),
+        (func::TO_STRING, Value::Text(text)) => Ok(Value::Text(text.clone())),
+        (func::TO_STRING, value) => match scalar_text(value) {
+            Some(text) => Ok(Value::Text(Arc::from(text.into_owned()))),
+            None => Err(invalid_argument("toString", value)),
+        },
+        (func::TO_INTEGER, Value::Int(value)) => Ok(Value::Int(*value)),
+        (func::TO_INTEGER, Value::Float(value)) => Ok(truncate_to_int(*value)
+            .map(Value::Int)
+            .unwrap_or(Value::Null)),
+        (func::TO_INTEGER, Value::Bool(value)) => Ok(Value::Int(i64::from(*value))),
+        (func::TO_INTEGER, Value::Text(text)) => {
+            Ok(text_to_integer(text).map(Value::Int).unwrap_or(Value::Null))
+        }
+        (func::TO_INTEGER, other) => Err(invalid_argument("toInteger", other)),
+        (func::TO_FLOAT, Value::Int(value)) => Ok(Value::Float(*value as f64)),
+        (func::TO_FLOAT, Value::Float(value)) => Ok(Value::Float(*value)),
+        (func::TO_FLOAT, Value::Text(text)) => Ok(text
+            .trim()
+            .parse::<f64>()
+            .map(Value::Float)
+            .unwrap_or(Value::Null)),
+        (func::TO_FLOAT, other) => Err(invalid_argument("toFloat", other)),
+        (_, Value::Bool(value)) => Ok(Value::Bool(*value)),
+        (_, Value::Text(text)) => Ok(match text.to_ascii_lowercase().as_str() {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => Value::Null,
+        }),
+        (_, other) => Err(invalid_argument("toBoolean", other)),
+    }
+}
+
+/// A conversion that yields null instead of a `TypeError`.
+fn convert_or_null(code: u8, value: &Value) -> Value {
+    convert(code, value).unwrap_or(Value::Null)
+}
+
 fn text_map(args: &[Value], name: &str, f: impl FnOnce(&str) -> String) -> Result<Value> {
     match args.first() {
         Some(Value::Null) | None => Ok(Value::Null),

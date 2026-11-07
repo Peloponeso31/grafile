@@ -34,10 +34,13 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
   multiple arguments and expressions over aggregations.
 - Scalar functions: `id`, `labels`, `type`, `startNode`, `endNode`,
   `coalesce`, `toString`, `toInteger`, `toFloat`, `toBoolean`, `size`,
-  `properties`, `keys`, `nodes`, `relationships`, `length`, `randomUUID`;
+  `properties`, `keys`, `nodes`, `relationships`, `length`, `randomUUID`,
+  `elementId`, `valueType`, `nullIf`, `isEmpty`, `isNaN`, the `…OrNull`
+  conversions and `to…List` list conversions;
   list functions (`range`, `head`, `last`, `tail`, `reverse`, `split`,
-  `substring`); string functions (`toUpper`, `toLower`, `trim`/`ltrim`/
-  `rtrim`, `left`, `right`, `replace`); math functions (`abs`, `sign`, `ceil`,
+  `substring`); string functions (`toUpper`/`upper`, `toLower`/`lower`,
+  `trim`/`btrim`/`ltrim`/`rtrim` with optional character sets,
+  `char_length`, `left`, `right`, `replace`); math functions (`abs`, `sign`, `ceil`,
   `floor`, `round`, `sqrt`, `exp`, `log`, `log10`, trigonometry,
   `degrees`/`radians`, `haversin`, `pi`, `e`, `rand`).
 - Built-in procedures: `db.labels()`, `db.propertyKeys()`,
@@ -494,16 +497,6 @@ Shell:
   `Connection::explain`.
 - A `--readonly` flag for ordinary sessions (only `grafile check` opens
   files read-only today).
-
-Functions:
-
-- Null-safe conversions: `toStringOrNull`, `toIntegerOrNull`,
-  `toFloatOrNull`, `toBooleanOrNull`.
-- Helpers: `isEmpty`, `isNaN`, `nullIf`, `valueType`, `char_length`,
-  `btrim`, `toIntegerList`, `toFloatList`, `toStringList`,
-  `toBooleanList`.
-- Aliases: `upper`/`lower`, `point.distance`.
-- `elementId(n)`, the Neo4j 5 replacement for `id()` that drivers call.
 
 Syntax:
 

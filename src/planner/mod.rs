@@ -3054,13 +3054,16 @@ fn static_function_kind(
         | "percentilecont" | "percentiledisc" | "tointeger" | "tofloat" | "distance" | "abs"
         | "sign" | "ceil" | "floor" | "round" | "sqrt" | "exp" | "log" | "log10" | "sin"
         | "cos" | "tan" | "cot" | "asin" | "acos" | "atan" | "atan2" | "degrees" | "radians"
-        | "haversin" | "pi" | "e" | "rand" => Kind::Number,
+        | "haversin" | "pi" | "e" | "rand" | "tointegerornull" | "tofloatornull"
+        | "char_length" | "character_length" => Kind::Number,
         "labels" | "keys" | "nodes" | "relationships" | "collect" | "range" | "tail"
-        | "reverse" | "split" => Kind::List,
+        | "reverse" | "split" | "tostringlist" | "tointegerlist" | "tofloatlist"
+        | "tobooleanlist" => Kind::List,
         "properties" => Kind::Map,
-        "type" | "tostring" | "substring" | "toupper" | "tolower" | "trim" | "ltrim" | "rtrim"
-        | "left" | "right" | "replace" | "randomuuid" => Kind::Text,
-        "toboolean" => Kind::Boolean,
+        "type" | "tostring" | "substring" | "toupper" | "tolower" | "upper" | "lower" | "trim"
+        | "ltrim" | "rtrim" | "btrim" | "left" | "right" | "replace" | "randomuuid"
+        | "tostringornull" | "valuetype" | "elementid" => Kind::Text,
+        "toboolean" | "tobooleanornull" | "isempty" | "isnan" => Kind::Boolean,
         "startnode" | "endnode" => Kind::Node,
         "date" | "localtime" | "time" | "localdatetime" | "datetime" | "duration" => Kind::Temporal,
         "point" => Kind::Point,
@@ -3203,6 +3206,9 @@ fn check_expr_kinds_with(
                 }
                 "length" => require(argument, &[Kind::List, Kind::Path, Kind::Null], name)?,
                 "size" => require(argument, &[Kind::List, Kind::Text, Kind::Null], name)?,
+                "char_length" | "character_length" => {
+                    require(argument, &[Kind::Text, Kind::Null], name)?
+                }
                 _ => {}
             }
         }

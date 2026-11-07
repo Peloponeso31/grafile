@@ -279,3 +279,99 @@ fn conversions_reject_incompatible_types() {
         assert_eq!(err.code(), grafile::ErrorCode::Type, "{source}");
     }
 }
+
+#[test]
+fn null_safe_and_list_conversions() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN toIntegerOrNull('7'), toIntegerOrNull([1]), toFloatOrNull({a: 1}), \
+         toStringOrNull(1.5), toStringOrNull([1]), toBooleanOrNull(1), toBooleanOrNull('TRUE'), \
+         toIntegerOrNull(null)",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "7", "null", "null", "1.5", "null", "null", "true", "null"
+        ]]
+    );
+    let rows = query(
+        &mut conn,
+        "RETURN toIntegerList(['1', 2.9, 'x', [3], null]), toFloatList([1, '2.5']), \
+         toStringList([1, true, {a: 1}]), toBooleanList(['false', 0, true]), \
+         toIntegerList(null)",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "[1, 2, null, null, null]",
+            "[1.0, 2.5]",
+            "[1, true, null]",
+            "[false, null, true]",
+            "null"
+        ]]
+    );
+    for source in ["RETURN toIntegerList('1')", "RETURN toStringList(5)"] {
+        conn.query(source, &Params::new())
+            .expect_err("list conversions require a list");
+    }
+}
+
+#[test]
+fn predicate_and_type_helpers() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN isEmpty(''), isEmpty([1]), isEmpty({}), isEmpty(null), \
+         isNaN(0.0 / 0.0), isNaN(1), isNaN(null), \
+         nullIf(1, 1), nullIf(1, 2), nullIf(null, 1)",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "true", "false", "true", "null", "true", "false", "null", "null", "1", "null"
+        ]]
+    );
+    let rows = query(
+        &mut conn,
+        "RETURN valueType(1), valueType(null), valueType([1, null]), valueType('a'), \
+         valueType(date('2026-11-07')), valueType({a: 1})",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "INTEGER NOT NULL",
+            "NULL",
+            "LIST<INTEGER> NOT NULL",
+            "STRING NOT NULL",
+            "DATE NOT NULL",
+            "MAP NOT NULL"
+        ]]
+    );
+    for source in ["RETURN isEmpty(1)", "RETURN isNaN('x')"] {
+        conn.query(source, &Params::new())
+            .expect_err("helpers reject other types");
+    }
+}
+
+#[test]
+fn string_helpers_and_aliases() {
+    let mut conn = connection();
+    seed(&mut conn);
+    let rows = query(
+        &mut conn,
+        "RETURN btrim('  a  '), btrim('xxaxx', 'x'), ltrim('xya', 'yx'), rtrim('ayx', 'xy'), \
+         btrim(null), btrim('a', null), char_length('héllo'), upper('a'), lower('B'), \
+         point.distance(point({x: 0, y: 0}), point({x: 3, y: 4}))",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["a", "a", "a", "a", "null", "null", "5", "A", "b", "5"]]
+    );
+    let rows = query(
+        &mut conn,
+        "MATCH (a:Person {name: 'alice'})-[r:KNOWS]->() \
+         RETURN elementId(a) = toString(id(a)), elementId(r) = toString(id(r)), elementId(null)",
+    );
+    assert_eq!(rows, vec![vec!["true", "true", "null"]]);
+}
