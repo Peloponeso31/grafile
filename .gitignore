@@ -3,3 +3,4 @@
 !tests/fixtures/versions/*.grafile
 /tck/report.json
 bugs/*
+*.db

@@ -8,6 +8,8 @@ license = "Apache-2.0"
 [lib]
 name = "grafile"
 crate-type = ["cdylib", "staticlib"]
+# Shares the `grafile` lib name with the core crate; rustdoc cannot document both.
+doc = false
 
 [dependencies]
 grafile = { path = ".." }
