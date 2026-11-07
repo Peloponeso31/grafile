@@ -552,6 +552,8 @@ pub enum Statement {
     Query(Query),
     /// A schema command (`CREATE INDEX`, `CREATE CONSTRAINT`, `DROP ...`).
     Ddl(DdlStatement),
+    /// `EXPLAIN <statement>`: describe the plan without running it.
+    Explain(Box<Statement>),
 }
 
 /// A schema DDL command.

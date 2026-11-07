@@ -227,3 +227,48 @@ fn foreach_rejects_non_updating_clauses() {
         .expect_err("non-updating clause must be rejected");
     assert!(err.to_string().contains("updating clauses"), "{err}");
 }
+
+#[test]
+fn unknown_names_suggest_close_matches() {
+    let mut conn = connection();
+    let err = conn
+        .query("RETURN toUper('a')", &Params::new())
+        .expect_err("unknown function");
+    assert!(err.message().contains("(did you mean `toUpper`?)"), "{err}");
+    let err = conn
+        .query("CALL db.label()", &Params::new())
+        .expect_err("unknown procedure");
+    assert!(err.message().contains("`db.labels`"), "{err}");
+    let err = conn
+        .query("RETURN qqqqqq(1)", &Params::new())
+        .expect_err("far from everything");
+    assert!(!err.message().contains("did you mean"), "{err}");
+}
+
+#[test]
+fn explain_returns_the_plan_and_profile_is_named() {
+    let mut conn = connection();
+    let rows = query(&mut conn, "EXPLAIN CREATE (:Person {name: 'x'})");
+    assert!(!rows.is_empty());
+    let rows = query(&mut conn, "explain MATCH (n:Person) RETURN n");
+    assert!(rows.iter().any(|row| row[0].contains("Scan")), "{rows:?}");
+    assert_eq!(
+        query(&mut conn, "MATCH (n) RETURN count(n)"),
+        vec![vec!["0"]]
+    );
+    let rows = query(
+        &mut conn,
+        "EXPLAIN CREATE INDEX i FOR (n:Person) ON (n.name)",
+    );
+    assert_eq!(rows.len(), 1);
+    assert!(query(&mut conn, "SHOW INDEXES").is_empty());
+    let err = conn
+        .query("PROFILE MATCH (n) RETURN n", &Params::new())
+        .expect_err("profile");
+    assert_eq!(err.code(), grafile::ErrorCode::Unsupported);
+    assert!(err.message().contains("use EXPLAIN"), "{err}");
+    let err = conn
+        .query("EXPLAIN PROFILE RETURN 1", &Params::new())
+        .expect_err("two prefixes");
+    assert_eq!(err.code(), grafile::ErrorCode::Syntax);
+}

@@ -2093,8 +2093,9 @@ fn undefined(name: &str) -> Error {
 fn scalar_function(name: &str) -> Result<u8> {
     func::lookup(name).ok_or_else(|| {
         Error::syntax(format!(
-            "UnknownFunction: `{}` is not a known function",
-            name.to_ascii_lowercase()
+            "UnknownFunction: `{}` is not a known function{}",
+            name.to_ascii_lowercase(),
+            crate::error::did_you_mean(name, func::FUNCTIONS.iter().map(|(name, _)| *name)),
         ))
     })
 }

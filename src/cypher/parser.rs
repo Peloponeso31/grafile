@@ -18,7 +18,12 @@ pub fn parse(source: &str) -> Result<Query> {
     Ok(query)
 }
 
-/// Parse a statement: a DDL command or a query.
+/// Whether `word` starts a statement prefix (`EXPLAIN`, `PROFILE`).
+fn is_statement_prefix(word: &str) -> bool {
+    word.eq_ignore_ascii_case("explain") || word.eq_ignore_ascii_case("profile")
+}
+
+/// Parse a statement: a DDL command, a query, or `EXPLAIN` of either.
 pub fn parse_statement(source: &str) -> Result<Statement> {
     let mut parser = parser_for(source)?;
     parser.parse_statement()
@@ -147,6 +152,20 @@ impl<'a> Parser<'a> {
 
     /// Parse a statement: a DDL command or a query.
     fn parse_statement(&mut self) -> Result<Statement> {
+        if self.eat_ident_text("explain") {
+            if self.peek_ident_text().is_some_and(is_statement_prefix) {
+                return self.fail("EXPLAIN cannot be combined with another statement prefix");
+            }
+            return Ok(Statement::Explain(Box::new(self.parse_statement()?)));
+        }
+        if self
+            .peek_ident_text()
+            .is_some_and(|text| text.eq_ignore_ascii_case("profile"))
+        {
+            return Err(Error::unsupported(
+                "PROFILE is not supported; use EXPLAIN to see the plan",
+            ));
+        }
         if let Some(text) = self.peek_ident_text() {
             if text.eq_ignore_ascii_case("show") {
                 let mut clauses = vec![self.parse_show()?];

@@ -66,6 +66,9 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
   reads local CSVs into the row pipeline.
 - Integrity: `grafile check FILE [--rebuild]` verifies every derived
   structure against the records and the page layout (see Phase 7).
+- Statement prefixes: `EXPLAIN` returns the plan as rows (one `plan`
+  column) without running the statement; `PROFILE` is rejected by name.
+  Unknown functions and procedures suggest the closest names.
 - Execution: index seeks on bound values and pushed-down `WHERE`
   equalities, label-bitmap intersection for multi-label scans, streaming
   aggregation, `OPTIONAL MATCH` and variable-length expansion, bounded
@@ -499,8 +502,6 @@ Shell:
 - An optional startup file, like sqlite's `~/.sqliterc`: dot-commands run
   before the first prompt, for example `.pretty on`, `.mode box` or
   `.param set tenant 'acme'`, with a flag to skip it.
-- An `EXPLAIN` statement prefix (and `.explain`) over the existing
-  `Connection::explain`.
 - A `--readonly` flag for ordinary sessions (only `grafile check` opens
   files read-only today).
 
@@ -512,12 +513,6 @@ Syntax:
 - `trim(BOTH 'x' FROM s)`, the `||` string operator and `x IS :: TYPE`
   type predicates.
 - `REMOVE n = {}`.
-
-Errors:
-
-- "Did you mean" suggestions for unknown functions and procedures.
-- A named error for unsupported statement prefixes such as `PROFILE`,
-  instead of "expected a clause … (found Ident)".
 
 ## Sequencing rules
 

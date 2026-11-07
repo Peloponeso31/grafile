@@ -271,6 +271,19 @@ impl Connection {
         let parsed = match cypher::parse_statement(source).map_err(compile)? {
             cypher::Statement::Query(parsed) => parsed,
             cypher::Statement::Ddl(ddl) => return self.execute_ddl(&ddl),
+            cypher::Statement::Explain(statement) => {
+                let plan = self
+                    .explain_statement(*statement, params.values())
+                    .map_err(compile)?;
+                return Ok(Rows {
+                    columns: vec!["plan".to_owned()],
+                    rows: plan
+                        .lines()
+                        .map(|line| vec![Value::Text(line.into())])
+                        .collect(),
+                    position: 0,
+                });
+            }
         };
         let prepared =
             planner::plan_query(&mut self.db, &parsed, params.values()).map_err(compile)?;
@@ -348,13 +361,24 @@ impl Connection {
         }
     }
 
-    /// Return the query plan as text (like `EXPLAIN QUERY PLAN`).
+    /// Return the query plan as text (like `EXPLAIN QUERY PLAN`). A
+    /// leading `EXPLAIN` in `source` is accepted and changes nothing.
     pub fn explain(&mut self, source: &str) -> Result<String> {
-        let parsed = match cypher::parse_statement(source)? {
+        self.explain_statement(cypher::parse_statement(source)?, &HashMap::new())
+    }
+
+    /// The plan of a parsed statement, planned with `params`.
+    fn explain_statement(
+        &mut self,
+        statement: cypher::Statement,
+        params: &HashMap<String, Value>,
+    ) -> Result<String> {
+        let parsed = match statement {
             cypher::Statement::Query(parsed) => parsed,
             cypher::Statement::Ddl(ddl) => return Ok(ddl.describe()),
+            cypher::Statement::Explain(inner) => return self.explain_statement(*inner, params),
         };
-        let prepared = planner::plan_query(&mut self.db, &parsed, &HashMap::new())?;
+        let prepared = planner::plan_query(&mut self.db, &parsed, params)?;
         let mut out = String::new();
         planner::explain(&prepared.plan, 0, &mut out);
         Ok(out)
@@ -362,8 +386,15 @@ impl Connection {
 
     /// Return the compiled VDBE program as text (like SQLite's `EXPLAIN`).
     pub fn explain_program(&mut self, source: &str) -> Result<String> {
-        let parsed = match cypher::parse_statement(source)? {
+        let statement = match cypher::parse_statement(source)? {
+            cypher::Statement::Explain(inner) => *inner,
+            other => other,
+        };
+        let parsed = match statement {
             cypher::Statement::Query(parsed) => parsed,
+            cypher::Statement::Explain(_) => {
+                return Err(Error::internal("the parser rejects nested EXPLAIN"));
+            }
             cypher::Statement::Ddl(_) => {
                 return Err(Error::unsupported(
                     "DDL statements have no VDBE program; use explain",

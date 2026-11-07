@@ -2819,7 +2819,12 @@ fn procedure_spec(name: &str) -> Result<&'static ProcedureSpec> {
         .iter()
         .find(|(candidate, _)| *candidate == name)
         .map(|(_, spec)| spec)
-        .ok_or_else(|| Error::unsupported(format!("procedure `{name}` is not supported")))
+        .ok_or_else(|| {
+            Error::unsupported(format!(
+                "procedure `{name}` is not supported{}",
+                crate::error::did_you_mean(name, procedure_names())
+            ))
+        })
 }
 
 /// Human-readable argument count for an arity error.

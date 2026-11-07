@@ -172,9 +172,58 @@ impl fmt::Display for ErrorCode {
     }
 }
 
+/// A " (did you mean `a` or `b`?)" suffix naming up to three candidates
+/// within two edits of `name` (ignoring ASCII case) or starting with it;
+/// empty when none is close.
+///
+/// # Examples
+///
+/// ```
+/// let hint = grafile::error::did_you_mean("toUper", ["toUpper", "toLower"]);
+/// assert_eq!(hint, " (did you mean `toUpper`?)");
+/// ```
+pub fn did_you_mean<'a>(name: &str, candidates: impl IntoIterator<Item = &'a str>) -> String {
+    let lowered = name.to_ascii_lowercase();
+    let mut close: Vec<(usize, &str)> = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let candidate_lowered = candidate.to_ascii_lowercase();
+            let distance = strsim::levenshtein(&lowered, &candidate_lowered);
+            (distance <= 2 || (lowered.len() >= 3 && candidate_lowered.starts_with(&lowered)))
+                .then_some((distance, candidate))
+        })
+        .collect();
+    close.sort_unstable();
+    close.dedup_by_key(|(_, candidate)| *candidate);
+    let names: Vec<String> = close
+        .iter()
+        .take(3)
+        .map(|(_, candidate)| format!("`{candidate}`"))
+        .collect();
+    match names.as_slice() {
+        [] => String::new(),
+        [only] => format!(" (did you mean {only}?)"),
+        [rest @ .., last] => format!(" (did you mean {} or {last}?)", rest.join(", ")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suggestions_rank_by_distance_and_cap_at_three() {
+        let names = ["count", "coalesce", "cos", "cot", "collect"];
+        assert_eq!(
+            did_you_mean("coun", names),
+            " (did you mean `count`, `cos` or `cot`?)"
+        );
+        assert_eq!(
+            did_you_mean("COALESC", names),
+            " (did you mean `coalesce`?)"
+        );
+        assert_eq!(did_you_mean("zzzzzz", names), "");
+    }
 
     #[test]
     fn io_error_maps_and_keeps_source() {
