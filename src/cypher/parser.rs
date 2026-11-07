@@ -10,12 +10,23 @@ use super::ast::*;
 use super::lexer::{Spanned, Token, lex, line_column};
 use crate::error::{Error, Result};
 use crate::record::Value;
+use crate::record::types::{BaseType, CypherType};
 
 /// Parse a full Cypher query.
 pub fn parse(source: &str) -> Result<Query> {
     let mut parser = parser_for(source)?;
     let query = parser.parse_query()?;
     Ok(query)
+}
+
+/// One alternative of a GQL type union.
+enum TypeWord {
+    /// `NULL`: admits null only.
+    Null,
+    /// `NOTHING`: admits no value.
+    Nothing,
+    /// Any other type.
+    Base(BaseType),
 }
 
 /// Whether `word` starts a statement prefix (`EXPLAIN`, `PROFILE`).
@@ -1319,6 +1330,7 @@ impl<'a> Parser<'a> {
             let op = match self.peek() {
                 Some(Token::Plus) => BinaryOp::Add,
                 Some(Token::Minus) => BinaryOp::Sub,
+                Some(Token::DoublePipe) => BinaryOp::Concat,
                 _ => break,
             };
             self.advance();
@@ -1431,11 +1443,27 @@ impl<'a> Parser<'a> {
                 Some(Token::Is) => {
                     self.advance();
                     let negated = self.eat(Token::Not);
-                    self.expect(Token::Null, "NULL after IS")?;
-                    expr = Expr::IsNull {
-                        expr: Box::new(expr),
-                        negated,
-                    };
+                    let typed = self.eat_ident_text("typed")
+                        || (self.peek() == Some(Token::Colon)
+                            && self.tokens.get(self.pos + 1).map(|entry| entry.token)
+                                == Some(Token::Colon));
+                    if typed {
+                        while self.eat(Token::Colon) {}
+                        expr = Expr::TypeCheck {
+                            expr: Box::new(expr),
+                            negated,
+                            ty: Box::new(self.parse_cypher_type()?),
+                        };
+                    } else {
+                        self.expect(Token::Null, "NULL or :: after IS")?;
+                        expr = Expr::IsNull {
+                            expr: Box::new(expr),
+                            negated,
+                        };
+                    }
+                }
+                Some(Token::LBrace) if matches!(expr, Expr::Variable(_)) => {
+                    expr = self.parse_map_projection(expr)?;
                 }
                 Some(Token::Dot) => {
                     self.advance();
@@ -1492,6 +1520,210 @@ impl<'a> Parser<'a> {
         Ok(expr)
     }
 
+    /// `{.key, .*, alias: expr, var}` after a variable.
+    fn parse_map_projection(&mut self, base: Expr) -> Result<Expr> {
+        self.expect(Token::LBrace, "'{' to open a map projection")?;
+        let mut all_properties = false;
+        let mut entries = Vec::new();
+        while self.peek() != Some(Token::RBrace) {
+            if self.eat(Token::Dot) {
+                if self.eat(Token::Star) {
+                    all_properties = true;
+                } else {
+                    let key = self.parse_name()?;
+                    let value = Expr::Property {
+                        base: Box::new(base.clone()),
+                        key: key.clone(),
+                    };
+                    entries.push((key, value));
+                }
+            } else {
+                let key = self.parse_map_key()?;
+                let value = if self.eat(Token::Colon) {
+                    self.parse_expr()?
+                } else {
+                    Expr::Variable(key.clone())
+                };
+                entries.push((key, value));
+            }
+            if !self.eat(Token::Comma) {
+                break;
+            }
+        }
+        self.expect(Token::RBrace, "'}' to close a map projection")?;
+        Ok(Expr::MapProjection {
+            base: Box::new(base),
+            all_properties,
+            entries,
+        })
+    }
+
+    /// The arguments of `trim(...)` after its `(`: `trim(s)`, or the SQL
+    /// form `trim([BOTH|LEADING|TRAILING] [characters] FROM s)`, which
+    /// becomes `btrim`, `ltrim` or `rtrim` with the character set.
+    fn parse_trim_arguments(&mut self) -> Result<Expr> {
+        let ends = ["both", "leading", "trailing"]
+            .into_iter()
+            .find(|word| self.eat_ident_text(word));
+        let first = if ends.is_some()
+            && self
+                .peek_ident_text()
+                .is_some_and(|word| word.eq_ignore_ascii_case("from"))
+        {
+            None
+        } else {
+            Some(self.parse_expr()?)
+        };
+        let args = if self.eat_ident_text("from") {
+            let original = self.parse_expr()?;
+            match first {
+                Some(characters) => vec![original, characters],
+                None => vec![original],
+            }
+        } else if ends.is_some() {
+            return self.fail("expected FROM in trim(...)");
+        } else {
+            first.into_iter().collect()
+        };
+        self.expect(Token::RParen, "')' to close trim(...)")?;
+        let name = match ends {
+            Some("leading") => "ltrim",
+            Some("trailing") => "rtrim",
+            _ => "btrim",
+        };
+        Ok(Expr::Function {
+            name: if args.len() == 1 && ends.is_none() {
+                "trim".to_owned()
+            } else {
+                name.to_owned()
+            },
+            distinct: false,
+            star: false,
+            args,
+        })
+    }
+
+    /// A GQL type: alternatives joined by `|`, each optionally `NOT NULL`.
+    /// The union admits null when any alternative does.
+    fn parse_cypher_type(&mut self) -> Result<CypherType> {
+        let mut alternatives = Vec::new();
+        let mut nullable = false;
+        loop {
+            match self.parse_type_word()? {
+                TypeWord::Base(base) => {
+                    alternatives.push(base);
+                    nullable |= !self.eat_not_null();
+                }
+                TypeWord::Null => nullable = true,
+                TypeWord::Nothing => {}
+            }
+            if !self.eat(Token::Pipe) {
+                break;
+            }
+        }
+        Ok(CypherType::new(alternatives, nullable))
+    }
+
+    /// `NOT NULL` after a type alternative.
+    fn eat_not_null(&mut self) -> bool {
+        if self.peek() == Some(Token::Not)
+            && self.tokens.get(self.pos + 1).map(|entry| entry.token) == Some(Token::Null)
+        {
+            self.pos += 2;
+            return true;
+        }
+        false
+    }
+
+    /// The text of the current token, whatever its kind, lowercased.
+    fn word(&self) -> Option<String> {
+        let spanned = self.tokens.get(self.pos)?;
+        Some(self.source[spanned.start..spanned.end].to_ascii_lowercase())
+    }
+
+    /// One alternative of a type union.
+    fn parse_type_word(&mut self) -> Result<TypeWord> {
+        let Some(word) = self.word() else {
+            return self.fail("expected a type");
+        };
+        self.advance();
+        let base = match word.as_str() {
+            "null" => return Ok(TypeWord::Null),
+            "nothing" => return Ok(TypeWord::Nothing),
+            "boolean" | "bool" => BaseType::Boolean,
+            "string" | "varchar" => BaseType::String,
+            "integer" | "int" | "int64" | "integer64" => BaseType::Integer,
+            "signed" => {
+                self.expect_ident_text("integer")?;
+                BaseType::Integer
+            }
+            "float" | "float64" => BaseType::Float,
+            "date" => BaseType::Date,
+            "duration" => BaseType::Duration,
+            "point" => BaseType::Point,
+            "node" | "vertex" => BaseType::Node,
+            "relationship" | "edge" => BaseType::Relationship,
+            "map" => BaseType::Map,
+            "path" => BaseType::Path,
+            "local" | "zoned" => {
+                let zoned = word == "zoned";
+                if self.eat_ident_text("time") {
+                    if zoned {
+                        BaseType::ZonedTime
+                    } else {
+                        BaseType::LocalTime
+                    }
+                } else {
+                    self.expect_ident_text("datetime")?;
+                    if zoned {
+                        BaseType::ZonedDateTime
+                    } else {
+                        BaseType::LocalDateTime
+                    }
+                }
+            }
+            "time" | "timestamp" => {
+                let timestamp = word == "timestamp";
+                let zoned = if self.eat_ident_text("with") {
+                    true
+                } else {
+                    self.expect_ident_text("without")?;
+                    false
+                };
+                self.expect_ident_text("time")?;
+                self.expect_ident_text("zone")?;
+                match (timestamp, zoned) {
+                    (false, false) => BaseType::LocalTime,
+                    (false, true) => BaseType::ZonedTime,
+                    (true, false) => BaseType::LocalDateTime,
+                    (true, true) => BaseType::ZonedDateTime,
+                }
+            }
+            "list" | "array" => {
+                self.expect(Token::Less, "'<' after LIST")?;
+                let element = self.parse_cypher_type()?;
+                self.expect(Token::Greater, "'>' to close LIST<...>")?;
+                BaseType::List(Box::new(element))
+            }
+            "any" => {
+                // `ANY NODE`, `ANY RELATIONSHIP`, ... name the same types;
+                // `ANY` and `ANY VALUE` are every value.
+                match self.word().as_deref() {
+                    Some("node" | "vertex" | "relationship" | "edge" | "map" | "path") => {
+                        return self.parse_type_word();
+                    }
+                    Some("value") => {
+                        self.advance();
+                        BaseType::Any
+                    }
+                    _ => BaseType::Any,
+                }
+            }
+            other => return self.fail(format!("unknown type `{other}`")),
+        };
+        Ok(TypeWord::Base(base))
+    }
+
     fn parse_primary(&mut self) -> Result<Expr> {
         let spanned = match self.tokens.get(self.pos).copied() {
             Some(spanned) => spanned,
@@ -1544,8 +1776,12 @@ impl<'a> Parser<'a> {
             }
             Token::Ident | Token::EscapedIdent => {
                 let name = self.parse_name()?;
-                // `exists { ... }` is an existential subquery, not a call.
-                if name.eq_ignore_ascii_case("exists") && self.peek() == Some(Token::LBrace) {
+                // `exists { ... }` and `count { ... }` are subqueries, not
+                // calls.
+                let counting = name.eq_ignore_ascii_case("count");
+                if (counting || name.eq_ignore_ascii_case("exists"))
+                    && self.peek() == Some(Token::LBrace)
+                {
                     self.advance();
                     let clauses =
                         if matches!(self.peek(), Some(Token::LParen) | Some(Token::LBracket)) {
@@ -1563,11 +1799,16 @@ impl<'a> Parser<'a> {
                         } else {
                             self.parse_clauses()?
                         };
-                    self.expect(Token::RBrace, "'}' to close the EXISTS subquery")?;
-                    return Ok(Expr::ExistsSubquery(Box::new(QueryPart {
+                    self.expect(Token::RBrace, "'}' to close the subquery")?;
+                    let part = Box::new(QueryPart {
                         union_all: false,
                         clauses,
-                    })));
+                    });
+                    return Ok(if counting {
+                        Expr::CountSubquery(part)
+                    } else {
+                        Expr::ExistsSubquery(part)
+                    });
                 }
                 // Namespaced function calls such as `date.truncate(...)` or
                 // `duration.inDays(...)`: an identifier, a dot, a second
@@ -1650,6 +1891,9 @@ impl<'a> Parser<'a> {
                         });
                     }
                     self.advance();
+                    if lower == "trim" {
+                        return self.parse_trim_arguments();
+                    }
                     let distinct = self.eat(Token::Distinct);
                     let mut star = false;
                     let mut args = Vec::new();

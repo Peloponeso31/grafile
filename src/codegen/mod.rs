@@ -12,7 +12,7 @@ use hashbrown::HashMap;
 use crate::cypher::{Expr, QuantifierKind, SetItem};
 use crate::error::{Error, Result};
 use crate::planner::Prepared;
-use crate::planner::plan::{CreateItem, Plan};
+use crate::planner::plan::{CreateItem, Plan, SubqueryResult};
 use crate::record::Value;
 use crate::vdbe::{AggSpec, BuildPathPart, Op, Program, binary_code, func, unary_code};
 
@@ -604,25 +604,31 @@ impl Codegen {
                 cg.patch(jump, end)?;
                 Ok(())
             }),
-            Plan::PatternPredicate { input, inner, var } => {
-                self.compile(input, ctx, &mut |cg, outer_ctx| {
-                    let cursor = cg.alloc_cursor();
-                    cg.emit(Op::CollectOpen { cursor });
-                    cg.compile(inner, outer_ctx, &mut |cg, inner_ctx| {
-                        cg.emit(Op::CollectRow {
-                            cursor,
-                            start: inner_ctx.window_start,
-                            count: inner_ctx.window_len,
-                        });
-                        Ok(())
-                    })?;
-                    let dest = cg.alloc_reg();
-                    cg.emit(Op::CtxHasRows { cursor, dest });
-                    let mut out_ctx = outer_ctx.clone();
-                    out_ctx.vars.insert(var.clone(), dest);
-                    out(cg, &mut out_ctx)
-                })
-            }
+            Plan::PatternPredicate {
+                input,
+                inner,
+                var,
+                result,
+            } => self.compile(input, ctx, &mut |cg, outer_ctx| {
+                let cursor = cg.alloc_cursor();
+                cg.emit(Op::CollectOpen { cursor });
+                cg.compile(inner, outer_ctx, &mut |cg, inner_ctx| {
+                    cg.emit(Op::CollectRow {
+                        cursor,
+                        start: inner_ctx.window_start,
+                        count: inner_ctx.window_len,
+                    });
+                    Ok(())
+                })?;
+                let dest = cg.alloc_reg();
+                cg.emit(match result {
+                    SubqueryResult::Exists => Op::CtxHasRows { cursor, dest },
+                    SubqueryResult::Count => Op::CtxRowCount { cursor, dest },
+                });
+                let mut out_ctx = outer_ctx.clone();
+                out_ctx.vars.insert(var.clone(), dest);
+                out(cg, &mut out_ctx)
+            }),
             Plan::PatternComprehension {
                 input,
                 inner,
@@ -1161,8 +1167,8 @@ impl Codegen {
                                 });
                             }
                             SetItem::Replace { .. } | SetItem::Append { .. } => {
-                                return Err(Error::unsupported(
-                                    "REMOVE with whole-property replacement is not supported",
+                                return Err(Error::internal(
+                                    "the parser only builds property and label REMOVE items",
                                 ));
                             }
                         }
@@ -1774,9 +1780,9 @@ impl Codegen {
 
     fn compile_expr_into(&mut self, expr: &Expr, ctx: &Ctx, dest: u32) -> Result<()> {
         match expr {
-            Expr::ExistsSubquery(_) => {
-                return Err(Error::unsupported(
-                    "EXISTS subqueries are only supported in predicates",
+            Expr::ExistsSubquery(_) | Expr::CountSubquery(_) => {
+                return Err(Error::internal(
+                    "EXISTS and COUNT subqueries are planned before code generation",
                 ));
             }
             Expr::Literal(value) => {
@@ -1989,6 +1995,24 @@ impl Codegen {
                 }
                 self.emit(Op::BuildMap { dest, pairs });
             }
+            Expr::MapProjection {
+                base,
+                all_properties,
+                entries,
+            } => {
+                let base = self.compile_expr(base, ctx)?;
+                let mut pairs = Vec::with_capacity(entries.len());
+                for (key, value) in entries {
+                    let reg = self.compile_expr(value, ctx)?;
+                    pairs.push((key.clone(), reg));
+                }
+                self.emit(Op::MapProjection {
+                    base,
+                    all_properties: *all_properties,
+                    pairs,
+                    dest,
+                });
+            }
             Expr::Case {
                 subject,
                 alternatives,
@@ -2032,6 +2056,15 @@ impl Codegen {
                 for jump in end_jumps {
                     self.patch(jump, end)?;
                 }
+            }
+            Expr::TypeCheck { expr, negated, ty } => {
+                let src = self.compile_expr(expr, ctx)?;
+                self.emit(Op::TypeCheck {
+                    src,
+                    dest,
+                    negated: *negated,
+                    ty: ty.clone(),
+                });
             }
             Expr::IsNull { expr, negated } => {
                 let src = self.compile_expr(expr, ctx)?;

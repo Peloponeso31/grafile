@@ -232,6 +232,17 @@ pub enum Op {
         /// Destination register.
         dest: u32,
     },
+    /// `expr IS [NOT] :: TYPE`.
+    TypeCheck {
+        /// Source register.
+        src: u32,
+        /// Destination register.
+        dest: u32,
+        /// Whether `NOT` was written.
+        negated: bool,
+        /// The tested type.
+        ty: Box<CypherType>,
+    },
     /// Whether a node carries a label.
     HasLabel {
         /// Node register.
@@ -256,6 +267,18 @@ pub enum Op {
         dest: u32,
         /// Key names and value registers.
         pairs: Vec<(String, u32)>,
+    },
+    /// A map projection: null for a null base, otherwise the base's
+    /// properties (when `all_properties`) overlaid by the pairs.
+    MapProjection {
+        /// The projected value.
+        base: u32,
+        /// Whether `.*` was written.
+        all_properties: bool,
+        /// Key names and value registers, overriding properties.
+        pairs: Vec<(String, u32)>,
+        /// Destination register.
+        dest: u32,
     },
     /// Jump when the register is false or null.
     IfNot {
@@ -428,6 +451,13 @@ pub enum Op {
     },
     /// Test whether a row cursor holds any rows.
     CtxHasRows {
+        /// Cursor slot.
+        cursor: u32,
+        /// Destination register.
+        dest: u32,
+    },
+    /// Store the number of rows a row cursor collected.
+    CtxRowCount {
         /// Cursor slot.
         cursor: u32,
         /// Destination register.
@@ -1617,6 +1647,15 @@ impl<'a> Executor<'a> {
                 let value = self.reg_value(*src)?;
                 self.regs[*dest as usize] = Reg::Value(Value::Bool(value.is_null()));
             }
+            Op::TypeCheck {
+                src,
+                dest,
+                negated,
+                ty,
+            } => {
+                let accepted = ty.accepts(&self.reg_value(*src)?);
+                self.regs[*dest as usize] = Reg::Value(Value::Bool(accepted != *negated));
+            }
             Op::HasLabel { node, label, dest } => {
                 let value = self.reg_value(*node)?;
                 let result = match value {
@@ -1671,6 +1710,35 @@ impl<'a> Executor<'a> {
                     ));
                 }
                 self.regs[*dest as usize] = Reg::Value(Value::Map(entries.into()));
+            }
+            Op::MapProjection {
+                base,
+                all_properties,
+                pairs,
+                dest,
+            } => {
+                let base = self.reg_value(*base)?;
+                let projected = if base.is_null() {
+                    Value::Null
+                } else {
+                    let mut entries: Vec<(Arc<str>, Value)> = if *all_properties {
+                        match self.call_function(func::PROPERTIES, &[base])? {
+                            Value::Map(properties) => properties.to_vec(),
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        Vec::with_capacity(pairs.len())
+                    };
+                    for (key, reg) in pairs {
+                        let value = self.reg_value(*reg)?;
+                        match entries.iter_mut().find(|(name, _)| **name == **key) {
+                            Some((_, slot)) => *slot = value,
+                            None => entries.push((Arc::from(key.as_str()), value)),
+                        }
+                    }
+                    Value::Map(entries.into())
+                };
+                self.regs[*dest as usize] = Reg::Value(projected);
             }
             Op::IfNot { reg, target } => match self.regs[*reg as usize].as_value().as_ref() {
                 Value::Bool(true) => {}
@@ -1873,11 +1941,14 @@ impl<'a> Executor<'a> {
                 }
             }
             Op::CtxHasRows { cursor, dest } => {
-                let has_rows = match &self.cursors[*cursor as usize] {
-                    Cursor::Rows { rows, .. } => !rows.is_empty(),
-                    _ => return Err(Error::internal("CtxHasRows on a non-row cursor")),
-                };
+                let (rows, _) = self.rows_mut(*cursor)?;
+                let has_rows = !rows.is_empty();
                 self.regs[*dest as usize] = Reg::Value(Value::Bool(has_rows));
+            }
+            Op::CtxRowCount { cursor, dest } => {
+                let (rows, _) = self.rows_mut(*cursor)?;
+                let count = rows.len() as i64;
+                self.regs[*dest as usize] = Reg::Value(Value::Int(count));
             }
             Op::CtxToList { cursor, dest } => {
                 let values = match &self.cursors[*cursor as usize] {
@@ -3492,6 +3563,8 @@ pub mod binary_code {
     pub const CONTAINS: u8 = 18;
     /// `=~`
     pub const REGEX: u8 = 19;
+    /// `||`
+    pub const CONCAT: u8 = 20;
 
     /// Encode a binary operator.
     pub const fn encode(op: BinaryOp) -> u8 {
@@ -3516,6 +3589,7 @@ pub mod binary_code {
             BinaryOp::EndsWith => ENDS_WITH,
             BinaryOp::Contains => CONTAINS,
             BinaryOp::Regex => REGEX,
+            BinaryOp::Concat => CONCAT,
         }
     }
 }
@@ -3531,6 +3605,14 @@ pub const fn unary_code(op: UnaryOp) -> u8 {
 fn binary_op(op: u8, a: &Value, b: &Value) -> Result<Value> {
     use binary_code as code;
     match op {
+        code::CONCAT => match (a, b) {
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (Value::Text(x), Value::Text(y)) => Ok(Value::Text(format!("{x}{y}").into())),
+            (Value::List(x), Value::List(y)) => {
+                Ok(Value::List(x.iter().chain(y.iter()).cloned().collect()))
+            }
+            _ => Err(type_error("||", a, b)),
+        },
         code::ADD => match temporal_add(a, b)? {
             Some(value) => Ok(value),
             None => numeric_or_concat(a, b, |x, y| x + y, |x, y| x.wrapping_add(y)),

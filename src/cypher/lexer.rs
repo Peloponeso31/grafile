@@ -240,6 +240,9 @@ pub enum Token {
     /// `|`
     #[token("|")]
     Pipe,
+    /// `||` (string and list concatenation)
+    #[token("||")]
+    DoublePipe,
     /// `!` (label expression negation)
     #[token("!")]
     Bang,
@@ -455,9 +458,8 @@ fn classify(token: Token, tokens: &[(usize, usize, Token)], index: usize) -> Tok
         }
         EscapedIdent => context_class(tokens, index),
         PlusEquals | Plus | Minus | Star | Slash | Percent | Caret | Equals | Less | Greater
-        | NotEquals | LessEquals | GreaterEquals | RegexMatch | ArrowRight | ArrowLeft | DotDot => {
-            TokenClass::Operator
-        }
+        | NotEquals | LessEquals | GreaterEquals | RegexMatch | ArrowRight | ArrowLeft | DotDot
+        | DoublePipe => TokenClass::Operator,
         LParen | RParen | LBracket | RBracket | LBrace | RBrace | Comma | Semicolon | Colon
         | Pipe | Bang | Amp | Dot => TokenClass::Punctuation,
         other => {

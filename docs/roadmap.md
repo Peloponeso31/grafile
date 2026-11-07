@@ -26,9 +26,13 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
   `nodes()`, `relationships()` and `length()`.
 - Expressions: parameters, list/map literals, map access, list indexing and
   slicing, list comprehensions, quantifiers (`all`, `any`, `none`, `single`),
-  `reduce()`, `CASE`, `IS [NOT] NULL`, `STARTS WITH` / `ENDS WITH` /
-  `CONTAINS` / `=~`, `IN`, label predicates, three-valued logic, numeric
-  cross-type comparison.
+  `reduce()`, `CASE`, `IS [NOT] NULL`, `IS [NOT] :: TYPE` / `IS TYPED`
+  (GQL types with `NOT NULL`, `LIST<T>` and unions), `STARTS WITH` /
+  `ENDS WITH` / `CONTAINS` / `=~`, `IN`, `||` string and list
+  concatenation, map projections (`n{.name, .*, key: expr, var}`),
+  `COUNT { … }` and `EXISTS { … }` subqueries, SQL-style
+  `trim(BOTH|LEADING|TRAILING … FROM s)`, label predicates, three-valued
+  logic, numeric cross-type comparison.
 - Aggregations: `count`, `sum`, `avg`, `min`, `max`, `collect`,
   `percentileCont`, `percentileDisc`, `stDev`, `stDevP`, with `DISTINCT`,
   multiple arguments and expressions over aggregations.
@@ -80,8 +84,6 @@ Explicit gaps (currently clear `Unsupported` errors):
 
 | Gap | Where rejected |
 |-----|----------------|
-| `REMOVE n = {…}` | codegen |
-| Map projections (`n{.name}`) | parser |
 | Unknown functions | codegen (by design) |
 
 Silently absent areas: none of the openCypher value types.
@@ -504,15 +506,6 @@ Shell:
   `.param set tenant 'acme'`, with a flag to skip it.
 - A `--readonly` flag for ordinary sessions (only `grafile check` opens
   files read-only today).
-
-Syntax:
-
-- Map projections (`n{.name, .age, key: expr, .*}`), currently a parser
-  error.
-- `COUNT { pattern }` subqueries, next to the existing `EXISTS` form.
-- `trim(BOTH 'x' FROM s)`, the `||` string operator and `x IS :: TYPE`
-  type predicates.
-- `REMOVE n = {}`.
 
 ## Sequencing rules
 
