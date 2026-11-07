@@ -447,6 +447,61 @@ comprehension.
 - Remote `LOAD CSV` over HTTP (local files first; revisit on demand).
 - GQL-only syntax beyond what openCypher 9 specifies.
 
+### Quality-of-life backlog (unscheduled)
+
+Small, self-contained conveniences that no phase schedules. They stay out of
+the plan, but a contribution that adds one is welcome if it follows the
+sequencing rules below. Each was confirmed missing against 0.3.0.
+
+Shell:
+
+- Persistent history: rustyline keeps it in memory only; load and save a
+  history file.
+- Tab completion: `GrafileHelper` implements `Completer` without logic;
+  complete dot-commands, keywords, function names and the database's labels,
+  relationship types and property keys.
+- Parameters from the shell: sqlite-style dot-commands (`.param set name
+  value`, `.param list`, `.param clear`) and a `-p name=value` flag for `-c`.
+  Today the shell always runs queries with an empty parameter set.
+- An optional startup file, like sqlite's `~/.sqliterc`: dot-commands run
+  before the first prompt, for example `.pretty on`, `.mode box` or
+  `.param set tenant 'acme'`, with a flag to skip it.
+- An `EXPLAIN` statement prefix (and `.explain`) over the existing
+  `Connection::explain`.
+- A `--readonly` flag for ordinary sessions (only `grafile check` opens
+  files read-only today).
+
+Functions:
+
+- Null-safe conversions: `toStringOrNull`, `toIntegerOrNull`,
+  `toFloatOrNull`, `toBooleanOrNull`.
+- Helpers: `isEmpty`, `isNaN`, `nullIf`, `valueType`, `char_length`,
+  `btrim`, `toIntegerList`, `toFloatList`, `toStringList`,
+  `toBooleanList`.
+- Aliases: `upper`/`lower`, `point.distance`.
+- `elementId(n)`, the Neo4j 5 replacement for `id()` that drivers call.
+
+Syntax:
+
+- Map projections (`n{.name, .age, key: expr, .*}`), currently a parser
+  error.
+- `COUNT { pattern }` subqueries, next to the existing `EXISTS` form.
+- `trim(BOTH 'x' FROM s)`, the `||` string operator and `x IS :: TYPE`
+  type predicates.
+- `REMOVE n = {}`.
+
+Introspection:
+
+- `SHOW INDEXES` and `SHOW CONSTRAINTS` returning rows (the data already
+  backs `.indexes`).
+- `db.schema.visualization()` and `db.schema.nodeTypeProperties()`.
+
+Errors:
+
+- "Did you mean" suggestions for unknown functions and procedures.
+- A named error for unsupported statement prefixes such as `PROFILE`,
+  instead of "expected a clause … (found Ident)".
+
 ## Sequencing rules
 
 1. No feature ships without TCK coverage: a feature is done when its

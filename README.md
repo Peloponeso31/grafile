@@ -1,362 +1,280 @@
 # grafile
 
-A graph database that lives in a single file, queried with Cypher.
+**A graph database in a single file, queried with Cypher.**
 
-grafile borrows SQLite's architecture wholesale — VFS, pager, B+tree, code
-generator, bytecode VM (VDBE) — and adds a **chunked incidence matrix** as the
-adjacency index: the graph is stored as sparse 256x256-bit bitmap fragments in
-a B+tree, so neighbor iteration, edge-existence checks and bitmap set
-operations are cheap, while node and edge records stay in ordinary table
-B+trees. No server, no sidecars at rest, embeddable from Rust or any language
-with a C FFI.
+[![CI](https://github.com/Peloponeso31/grafile/actions/workflows/ci.yml/badge.svg)](https://github.com/Peloponeso31/grafile/actions/workflows/ci.yml)
+[![openCypher TCK](https://github.com/Peloponeso31/grafile/actions/workflows/tck.yml/badge.svg)](https://github.com/Peloponeso31/grafile/actions/workflows/tck.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+grafile is to graphs what SQLite is to tables: no server, no setup, one
+portable file. Open it from the shell, from Rust, or from any language with a
+C FFI, and query it with the openCypher dialect you already know from Neo4j.
 
 ```console
-$ grafile social.grafile
-grafile> CREATE (alice:Person {name: 'alice', age: 30}),
-         (bob:Person {name: 'bob', age: 25}),
-         (alice)-[:KNOWS {since: 2020}]->(bob);
+$ grafile social.grafile -c "CREATE (alice:Person {name: 'alice', age: 30}),
+    (bob:Person {name: 'bob', age: 25}), (carol:Person {name: 'carol', age: 41}),
+    (alice)-[:KNOWS {since: 2020}]->(bob), (bob)-[:KNOWS {since: 2023}]->(carol)"
 OK
-grafile> MATCH (a:Person)-[:KNOWS]->(b)
-         RETURN a.name AS from_name, b.name AS to_name;
-+-----------+---------+
-| from_name | to_name |
-+-----------+---------+
-| alice     | bob     |
-+-----------+---------+
+$ grafile social.grafile -c "MATCH p = shortestPath((a:Person {name: 'alice'})-[:KNOWS*]->(c:Person {name: 'carol'}))
+    RETURN [n IN nodes(p) | n.name] AS route, length(p) AS hops"
++---------------------+------+
+| route               | hops |
++---------------------+------+
+| [alice, bob, carol] | 2    |
++---------------------+------+
 ```
 
-## Why grafile
+## Highlights
 
-- **One file, zero setup.** The database is a single file. A transient
-  `-journal` sidecar exists only while a write transaction is in flight, so a
-  grafile database is self-contained at rest.
-- **Graph-native storage.** Adjacency is kept in a bitmap index, so walking
-  relationships and checking whether an edge exists do not scan tables.
-- **Crash-safe.** Writes use a rollback journal and every page is checksummed;
-  recovery is tested by tearing writes at every operation boundary.
-- **Embeddable.** Use it as a Rust library or through a C ABI from Go, Python,
-  Dart and anything else with C FFI.
-- **Measured, not claimed.** Conformance is checked against the openCypher TCK
-  on every change, with a published pass rate (see below).
+- **One file, zero configuration.** The database is a single file; a
+  `-journal` sidecar exists only while a write transaction is in flight.
+- **Real Cypher.** 3844 of 3844 applicable openCypher TCK scenarios pass,
+  plus the Neo4j extensions people actually use: schema DDL, constraints,
+  fulltext indexes, `LOAD CSV` and `CALL { ... } IN TRANSACTIONS`.
+- **Graph-native storage.** Relationships live in a bitmap incidence index,
+  so traversals and edge-existence checks never scan tables.
+- **Crash-safe and self-checking.** A rollback journal and per-page checksums
+  protect every commit, and `grafile check` verifies every index and bitmap
+  against the records they derive from.
+- **Fast where it matters.** Indexed lookups take about 3.5 µs, and the
+  Neo4j seed script with 2.3 million nodes and 13 million relationships loads
+  in under eight minutes on an Apple M5.
+- **Embeddable anywhere.** A Rust crate and a stable, SQLite-shaped C ABI,
+  with examples for C, Go, Python and Dart.
 
-## Architecture
+## Contents
 
-A query flows top to bottom:
+- [Install](#install)
+- [Using the shell](#using-the-shell)
+- [Cypher at a glance](#cypher-at-a-glance)
+- [Embedding grafile](#embedding-grafile)
+- [Performance](#performance)
+- [Reliability](#reliability)
+- [Developing grafile](#developing-grafile)
+- [License](#license)
 
-```
-Cypher text -> cypher::parse -> planner::plan_query -> codegen::compile
-            -> vdbe::execute -> cursors -> btree -> pager -> vfs
-```
+## Install
 
-| Layer | Module | Responsibility |
-|-------|--------|----------------|
-| OS interface | `vfs` | `StdVfs` plus an in-memory VFS with fault injection |
-| Pager | `pager` | Page cache, rollback journal, freelist, checksums |
-| B+tree | `btree` | Slotted pages, overflow chains, cursors, integrity checks |
-| Records | `record` | Record codec and order-preserving index keys |
-| Catalog | `catalog` | Labels, edge types, property keys, index definitions |
-| Incidence matrix | `matrix` | Bitmap fragments per direction/type/label plane |
-| Engine | `engine` | Node/edge operations, index maintenance, transactions |
-| Front end | `cypher` | Lexer, parser, AST |
-| Planner | `planner` | Index seek > label scan > full scan, BFS expansion |
-| Code generator | `codegen` | Continuation-passing compilation to bytecode |
-| VDBE | `vdbe` | Register machine with cursor loops, sort and aggregation |
-| API / CLI | `api`, `main` | `Connection`, `Params`, `Rows`; REPL and scripts |
-
-Design points worth knowing before changing storage code:
-
-- **Single file.** Pages are 4 KiB by default and every page carries a CRC32C,
-  computed once when dirty pages are written at commit (not on every in-memory
-  mutation). The database header holds the format version, page size, UUID,
-  creation time, freelist head and tree roots. The layout is specified in
-  [docs/format.md](docs/format.md).
-- **Transactions.** A SQLite-style rollback journal: a transient
-  `<db>-journal` sidecar is created per write transaction and removed on
-  commit, so the database file is self-contained at rest. Readers take a
-  shared file lock, writers an exclusive one. The journal is flushed with a
-  full sync; database pages and journal invalidation use a normal `fsync`.
-  `CALL { ... } IN TRANSACTIONS OF n ROWS` commits every batch and opens the
-  next write transaction, so earlier batches survive a later failure.
-- **The adjacency index.** `matrix` keeps fixed-size fragments (256 nodes x
-  256 edges of bits) as records in a B+tree: an out-plane and an in-plane per
-  edge type, plus label and edge-type bitmaps. Fragments are stored sparse
-  (sorted bit offsets) while they are small and switch to dense word arrays as
-  they fill. A write-back cache keeps touched fragments in memory for the
-  duration of a transaction.
-- **Determinism.** Query results do not depend on hash-map iteration order:
-  the planner scope is insertion-ordered and records keep properties sorted by
-  key.
-
-### Project layout
-
-```
-src/            library + CLI (main.rs)
-  cypher/       lexer (logos), recursive-descent parser, AST
-  planner/      anchor selection, pattern expansion, pipeline operators
-  codegen/      plan -> VDBE bytecode
-  vdbe/         register VM: cursor loops, sort/aggregate row cursors
-  engine/       node/edge operations, schema, indexes, fragment store
-  matrix/       chunked incidence matrix (sparse/dense bitmap fragments)
-  record/       varint/typed record codec, order-preserving index keys
-  btree/        slotted pages, overflow chains, cursors, integrity checker
-  catalog/      labels, edge types, property keys, index definitions
-  pager/        page cache, rollback journal, freelist, CRC32C checksums
-  vfs/          StdVfs + fault-injecting MemVfs for crash tests
-  api.rs        Connection, Params, Rows
-benches/        criterion: storage, queries, insert (SQLite baselines)
-examples/       profile_insert.rs: insert-path profiling workload
-tests/          end-to-end Cypher suites by feature area, CLI tests, helpers
-ffi/            C ABI crate, header and language examples
-tck-runner/     openCypher TCK harness (see docs/tck.md)
-third_party/    vendored openCypher TCK (submodule)
-docs/           format.md, ffi.md, tck.md, roadmap.md, benchmarks.md
-```
-
-## Installation
-
-macOS and Linux, any distro. The script picks the right static binary,
-verifies its SHA-256, and installs to `~/.local/bin` without sudo:
+**macOS and Linux.** The script downloads the right static binary, verifies
+its SHA-256 and installs it to `~/.local/bin`, without sudo:
 
 ```console
 $ curl -LsSf https://github.com/Peloponeso31/grafile/releases/latest/download/install.sh | sh
 ```
 
-Set `GRAFILE_PREFIX` to install elsewhere, or `GRAFILE_VERSION` to pin a
-release. Alongside the binary the script installs the FFI library
-(`lib/libgrafile.*`), the C header (`include/grafile.h`) and pkg-config
-metadata (`lib/pkgconfig/grafile.pc`), so programs can link with:
+Set `GRAFILE_PREFIX` to install elsewhere or `GRAFILE_VERSION` to pin a
+release. The script also installs the C library (`lib/libgrafile.*`), its
+header (`include/grafile.h`) and pkg-config metadata.
 
-```console
-$ export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig:$PKG_CONFIG_PATH"
-$ cc app.c $(pkg-config --cflags --libs grafile)
-```
-
-See [docs/ffi.md](docs/ffi.md) for the C ABI.
-
-Debian/Ubuntu users can install the `.deb`; Fedora/RHEL users the `.rpm`
-(x86_64 and aarch64 packages are released):
+**Debian/Ubuntu and Fedora/RHEL** (x86_64 and aarch64 packages are released):
 
 ```console
 $ sudo dpkg -i grafile_0.3.0-1_amd64.deb
 $ sudo rpm -i grafile-0.3.0-1.x86_64.rpm
 ```
 
-Windows, once the first manifest is merged into the winget community
+**Windows**, once the manifest is merged into the winget community
 repository:
 
 ```console
 $ winget install Peloponeso31.Grafile
 ```
 
-From source (stable Rust, edition 2024):
+**From source** (stable Rust, edition 2024):
 
 ```console
-$ cargo install --path .        # installs the `grafile` binary
+$ cargo install --path .
 ```
 
-Every release also ships tarballs, packages and `SHA256SUMS.txt` on the
+Every release ships tarballs, packages and `SHA256SUMS.txt` on the
 [releases page](https://github.com/Peloponeso31/grafile/releases).
 
 ## Using the shell
 
 ```console
-$ grafile social.grafile        # start the shell on a new or existing file
+$ grafile social.grafile                    # interactive shell (creates the file if needed)
+$ grafile social.grafile -c "MATCH (n) RETURN count(n)"   # one query, then exit
+$ grafile social.grafile import.cypher      # run a script of ;-separated statements
+$ grafile check social.grafile              # verify integrity, read-only
 ```
 
-From a checkout, `cargo run --release -- social.grafile` does the same without
-installing.
-
-Run one query and exit:
-
-```console
-$ grafile social.grafile -c "MATCH (n:Person) RETURN count(n) AS people"
-+--------+
-| people |
-+--------+
-| 2      |
-+--------+
-```
-
-`-c` runs a single query. For several statements, put them in a script file
-(statements are separated by `;`) or type them in the shell:
-
-```console
-$ grafile social.grafile import.cypher
-```
-
-Errors carry a code (and a position for syntax errors), and the process exits
-with status 1, so scripts and CI jobs can rely on it:
+Statements in the shell end with `;` or an empty line. Input is
+syntax-highlighted (`NO_COLOR` turns colors off), and errors carry a code and,
+for syntax errors, a position. Failed commands exit with status 1, so scripts
+and CI jobs can rely on them:
 
 ```console
 $ grafile social.grafile -c "MATCH (n"
 error: Syntax: expected ')' to close a node pattern at line 1 column 9 (found end of input)
-$ grafile social.grafile -c "RETURN 1 + 'x'"
-error: Type: cannot apply arithmetic to integer and string
 ```
 
-### Checking integrity
+Scripts may contain `//` and `/* */` comments, and long loads show a progress
+bar. The script runner accepts Neo4j-style seed files unchanged; the
+1/100-scale audited seed script in `tests/fixtures/seed_1_100.cypher` loads in
+under two seconds.
 
-`grafile check FILE` verifies a database without modifying it (it opens the
-file read-only): every relationship's incidence and type bits, every label
-bit, property index entry, uniqueness and existence constraint and fulltext
-posting is compared with the node and relationship records it derives from,
-alongside B+tree ordering, page ownership and the freelist. Findings are
-printed one per line with a summary, and the exit status is 1 when any
-remain:
-
-```console
-$ grafile check social.grafile
-0 findings: 2306 pages (0 free), 23845 nodes, 131470 edges, 16433 fragments, 51145 index entries, 57133 postings
-```
-
-`grafile check FILE --rebuild` regenerates the bitmaps and indexes from the
-records inside one write transaction and checks again. Records are never
-modified: damaged primary data is reported, not guessed. From code, use
-`Database::check_integrity()` and `Database::rebuild_derived()`; from C,
-`grafile_check_json()`.
-
-The interactive shell remembers a few conveniences:
+### Shell commands
 
 | Command | Effect |
 | --- | --- |
 | `.schema` | labels, relationship types and property keys |
 | `.indexes` | index and constraint definitions |
-| `.meta` | database header: page size, UUID, freelist, tree roots |
-| `.mode NAME` | output mode: `table`, `box`, `csv`, `json`, `markdown`, … |
-| `.headers on\|off` | column titles |
-| `.pretty on\|off` | expand nodes and edges to highlighted JSON |
-| `.timer on\|off` | per-query timing |
+| `.meta [raw\|human]` | database header: page size, UUID, freelist, tree roots |
+| `.mode NAME` | `table`, `box`, `qbox`, `psql`, `markdown`, `column`, `list`, `tabs`, `csv`, `quote`, `line`, `json` |
+| `.headers on\|off`, `.separators on\|off` | table layout |
+| `.pretty on\|off` | render nodes and relationships as highlighted JSON |
+| `.colors on\|off`, `.timer on\|off` | highlighting and per-query timing |
 | `.read FILE` | run a script |
-| `.help` / `.quit` | help and exit |
+| `.clear`, `.help`, `.quit` | housekeeping |
 
-`.meta` prints the interpreted database header (page size, UUID, freelist,
-tree roots, allocated counts); inside an open transaction it shows uncommitted
-changes, because the header is the in-memory authoritative copy. Input is
-syntax-highlighted while typing (`NO_COLOR` disables it). `.mode json` emits
-one JSON object per row, which makes piping into `jq` or another program
-straightforward:
+`.mode json` prints one JSON object per row, ready for `jq`:
 
 ```console
 grafile> .mode json
-grafile> MATCH (n:Person) RETURN n;
+grafile> MATCH (n:Person {name: 'alice'}) RETURN n;
 {"n":{"id":1,"labels":["Person"],"properties":{"name":"alice","age":30}}}
 ```
 
-### A Cypher tour
+### Checking integrity
 
-```cypher
-// Create nodes and a relationship in one statement.
-CREATE (alice:Person {name: 'alice', age: 30}),
-       (bob:Person {name: 'bob', age: 25}),
-       (alice)-[:KNOWS {since: 2020}]->(bob)
+`grafile check FILE` opens the database read-only and compares every derived
+structure (relationship and label bitmaps, property and fulltext indexes,
+uniqueness and existence constraints) with the node and relationship records,
+alongside B+tree ordering, page ownership and the freelist. It prints any
+findings and a summary, and exits with status 1 when something is wrong:
 
-// Traverse relationships.
-MATCH (a:Person)-[:KNOWS]->(b)
-RETURN a.name AS from_name, b.name AS to_name
-
-// Filter, sort and paginate.
-MATCH (p:Person)
-WHERE p.age > 24
-RETURN p.name AS name
-ORDER BY p.name
-SKIP 0 LIMIT 10
-
-// Aggregate.
-MATCH (p:Person)
-RETURN count(p) AS people, avg(p.age) AS avg_age
-
-// Chain clauses with WITH and build rows with UNWIND.
-UNWIND [1, 2, 3] AS x
-WITH x * 2 AS doubled
-RETURN sum(doubled) AS total
-
-// Create if missing, update if present.
-MERGE (carol:Person {name: 'carol'})
-ON CREATE SET carol.age = 40
-ON MATCH SET carol.seen = true
-RETURN carol.name AS name
-
-// Update and delete.
-MATCH (p:Person {name: 'bob'}) SET p.age = 26
-MATCH (a)-[r:KNOWS]->(b) DELETE r
-MATCH (p:Person) DETACH DELETE p
+```console
+$ grafile check social.grafile
+0 findings: 5 pages (0 free), 3 nodes, 2 edges, 6 fragments, 0 index entries, 0 postings
 ```
 
-## Using the library
+`grafile check FILE --rebuild` regenerates bitmaps and indexes from the
+records in one transaction and checks again. Records themselves are never
+rewritten: damaged primary data is reported, not guessed at.
+
+## Cypher at a glance
+
+```cypher
+// Create, match and traverse.
+CREATE (a:Person {name: 'alice'})-[:KNOWS {since: 2020}]->(b:Person {name: 'bob'});
+MATCH (a:Person)-[:KNOWS*1..3]->(b) WHERE a.name = 'alice' RETURN DISTINCT b.name;
+
+// Aggregate, sort and paginate.
+MATCH (p:Person)-[:KNOWS]->(friend)
+RETURN p.name AS person, count(friend) AS friends
+ORDER BY friends DESC LIMIT 10;
+
+// Upsert.
+MERGE (c:Person {name: 'carol'})
+ON CREATE SET c.created = datetime()
+ON MATCH SET c.seen = true;
+
+// Optional patterns, subqueries and comprehensions.
+MATCH (p:Person)
+OPTIONAL MATCH (p)-[:KNOWS]->(f)
+CALL (p) { MATCH (p)<-[:KNOWS]-(fan) RETURN count(fan) AS fans }
+RETURN p.name, [x IN collect(f.name) WHERE x IS NOT NULL] AS knows, fans;
+
+// Bulk loads in batches that commit as they go.
+LOAD CSV WITH HEADERS FROM 'people.csv' AS row
+CALL (row) { CREATE (:Person {name: row.name, age: toInteger(row.age)}) }
+IN TRANSACTIONS OF 10000 ROWS;
+```
+
+### Schema, indexes and fulltext search
+
+Schema DDL follows Neo4j 5:
+
+```cypher
+CREATE CONSTRAINT person_email IF NOT EXISTS FOR (n:Person) REQUIRE n.email IS UNIQUE;
+CREATE INDEX person_name FOR (n:Person) ON (n.name);
+CREATE FULLTEXT INDEX post_text FOR (n:Post) ON EACH [n.title, n.body];
+
+CALL db.index.fulltext.queryNodes('post_text', '"graph database" OR sqlite')
+YIELD node, score
+RETURN node.title, score;
+```
+
+`IS UNIQUE`, `IS NOT NULL` and `IS NODE KEY` are enforced on every write, and
+the relationship form `FOR ()-[r:TYPE]-()` covers unique and not-null
+constraints. Equality lookups use an index whether the value is a literal, a
+parameter or a variable bound earlier in the query (`{id: uid}`,
+`WHERE n.id = uid`). Fulltext queries take terms, `"phrases"`, `AND` and
+`OR`. The analyzer splits on non-alphanumeric characters and lowercases, and
+is deliberately not Lucene-compatible.
+
+### What is supported
+
+| Area | Coverage |
+| --- | --- |
+| Clauses | `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN`, `WITH`, `UNWIND`, `CREATE`, `MERGE` (`ON CREATE`/`ON MATCH`), `SET`, `REMOVE`, `DELETE`, `DETACH DELETE`, `FOREACH`, `UNION [ALL]`, `LOAD CSV`, `CALL { ... }` (unit, returning, correlated, `IN TRANSACTIONS`) |
+| Patterns | directions, label expressions (`:A\|B`, `:A&B`, `:!A`), inline property maps, variable-length paths (`*1..3`), named paths, `shortestPath`, `allShortestPaths`, pattern predicates and comprehensions |
+| Expressions | parameters, list and map literals, indexing and slicing, list comprehensions, `all`/`any`/`none`/`single`, `reduce`, `CASE`, string predicates and `=~`, three-valued logic |
+| Aggregation | `count`, `sum`, `avg`, `min`, `max`, `collect`, `percentileCont`, `percentileDisc`, `stDev`, `stDevP`, with `DISTINCT` |
+| Functions | graph accessors, conversions, list, string and math libraries, `randomUUID`, `coalesce` |
+| Types | `date`, `time`, `localtime`, `datetime`, `localdatetime` (IANA zones), `duration`, `point` (cartesian and WGS-84) with ISO 8601 parsing, arithmetic, truncation and `distance()` |
+| Procedures | `db.labels`, `db.propertyKeys`, `db.relationshipTypes`, `db.awaitIndexes`, `db.index.fulltext.queryNodes` |
+
+Unsupported features fail with a clear `Unsupported` error instead of a wrong
+answer: `REMOVE n = {...}`, map projections (`n{.name}`), `SHOW INDEXES` /
+`SHOW CONSTRAINTS` and user-defined procedures. What is planned next is in
+[docs/roadmap.md](docs/roadmap.md).
+
+## Embedding grafile
+
+### Rust
+
+grafile is not on crates.io yet; depend on the repository (pin a release
+with `tag = "vX.Y.Z"`):
+
+```toml
+[dependencies]
+grafile = { git = "https://github.com/Peloponeso31/grafile" }
+```
 
 ```rust
 use grafile::api::{Connection, Params};
 
-let mut conn = Connection::open("graph.grafile")?;
-conn.execute("CREATE (a:Person {name: 'alice'})-[:KNOWS]->(b:Person {name: 'bob'})")?;
+fn main() -> Result<(), grafile::Error> {
+    let mut conn = Connection::create("graph.grafile")?; // `Connection::open` for an existing file
+    conn.execute("CREATE (:Person {name: 'alice'})-[:KNOWS]->(:Person {name: 'bob'})")?;
 
-let mut params = Params::new();
-params.insert("name", "alice");
-let rows = conn.query(
-    "MATCH (a:Person {name: $name})-[:KNOWS]->(b) RETURN b.name AS friend",
-    &params,
-)?;
-for row in rows.iter() {
-    println!("{row:?}");
+    let mut params = Params::new();
+    params.insert("name", "alice");
+    let rows = conn.query(
+        "MATCH (:Person {name: $name})-[:KNOWS]->(friend) RETURN friend.name AS friend",
+        &params,
+    )?;
+    for row in rows.iter() {
+        println!("{row:?}"); // [Text("bob")]
+    }
+
+    // Statements autocommit; group them explicitly when needed.
+    conn.begin()?;
+    conn.execute("CREATE (:Person {name: 'carol'})")?;
+    conn.commit()?;
+    Ok(())
 }
-# Ok::<(), grafile::Error>(())
 ```
 
-Schema DDL is a Neo4j extension (openCypher defines none). It runs as
-regular statements from the shell, scripts or the API:
+Every error carries an `ErrorCode` (`Syntax`, `Constraint`, `Busy`,
+`Corrupt`, ...) and a message; `query_with_phase` also tells compile-time
+from runtime failures. `explain` prints the logical plan and
+`explain_program` the bytecode. `database_mut` exposes the engine for bulk
+loading, and `Database::check_integrity` / `rebuild_derived` back the
+`check` command.
 
-```console
-grafile> CREATE CONSTRAINT person_email IF NOT EXISTS FOR (n:Person) REQUIRE n.email IS UNIQUE
-grafile> CREATE INDEX person_name FOR (n:Person) ON (n.name)
-grafile> DROP CONSTRAINT person_email IF EXISTS
-```
+### C and other languages
 
-`IS UNIQUE`, `IS NOT NULL` and `REQUIRE (n.a, n.b) IS NODE KEY` are
-enforced on creation, property removal and whole-map replacement, and
-the edge form `FOR ()-[r:TYPE]-()` covers unique and not-null edge
-constraints. `SHOW INDEXES` / `SHOW CONSTRAINTS` are not supported.
-
-Fulltext indexes cover the text properties of one label and are queried
-through a procedure:
-
-```console
-grafile> CREATE FULLTEXT INDEX post_text FOR (n:Post) ON EACH [n.title, n.body]
-grafile> CALL db.index.fulltext.queryNodes('post_text', '"hot take" OR graphs AND coffee') YIELD node, score RETURN node.title, score
-```
-
-Queries take terms, `"phrases"` and `AND`/`OR` (`AND` binds tighter;
-adjacent terms are alternatives). Text is split at non-alphanumeric
-characters and lowercased; the analyzer and scores are not
-Lucene-compatible. The Rust API keeps the direct constructors:
-
-```rust
-conn.create_node_index("name", Some("Person"), true)?; // unique index
-conn.create_edge_index("since", Some("KNOWS"), false)?;
-```
-
-`Connection::query_with_phase` reports whether a failure came from
-compilation or execution; `explain` prints the logical plan and
-`explain_program` the VDBE bytecode. `database_mut` exposes the engine for
-bulk loading and introspection. Errors are SQLite-shaped: every failure
-carries an `ErrorCode` (`Syntax`, `Constraint`, `Busy`, `Corrupt`, …) plus a
-message and optional source.
-
-## Embedding: C ABI
-
-`grafile-ffi` builds `libgrafile.so` / `libgrafile.dylib` / `grafile.dll` plus
-a hand-written `grafile.h`, so any language with C FFI can embed the engine
-in-process: C/C++, Go (cgo), Python (ctypes), Ruby, Node, Java, C#, Dart,
-Swift, PHP.
-
-```console
-$ cargo build -p grafile-ffi --release   # or scripts/build-ffi.sh
-$ bash scripts/ffi-smoke.sh              # C and Python smoke tests
-```
+`grafile-ffi` builds `libgrafile.so` / `libgrafile.dylib` / `grafile.dll` and
+ships a hand-written `grafile.h`. The API follows SQLite's shape:
+`prepare`/`step`/`column`, JSON helpers and SQLite-compatible result codes.
 
 ```c
 GrafileDb *db = NULL;
 char *err = NULL;
-grafile_open("graph.grafile", &db, &err);
+if (grafile_open("graph.grafile", &db, &err) != GRAFILE_OK) { /* report err */ }
+
 char *json = NULL;
 grafile_query_json(db, "MATCH (n:Person) RETURN n.name AS name", NULL, &json);
 puts(json);
@@ -364,148 +282,169 @@ grafile_free(json);
 grafile_close(db);
 ```
 
-The API follows SQLite's shape (`prepare`/`step`/`column`, JSON helpers,
-SQLite-compatible result codes). Ownership, threading and error handling are
-documented in [docs/ffi.md](docs/ffi.md), with C, Go, Python and Dart examples
-in `ffi/examples/`.
-
-## Cypher support
-
-Implemented: `MATCH` (node and relationship patterns, directions, type
-disjunction and label expressions — `:A|B`, `:A&B`, `:!A` — inline
-property filters including non-literal values),
-`OPTIONAL MATCH`, `WHERE`, `RETURN` and `WITH` (with
-`DISTINCT`, `ORDER BY`, `SKIP`, `LIMIT`), `UNWIND`,
-`LOAD CSV [WITH HEADERS] FROM file AS row`, `CREATE`, `MERGE` (with
-`ON CREATE SET` / `ON MATCH SET`), `SET`, `REMOVE`, `DELETE` /
-`DETACH DELETE`, `FOREACH`, `CALL` for built-in `db.*` procedures
-(including `db.index.fulltext.queryNodes`),
-`CALL { ... }` unit and returning subqueries (correlated through `WITH` or a
-`CALL (x, y) { ... }` scope clause, with `IN TRANSACTIONS OF n ROWS` batch
-commits), `UNION` / `UNION ALL`, `SET n += {…}`,
-parameters (`$name`), list and map literals, map field access and subscript
-(`m.k`, `m['k']`), list indexing and slicing (`list[1..3]`), list
-comprehensions, pattern predicates and pattern comprehensions,
-quantifiers (`all`, `any`, `none`, `single`), `reduce()`,
-variable-length paths (`*1..3`), `shortestPath()` / `allShortestPaths()`,
-named paths (`p = …`) with `nodes(p)`,
-`relationships(p)` and `length(p)`, `CASE`,
-`IS [NOT] NULL`, string predicates (`STARTS WITH`, `ENDS WITH`, `CONTAINS`,
-`=~`), label predicates, three-valued logic, and the aggregations `count`,
-`sum`, `avg`, `min`, `max`, `collect`, `percentileCont`, `percentileDisc`,
-`stDev`, `stDevP` (with `DISTINCT` and expressions over aggregations).
-Scalar functions: the graph accessors (`id`, `labels`, `type`, `startNode`,
-`endNode`, `properties`, `keys`, `nodes`, `relationships`, `size`,
-`length`), conversions (`toString`, `toInteger`, `toFloat`, `toBoolean`),
-list functions (`range` with two or three arguments, `head`, `last`, `tail`,
-`reverse`, `split`, `substring`, `coalesce`), string functions (`toUpper`,
-`toLower`, `trim`, `ltrim`, `rtrim`, `left`, `right`, `replace`), `randomUUID`
-and the math library (`abs`, `sign`, `ceil`, `floor`, `round`, `sqrt`, `exp`,
-`log`, `log10`, `sin`, `cos`, `tan`, `cot`, `asin`, `acos`, `atan`, `atan2`,
-`haversin`, `degrees`, `radians`, `pi`, `e`, `rand`).
-
-Temporal and spatial values are first class: `date`, `localtime`, `time`,
-`localdatetime`, `datetime` (fixed offsets and IANA zones like
-`Europe/Stockholm`), `duration` and `point`, built from strings, component
-maps or other temporal values, comparable and storable, with ISO 8601
-serialization, component accessors (`d.year`, `t.offset`, `du.months`,
-`p.longitude`), calendar and clock arithmetic (`date + duration`, `duration
-* 2`), `duration.between`/`inMonths`/`inDays`/`inSeconds`,
-`date.truncate`/`datetime.truncate` and friends (millennium through
-microsecond), plus `distance()` for cartesian and WGS-84 points.
-
-Explicit gaps fail with clear `Unsupported` errors instead of wrong
-results: `REMOVE n = {…}`, map projections (`n{.name}`), `SHOW
-INDEXES`/`SHOW CONSTRAINTS`, and negated or conjunctive type expressions
-on variable-length and shortest-path patterns. The plan to close them,
-ordered by TCK scenario share, is in [docs/roadmap.md](docs/roadmap.md).
-Storage-side work tracked alongside it: WAL mode for concurrent
-readers, delete rebalancing and `VACUUM`-style compaction, bulk loading,
-and streaming scans.
-
-## Conformance: the openCypher TCK
-
-Conformance is measured, not claimed. The vendored openCypher TCK (pinned
-submodule, tag `2024.3`) is executed scenario by scenario through the public
-API:
+After the install script, link with pkg-config:
 
 ```console
-$ git submodule update --init
-$ cargo run -p tck-runner --release      # exits 0 when the gate passes
+$ export PKG_CONFIG_PATH="$HOME/.local/lib/pkgconfig:$PKG_CONFIG_PATH"
+$ cc app.c $(pkg-config --cflags --libs grafile)
 ```
 
-The gate fails on unexpected failures, harness errors (steps or cells the
-runner cannot evaluate) and **stale allow-list entries**, so a fix must prune
-its allow-list entries in the same commit. Current baseline: 3897 scenarios,
-3844 passing (98.6% of the suite, 100% of applicable scenarios), 53
-allow-listed (the CALL procedure family, a non-goal, and one nested pattern
-comprehension), zero harness errors. Run instructions, error mapping and
-comparison semantics are documented in [docs/tck.md](docs/tck.md).
-
-## Testing
-
-```console
-$ cargo test --workspace   # unit + property + crash recovery + integration + FFI + harness
-$ cargo bench              # criterion: storage, queries, insert
-```
-
-- Unit tests live beside the code; B+tree, fragment codecs and crash recovery
-  are also checked against reference models with `proptest`
-  (`proptest-regressions/` keeps seed corpora for past failures).
-- Crash recovery is exercised with the fault-injecting `MemVfs`, which fails
-  or tears writes at every operation boundary; reopened databases are verified
-  for integrity, including a randomized multi-fault commit proptest.
-- `tests/` holds end-to-end suites by feature area (`matching`, `functions`,
-  `temporal`, `paths`, `writes`, `schema`, `transactions`, ...) sharing
-  helpers from `tests/support/`, plus `tests/cli.rs` for the binary's flags,
-  scripts, piped input and exit codes.
-- The integrity checker is the oracle for derived data: every suite built on
-  `tests/support::connection()` ends with a clean-report assertion, and
-  model-based proptests (`src/engine/model_tests.rs`) mirror random write
-  sequences, with ids biased toward band boundaries, in an in-memory
-  reference graph, including commits interrupted at random I/O operations.
-- `tests/compat.rs` opens the file written by every release since 0.2.0
-  (`tests/fixtures/versions/`) and requires a clean check and identical
-  snapshot answers.
-- The TCK harness has fixture-based tests for the gate itself plus a parse and
-  classification test over every vendored feature file.
-- CI runs formatting, clippy, documentation, the full test suite on macOS and
-  Linux and a benchmark smoke run on every pull request; the FFI crate is
-  built and tested on macOS, Linux and Windows (with C and Python smoke tests
-  on macOS and Linux) and the TCK gate runs on every pull request.
+Ownership, threading and error handling are documented in
+[docs/ffi.md](docs/ffi.md); runnable C, Go, Python and Dart examples live in
+[`ffi/examples/`](ffi/examples). Within 0.x the ABI only grows: check
+`grafile_libversion()` (currently 2000) against `GRAFILE_VERSION_NUMBER`.
 
 ## Performance
 
-`cargo bench` measures the storage layer, end-to-end Cypher latency and write
-workloads against SQLite baselines. Point lookups are single-digit
-microseconds, label counts run at ~50 ns per row, indexed equality is
-thousands of times faster than a label scan and 30 KB overflow values read in
-under a microsecond. Current numbers, methodology and the baseline-comparison
-workflow live in [docs/benchmarks.md](docs/benchmarks.md).
+Measured with Criterion on an Apple M5, in memory, release build:
 
-## Contributing
+| Workload | Time |
+| --- | ---: |
+| Indexed point lookup, 50 000 nodes | 3.5 µs |
+| Lookup by a variable key (`{id: uid}`), 50 000 nodes | 5.0 µs |
+| One-hop traversal | 5.2 µs |
+| Count a label, 50 000 nodes | 0.89 ms (18 ns per node) |
+| Count a two-label conjunction, 50 000 nodes | 93 µs |
+| `sum`/`count`/`avg` over 1 million rows | 36 ms |
+| `shortestPath` across a 10x10 grid | 102 µs |
+| `CREATE INDEX` over 50 000 existing nodes | 7.0 ms |
+| Seed script, 23 845 nodes and 131k relationships (1/100 scale, real file) | 1.6 s |
+| Seed script, 2.25 M nodes and 13 M relationships (full size, real file) | 460 s |
 
-Before a commit: `cargo fmt --all --check`,
-`cargo clippy --workspace --all-targets -- -D warnings`,
-`cargo test --workspace`, and — when behavior changes — the TCK gate.
-Commits follow conventional commits.
+Write workloads are compared with SQLite and, together with the
+methodology and the before/after history of every optimization, live in
+[docs/benchmarks.md](docs/benchmarks.md).
 
-Rules of the house:
+## Reliability
 
-- No feature ships without TCK coverage. Fixing a gap means removing its
-  allow-list entries in the same commit; the gate fails on stale entries.
-- Harness errors (unrecognized steps, cells, setups) are never allow-listed:
-  fix the runner first.
-- Storage changes follow [docs/format.md](docs/format.md) and bump the format
-  minor version; readers stay backward compatible.
-- Each release adds its compatibility fixture: run
-  `scripts/version-fixture.sh` on the release commit and commit
+- **Transactions.** A SQLite-style rollback journal: readers take a shared
+  lock, writers an exclusive one, and a crash at any point leaves either the
+  old or the new state. `IN TRANSACTIONS` batches commit as they go, so
+  earlier batches survive a later failure.
+- **Checksums.** Every page carries a CRC32C, verified on every read.
+- **Fault injection.** An in-memory VFS fails or tears writes at every I/O
+  operation; property tests then reopen the database and require the old
+  or new state exactly, with a clean integrity report.
+- **The checker as an oracle.** Every integration test ends by asserting a
+  clean `check` report, and model-based tests mirror random write sequences
+  in a reference graph.
+- **Compatibility.** Files written by every release since 0.2.0 are checked
+  in, and each build must open them, check them clean and answer the same
+  queries identically.
+- **Conformance.** The openCypher TCK runs on every pull request; the format
+  is specified in [docs/format.md](docs/format.md) and stays backward
+  compatible.
+
+## Developing grafile
+
+### Architecture
+
+grafile follows SQLite's layering, with a bitmap incidence matrix as the
+adjacency index:
+
+```
+Cypher text -> cypher (lexer, parser) -> planner -> codegen -> vdbe (bytecode VM)
+            -> engine -> btree / matrix -> pager -> vfs
+```
+
+| Layer | Module | Responsibility |
+| --- | --- | --- |
+| Front end | `cypher` | logos lexer, recursive-descent parser, AST |
+| Planner | `planner` | anchor choice (index seek over label scan over full scan), `WHERE` push-down, expansion order |
+| Code generator | `codegen` | continuation-passing compilation of plans to bytecode |
+| VM | `vdbe` | register machine: cursor loops, streaming aggregation, bounded sorts, subroutines |
+| Engine | `engine` | node and relationship operations, index maintenance, shortest paths, integrity checker |
+| Incidence matrix | `matrix` | 256 x 256-bit sparse/dense bitmap fragments per direction, type and label |
+| Records | `record` | record codec and order-preserving index keys |
+| Catalog | `catalog` | labels, types, property keys, index and constraint definitions |
+| Fulltext | `fulltext` | analyzer, inverted index, BM25-style scoring |
+| B+tree | `btree` | slotted pages, overflow chains, cursors, bulk build |
+| Pager | `pager` | page cache with a clean-page LRU, rollback journal, freelist, checksums |
+| OS interface | `vfs` | `StdVfs` and a fault-injecting in-memory VFS |
+| API and CLI | `api`, `main` | `Connection`, `Params`, `Rows`; shell and script runner |
+
+Worth knowing before changing storage code:
+
+- **Adjacency.** Relationships are bits in fixed-size fragments (256 nodes by
+  256 relationships) stored as B+tree records: an out-plane and an in-plane
+  per relationship type, plus label and type bitmaps. Fragments stay sparse
+  (sorted offsets) until they fill, then switch to dense words.
+- **Pages.** 4 KiB by default, each with a CRC32C computed once at commit.
+  The header holds the format version, UUID, freelist and tree roots; the
+  layout is in [docs/format.md](docs/format.md).
+- **Determinism.** Results never depend on hash-map iteration order: planner
+  scopes are insertion-ordered and records keep properties sorted by key.
+
+### Repository layout
+
+```
+src/          library and CLI (main.rs); one directory per layer above
+tests/        end-to-end suites by feature area, CLI tests, shared helpers in support/
+benches/      Criterion: storage, queries, insert (with SQLite baselines)
+ffi/          C ABI crate, grafile.h and language examples
+tck-runner/   openCypher TCK harness (see docs/tck.md)
+third_party/  vendored openCypher TCK (git submodule)
+scripts/      FFI build and smoke tests, release fixture generator
+docs/         format.md, ffi.md, tck.md, roadmap.md, benchmarks.md
+```
+
+### Build, test and benchmark
+
+```console
+$ cargo build --release
+$ cargo test --workspace                                   # unit, property, crash, integration, FFI
+$ cargo test --release --test seed_fixture -- --ignored    # 1/100 seed acceptance test
+$ git submodule update --init && cargo run -p tck-runner --release   # openCypher TCK gate
+$ cargo bench --bench queries                              # or storage, insert
+$ bash scripts/ffi-smoke.sh                                # C and Python against the shared library
+```
+
+The TCK gate fails on unexpected failures, on harness errors and on stale
+allow-list entries, so a fix must prune its allow-list entries in the same
+commit. The current allow-list holds the 52 procedure-registration scenarios
+(a non-goal) and one nested pattern comprehension; see
+[docs/tck.md](docs/tck.md).
+
+To compare performance before and after a change, save a Criterion baseline
+(`cargo bench -- --save-baseline main`) and compare against it
+(`cargo bench -- --baseline main`). Run benchmarks one at a time on an idle
+machine.
+
+### Contributing
+
+Before a commit, run what CI runs:
+
+```console
+$ cargo fmt --all --check
+$ cargo clippy --workspace --all-targets -- -D warnings
+$ RUSTDOCFLAGS="-D warnings" cargo doc -p grafile --no-deps
+$ cargo test --workspace
+```
+
+Plus the TCK gate whenever query behavior changes. Commits follow
+[Conventional Commits](https://www.conventionalcommits.org/).
+
+House rules:
+
+- **No feature without TCK coverage.** Features the TCK does not exercise
+  (DDL, fulltext, subqueries) need unit and integration tests and must not
+  regress the TCK report.
+- **Harness errors are never allow-listed.** Fix the runner instead.
+- **Storage changes follow [docs/format.md](docs/format.md)**, bump the
+  format minor version and keep readers backward compatible. Changes to
+  storage, the incidence matrix or write paths come with checker coverage and
+  a boundary case in `src/engine/model_tests.rs`.
+- **Performance changes come with benchmark evidence.** A fast path ships
+  only when it beats the code it replaces on the recorded machine; the
+  simpler path stays as the test oracle.
+- **No panics on user input.** No `unwrap` in library code, and `unsafe` only
+  with a documented safety invariant.
+- **Releases.** Bump the version in `Cargo.toml` and `ffi/Cargo.toml`, run
+  `scripts/version-fixture.sh` and commit
   `tests/fixtures/versions/<version>.grafile`.
-- Panics on user input are treated as bugs: no `unwrap` in library paths, and
-  `unsafe` only with a documented safety invariant.
-- AI use is fine, work will be anaylized and compared with the description of
-  your pull request.
+- **AI-assisted work is welcome.** It is reviewed against the description in
+  your pull request like any other contribution.
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+MIT; see [LICENSE](LICENSE).
