@@ -820,14 +820,19 @@ impl Codegen {
             }
             Plan::Distinct { input } => {
                 let cursor = self.alloc_cursor();
-                self.emit(Op::CollectOpen { cursor });
+                self.emit(Op::SorterOpen {
+                    cursor,
+                    dedup: true,
+                });
                 let mut produced: Option<Ctx> = None;
                 self.compile(input, ctx, &mut |cg, in_ctx| {
                     produced = Some(in_ctx.clone());
-                    cg.emit(Op::CollectRow {
+                    cg.emit(Op::SorterRow {
                         cursor,
                         start: in_ctx.window_start,
                         count: in_ctx.window_len,
+                        prefix: 0,
+                        ascending: vec![true; in_ctx.window_len as usize],
                     });
                     Ok(())
                 })?;
@@ -863,7 +868,10 @@ impl Codegen {
                         skip,
                         limit,
                     }),
-                    None => self.emit(Op::CollectOpen { cursor }),
+                    None => self.emit(Op::SorterOpen {
+                        cursor,
+                        dedup: false,
+                    }),
                 };
                 let mut produced: Option<(Ctx, u32)> = None;
                 self.compile(input, ctx, &mut |cg, in_ctx| {
@@ -890,10 +898,12 @@ impl Codegen {
                             prefix,
                             ascending: ascending.clone(),
                         }),
-                        None => cg.emit(Op::CollectRow {
+                        None => cg.emit(Op::SorterRow {
                             cursor,
                             start,
                             count,
+                            prefix,
+                            ascending: ascending.clone(),
                         }),
                     };
                     Ok(())

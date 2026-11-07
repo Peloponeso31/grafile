@@ -26,6 +26,10 @@ use crate::temporal::datetime::{DateTime, LocalDateTime, LocalTime, Time};
 use crate::temporal::duration::Duration;
 use crate::temporal::point::Point;
 
+pub(crate) mod sorter;
+
+use sorter::{Merge, Sorted, Sorter, SpillTarget};
+
 /// A register value: a plain value or an entity reference.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reg {
@@ -324,6 +328,27 @@ pub enum Op {
         /// Per-key sort direction.
         ascending: Vec<bool>,
     },
+    /// Open a spilling sort cursor for an unbounded `ORDER BY` or, with
+    /// `dedup`, a `DISTINCT`.
+    SorterOpen {
+        /// Cursor slot.
+        cursor: u32,
+        /// Drop rows whose sort keys equal the previous row's.
+        dedup: bool,
+    },
+    /// Buffer a register window in a spilling sort cursor.
+    SorterRow {
+        /// Cursor slot.
+        cursor: u32,
+        /// First register.
+        start: u32,
+        /// Number of registers.
+        count: u32,
+        /// Number of leading row columns before the sort keys.
+        prefix: u32,
+        /// Per-key sort direction.
+        ascending: Vec<bool>,
+    },
     /// Commit the current transaction and begin the next batch.
     BatchCommit {
         /// Input rows per transaction.
@@ -356,7 +381,7 @@ pub enum Op {
         /// Aggregations, in argument order.
         aggs: Vec<AggSpec>,
     },
-    /// Sort collected rows by their trailing key columns.
+    /// Finish a sort cursor: rows ordered by their trailing key columns.
     SortRows {
         /// Cursor slot.
         cursor: u32,
@@ -367,7 +392,8 @@ pub enum Op {
         /// Per-key sort direction.
         ascending: Vec<bool>,
     },
-    /// Sort by trailing key columns and drop duplicate key groups.
+    /// Finish a deduplicating sort cursor: rows ordered by their trailing
+    /// key columns with duplicate key groups dropped.
     DedupRows {
         /// Cursor slot.
         cursor: u32,
@@ -874,6 +900,10 @@ enum Cursor {
     },
     /// Rows of a bounded sort.
     TopK(TopK),
+    /// Rows of an unbounded sort or `DISTINCT` being collected.
+    Sorter(Sorter),
+    /// A finished sort streaming from spilled runs.
+    Merge(Merge),
     /// A streaming variable-length expansion.
     VarExpand(Box<crate::engine::VarExpansion>),
 }
@@ -1626,46 +1656,38 @@ impl<'a> Executor<'a> {
                 let row = &self.regs[*start as usize..(*start + *count) as usize];
                 top.offer(row, *prefix as usize, ascending);
             }
+            Op::SorterOpen { cursor, dedup } => {
+                let target = SpillTarget {
+                    vfs: Arc::clone(self.db.vfs()),
+                    database: self.db.path().to_path_buf(),
+                };
+                self.cursors[*cursor as usize] =
+                    Cursor::Sorter(Sorter::new(target, self.db.sort_memory(), *dedup));
+            }
+            Op::SorterRow {
+                cursor,
+                start,
+                count,
+                prefix,
+                ascending,
+            } => {
+                let Cursor::Sorter(sorter) = &mut self.cursors[*cursor as usize] else {
+                    return Err(Error::internal("SorterRow on a non-sort cursor"));
+                };
+                let row = &self.regs[*start as usize..(*start + *count) as usize];
+                sorter.push(row, *prefix as usize, ascending)?;
+            }
             Op::SortRows {
                 cursor,
                 prefix,
                 ascending,
                 ..
-            } => {
-                let prefix = *prefix as usize;
-                let slot = &mut self.cursors[*cursor as usize];
-                if let Cursor::TopK(_) = slot {
-                    let Cursor::TopK(top) = std::mem::replace(slot, Cursor::Empty) else {
-                        unreachable!("matched a bounded cursor above");
-                    };
-                    *slot = Cursor::Rows {
-                        rows: top.finish(prefix, ascending),
-                        pos: 0,
-                    };
-                } else {
-                    let (rows, _) = self.rows_mut(*cursor)?;
-                    rows.sort_by(|a, b| compare_keys(&a[prefix..], &b[prefix..], ascending));
-                }
-            }
+            } => self.finish_sort(*cursor, *prefix as usize, ascending)?,
             Op::DedupRows {
                 cursor,
                 prefix,
                 keys,
-            } => {
-                let (rows, _) = self.rows_mut(*cursor)?;
-                let prefix = *prefix as usize;
-                let keys = *keys as usize;
-                rows.sort_by(|a, b| {
-                    for key in 0..keys {
-                        let ordering = a[prefix + key].cmp(&b[prefix + key]);
-                        if ordering != std::cmp::Ordering::Equal {
-                            return ordering;
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-                rows.dedup_by(|a, b| (0..keys).all(|key| a[prefix + key] == b[prefix + key]));
-            }
+            } => self.finish_sort(*cursor, *prefix as usize, &vec![true; *keys as usize])?,
             Op::TruncateRows {
                 cursor,
                 skip,
@@ -1725,6 +1747,8 @@ impl<'a> Executor<'a> {
                         *pos = 0;
                         rows.is_empty()
                     }
+                    // A merge is rewound once, right after its sort finishes.
+                    Cursor::Merge(merge) => !merge.advance()?,
                     _ => return Err(Error::internal("CtxRewind on a non-row cursor")),
                 };
                 if empty {
@@ -1737,6 +1761,7 @@ impl<'a> Executor<'a> {
                         *pos += 1;
                         *pos >= rows.len()
                     }
+                    Cursor::Merge(merge) => !merge.advance()?,
                     _ => return Err(Error::internal("CtxNext on a non-row cursor")),
                 };
                 if exhausted {
@@ -1751,6 +1776,9 @@ impl<'a> Executor<'a> {
                 let row = match &self.cursors[*cursor as usize] {
                     Cursor::Rows { rows, pos } => rows
                         .get(*pos)
+                        .ok_or_else(|| Error::internal("CtxData on exhausted cursor"))?,
+                    Cursor::Merge(merge) => merge
+                        .current()
                         .ok_or_else(|| Error::internal("CtxData on exhausted cursor"))?,
                     _ => return Err(Error::internal("CtxData on a non-row cursor")),
                 };
@@ -2374,6 +2402,23 @@ impl<'a> Executor<'a> {
             }
         }
         Ok(values.into_iter().map(|value| vec![value]).collect())
+    }
+
+    /// Finish a bounded or spilling sort cursor into a row cursor or merge.
+    fn finish_sort(&mut self, cursor: u32, prefix: usize, ascending: &[bool]) -> Result<()> {
+        let slot = &mut self.cursors[cursor as usize];
+        *slot = match std::mem::replace(slot, Cursor::Empty) {
+            Cursor::TopK(top) => Cursor::Rows {
+                rows: top.finish(prefix, ascending),
+                pos: 0,
+            },
+            Cursor::Sorter(sorter) => match sorter.finish(prefix, ascending)? {
+                Sorted::Rows(rows) => Cursor::Rows { rows, pos: 0 },
+                Sorted::Merge(merge) => Cursor::Merge(merge),
+            },
+            _ => return Err(Error::internal("finishing a sort on a non-sort cursor")),
+        };
+        Ok(())
     }
 
     fn rows_mut(&mut self, cursor: u32) -> Result<(&mut Vec<Vec<Reg>>, usize)> {
@@ -5049,27 +5094,36 @@ mod tests {
         let mut db = test_db();
         let program = program(
             vec![
-                Op::CollectOpen { cursor: 0 },
+                Op::SorterOpen {
+                    cursor: 0,
+                    dedup: true,
+                },
                 Op::Constant { dest: 0, value: 0 },
                 Op::Constant { dest: 1, value: 1 },
-                Op::CollectRow {
+                Op::SorterRow {
                     cursor: 0,
                     start: 0,
                     count: 2,
+                    prefix: 0,
+                    ascending: vec![true],
                 },
                 Op::Constant { dest: 0, value: 2 },
                 Op::Constant { dest: 1, value: 3 },
-                Op::CollectRow {
+                Op::SorterRow {
                     cursor: 0,
                     start: 0,
                     count: 2,
+                    prefix: 0,
+                    ascending: vec![true],
                 },
                 Op::Constant { dest: 0, value: 4 },
                 Op::Constant { dest: 1, value: 5 },
-                Op::CollectRow {
+                Op::SorterRow {
                     cursor: 0,
                     start: 0,
                     count: 2,
+                    prefix: 0,
+                    ascending: vec![true],
                 },
                 Op::DedupRows {
                     cursor: 0,

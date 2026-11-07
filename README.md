@@ -27,7 +27,8 @@ $ grafile social.grafile -c "MATCH p = shortestPath((a:Person {name: 'alice'})-[
 ## Highlights
 
 - **One file, zero configuration.** The database is a single file; a
-  `-journal` sidecar exists only while a write transaction is in flight.
+  `-journal` sidecar exists only while a write transaction is in flight, and
+  `-sort-*` files only while a large sort spills.
 - **Real Cypher.** 3844 of 3844 applicable openCypher TCK scenarios pass,
   plus the Neo4j extensions people actually use: schema DDL, constraints,
   fulltext indexes, `LOAD CSV` and `CALL { ... } IN TRANSACTIONS`.
@@ -321,6 +322,10 @@ methodology and the before/after history of every optimization, live in
   lock, writers an exclusive one, and a crash at any point leaves either the
   old or the new state. `IN TRANSACTIONS` batches commit as they go, so
   earlier batches survive a later failure.
+- **Bounded sorts.** An `ORDER BY` without `LIMIT`, or a `DISTINCT`, buffers
+  up to 256 MiB of rows (`Connection::set_sort_memory`) and then spills
+  sorted runs to `<db>-sort-*` files, merged and removed when the query
+  ends.
 - **Checksums.** Every page carries a CRC32C, verified on every read.
 - **Fault injection.** An in-memory VFS fails or tears writes at every I/O
   operation; property tests then reopen the database and require the old
@@ -352,7 +357,7 @@ Cypher text -> cypher (lexer, parser) -> planner -> codegen -> vdbe (bytecode VM
 | Front end | `cypher` | logos lexer, recursive-descent parser, AST |
 | Planner | `planner` | anchor choice (index seek over label scan over full scan), `WHERE` push-down, expansion order |
 | Code generator | `codegen` | continuation-passing compilation of plans to bytecode |
-| VM | `vdbe` | register machine: cursor loops, streaming aggregation, bounded sorts, subroutines |
+| VM | `vdbe` | register machine: cursor loops, streaming aggregation, bounded and spilling sorts, subroutines |
 | Engine | `engine` | node and relationship operations, index maintenance, shortest paths, integrity checker |
 | Incidence matrix | `matrix` | 256 x 256-bit sparse/dense bitmap fragments per direction, type and label |
 | Records | `record` | record codec and order-preserving index keys |

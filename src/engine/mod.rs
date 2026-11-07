@@ -48,7 +48,12 @@ pub struct Database {
     /// Edges deleted by the statement in progress, with their type so
     /// `type()` can still answer.
     deleted_edges: std::collections::HashMap<u64, u32>,
+    /// Bytes an unbounded sort or `DISTINCT` buffers before spilling a run.
+    sort_memory: usize,
 }
+
+/// Default sort budget: 256 MiB of buffered rows before spilling.
+pub const DEFAULT_SORT_MEMORY: usize = 256 << 20;
 
 /// One variable-length expansion: the relationships in traversal order and
 /// the nodes they connect (one more node than edges).
@@ -170,6 +175,7 @@ impl Database {
             fragments,
             deleted_nodes: std::collections::HashSet::new(),
             deleted_edges: std::collections::HashMap::new(),
+            sort_memory: DEFAULT_SORT_MEMORY,
         })
     }
 
@@ -199,6 +205,7 @@ impl Database {
             fragments,
             deleted_nodes: std::collections::HashSet::new(),
             deleted_edges: std::collections::HashMap::new(),
+            sort_memory: DEFAULT_SORT_MEMORY,
         })
     }
 
@@ -215,6 +222,28 @@ impl Database {
     /// Path of the database file.
     pub fn path(&self) -> &Path {
         self.pager.path()
+    }
+
+    /// The VFS the database file was opened through; sort spill files use
+    /// it too.
+    pub fn vfs(&self) -> &Arc<dyn Vfs> {
+        self.pager.vfs()
+    }
+
+    /// Bytes an unbounded `ORDER BY` or `DISTINCT` buffers before it writes
+    /// a sorted run to a spill file next to the database.
+    pub fn sort_memory(&self) -> usize {
+        self.sort_memory
+    }
+
+    /// Set the sort budget (see [`Database::sort_memory`]).
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Approximate bytes of buffered rows per sort before
+    ///   spilling; values below one row still spill one row at a time
+    pub fn set_sort_memory(&mut self, bytes: usize) {
+        self.sort_memory = bytes;
     }
 
     /// The catalog (for id lookups and DDL).
@@ -1534,7 +1563,12 @@ impl Database {
     }
 
     /// Index every node carrying a new fulltext index's label.
+    /// Fill an empty fulltext index from every node with its label: records
+    /// are read serially (every page read goes through the pager), then
+    /// analyzed and sorted on every core and bulk-built bottom-up.
     fn backfill_fulltext_index(&mut self, index_id: u32) -> Result<()> {
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+
         let Some(def) = self
             .schema()
             .fulltext_indexes
@@ -1550,15 +1584,37 @@ impl Database {
             ProgressStyle::with_template("{spinner:.green} {msg} {pos}/{len} [{elapsed_precise}]")
                 .expect("valid fulltext backfill template"),
         );
-        progress.set_message(format!("backfilling fulltext index `{}`", def.name));
+        progress.set_message(format!("reading nodes for fulltext index `{}`", def.name));
+        let mut records = Vec::with_capacity(node_ids.len());
         for node_id in node_ids {
             if let Some(record) = self.get_node(node_id)? {
-                self.fulltext_update(index_id, &record, node_id, true)?;
+                records.push((node_id, record));
             }
             progress.inc(1);
         }
         progress.finish_and_clear();
-        Ok(())
+        // `fold` builds one buffer per rayon task and `reduce` concatenates
+        // them, so analysis runs on every core without shared state.
+        let mut postings = records
+            .par_iter()
+            .fold(IndexKeys::default, |mut postings, (node_id, record)| {
+                let texts = def
+                    .key_ids
+                    .iter()
+                    .filter_map(|key_id| record.get(*key_id).and_then(Value::as_text));
+                for (term, positions) in document_terms(texts) {
+                    postings.push_entry(
+                        &term_prefix(&term),
+                        *node_id,
+                        &encode_positions(&positions),
+                    );
+                }
+                postings
+            })
+            .reduce(IndexKeys::default, IndexKeys::append);
+        postings.sort();
+        Btree::from_root(def.root, TreeKind::Index)
+            .build_sorted(&mut self.pager, postings.entries())
     }
 
     /// Search a fulltext index.
@@ -2435,34 +2491,67 @@ fn table_key_id(key: &[u8], what: &str) -> Result<u64> {
     Ok(u64::from_be_bytes(bytes))
 }
 
-/// Index keys gathered for a bulk build: one flat byte buffer plus the span
-/// of each key, so millions of keys cost two allocations rather than one
-/// each. Every key is a value prefix followed by an 8-byte entity id.
+/// Index entries gathered for a bulk build: one flat byte buffer plus the
+/// spans of each entry, so millions of entries cost two allocations rather
+/// than one each. Every key is a value prefix followed by an 8-byte entity
+/// id; property index entries carry an empty value, fulltext postings their
+/// encoded positions.
 #[derive(Debug, Default)]
 struct IndexKeys {
     bytes: Vec<u8>,
-    spans: Vec<std::ops::Range<usize>>,
+    spans: Vec<EntrySpan>,
+}
+
+/// Where one entry lives in [`IndexKeys::bytes`]: the key, then its value
+/// up to `value_end`.
+#[derive(Debug, Clone)]
+struct EntrySpan {
+    key: std::ops::Range<usize>,
+    value_end: usize,
 }
 
 impl IndexKeys {
     fn push(&mut self, prefix: &[u8], id: u64) {
+        self.push_entry(prefix, id, &[]);
+    }
+
+    fn push_entry(&mut self, prefix: &[u8], id: u64, value: &[u8]) {
         let start = self.bytes.len();
         self.bytes.extend_from_slice(prefix);
         self.bytes.extend_from_slice(&id.to_be_bytes());
-        self.spans.push(start..self.bytes.len());
+        let key_end = self.bytes.len();
+        self.bytes.extend_from_slice(value);
+        self.spans.push(EntrySpan {
+            key: start..key_end,
+            value_end: self.bytes.len(),
+        });
     }
 
-    fn key(&self, span: &std::ops::Range<usize>) -> &[u8] {
-        &self.bytes[span.clone()]
+    /// Move every entry of `other` to the end of `self` (the reduce step of
+    /// a parallel gather).
+    fn append(mut self, other: Self) -> Self {
+        let offset = self.bytes.len();
+        self.bytes.extend_from_slice(&other.bytes);
+        self.spans
+            .extend(other.spans.into_iter().map(|span| EntrySpan {
+                key: span.key.start + offset..span.key.end + offset,
+                value_end: span.value_end + offset,
+            }));
+        self
     }
 
-    /// Order the keys, sorting on every core (keys are unique because they
-    /// end in the entity id, so an unstable sort is deterministic).
+    fn key(&self, span: &EntrySpan) -> &[u8] {
+        &self.bytes[span.key.clone()]
+    }
+
+    /// Order the entries by key, sorting on every core (keys are unique
+    /// because they end in the entity id, so an unstable sort is
+    /// deterministic).
     fn sort(&mut self) {
         use rayon::slice::ParallelSliceMut;
         let bytes = &self.bytes;
         self.spans
-            .par_sort_unstable_by(|a, b| bytes[a.clone()].cmp(&bytes[b.clone()]));
+            .par_sort_unstable_by(|a, b| bytes[a.key.clone()].cmp(&bytes[b.key.clone()]));
     }
 
     /// After [`Self::sort`]: the id of the second entity found sharing a
@@ -2478,7 +2567,9 @@ impl IndexKeys {
     }
 
     fn entries(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        self.spans.iter().map(|span| (self.key(span), &[][..]))
+        self.spans
+            .iter()
+            .map(|span| (self.key(span), &self.bytes[span.key.end..span.value_end]))
     }
 }
 

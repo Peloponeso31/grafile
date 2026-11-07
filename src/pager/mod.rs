@@ -226,6 +226,11 @@ impl Pager {
         Ok(())
     }
 
+    /// The VFS this pager opened its file through.
+    pub fn vfs(&self) -> &Arc<dyn Vfs> {
+        &self.vfs
+    }
+
     /// Database path.
     pub fn path(&self) -> &Path {
         &self.path

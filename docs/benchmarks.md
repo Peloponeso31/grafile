@@ -72,6 +72,13 @@ percent with the compiler upgrade.
 | `sum(x), count(x), avg(x)` | 138 ms | 36.1 ms | 3.8x |
 | `x % 16 AS k, sum(x)` | 166 ms | 55.1 ms | 3.0x |
 | `WHERE x % 7 = 3 RETURN count(*)` | 90.8 ms | 55.2 ms | 1.64x |
+| `ORDER BY (x * 7919) % 1000003`, unlimited sort budget | 450 ms | 280 ms | 1.61x |
+| same, 16 MiB sort budget (spilled runs and a merge) | — | 309 ms | — |
+
+Unbounded sorts buffer rows until the sort budget, then spill stably
+sorted runs next to the database and merge them. Runs sort with `rayon`'s
+stable parallel sort (425 ms serial in memory, 336 ms serial spilled).
+Spilling at 16 MiB costs about 10% over the in-memory sort.
 
 ### Writes (10 000 rows)
 
@@ -95,11 +102,15 @@ percent with the compiler upgrade.
 | `shortestPath`, 10x10 directed grid, corner to corner | 87.4 ms | 102 µs | — |
 | `allShortestPaths`, same grid (48 620 paths) | 106.9 ms | 91.0 ms | — |
 | `UNWIND … CREATE`, 10 000 nodes in 500-row batches | 76.1 ms | 7.30 ms | — |
+| `CREATE FULLTEXT INDEX` over 50 000 six-word texts | 171 ms | 34.0 ms | — |
 
 Backfill gathers keys, sorts them with `rayon` and bulk-builds the index
 tree. A serial sort measured 7.75 ms and 0.81 s on the two sizes, so the
 parallel sort is worth about 10%; packing the tree without descents does
-the rest. `allShortestPaths` is now dominated by producing its 48 620 rows.
+the rest. The fulltext backfill reads records serially, then analyzes the
+texts and sorts the postings on every core and bulk-builds the tree, instead
+of inserting each posting. `allShortestPaths` is now dominated by producing
+its 48 620 rows.
 
 ### Storage
 

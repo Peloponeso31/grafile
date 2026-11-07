@@ -62,7 +62,8 @@ Implemented and gated (see `docs/tck.md` for the pass rate):
 - Execution: index seeks on bound values and pushed-down `WHERE`
   equalities, label-bitmap intersection for multi-label scans, streaming
   aggregation, `OPTIONAL MATCH` and variable-length expansion, bounded
-  top-k sorts, bidirectional shortest paths and bulk-built index backfill
+  top-k sorts, spilling sorts, bidirectional shortest paths and bulk-built
+  index backfill
   (see Phase 8).
 
 Explicit gaps (currently clear `Unsupported` errors):
@@ -84,7 +85,8 @@ Known limitations:
 ## Phases
 
 Status markers: `[done]` implemented and gated, `[partial]` some items
-finished, `[pending]` not started. Items the TCK does not exercise are
+finished, `[pending]` not started, `[declined]` closed without building it
+(the reason is given). Items the TCK does not exercise are
 verified by unit and integration tests and must not regress the report.
 
 Current baseline: 3844 of 3897 scenarios passing (98.6%), 53 allow-listed.
@@ -337,7 +339,7 @@ derived from node and edge records, so the records serve as the oracle.
 Non-goals: online or incremental checking during normal writes, and repairing
 primary records.
 
-### Phase 8 — Query performance, vectorization and SIMD (large) [partial]
+### Phase 8 — Query performance, vectorization and SIMD (large) [done]
 
 This phase absorbs the former Phase 6 items: streaming `OPTIONAL MATCH` and
 variable-length expansion, bidirectional shortest-path search, and
@@ -363,7 +365,7 @@ Every benchmark target below is met; numbers are in `docs/benchmarks.md`.
   list's item registers into every row (76.1 ms to 7.3 ms for 10 000
   rows). Batched node and edge creation and group commits were not needed
   for the target and are not built.
-- [partial] Batch/vectorized execution: the targets were met without a
+- [declined] Batch/vectorized execution: the targets were met without a
   columnar pipeline. The VM borrows instructions and operands instead of
   cloning them each step, aggregation folds rows into per-group
   accumulators as they arrive (memory bounded by the number of groups, no
@@ -392,16 +394,24 @@ Every benchmark target below is met; numbers are in `docs/benchmarks.md`.
   kept every simple path in its frontier, remains for an unbound target and
   for a minimum above the distance, and is the property-test oracle).
   `shortestPath` across a 10x10 grid: 87.4 ms to 102 µs.
-- [pending] An external merge sort for unbounded `ORDER BY`: no workload
-  sorts more rows than fit in memory yet, and spilling needs temporary
-  files through the VFS.
+- [done] External merge sort: an unbounded `ORDER BY` or a `DISTINCT`
+  buffers rows up to a sort budget (`Connection::set_sort_memory`, 256 MiB
+  by default), then writes stably sorted runs to `<db>-sort-<pid>-<n>`
+  files through the database's VFS, and a k-way merge streams them back.
+  Ties go to the earlier run, so the output equals the in-memory stable
+  sort; `DISTINCT` also deduplicates each run. Spill files are removed when
+  the cursor drops, on success, error or an early stop. Runs sort with
+  `rayon`'s stable parallel sort: one million rows in 280 ms in memory
+  (450 ms before) and 309 ms with a 16 MiB budget.
 - [done] Parallel index backfill: backfills gather keys into one buffer,
   sort them with `rayon`, detect unique violations as adjacent equal
   values and fill the empty tree with `Btree::build_sorted` (packed leaves,
   then interior levels). 50k nodes: 25.0 ms to 7.0 ms (unique 35.0 ms to
   7.1 ms); the parallel sort is about 10% of the gain. Record decoding
-  stays serial because every page read goes through the single pager;
-  fulltext backfill and morsel-driven parallel scans are not built.
+  stays serial because every page read goes through the single pager.
+  Fulltext backfill reads records serially, then analyzes texts and sorts
+  postings on every core and bulk-builds the tree: 50k texts, 171 ms to
+  34 ms.
 - [done] Benchmark gates: Criterion groups for seek versus scan,
   variable-key lookups, multi-label counts, one-million-row aggregates and
   filters, and dense fragment kernels; results recorded in
@@ -414,6 +424,17 @@ Every benchmark target below is met; numbers are in `docs/benchmarks.md`.
 | Numeric filter, 1M rows | 90.8 ms | ≥ 1.5x | 55.2 ms (1.64x) |
 | `sum`/`count`/`avg`, 1M values | 138 ms | ≥ 2x | 36.1 ms (3.8x) |
 | Dense 8 KiB bitmap AND/OR/cardinality | scalar words | ≥ 1.5x | not met by SIMD; scalar already vectorized |
+| Unbounded sort, 1M rows | 450 ms | spills within budget | 280 ms in memory, 309 ms spilled at 16 MiB |
+
+Declined, with the reasons the phase closed on:
+
+- A columnar pipeline (1024-row batches with `wide` kernels): per-row cost
+  is interpretation and record access, not arithmetic.
+- Parallel scans and parallel record decoding: every page read goes through
+  one `&mut` pager; this needs a shared, `Sync` page cache first.
+- Bitmap OR, XOR, rank/select and batched expansion: no caller needs them.
+- Batched node and edge creation and group commits: the seed load is
+  I/O-bound and met its target without them.
 
 `std::simd` is still unstable on rustc 1.99.1, so kernels would use `wide`.
 Any `std::arch` specialisation is isolated, runtime-detected and
@@ -435,7 +456,7 @@ scenarios are excluded), so milestones are stated against the whole suite.
 | After Phase 5 | Allow-list contains only non-goals (e.g. registered procedures) |
 | After Phase 6 | 1/100 seed script runs end to end; TCK report unchanged |
 | After Phase 7 | Checker clean on every suite, fixture and release file |
-| After Phase 8 | Bound equality lookups use index seeks; benchmark targets met (bitmap SIMD target withdrawn: scalar is already vectorized) |
+| After Phase 8 | Bound equality lookups use index seeks; unbounded sorts spill; benchmark targets met (bitmap SIMD target withdrawn: scalar is already vectorized) |
 
 Phase 4 achieved 3844 of 3897 scenarios (98.6%); the allow-list holds the
 52 CALL procedure scenarios (non-goal) and one nested pattern
@@ -446,6 +467,9 @@ comprehension.
 - User-defined procedures and functions beyond built-ins.
 - Remote `LOAD CSV` over HTTP (local files first; revisit on demand).
 - GQL-only syntax beyond what openCypher 9 specifies.
+- The Phase 8 items declined for lack of a workload: a columnar pipeline,
+  pager-parallel scans, bitmap OR/XOR/rank/select, batched expansion and
+  group commits. A workload that needs one reopens it with a benchmark.
 
 ### Quality-of-life backlog (unscheduled)
 

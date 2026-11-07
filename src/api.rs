@@ -237,6 +237,13 @@ impl Connection {
         &mut self.db
     }
 
+    /// Set how many bytes of rows an unbounded `ORDER BY` or `DISTINCT`
+    /// buffers before spilling sorted runs to `<db>-sort-*` files (default
+    /// [`crate::engine::DEFAULT_SORT_MEMORY`]).
+    pub fn set_sort_memory(&mut self, bytes: usize) {
+        self.db.set_sort_memory(bytes);
+    }
+
     /// Run a Cypher query and return all result rows.
     pub fn query(&mut self, source: &str, params: &Params) -> Result<Rows> {
         self.query_with_phase(source, params)
@@ -447,6 +454,46 @@ mod tests {
     fn connection() -> Connection {
         Connection::create_with_vfs(Arc::new(MemVfs::new()), Path::new("test.db"), 4096)
             .expect("create connection")
+    }
+
+    /// Every row of `source` under a sort budget of `budget` bytes, and the
+    /// number of runs the query spilled.
+    fn sorted_rows(conn: &mut Connection, source: &str, budget: usize) -> (Vec<Vec<Value>>, u64) {
+        use crate::vdbe::sorter::SPILLED_RUNS;
+        conn.set_sort_memory(budget);
+        let before = SPILLED_RUNS.with(std::cell::Cell::get);
+        let rows = conn.query(source, &Params::new()).expect("query");
+        let spilled = SPILLED_RUNS.with(std::cell::Cell::get) - before;
+        (rows.rows().to_vec(), spilled)
+    }
+
+    #[test]
+    fn spilled_order_by_and_distinct_match_in_memory_results() {
+        let vfs = Arc::new(MemVfs::new());
+        let mut conn = Connection::create_with_vfs(vfs.clone(), Path::new("sort.db"), 4096)
+            .expect("create connection");
+        conn.execute(
+            "UNWIND range(1, 20000) AS x \
+             CREATE (:N {k: x % 997, name: 'n' + toString(x), tags: [x % 3, x % 7]})",
+        )
+        .expect("seed");
+        for source in [
+            "MATCH (n:N) RETURN n, {p: n.k % 5, t: n.tags} AS m ORDER BY n.k DESC, m",
+            "MATCH (n:N) RETURN DISTINCT n.k, {t: n.tags} AS m",
+            "MATCH (n:N) WITH n ORDER BY n.k LIMIT 15000 RETURN n.name ORDER BY n.name",
+        ] {
+            let (in_memory, unspilled) = sorted_rows(&mut conn, source, usize::MAX);
+            let (spilled, runs) = sorted_rows(&mut conn, source, 64 << 10);
+            assert_eq!(unspilled, 0, "{source}");
+            assert!(runs > 1, "{source} did not spill");
+            assert_eq!(spilled, in_memory, "{source}");
+        }
+        let store = vfs.store().lock().expect("store");
+        assert!(
+            !store
+                .keys()
+                .any(|path| path.to_string_lossy().contains("-sort-"))
+        );
     }
 
     #[test]
