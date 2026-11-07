@@ -485,27 +485,14 @@ comprehension.
   pager-parallel scans, bitmap OR/XOR/rank/select, batched expansion and
   group commits. A workload that needs one reopens it with a benchmark.
 
-### Quality-of-life backlog (unscheduled)
+### Quality-of-life backlog (delivered)
 
-Small, self-contained conveniences that no phase schedules. They stay out of
-the plan, but a contribution that adds one is welcome if it follows the
-sequencing rules below. Each was confirmed missing against 0.3.0.
-
-Shell:
-
-- Persistent history: rustyline keeps it in memory only; load and save a
-  history file.
-- Tab completion: `GrafileHelper` implements `Completer` without logic;
-  complete dot-commands, keywords, function names and the database's labels,
-  relationship types and property keys.
-- Parameters from the shell: sqlite-style dot-commands (`.param set name
-  value`, `.param list`, `.param clear`) and a `-p name=value` flag for `-c`.
-  Today the shell always runs queries with an empty parameter set.
-- An optional startup file, like sqlite's `~/.sqliterc`: dot-commands run
-  before the first prompt, for example `.pretty on`, `.mode box` or
-  `.param set tenant 'acme'`, with a flag to skip it.
-- A `--readonly` flag for ordinary sessions (only `grafile check` opens
-  files read-only today).
+The conveniences listed here against 0.3.0 have all shipped: shell history,
+completion, `.param` and `--param`, `~/.grafilerc`, `--readonly`,
+`EXPLAIN`, the null-safe and list conversions and other Neo4j 5 helpers,
+map projections, `COUNT { }`, `||`, `IS :: TYPE`, SQL-style `trim`,
+`SHOW INDEXES`/`SHOW CONSTRAINTS`, the schema property procedures, did-you-mean
+suggestions and the named `PROFILE` error. New small items go here.
 
 ## Sequencing rules
 

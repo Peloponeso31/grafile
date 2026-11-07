@@ -7,12 +7,12 @@
 //! grafile check FILE [--rebuild]   verify integrity; exit status 1 on findings
 //! ```
 //!
-//! Dot commands: `.help`, `.schema`, `.indexes`, `.read FILE`, `.timer on|off`,
-//! `.mode [NAME]`, `.headers on|off`, `.colors on|off`, `.pretty on|off`,
-//! `.clear` (alias `.cls`), `.quit`.
+//! Options: `--readonly`, `--param NAME=EXPR`, `--init FILE`, `--no-init`.
+//! The startup file (`~/.grafilerc`) and scripts may mix dot commands and
+//! statements; see [`DOT_COMMANDS`] for the dot commands.
 
 use std::borrow::Cow;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
@@ -22,11 +22,14 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use grafile::api::{Connection, Params, Rows};
-use grafile::cypher::lexer::{TokenClass, highlight_spans};
+use grafile::cypher::lexer::{KEYWORDS, TokenClass, highlight_spans};
 use grafile::cypher::split_statements;
+use grafile::error::did_you_mean;
 use grafile::json::{JsonColors, JsonOptions, format_unix_utc, row_object_json, value_json};
+use grafile::planner::procedure_names;
 use grafile::record::Value;
 use grafile::vdbe::format_value;
+use grafile::vdbe::func::FUNCTIONS;
 use grafile::vfs::OpenMode;
 use grafile::vfs::StdVfs;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -36,7 +39,7 @@ use rustyline::highlight::{CmdKind, Highlighter};
 use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
-use rustyline::{Config, Editor};
+use rustyline::{Config, Context as LineContext, Editor};
 
 fn main() -> ExitCode {
     match run() {
@@ -61,62 +64,115 @@ fn run() -> Result<ExitCode> {
     if args.first().is_some_and(|arg| arg == "check") {
         return run_check(&args[1..]);
     }
-    let mut path: Option<String> = None;
-    let mut command: Option<String> = None;
-    let mut script: Option<String> = None;
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "-c" => {
-                index += 1;
-                command = Some(
-                    args.get(index)
-                        .context("-c requires a query argument")?
-                        .clone(),
-                );
-            }
-            other => {
-                if path.is_none() {
-                    path = Some(other.to_owned());
-                } else if script.is_none() {
-                    script = Some(other.to_owned());
-                } else {
-                    anyhow::bail!("unexpected argument `{other}`");
-                }
-            }
-        }
-        index += 1;
+    let cli = Cli::parse(&args)?;
+    let path = cli.path.as_deref().unwrap_or("grafile.db");
+    let mut conn = if cli.readonly {
+        Connection::open_with_vfs(Arc::new(StdVfs), Path::new(path), OpenMode::ReadOnly)
+            .with_context(|| format!("cannot open `{path}` read-only"))?
+    } else {
+        open_or_create(path)?
+    };
+    let mut settings = Settings::new();
+    if let Some(init) = cli.init.resolve()? {
+        run_startup_file(&mut conn, &init, &mut settings);
     }
-    let path = path.unwrap_or_else(|| "grafile.db".to_owned());
-    let mut conn = open_or_create(&path)?;
-    let settings = Settings::new();
-
-    if let Some(query) = command {
+    for (name, expression) in &cli.params {
+        set_param(&mut conn, &mut settings, name, expression)?;
+    }
+    if let Some(query) = cli.command {
         run_query(&mut conn, &query, &settings)?;
         return Ok(ExitCode::SUCCESS);
     }
-    if let Some(script) = script {
+    if let Some(script) = cli.script {
         let text = std::fs::read_to_string(&script)
             .with_context(|| format!("cannot read script `{script}`"))?;
-        let statements = split_statements(&text);
-        let total = statements.len();
-        let progress = script_progress(total);
-        for (index, statement) in statements.iter().enumerate() {
-            if statement.trim().is_empty() {
-                continue;
-            }
-            progress.set_message(format!("statement {}/{}", index + 1, total));
-            if let Err(error) = run_query(&mut conn, statement, &settings) {
-                progress.finish_and_clear();
-                return Err(error.context(format!("statement {} failed", index + 1)));
-            }
-            progress.inc(1);
-        }
-        progress.finish_and_clear();
+        let options = ScriptOptions {
+            origin: &script,
+            stop_on_error: true,
+            progress: true,
+        };
+        run_script(&mut conn, &text, &mut settings, &options)?;
         return Ok(ExitCode::SUCCESS);
     }
-    repl(&mut conn)?;
+    repl(&mut conn, &mut settings)?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// Command-line options of the shell (everything but `check`).
+#[derive(Debug, Default, PartialEq)]
+struct Cli {
+    path: Option<String>,
+    command: Option<String>,
+    script: Option<String>,
+    readonly: bool,
+    init: InitFile,
+    /// `--param NAME=EXPR` bindings, in order.
+    params: Vec<(String, String)>,
+}
+
+/// Which startup file runs before the session.
+#[derive(Debug, Default, PartialEq)]
+enum InitFile {
+    /// `~/.grafilerc` when it exists.
+    #[default]
+    Default,
+    /// `--init FILE`, which must exist.
+    Path(String),
+    /// `--no-init`.
+    Skip,
+}
+
+impl InitFile {
+    /// The startup file to run, if any.
+    fn resolve(&self) -> Result<Option<std::path::PathBuf>> {
+        Ok(match self {
+            Self::Default => std::env::home_dir()
+                .map(|home| home.join(".grafilerc"))
+                .filter(|path| path.is_file()),
+            Self::Path(path) => {
+                anyhow::ensure!(Path::new(path).is_file(), "startup file `{path}` not found");
+                Some(path.into())
+            }
+            Self::Skip => None,
+        })
+    }
+}
+
+impl Cli {
+    /// Parse the shell arguments: `[database] [script]`, `-c QUERY`,
+    /// `--readonly`, `--init FILE`, `--no-init` and `--param NAME=EXPR`.
+    fn parse(args: &[String]) -> Result<Self> {
+        let mut cli = Self::default();
+        let mut args = args.iter();
+        while let Some(arg) = args.next() {
+            let mut value = |flag: &str| {
+                args.next()
+                    .cloned()
+                    .with_context(|| format!("{flag} requires an argument"))
+            };
+            match arg.as_str() {
+                "-c" => cli.command = Some(value("-c")?),
+                "--readonly" => cli.readonly = true,
+                "--init" => cli.init = InitFile::Path(value("--init")?),
+                "--no-init" => cli.init = InitFile::Skip,
+                "-p" | "--param" => {
+                    let binding = value("--param")?;
+                    let (name, expression) = binding
+                        .split_once('=')
+                        .context("--param expects NAME=EXPRESSION")?;
+                    cli.params
+                        .push((name.trim().to_owned(), expression.trim().to_owned()));
+                }
+                other if other.starts_with('-') && other.len() > 1 => {
+                    anyhow::bail!("unknown option `{other}`; try --help")
+                }
+                other if cli.path.is_none() => cli.path = Some(other.to_owned()),
+                other if cli.script.is_none() => cli.script = Some(other.to_owned()),
+                other => anyhow::bail!("unexpected argument `{other}`"),
+            }
+        }
+        Ok(cli)
+    }
 }
 
 /// `grafile check FILE [--rebuild]`: print the integrity report and exit
@@ -279,6 +335,10 @@ struct Settings {
     row_separators: bool,
     pretty: bool,
     timer: bool,
+    /// Parameters bound with `.param` or `--param`.
+    params: Params,
+    /// Suppress dot-command confirmations (scripts and the startup file).
+    quiet: bool,
 }
 
 impl Settings {
@@ -292,11 +352,20 @@ impl Settings {
             row_separators: true,
             pretty: false,
             timer: false,
+            params: Params::new(),
+            quiet: false,
         }
     }
 
     fn colors_enabled(&self) -> bool {
         self.colors.get()
+    }
+
+    /// Print a dot-command confirmation unless running quietly.
+    fn note(&self, message: &str) {
+        if !self.quiet {
+            println!("{message}");
+        }
     }
 }
 
@@ -363,13 +432,112 @@ fn json_options(settings: &Settings) -> JsonOptions {
     }
 }
 
-/// rustyline helper providing Cypher syntax highlighting.
+/// rustyline helper providing Cypher syntax highlighting and completion.
 struct GrafileHelper {
     colors: Rc<Cell<bool>>,
+    names: Rc<RefCell<CompletionNames>>,
 }
 
 impl Completer for GrafileHelper {
     type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &LineContext<'_>,
+    ) -> rustyline::Result<(usize, Vec<String>)> {
+        Ok(completions(line, pos, &self.names.borrow()))
+    }
+}
+
+/// Database and session names offered by completion, refreshed after each
+/// statement.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct CompletionNames {
+    /// Labels and relationship types (completed after `:`).
+    symbols: Vec<String>,
+    /// Property keys (completed after `name.`).
+    property_keys: Vec<String>,
+    /// Bound parameters (completed after `$`).
+    params: Vec<String>,
+}
+
+impl CompletionNames {
+    fn of(conn: &Connection, settings: &Settings) -> Self {
+        let schema = conn.schema();
+        Self {
+            symbols: schema
+                .labels
+                .iter()
+                .chain(&schema.edge_types)
+                .cloned()
+                .collect(),
+            property_keys: schema.property_keys.clone(),
+            params: settings.params.values().keys().cloned().collect(),
+        }
+    }
+}
+
+/// Completion candidates for the word ending at `pos`, and where it starts:
+/// dot commands at the start of a line, labels and types after `:`,
+/// parameters after `$`, property keys after `name.`, and otherwise
+/// keywords, functions and procedures.
+fn completions(line: &str, pos: usize, names: &CompletionNames) -> (usize, Vec<String>) {
+    let before = &line[..pos];
+    let start = before
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_alphanumeric() || *c == '_' || *c == '.'))
+        .map_or(0, |(index, c)| index + c.len_utf8());
+    let word = &before[start..];
+    let prefixed = |candidates: &mut dyn Iterator<Item = &str>, prefix: &str| {
+        let lowered = prefix.to_lowercase();
+        let mut matched: Vec<String> = candidates
+            .filter(|candidate| candidate.to_lowercase().starts_with(&lowered))
+            .map(str::to_owned)
+            .collect();
+        matched.sort_unstable();
+        matched.dedup();
+        matched
+    };
+    if before[..start].trim().is_empty() && word.starts_with('.') {
+        let commands = &mut DOT_COMMANDS.iter().map(|(name, _, _)| *name);
+        return (start, prefixed(commands, word));
+    }
+    match before[..start].chars().next_back() {
+        Some(':') => {
+            return (
+                start,
+                prefixed(&mut names.symbols.iter().map(String::as_str), word),
+            );
+        }
+        Some('$') => {
+            return (
+                start,
+                prefixed(&mut names.params.iter().map(String::as_str), word),
+            );
+        }
+        _ => {}
+    }
+    let callables = || {
+        FUNCTIONS
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(procedure_names())
+    };
+    if let Some((owner, member)) = word.rsplit_once('.') {
+        let namespace = format!("{}.", owner.to_lowercase());
+        if !callables().any(|name| name.to_lowercase().starts_with(&namespace)) {
+            let keys = &mut names.property_keys.iter().map(String::as_str);
+            return (start + owner.len() + 1, prefixed(keys, member));
+        }
+    }
+    if word.is_empty() {
+        return (start, Vec::new());
+    }
+    let words = &mut KEYWORDS.iter().copied().chain(callables());
+    (start, prefixed(words, word))
 }
 
 impl Hinter for GrafileHelper {
@@ -395,12 +563,31 @@ impl rustyline::Helper for GrafileHelper {}
 
 // ---- REPL ----
 
-fn repl(conn: &mut Connection) -> Result<()> {
-    let mut settings = Settings::new();
+/// Where interactive history lives: `GRAFILE_HISTORY` (empty disables it)
+/// or `~/.grafile_history`. Piped input keeps no history.
+fn history_path() -> Option<std::path::PathBuf> {
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    match std::env::var_os("GRAFILE_HISTORY") {
+        Some(path) if path.is_empty() => None,
+        Some(path) => Some(path.into()),
+        None => std::env::home_dir().map(|home| home.join(".grafile_history")),
+    }
+}
+
+fn repl(conn: &mut Connection, settings: &mut Settings) -> Result<()> {
     let mut editor: Editor<GrafileHelper, DefaultHistory> = Editor::with_config(Config::default())?;
+    let names = Rc::new(RefCell::new(CompletionNames::of(conn, settings)));
     editor.set_helper(Some(GrafileHelper {
         colors: settings.colors.clone(),
+        names: Rc::clone(&names),
     }));
+    let history = history_path();
+    if let Some(path) = &history {
+        // A missing history file just means a first session.
+        let _ = editor.load_history(path);
+    }
     let mut buffer = String::new();
     println!(
         "grafile {} (type .help for commands)",
@@ -415,8 +602,19 @@ fn repl(conn: &mut Connection) -> Result<()> {
         match editor.readline(prompt) {
             Ok(line) => {
                 let trimmed = line.trim();
+                if buffer.is_empty() && trimmed.is_empty() {
+                    continue;
+                }
+                let _ = editor.add_history_entry(line.as_str());
+                if let Some(path) = &history
+                    && let Err(err) = editor.append_history(path)
+                {
+                    eprintln!("warning: cannot save history to {}: {err}", path.display());
+                }
                 if buffer.is_empty() && trimmed.starts_with('.') {
-                    match run_dot_command(conn, trimmed, &mut settings) {
+                    let outcome = run_dot_command(conn, trimmed, settings);
+                    *names.borrow_mut() = CompletionNames::of(conn, settings);
+                    match outcome {
                         Ok(DotOutcome::Continue) => continue,
                         Ok(DotOutcome::Quit) => break,
                         Err(err) => {
@@ -425,10 +623,6 @@ fn repl(conn: &mut Connection) -> Result<()> {
                         }
                     }
                 }
-                if buffer.is_empty() && trimmed.is_empty() {
-                    continue;
-                }
-                let _ = editor.add_history_entry(line.as_str());
                 buffer.push_str(&line);
                 buffer.push('\n');
                 // Execute when terminated by ';' or an empty line.
@@ -438,11 +632,12 @@ fn repl(conn: &mut Connection) -> Result<()> {
                         if statement.trim().is_empty() {
                             continue;
                         }
-                        if let Err(err) = run_query(conn, &statement, &settings) {
+                        if let Err(err) = run_query(conn, &statement, settings) {
                             eprintln!("error: {err:#}");
                         }
                     }
                     buffer.clear();
+                    *names.borrow_mut() = CompletionNames::of(conn, settings);
                 }
             }
             Err(ReadlineError::Interrupted) => {
@@ -456,6 +651,7 @@ fn repl(conn: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DotOutcome {
     Continue,
     Quit,
@@ -472,68 +668,46 @@ fn run_dot_command(
     match command {
         ".quit" | ".exit" => return Ok(DotOutcome::Quit),
         ".help" => print_help(),
-        ".timer" => match argument {
-            "on" => {
-                settings.timer = true;
-                println!("timer on");
-            }
-            "off" => {
-                settings.timer = false;
-                println!("timer off");
-            }
-            _ => println!("usage: .timer on|off"),
-        },
-        ".colors" => match argument {
-            "on" => {
-                settings.colors.set(true);
-                println!("colors on");
-            }
-            "off" => {
-                settings.colors.set(false);
-                println!("colors off");
-            }
-            _ => println!("usage: .colors on|off"),
-        },
-        ".headers" => match argument {
-            "on" => {
-                settings.headers = true;
-                println!("headers on");
-            }
-            "off" => {
-                settings.headers = false;
-                println!("headers off");
-            }
-            _ => println!("usage: .headers on|off"),
-        },
-        ".separators" => match argument {
-            "on" => {
-                settings.row_separators = true;
-                println!("row separators on");
-            }
-            "off" => {
-                settings.row_separators = false;
-                println!("row separators off");
-            }
-            _ => println!("usage: .separators on|off"),
-        },
-        ".pretty" => match argument {
-            "on" => {
-                settings.pretty = true;
-                println!("pretty on");
-            }
-            "off" => {
-                settings.pretty = false;
-                println!("pretty off");
-            }
-            _ => println!("usage: .pretty on|off"),
-        },
+        ".timer" | ".colors" | ".headers" | ".separators" | ".pretty" => {
+            let on = match argument {
+                "on" => true,
+                "off" => false,
+                _ => {
+                    println!("usage: {command} on|off");
+                    return Ok(DotOutcome::Continue);
+                }
+            };
+            let label = match command {
+                ".timer" => {
+                    settings.timer = on;
+                    "timer"
+                }
+                ".colors" => {
+                    settings.colors.set(on);
+                    "colors"
+                }
+                ".headers" => {
+                    settings.headers = on;
+                    "headers"
+                }
+                ".separators" => {
+                    settings.row_separators = on;
+                    "row separators"
+                }
+                _ => {
+                    settings.pretty = on;
+                    "pretty"
+                }
+            };
+            settings.note(&format!("{label} {}", if on { "on" } else { "off" }));
+        }
         ".mode" => match argument {
             "" => println!("mode: {}", settings.mode.name()),
             "--list" => print_modes(),
             name => match OutputMode::parse(name) {
                 Some(mode) => {
                     settings.mode = mode;
-                    println!("mode: {}", mode.name());
+                    settings.note(&format!("mode: {}", mode.name()));
                 }
                 None => {
                     println!("unknown mode `{name}`");
@@ -552,19 +726,221 @@ fn run_dot_command(
             run_query(conn, "SHOW CONSTRAINTS", settings)?;
         }
         ".clear" | ".cls" => clear_screen(),
+        ".param" => run_param_command(conn, argument, settings)?,
         ".read" => {
             let text = std::fs::read_to_string(argument)
                 .with_context(|| format!("cannot read `{argument}`"))?;
-            for statement in split_statements(&text) {
-                if statement.trim().is_empty() {
-                    continue;
-                }
-                run_query(conn, &statement, settings)?;
-            }
+            let options = ScriptOptions {
+                origin: argument,
+                stop_on_error: true,
+                progress: false,
+            };
+            return run_script(conn, &text, settings, &options);
         }
-        other => println!("unknown command `{other}`; try .help"),
+        other => anyhow::bail!(
+            "unknown command `{other}`{}; try .help",
+            did_you_mean(other, DOT_COMMANDS.iter().map(|(name, _, _)| *name))
+        ),
     }
     Ok(DotOutcome::Continue)
+}
+
+/// `.param set NAME EXPR`, `.param unset NAME`, `.param list` and
+/// `.param clear`.
+fn run_param_command(conn: &mut Connection, argument: &str, settings: &mut Settings) -> Result<()> {
+    let mut words = argument.splitn(2, char::is_whitespace);
+    let action = words.next().unwrap_or("");
+    let rest = words.next().unwrap_or("").trim();
+    match action {
+        "" | "list" => {
+            let mut bound: Vec<(&String, &Value)> = settings.params.values().iter().collect();
+            bound.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, value) in bound {
+                println!("${name} = {}", quote_literal(value));
+            }
+        }
+        "set" => {
+            let (name, expression) = rest
+                .split_once(char::is_whitespace)
+                .context("usage: .param set NAME EXPRESSION")?;
+            set_param(conn, settings, name, expression.trim())?;
+        }
+        "unset" => {
+            if settings.params.remove(rest).is_none() {
+                println!("no parameter `{rest}`");
+            }
+        }
+        "clear" => settings.params.clear(),
+        other => println!("unknown .param action `{other}`; use set, unset, list or clear"),
+    }
+    Ok(())
+}
+
+/// Bind `name` to the value of a Cypher `expression`, evaluated as
+/// `RETURN expression` with the parameters already bound.
+fn set_param(
+    conn: &mut Connection,
+    settings: &mut Settings,
+    name: &str,
+    expression: &str,
+) -> Result<()> {
+    let name = name.strip_prefix('$').unwrap_or(name);
+    anyhow::ensure!(
+        !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_'),
+        "invalid parameter name `{name}`"
+    );
+    let rows = conn
+        .query(&format!("RETURN {expression}"), &settings.params)
+        .with_context(|| format!("cannot evaluate `{expression}`"))?;
+    let [row] = rows.rows() else {
+        anyhow::bail!("`{expression}` must produce exactly one value");
+    };
+    let [value] = row.as_slice() else {
+        anyhow::bail!("`{expression}` must produce exactly one value");
+    };
+    settings.params.insert(name, value.clone());
+    Ok(())
+}
+
+/// How [`run_script`] labels and reacts to its items.
+struct ScriptOptions<'a> {
+    /// File name used in error messages.
+    origin: &'a str,
+    /// Stop at the first failing item (otherwise report it and go on).
+    stop_on_error: bool,
+    /// Show a progress bar over the statements.
+    progress: bool,
+}
+
+/// One dot-command line or Cypher statement of a script, with the 1-based
+/// line it starts on.
+#[derive(Debug, Clone, PartialEq)]
+struct ScriptItem {
+    line: usize,
+    text: String,
+    dot: bool,
+}
+
+/// Split a script into dot-command lines and statements. A line starting
+/// with `.` is a dot command only between statements, so a `.` inside a
+/// statement that spans lines stays Cypher.
+fn script_items(text: &str) -> Vec<ScriptItem> {
+    let mut items = Vec::new();
+    let mut chunk_start = 0;
+    let mut chunk_line = 1;
+    let mut between_statements = true;
+    let mut offset = 0;
+    for (index, line) in text.split_inclusive('\n').enumerate() {
+        let trimmed = line.trim();
+        if between_statements && trimmed.starts_with('.') {
+            push_statements(&mut items, &text[chunk_start..offset], chunk_line);
+            items.push(ScriptItem {
+                line: index + 1,
+                text: trimmed.to_owned(),
+                dot: true,
+            });
+            chunk_start = offset + line.len();
+            chunk_line = index + 2;
+        } else if !trimmed.is_empty() && !trimmed.starts_with("//") {
+            between_statements = trimmed.ends_with(';');
+        }
+        offset += line.len();
+    }
+    push_statements(&mut items, &text[chunk_start..], chunk_line);
+    items
+}
+
+/// Append the statements of `chunk`, which starts on `first_line`.
+fn push_statements(items: &mut Vec<ScriptItem>, chunk: &str, first_line: usize) {
+    let mut search = 0;
+    for statement in split_statements(chunk) {
+        // Statements are verbatim slices of the chunk, so their position
+        // gives their line.
+        let start = chunk[search..]
+            .find(statement.as_str())
+            .map_or(search, |found| search + found);
+        search = start + statement.len();
+        if statement.trim().is_empty() {
+            continue;
+        }
+        let code = start + (statement.len() - statement.trim_start().len());
+        items.push(ScriptItem {
+            line: first_line + chunk[..code.min(chunk.len())].matches('\n').count(),
+            text: statement,
+            dot: false,
+        });
+    }
+}
+
+/// Run a script's dot commands and statements in order. Confirmations are
+/// silent, as in sqlite; errors name the statement and its line.
+fn run_script(
+    conn: &mut Connection,
+    text: &str,
+    settings: &mut Settings,
+    options: &ScriptOptions<'_>,
+) -> Result<DotOutcome> {
+    let items = script_items(text);
+    let total = items.iter().filter(|item| !item.dot).count();
+    let progress = if options.progress {
+        script_progress(total)
+    } else {
+        ProgressBar::hidden()
+    };
+    let was_quiet = std::mem::replace(&mut settings.quiet, true);
+    let mut statement = 0;
+    let mut outcome = Ok(DotOutcome::Continue);
+    for item in &items {
+        let result = if item.dot {
+            run_dot_command(conn, &item.text, settings)
+        } else {
+            statement += 1;
+            progress.set_message(format!("statement {statement}/{total}"));
+            let result = run_query(conn, &item.text, settings).map(|()| DotOutcome::Continue);
+            progress.inc(1);
+            result
+        };
+        let failure = match result {
+            Ok(DotOutcome::Continue) => continue,
+            Ok(DotOutcome::Quit) => {
+                outcome = Ok(DotOutcome::Quit);
+                break;
+            }
+            Err(error) if item.dot => error.context(format!(
+                "{}:{}: `{}` failed",
+                options.origin, item.line, item.text
+            )),
+            Err(error) => error.context(format!(
+                "statement {statement} failed at {}:{}",
+                options.origin, item.line
+            )),
+        };
+        if options.stop_on_error {
+            outcome = Err(failure);
+            break;
+        }
+        eprintln!("error: {failure:#}");
+    }
+    settings.quiet = was_quiet;
+    progress.finish_and_clear();
+    outcome
+}
+
+/// Run the startup file before the session; failures are reported and the
+/// session goes on.
+fn run_startup_file(conn: &mut Connection, path: &Path, settings: &mut Settings) {
+    let origin = path.display().to_string();
+    let options = ScriptOptions {
+        origin: &origin,
+        stop_on_error: false,
+        progress: false,
+    };
+    let result = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read startup file `{origin}`"))
+        .and_then(|text| run_script(conn, &text, settings, &options));
+    if let Err(error) = result {
+        eprintln!("error: {error:#}");
+    }
 }
 
 fn print_modes() {
@@ -574,7 +950,7 @@ fn print_modes() {
 
 fn run_query(conn: &mut Connection, source: &str, settings: &Settings) -> Result<()> {
     let start = Instant::now();
-    let rows = conn.query(source, &Params::new())?;
+    let rows = conn.query(source, &settings.params)?;
     let elapsed = start.elapsed();
     let output = render_rows(conn, &rows, settings)?;
     print!("{output}");
@@ -1217,46 +1593,96 @@ fn clear_screen() {
     }
 }
 
+/// Every dot command: name, usage and description, for `.help` and
+/// completion.
+const DOT_COMMANDS: &[(&str, &str, &str)] = &[
+    (".help", ".help", "this message"),
+    (".schema", ".schema", "labels, edge types and property keys"),
+    (".indexes", ".indexes", "SHOW INDEXES and SHOW CONSTRAINTS"),
+    (
+        ".meta",
+        ".meta [raw|human]",
+        "database header metadata (default human)",
+    ),
+    (
+        ".mode",
+        ".mode [NAME]",
+        "output mode (.mode --list to see all)",
+    ),
+    (
+        ".headers",
+        ".headers on|off",
+        "show column titles (default on)",
+    ),
+    (
+        ".separators",
+        ".separators on|off",
+        "lines between table rows (default on)",
+    ),
+    (
+        ".colors",
+        ".colors on|off",
+        "syntax highlighting (default: on when a terminal)",
+    ),
+    (
+        ".pretty",
+        ".pretty on|off",
+        "render nodes/edges as highlighted JSON",
+    ),
+    (
+        ".param",
+        ".param set NAME EXPR",
+        "bind $NAME (also unset NAME, list, clear)",
+    ),
+    (
+        ".read",
+        ".read FILE",
+        "run statements and dot commands from a file",
+    ),
+    (".timer", ".timer on|off", "show query timing"),
+    (".clear", ".clear (.cls)", "clear the terminal screen"),
+    (".cls", ".cls", "clear the terminal screen"),
+    (".quit", ".quit (.exit)", "exit"),
+    (".exit", ".exit", "exit"),
+];
+
 fn print_help() {
+    let commands: String = DOT_COMMANDS
+        .iter()
+        .filter(|(name, usage, _)| usage.starts_with(name) && !matches!(*name, ".cls" | ".exit"))
+        .map(|(_, usage, description)| format!("  {usage:<22}{description}\n"))
+        .collect();
     println!(
         "grafile: a graph database that lives in a file
 
 usage:
-  grafile [database]              open or create a database and start the REPL
-  grafile [database] -c \"QUERY\"   run one query and exit
-  grafile [database] script.cypher
-  grafile check FILE [--rebuild]  verify integrity (exit status 1 on findings);
-                                  --rebuild regenerates bitmaps and indexes
+  grafile [options] [database]              open or create a database; start the REPL
+  grafile [options] [database] -c \"QUERY\"   run one query and exit
+  grafile [options] [database] script.cypher
+  grafile check FILE [--rebuild]            verify integrity (exit status 1 on findings);
+                                            --rebuild regenerates bitmaps and indexes
 
-repl:
-  queries end with ';' or an empty line
-  .help             this message
-  .schema           labels, edge types and property keys
-  .indexes          index and constraint definitions
-  .meta [raw|human] database header metadata (default human)
-  .mode [NAME]      output mode (.mode --list to see all)
-  .headers on|off   show column titles (default on)
-  .separators on|off  lines between table rows (default on)
-  .colors on|off    syntax highlighting (default: on when a terminal)
-  .pretty on|off    render nodes/edges as highlighted JSON
-  .read FILE        run statements from a file
-  .timer on|off     show query timing
-  .clear (.cls)     clear the terminal screen
-  .quit             exit
+options:
+  --readonly            open an existing database read-only
+  --param NAME=EXPR     bind $NAME to a Cypher expression (repeatable; also -p)
+  --init FILE           run FILE instead of ~/.grafilerc before the session
+  --no-init             skip the startup file
+
+repl (queries end with ';' or an empty line; Tab completes):
+{commands}
+history is kept in ~/.grafile_history (GRAFILE_HISTORY overrides; empty disables)
 
 modes: table (default), box, qbox, psql, markdown, column,
        list, tabs, csv, quote, line, json
 
-cypher (v1): MATCH, OPTIONAL MATCH, WHERE, RETURN, WITH, UNWIND,
-             LOAD CSV, CREATE, MERGE, SET, REMOVE, DELETE/DETACH DELETE,
-             FOREACH, CALL, UNION, ORDER BY, SKIP, LIMIT, DISTINCT,
-             aggregations (count/sum/avg/min/max/collect/percentile/
-             stDev), a built-in function library, temporal values
-             (date/time/datetime/duration with IANA zones) and spatial
-             points, parameters ($name)
-ddl (extension): CREATE INDEX|CONSTRAINT name [IF NOT EXISTS]
-             FOR (n:Label)|()-[r:TYPE]-() ..., DROP INDEX|CONSTRAINT name
-             [IF EXISTS] (SHOW is not supported)"
+cypher: MATCH, OPTIONAL MATCH, WHERE, RETURN, WITH, UNWIND, LOAD CSV,
+        CREATE, MERGE, SET, REMOVE, DELETE/DETACH DELETE, FOREACH, CALL,
+        CALL {{ }}, UNION, ORDER BY, SKIP, LIMIT, DISTINCT, aggregations,
+        EXISTS/COUNT subqueries, map projections, IS :: TYPE, a built-in
+        function library, temporal and spatial values, parameters ($name),
+        EXPLAIN
+ddl:    CREATE [FULLTEXT] INDEX|CONSTRAINT name [IF NOT EXISTS] ...,
+        DROP INDEX|CONSTRAINT name [IF EXISTS], SHOW INDEXES|CONSTRAINTS"
     );
 }
 
@@ -1279,6 +1705,8 @@ mod tests {
             row_separators: true,
             pretty: false,
             timer: false,
+            params: Params::new(),
+            quiet: false,
         }
     }
 
@@ -1575,11 +2003,14 @@ mod tests {
     }
 
     #[test]
-    fn unknown_command_continues() {
+    fn unknown_command_is_an_error_with_a_suggestion() {
         let mut conn = connection("clear-unknown.db");
         let mut settings = settings(OutputMode::Table);
-        let outcome = run_dot_command(&mut conn, ".nope", &mut settings).expect("command");
-        assert!(matches!(outcome, DotOutcome::Continue));
+        let error = run_dot_command(&mut conn, ".mdoe", &mut settings).expect_err("unknown");
+        assert!(
+            error.to_string().contains("did you mean `.mode`"),
+            "{error}"
+        );
     }
     #[test]
     fn size_formatting_uses_binary_units() {
@@ -1644,5 +2075,155 @@ mod tests {
             let outcome = run_dot_command(&mut conn, command, &mut settings).expect("command");
             assert!(matches!(outcome, DotOutcome::Continue));
         }
+    }
+
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| (*item).to_owned()).collect()
+    }
+
+    #[test]
+    fn script_items_separate_dot_commands_and_track_lines() {
+        let text = ".mode csv\nCREATE (:A {x: 1});\n// note\nMATCH (n)\n.x = 1\nRETURN n;\n  .headers off\n";
+        let items = script_items(text);
+        let summary: Vec<(usize, bool, &str)> = items
+            .iter()
+            .map(|item| (item.line, item.dot, item.text.trim()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (1, true, ".mode csv"),
+                (2, false, "CREATE (:A {x: 1})"),
+                (3, false, "// note\nMATCH (n)\n.x = 1\nRETURN n"),
+                (7, true, ".headers off"),
+            ]
+        );
+    }
+
+    #[test]
+    fn scripts_stop_or_continue_and_restore_quiet() {
+        let mut conn = connection("script.db");
+        let mut settings = settings(OutputMode::Table);
+        let options = ScriptOptions {
+            origin: "test.cypher",
+            stop_on_error: true,
+            progress: false,
+        };
+        let text = ".headers off\nRETURN 1;\nRETURN nope(;\nCREATE (:Never);\n";
+        let error = run_script(&mut conn, text, &mut settings, &options).expect_err("stops");
+        assert!(format!("{error:#}").contains("statement 2 failed at test.cypher:3"));
+        assert!(!settings.headers);
+        assert!(!settings.quiet);
+        let options = ScriptOptions {
+            stop_on_error: false,
+            ..options
+        };
+        run_script(&mut conn, text, &mut settings, &options).expect("continues");
+        let rows = conn
+            .query("MATCH (n:Never) RETURN count(n)", &Params::new())
+            .expect("count");
+        assert_eq!(rows.rows()[0][0], Value::Int(1));
+    }
+
+    #[test]
+    fn param_command_binds_lists_and_clears() {
+        let mut conn = connection("params.db");
+        let mut settings = settings(OutputMode::Table);
+        for command in [
+            ".param set tenant 'acme'",
+            ".param set $limit 2 + 3",
+            ".param set doubled $limit * 2",
+            ".param list",
+        ] {
+            run_dot_command(&mut conn, command, &mut settings).expect(command);
+        }
+        let values = settings.params.values();
+        assert_eq!(values.get("tenant"), Some(&Value::from("acme")));
+        assert_eq!(values.get("limit"), Some(&Value::Int(5)));
+        assert_eq!(values.get("doubled"), Some(&Value::Int(10)));
+        let rows = conn
+            .query("RETURN $tenant", &settings.params)
+            .expect("bound parameter");
+        assert_eq!(rows.rows()[0][0], Value::from("acme"));
+        run_dot_command(&mut conn, ".param unset tenant", &mut settings).expect("unset");
+        assert!(!settings.params.values().contains_key("tenant"));
+        run_dot_command(&mut conn, ".param clear", &mut settings).expect("clear");
+        assert!(settings.params.values().is_empty());
+        for bad in [
+            ".param set",
+            ".param set x",
+            ".param set x-y 1",
+            ".param set x [1, 2] + nope",
+        ] {
+            assert!(
+                run_dot_command(&mut conn, bad, &mut settings).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn completions_follow_the_cursor_context() {
+        let names = CompletionNames {
+            symbols: strings(&["Person", "KNOWS"]),
+            property_keys: strings(&["name", "age"]),
+            params: strings(&["tenant"]),
+        };
+        assert_eq!(completions(".mo", 3, &names), (0, strings(&[".mode"])));
+        assert_eq!(
+            completions("MATCH (n:Pe", 11, &names),
+            (9, strings(&["Person"]))
+        );
+        assert_eq!(
+            completions("RETURN $te", 10, &names),
+            (8, strings(&["tenant"]))
+        );
+        assert_eq!(
+            completions("RETURN n.na", 11, &names),
+            (9, strings(&["name"]))
+        );
+        assert_eq!(
+            completions("RETURN toUp", 11, &names),
+            (7, strings(&["toUpper"]))
+        );
+        assert_eq!(
+            completions("RETURN date.tr", 14, &names),
+            (7, strings(&["date.transaction", "date.truncate"]))
+        );
+        assert_eq!(completions("ret", 3, &names), (0, strings(&["RETURN"])));
+        assert_eq!(completions("MATCH ", 6, &names), (6, Vec::new()));
+    }
+
+    #[test]
+    fn cli_parses_flags_and_positionals() {
+        let args = strings(&[
+            "--readonly",
+            "db.grafile",
+            "--param",
+            "x = 1 + 2",
+            "-p",
+            "y='a=b'",
+            "--no-init",
+            "-c",
+            "RETURN $x",
+        ]);
+        let cli = Cli::parse(&args).expect("parse");
+        assert_eq!(
+            cli,
+            Cli {
+                path: Some("db.grafile".to_owned()),
+                command: Some("RETURN $x".to_owned()),
+                script: None,
+                readonly: true,
+                init: InitFile::Skip,
+                params: vec![
+                    ("x".to_owned(), "1 + 2".to_owned()),
+                    ("y".to_owned(), "'a=b'".to_owned())
+                ],
+            }
+        );
+        assert!(Cli::parse(&strings(&["--bogus"])).is_err());
+        assert!(Cli::parse(&strings(&["--param", "novalue"])).is_err());
+        assert!(Cli::parse(&strings(&["--init"])).is_err());
     }
 }

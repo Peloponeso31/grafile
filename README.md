@@ -109,8 +109,8 @@ $ grafile social.grafile -c "MATCH (n"
 error: Syntax: expected ')' to close a node pattern at line 1 column 9 (found end of input)
 ```
 
-Scripts may contain `//` and `/* */` comments, and long loads show a progress
-bar. The script runner accepts Neo4j-style seed files unchanged; the
+Scripts may contain `//` and `/* */` comments and dot commands between
+statements, and long loads show a progress bar. The script runner accepts Neo4j-style seed files unchanged; the
 1/100-scale audited seed script in `tests/fixtures/seed_1_100.cypher` loads in
 under two seconds.
 
@@ -119,7 +119,8 @@ under two seconds.
 | Command | Effect |
 | --- | --- |
 | `.schema` | labels, relationship types and property keys |
-| `.indexes` | index and constraint definitions |
+| `.indexes` | `SHOW INDEXES` and `SHOW CONSTRAINTS` |
+| `.param set NAME EXPR`, `.param unset NAME`, `.param list`, `.param clear` | bind `$NAME` to the value of any Cypher expression |
 | `.meta [raw\|human]` | database header: page size, UUID, freelist, tree roots |
 | `.mode NAME` | `table`, `box`, `qbox`, `psql`, `markdown`, `column`, `list`, `tabs`, `csv`, `quote`, `line`, `json` |
 | `.headers on\|off`, `.separators on\|off` | table layout |
@@ -127,6 +128,25 @@ under two seconds.
 | `.colors on\|off`, `.timer on\|off` | highlighting and per-query timing |
 | `.read FILE` | run a script |
 | `.clear`, `.help`, `.quit` | housekeeping |
+
+Tab completes dot commands, keywords, functions and procedures, labels and
+relationship types after `:`, property keys after `n.` and parameters after
+`$`. Interactive history persists in `~/.grafile_history` (`GRAFILE_HISTORY`
+moves it; an empty value disables it). Like sqlite's `~/.sqliterc`,
+`~/.grafilerc` runs before every session, including `-c` and scripts:
+
+```text
+.mode box
+.param set tenant 'acme'
+```
+
+| Option | Effect |
+| --- | --- |
+| `--readonly` | open an existing file read-only; writes fail |
+| `--param NAME=EXPR` (`-p`) | bind a parameter before running (repeatable) |
+| `--init FILE`, `--no-init` | run another startup file, or none |
+
+Prefix a statement with `EXPLAIN` to see its plan without running it.
 
 `.mode json` prints one JSON object per row, ready for `jq`:
 
@@ -208,17 +228,17 @@ is deliberately not Lucene-compatible.
 
 | Area | Coverage |
 | --- | --- |
-| Clauses | `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN`, `WITH`, `UNWIND`, `CREATE`, `MERGE` (`ON CREATE`/`ON MATCH`), `SET`, `REMOVE`, `DELETE`, `DETACH DELETE`, `FOREACH`, `UNION [ALL]`, `LOAD CSV`, `CALL { ... }` (unit, returning, correlated, `IN TRANSACTIONS`) |
+| Clauses | `MATCH`, `OPTIONAL MATCH`, `WHERE`, `RETURN`, `WITH`, `UNWIND`, `CREATE`, `MERGE` (`ON CREATE`/`ON MATCH`), `SET`, `REMOVE`, `DELETE`, `DETACH DELETE`, `FOREACH`, `UNION [ALL]`, `LOAD CSV`, `CALL { ... }` (unit, returning, correlated, `IN TRANSACTIONS`), `CALL ... YIELD ... WHERE`, `SHOW INDEXES`/`SHOW CONSTRAINTS`, `EXPLAIN` |
 | Patterns | directions, label expressions (`:A\|B`, `:A&B`, `:!A`), inline property maps, variable-length paths (`*1..3`), named paths, `shortestPath`, `allShortestPaths`, pattern predicates and comprehensions |
-| Expressions | parameters, list and map literals, indexing and slicing, list comprehensions, `all`/`any`/`none`/`single`, `reduce`, `CASE`, string predicates and `=~`, three-valued logic |
+| Expressions | parameters, list and map literals, map projections (`n{.name, .*}`), indexing and slicing, list comprehensions, `all`/`any`/`none`/`single`, `reduce`, `CASE`, `EXISTS { }` and `COUNT { }`, string predicates and `=~`, `\|\|` concatenation, `IS :: TYPE`, three-valued logic |
 | Aggregation | `count`, `sum`, `avg`, `min`, `max`, `collect`, `percentileCont`, `percentileDisc`, `stDev`, `stDevP`, with `DISTINCT` |
-| Functions | graph accessors, conversions, list, string and math libraries, `randomUUID`, `coalesce` |
+| Functions | graph accessors (`elementId`), conversions including `toXOrNull` and `toXList`, `valueType`, `isEmpty`, `nullIf`, list, string (`btrim`, `trim(BOTH ... FROM ...)`) and math libraries, `randomUUID`, `coalesce`; unknown names suggest close matches |
 | Types | `date`, `time`, `localtime`, `datetime`, `localdatetime` (IANA zones), `duration`, `point` (cartesian and WGS-84) with ISO 8601 parsing, arithmetic, truncation and `distance()` |
-| Procedures | `db.labels`, `db.propertyKeys`, `db.relationshipTypes`, `db.awaitIndexes`, `db.index.fulltext.queryNodes` |
+| Procedures | `db.labels`, `db.propertyKeys`, `db.relationshipTypes`, `db.indexes`, `db.constraints`, `db.schema.nodeTypeProperties`, `db.schema.relTypeProperties`, `db.awaitIndexes`, `db.index.fulltext.queryNodes` |
 
 Unsupported features fail with a clear `Unsupported` error instead of a wrong
-answer: `REMOVE n = {...}`, map projections (`n{.name}`), `SHOW INDEXES` /
-`SHOW CONSTRAINTS` and user-defined procedures. What is planned next is in
+answer: `PROFILE`, nested `CALL { }`, `db.schema.visualization()` and
+user-defined procedures. What is planned next is in
 [docs/roadmap.md](docs/roadmap.md).
 
 ## Embedding grafile

@@ -4,9 +4,22 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
+/// Run the shell with an empty home directory, so no developer
+/// `~/.grafilerc` or history file leaks into a test.
 fn run(args: &[&str], stdin: Option<&str>) -> Output {
+    let home = Path::new(env!("CARGO_TARGET_TMPDIR")).join("cli-empty-home");
+    std::fs::create_dir_all(&home).expect("empty home");
+    run_in(&home, args, stdin)
+}
+
+/// Run the shell with `home` as the home directory.
+fn run_in(home: &Path, args: &[&str], stdin: Option<&str>) -> Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_grafile"));
-    command.args(args);
+    command
+        .args(args)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .env_remove("GRAFILE_HISTORY");
     if let Some(input) = stdin {
         command.stdin(Stdio::piped());
         let mut child = command
@@ -211,4 +224,114 @@ fn check_exits_with_status_one_on_damage() {
     let output = run(&["check", "missing.db"], None);
     assert_eq!(output.status.code(), Some(1));
     assert!(stderr(&output).contains("cannot open `missing.db`"));
+}
+
+#[test]
+fn readonly_sessions_read_but_never_write_or_create() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("ro.db");
+    let path = db.to_str().expect("path");
+    assert!(
+        run(&[path, "-c", "CREATE (:Person)"], None)
+            .status
+            .success()
+    );
+    let read = run(
+        &["--readonly", path, "-c", "MATCH (n) RETURN count(n) AS c"],
+        None,
+    );
+    assert!(read.status.success(), "{}", stderr(&read));
+    assert!(stdout(&read).contains('1'), "{}", stdout(&read));
+    let write = run(&["--readonly", path, "-c", "CREATE (:Person)"], None);
+    assert!(!write.status.success());
+    assert!(stderr(&write).contains("ReadOnly"), "{}", stderr(&write));
+    let missing = dir.path().join("missing.db");
+    let open = run(&["--readonly", missing.to_str().expect("path")], None);
+    assert!(!open.status.success());
+    assert!(!missing.exists(), "--readonly never creates a file");
+}
+
+#[test]
+fn startup_file_and_params_shape_every_mode() {
+    let home = tempfile::tempdir().expect("home");
+    std::fs::write(
+        home.path().join(".grafilerc"),
+        ".mode csv\n.param set greeting 'hi'\n.bogus\n",
+    )
+    .expect("rc");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("rc.db");
+    let path = db.to_str().expect("path");
+    let query = "RETURN $greeting AS g";
+    let output = run_in(home.path(), &[path, "-c", query], None);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "g\r\nhi\r\n");
+    assert!(
+        stderr(&output).contains(".grafilerc:3"),
+        "{}",
+        stderr(&output)
+    );
+    let skipped = run_in(home.path(), &["--no-init", path, "-c", query], None);
+    assert!(!skipped.status.success());
+    assert!(
+        stderr(&skipped).contains("greeting"),
+        "{}",
+        stderr(&skipped)
+    );
+    let other = dir.path().join("other.rc");
+    std::fs::write(&other, ".param set greeting 'yo'\n").expect("other rc");
+    let replaced = run_in(
+        home.path(),
+        &["--init", other.to_str().expect("path"), path, "-c", query],
+        None,
+    );
+    assert!(stdout(&replaced).contains("yo"), "{}", stdout(&replaced));
+    assert!(
+        !stdout(&replaced).contains("g\r\nyo"),
+        "the rc's .mode csv is replaced"
+    );
+    let flagged = run(
+        &[
+            path,
+            "--param",
+            "x=41",
+            "-p",
+            "y=$x + 1",
+            "-c",
+            "RETURN $y AS y",
+        ],
+        None,
+    );
+    assert!(stdout(&flagged).contains("42"), "{}", stdout(&flagged));
+}
+
+#[test]
+fn scripts_mix_dot_commands_and_keep_no_piped_history() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("mixed.db");
+    let script = dir.path().join("mixed.cypher");
+    std::fs::write(&script, ".mode csv\nRETURN 1 AS a;\n").expect("script");
+    let output = run(
+        &[db.to_str().expect("path"), script.to_str().expect("path")],
+        None,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "a\r\n1\r\n");
+    let history = dir.path().join("history");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_grafile"));
+    let piped = command
+        .arg(db.to_str().expect("path"))
+        .env("GRAFILE_HISTORY", &history)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    piped
+        .stdin
+        .as_ref()
+        .expect("stdin")
+        .write_all(b"RETURN 1;\n.quit\n")
+        .expect("write");
+    assert!(piped.wait_with_output().expect("wait").status.success());
+    assert!(!history.exists(), "piped sessions keep no history");
 }

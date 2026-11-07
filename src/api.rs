@@ -54,6 +54,16 @@ impl Params {
     pub fn values(&self) -> &HashMap<String, Value> {
         &self.values
     }
+
+    /// Unbind a parameter, returning its value if it was bound.
+    pub fn remove(&mut self, name: &str) -> Option<Value> {
+        self.values.remove(name)
+    }
+
+    /// Unbind every parameter.
+    pub fn clear(&mut self) {
+        self.values.clear();
+    }
 }
 
 /// The pipeline stage that produced a query failure.
