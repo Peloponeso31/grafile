@@ -307,8 +307,18 @@ impl Database {
         self.pager.end_read()
     }
 
-    /// Commit the active write transaction, persisting tree roots.
+    /// Commit the active write transaction, persisting tree roots. A failed
+    /// commit rolls the transaction back before returning its error, so the
+    /// file and the lock are never left mid-transaction.
     pub fn commit(&mut self) -> Result<()> {
+        let committed = self.commit_inner();
+        if committed.is_err() && self.pager.in_write_txn() {
+            let _ = self.rollback();
+        }
+        committed
+    }
+
+    fn commit_inner(&mut self) -> Result<()> {
         // Flush cached fragments first: the flush may split the fragment
         // B+tree and move its root.
         self.fragments.flush(&mut self.pager)?;
@@ -1737,6 +1747,7 @@ impl Database {
             return Ok(());
         };
         let mut keys = IndexKeys::default();
+        let mut seen = UniqueValues::new(def.unique());
         let mut cursor = self.nodes.cursor();
         let mut ok = cursor.first(&mut self.pager)?;
         while ok {
@@ -1745,19 +1756,17 @@ impl Database {
             if (def.label_id == 0 || record.labels.contains(&def.label_id))
                 && let Some(prefix) = node_index_prefix(&record, &def)
             {
+                if !seen.insert(def.key_ids.iter().filter_map(|key| record.get(*key))) {
+                    return Err(Error::constraint(format!(
+                        "unique index {} violated by node {node_id}",
+                        def.id
+                    )));
+                }
                 keys.push(&prefix, node_id);
             }
             ok = cursor.next(&mut self.pager)?;
         }
         keys.sort();
-        if def.unique()
-            && let Some(node_id) = keys.first_duplicate()
-        {
-            return Err(Error::constraint(format!(
-                "unique index {} violated by node {node_id}",
-                def.id
-            )));
-        }
         Btree::from_root(def.root, TreeKind::Index).build_sorted(&mut self.pager, keys.entries())
     }
 
@@ -1774,6 +1783,7 @@ impl Database {
             return Ok(());
         };
         let mut keys = IndexKeys::default();
+        let mut seen = UniqueValues::new(def.unique());
         let mut cursor = self.edges.cursor();
         let mut ok = cursor.first(&mut self.pager)?;
         while ok {
@@ -1782,19 +1792,17 @@ impl Database {
             if (def.type_id == 0 || record.edge_type == def.type_id)
                 && let Some(prefix) = edge_index_prefix(&record, &def)
             {
+                if !seen.insert(def.key_ids.iter().filter_map(|key| record.get(*key))) {
+                    return Err(Error::constraint(format!(
+                        "unique index {} violated by edge {edge_id}",
+                        def.id
+                    )));
+                }
                 keys.push(&prefix, edge_id);
             }
             ok = cursor.next(&mut self.pager)?;
         }
         keys.sort();
-        if def.unique()
-            && let Some(edge_id) = keys.first_duplicate()
-        {
-            return Err(Error::constraint(format!(
-                "unique index {} violated by edge {edge_id}",
-                def.id
-            )));
-        }
         Btree::from_root(def.root, TreeKind::Index).build_sorted(&mut self.pager, keys.entries())
     }
 
@@ -2167,16 +2175,16 @@ impl Database {
             return Ok(());
         };
         let mut tree = Btree::from_root(def.root, TreeKind::Index);
-        if def.unique() {
-            // Index keys embed the entity id, so key uniqueness cannot
-            // enforce value uniqueness: probe the value prefix instead.
-            let mut cursor = tree.cursor();
-            if cursor.seek_ge(&mut self.pager, &prefix)? && cursor.key().starts_with(&prefix) {
-                return Err(Error::constraint(format!(
-                    "unique index {} violated by node {node_id}",
-                    def.id
-                )));
-            }
+        // Index keys embed the entity id, so key uniqueness cannot enforce
+        // value uniqueness: probe the value prefixes instead.
+        if def.unique()
+            && self
+                .any_prefix_present(&tree, def.key_ids.iter().filter_map(|key| record.get(*key)))?
+        {
+            return Err(Error::constraint(format!(
+                "unique index {} violated by node {node_id}",
+                def.id
+            )));
         }
         let mut key = prefix;
         key.extend_from_slice(&node_id.to_be_bytes());
@@ -2307,19 +2315,35 @@ impl Database {
             return Ok(());
         };
         let mut tree = Btree::from_root(def.root, TreeKind::Index);
-        if def.unique() {
-            let mut cursor = tree.cursor();
-            if cursor.seek_ge(&mut self.pager, &prefix)? && cursor.key().starts_with(&prefix) {
-                return Err(Error::constraint(format!(
-                    "unique index {} violated by edge {edge_id}",
-                    def.id
-                )));
-            }
+        if def.unique()
+            && self
+                .any_prefix_present(&tree, def.key_ids.iter().filter_map(|key| record.get(*key)))?
+        {
+            return Err(Error::constraint(format!(
+                "unique index {} violated by edge {edge_id}",
+                def.id
+            )));
         }
         let mut key = prefix;
         key.extend_from_slice(&edge_id.to_be_bytes());
         tree.insert(&mut self.pager, &key, &[])?;
         self.replace_edge_index_root(index_id, tree.root())
+    }
+
+    /// Whether `tree` holds an entry whose values equal `values` under
+    /// Cypher equality (so `1` matches an entry stored for `1.0`).
+    fn any_prefix_present<'v>(
+        &mut self,
+        tree: &Btree,
+        values: impl Iterator<Item = &'v Value>,
+    ) -> Result<bool> {
+        let mut cursor = tree.cursor();
+        for prefix in equal_value_prefixes(values) {
+            if cursor.seek_ge(&mut self.pager, &prefix)? && cursor.key().starts_with(&prefix) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn delete_edge_index_entry(
@@ -2543,7 +2567,79 @@ fn edge_index_prefix(record: &EdgeRecord, def: &crate::catalog::EdgeIndexDef) ->
     Some(prefix)
 }
 
-/// Prefix shared by all index entries with `value`.
+/// The other numeric value equal to `value` under Cypher equality: the
+/// float of an integer it represents exactly, or the integer of an
+/// integral float in range.
+fn numeric_twin(value: &Value) -> Option<Value> {
+    match value {
+        Value::Int(integer) => {
+            let float = *integer as f64;
+            // Compare in i128: `i64::MAX as f64` rounds up to 2^63, which an
+            // `as i64` cast would saturate back to `i64::MAX`.
+            (float as i128 == i128::from(*integer)).then_some(Value::Float(float))
+        }
+        Value::Float(float) => {
+            const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+            (float.fract() == 0.0 && (-TWO_POW_63..TWO_POW_63).contains(float))
+                .then_some(Value::Int(*float as i64))
+        }
+        _ => None,
+    }
+}
+
+/// Every encoded index prefix whose values equal `values` under Cypher
+/// equality: each numeric value also appears as its [`numeric_twin`].
+fn equal_value_prefixes<'v>(values: impl Iterator<Item = &'v Value>) -> Vec<Vec<u8>> {
+    let mut prefixes = vec![Vec::new()];
+    for value in values {
+        let twin = numeric_twin(value);
+        let twin_prefixes = twin.as_ref().map(|_| prefixes.clone());
+        for prefix in &mut prefixes {
+            encode_index_key(prefix, value);
+        }
+        if let (Some(twin), Some(mut twin_prefixes)) = (twin, twin_prefixes) {
+            for prefix in &mut twin_prefixes {
+                encode_index_key(prefix, &twin);
+            }
+            prefixes.extend(twin_prefixes);
+        }
+    }
+    prefixes
+}
+
+/// Value tuples seen while backfilling a unique index, compared under Cypher
+/// equality by encoding integral floats as integers.
+struct UniqueValues {
+    seen: Option<HashSet<Vec<u8>>>,
+}
+
+impl UniqueValues {
+    /// A tracker that checks values only when `unique` is set.
+    fn new(unique: bool) -> Self {
+        Self {
+            seen: unique.then(HashSet::new),
+        }
+    }
+
+    /// Record `values`; `false` when an equal tuple was already recorded.
+    fn insert<'v>(&mut self, values: impl Iterator<Item = &'v Value>) -> bool {
+        let Some(seen) = &mut self.seen else {
+            return true;
+        };
+        let mut canonical = Vec::new();
+        for value in values {
+            match value {
+                Value::Float(_) => match numeric_twin(value) {
+                    Some(integer) => encode_index_key(&mut canonical, &integer),
+                    None => encode_index_key(&mut canonical, value),
+                },
+                _ => encode_index_key(&mut canonical, value),
+            }
+        }
+        seen.insert(canonical)
+    }
+}
+
 /// The id in an 8-byte big-endian record table key.
 fn table_key_id(key: &[u8], what: &str) -> Result<u64> {
     let bytes: [u8; 8] = key
@@ -2667,18 +2763,6 @@ impl IndexKeys {
         let bytes = &self.bytes;
         self.spans
             .par_sort_unstable_by(|a, b| bytes[a.key.clone()].cmp(&bytes[b.key.clone()]));
-    }
-
-    /// After [`Self::sort`]: the id of the second entity found sharing a
-    /// value with its predecessor.
-    fn first_duplicate(&self) -> Option<u64> {
-        self.spans.windows(2).find_map(|pair| {
-            let (left, right) = (self.key(&pair[0]), self.key(&pair[1]));
-            let (left_value, _) = left.split_at(left.len() - 8);
-            let (right_value, id) = right.split_at(right.len() - 8);
-            (left_value == right_value)
-                .then(|| u64::from_be_bytes(id.try_into().expect("8-byte id suffix")))
-        })
     }
 
     fn entries(&self) -> impl Iterator<Item = (&[u8], &[u8])> {

@@ -59,6 +59,9 @@ struct WriteTxn {
     journaled: HashSet<u32>,
     journal_offset: u64,
     record_count: u64,
+    /// Whether commit began writing pages to the database file; a rollback
+    /// after that point must replay the journal to undo them.
+    pages_written: bool,
 }
 
 /// Borrowed page contents plus the frame generation.
@@ -150,40 +153,20 @@ impl Pager {
     /// Open an existing database file, recovering a hot journal if present.
     pub fn open(vfs: Arc<dyn Vfs>, path: &Path, mode: OpenMode) -> Result<Self> {
         let file = vfs.open(path, mode)?;
-        let size = file.size()?;
-        if size < DB_HEADER_END as u64 {
-            return Err(Error::new(
-                ErrorCode::NotADb,
-                format!("{} is too small to be a grafile database", path.display()),
-            ));
-        }
-        let mut header_bytes = vec![0u8; DB_HEADER_END];
-        file.read_at(&mut header_bytes, 0)?;
-        let header = DatabaseHeader::parse(&header_bytes)?;
-        let page_size = header.page_size as usize;
-        if size < page_size as u64 {
-            return Err(Error::corrupt(format!(
-                "{} is shorter than one page",
-                path.display()
-            )));
-        }
         let jpath = journal_path(path);
-        if vfs.exists(&jpath)? {
-            Self::recover_journal(vfs.as_ref(), &*file, &jpath, mode)?;
-        }
-        let mut page_one = vec![0u8; page_size];
-        file.read_at(&mut page_one, 0)?;
-        verify_page_checksum(&page_one, 1)?;
-        let header = DatabaseHeader::parse(&page_one)?;
-        if header.page_count < 1 {
-            return Err(Error::corrupt("database header declares zero pages"));
-        }
+        // Hold the shared lock while reading page 1 so a concurrent writer
+        // cannot tear it or delete the journal between our checks.
+        file.lock(LockLevel::Shared)?;
+        let read = Self::read_page_one(vfs.as_ref(), &*file, path, &jpath, mode);
+        let unlock = file.unlock(LockLevel::Shared);
+        let (page_one, header) = read?;
+        unlock?;
         let mut pager = Self {
             vfs,
             file,
             path: path.to_path_buf(),
             journal_path: jpath,
-            page_size,
+            page_size: page_one.len(),
             header,
             header_dirty: false,
             cache: HashMap::new(),
@@ -199,12 +182,49 @@ impl Pager {
         Ok(pager)
     }
 
+    /// Validate the file, recover a hot journal, and read page 1 with its
+    /// header. Expects the shared lock held and leaves it held.
+    fn read_page_one(
+        vfs: &dyn Vfs,
+        file: &dyn File,
+        path: &Path,
+        jpath: &Path,
+        mode: OpenMode,
+    ) -> Result<(Vec<u8>, DatabaseHeader)> {
+        let size = file.size()?;
+        if size < DB_HEADER_END as u64 {
+            return Err(Error::new(
+                ErrorCode::NotADb,
+                format!("{} is too small to be a grafile database", path.display()),
+            ));
+        }
+        let mut header_bytes = vec![0u8; DB_HEADER_END];
+        file.read_at(&mut header_bytes, 0)?;
+        let page_size = DatabaseHeader::parse(&header_bytes)?.page_size as usize;
+        if size < page_size as u64 {
+            return Err(Error::corrupt(format!(
+                "{} is shorter than one page",
+                path.display()
+            )));
+        }
+        if vfs.exists(jpath)? {
+            Self::recover_journal(vfs, file, jpath, mode)?;
+        }
+        let mut page_one = vec![0u8; page_size];
+        file.read_at(&mut page_one, 0)?;
+        verify_page_checksum(&page_one, 1)?;
+        let header = DatabaseHeader::parse(&page_one)?;
+        if header.page_count < 1 {
+            return Err(Error::corrupt("database header declares zero pages"));
+        }
+        Ok((page_one, header))
+    }
+
+    /// Replay a hot journal. Expects the shared lock held and leaves it held;
+    /// a writable replay upgrades to the exclusive lock in between.
     fn recover_journal(vfs: &dyn Vfs, file: &dyn File, jpath: &Path, mode: OpenMode) -> Result<()> {
         if !mode.is_writable() {
-            let journal_file = vfs.open(jpath, OpenMode::ReadOnly)?;
-            let mut block = vec![0u8; journal::JOURNAL_HEADER_SIZE];
-            journal_file.read_at(&mut block, 0)?;
-            if journal::JournalHeader::parse(&block)?.is_some() {
+            if Self::journal_is_hot(vfs, jpath)? {
                 return Err(Error::new(
                     ErrorCode::ReadOnly,
                     "database needs journal recovery but was opened read-only",
@@ -212,18 +232,23 @@ impl Pager {
             }
             return Ok(());
         }
+        file.unlock(LockLevel::Shared)?;
         file.lock(LockLevel::Exclusive)?;
         let result = (|| {
+            // Another process may have recovered and removed it first.
+            if !vfs.exists(jpath)? {
+                return Ok(());
+            }
             let journal_file = vfs.open(jpath, OpenMode::ReadWrite)?;
-            let outcome = journal::recover(file, &*journal_file)?;
+            journal::recover(file, &*journal_file)?;
             drop(journal_file);
-            vfs.remove(jpath)?;
-            Ok::<_, Error>(outcome)
+            vfs.remove(jpath)
         })();
         let unlock = file.unlock(LockLevel::Exclusive);
+        let relock = file.lock(LockLevel::Shared);
         result?;
         unlock?;
-        Ok(())
+        relock
     }
 
     /// The VFS this pager opened its file through.
@@ -331,7 +356,12 @@ impl Pager {
 
     /// Whether the journal file carries a valid transaction header.
     fn journal_is_hot(vfs: &dyn Vfs, path: &Path) -> Result<bool> {
-        let journal_file = vfs.open(path, OpenMode::ReadOnly)?;
+        let journal_file = match vfs.open(path, OpenMode::ReadOnly) {
+            Ok(file) => file,
+            // A writer finished and removed it after our existence check.
+            Err(err) if err.code() == ErrorCode::NotFound => return Ok(false),
+            Err(err) => return Err(err),
+        };
         let mut block = vec![0u8; journal::JOURNAL_HEADER_SIZE];
         journal_file.read_at(&mut block, 0)?;
         Ok(journal::JournalHeader::parse(&block)?.is_some())
@@ -454,6 +484,7 @@ impl Pager {
             journaled: HashSet::new(),
             journal_offset: self.page_size as u64,
             record_count: 0,
+            pages_written: false,
         });
         Ok(())
     }
@@ -496,6 +527,7 @@ impl Pager {
             pages.sort_unstable();
             pages
         };
+        txn.pages_written = true;
         // Checksums are computed once per page here rather than on every
         // mutation: intermediate page states never reach the disk.
         for page_no in &dirty_pages {
@@ -524,6 +556,12 @@ impl Pager {
     fn finish_txn(&mut self, committed: bool) -> Result<()> {
         let txn = self.txn.take().expect("txn present");
         let result: Result<()> = (|| {
+            if !committed && txn.pages_written {
+                // A commit failed midway: restore the original pages. If the
+                // replay itself fails the journal stays hot for the next open.
+                journal::recover(&*self.file, &*txn.journal)?;
+                self.file.sync_data()?;
+            }
             if committed {
                 // Invalidate the journal so a resurrected file is ignored,
                 // then delete it. A normal sync is enough: if the zeroing is
@@ -532,22 +570,23 @@ impl Pager {
                 txn.journal.write_at(&[0u8; 8], 0)?;
                 txn.journal.sync_data()?;
             }
-            self.vfs.remove(&self.journal_path)?;
-            if committed {
-                for (page_no, frame) in self.cache.iter_mut() {
-                    if frame.dirty {
-                        frame.dirty = false;
-                        self.clean_lru.insert(*page_no);
-                    }
-                }
-            } else {
-                self.header = txn.header_snapshot;
-                self.cache.retain(|_, frame| !frame.dirty);
-                self.header_dirty = false;
-            }
-            self.evict_if_needed(None);
-            Ok(())
+            self.vfs.remove(&self.journal_path)
         })();
+        if committed && result.is_ok() {
+            for (page_no, frame) in self.cache.iter_mut() {
+                if frame.dirty {
+                    frame.dirty = false;
+                    self.clean_lru.insert(*page_no);
+                }
+            }
+        } else {
+            // A rollback, or a commit whose journal cleanup failed: forget
+            // the transaction's pages so later reads come from the file.
+            self.header = txn.header_snapshot;
+            self.cache.retain(|_, frame| !frame.dirty);
+            self.header_dirty = false;
+        }
+        self.evict_if_needed(None);
         // Release the writer slot and file lock even when cleanup failed.
         self.release_writer_claim();
         self.txn_generation = self.txn_generation.wrapping_add(1);
@@ -947,6 +986,52 @@ mod tests {
         assert_eq!(pager.header().user_version, 7);
         assert_eq!(pager.header().change_counter, 1);
         assert_eq!(pager.header().page_size, PAGE_SIZE);
+    }
+
+    #[test]
+    fn rollback_after_a_failed_commit_restores_the_file() {
+        let path = Path::new("failed_commit.db");
+        for fail_after in 0.. {
+            // Arrange: five committed pages, then a transaction rewriting them.
+            let vfs = Arc::new(MemVfs::new());
+            let mut pager = create_pager(vfs.clone(), path);
+            pager.begin_write().expect("begin");
+            let pages: Vec<u32> = (0..5).map(|_| pager.alloc_page().expect("alloc")).collect();
+            for &page_no in &pages {
+                init_page(&mut pager, page_no, PageType::TableLeaf).expect("init");
+            }
+            pager.commit().expect("commit");
+            let before = vfs.contents(path).expect("database file");
+            pager.begin_write().expect("begin");
+            for &page_no in &pages {
+                init_page(&mut pager, page_no, PageType::IndexLeaf).expect("rewrite");
+            }
+
+            // Act: fail the commit after `fail_after` I/O operations, then
+            // roll back with the fault cleared.
+            vfs.inject_fault(FaultConfig {
+                fail_after_ops: Some(fail_after),
+                torn_write: false,
+            });
+            let committed = pager.commit();
+            vfs.clear_fault();
+            if committed.is_ok() {
+                break;
+            }
+            if !pager.in_write_txn() {
+                // The pages landed and only the journal cleanup failed: the
+                // next open settles the file from the journal's state.
+                drop(pager);
+                Pager::open(vfs.clone(), path, OpenMode::ReadWrite).expect("reopen");
+                assert!(vfs.contents(&journal_path(path)).is_none());
+                continue;
+            }
+            pager.rollback().expect("rollback");
+
+            // Assert: the file is byte-for-byte what was last committed.
+            assert_eq!(vfs.contents(path).expect("database file"), before);
+            assert!(vfs.contents(&journal_path(path)).is_none());
+        }
     }
 
     #[test]

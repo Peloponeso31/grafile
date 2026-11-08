@@ -6,6 +6,7 @@
 //! independent of the host's `/usr/share/zoneinfo`.
 
 use crate::temporal::civil::{Date, civil_from_days};
+use crate::temporal::datetime::LocalDateTime;
 
 /// Smallest civil year the time zone database can resolve. Jiff's civil
 /// types stop at year 9999, while grafile's dates go far beyond; zone
@@ -49,6 +50,32 @@ pub fn offset_for_civil(name: &str, civil: Civil) -> Result<Offset, String> {
         .compatible()
         .map_err(|err| format!("cannot resolve `{name}` at {civil}: {err}"))?;
     Ok(zoned.offset().seconds())
+}
+
+/// Resolve a local datetime in zone `name` to its canonical local datetime
+/// and offset. Folds take the first occurrence; a time inside a DST gap moves
+/// forward by the gap's length (`02:30` becomes `03:30` when clocks spring
+/// from `02:00` to `03:00`), so the pair always names a real instant.
+///
+/// # Errors
+///
+/// Returns a message when the zone is unknown or the year lies outside the
+/// time zone database's range.
+pub fn resolve_local(name: &str, local: LocalDateTime) -> Result<(LocalDateTime, Offset), String> {
+    let zone = jiff::tz::TimeZone::get(name).map_err(|_| format!("unknown time zone `{name}`"))?;
+    let civil = Civil::from_date_and_nanos(local.date(), local.time().nanos());
+    let zoned = zone
+        .to_ambiguous_zoned(civil.to_jiff()?)
+        .compatible()
+        .map_err(|err| format!("cannot resolve `{name}` at {civil}: {err}"))?;
+    let offset = zoned.offset().seconds();
+    let instant = zoned.timestamp();
+    let resolved = LocalDateTime::from_epoch(
+        instant.as_second() + i64::from(offset),
+        i64::from(instant.subsec_nanosecond()),
+    )
+    .ok_or_else(|| "resolved datetime out of range".to_owned())?;
+    Ok((resolved, offset))
 }
 
 /// A civil datetime for zone lookups.

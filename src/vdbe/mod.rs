@@ -779,7 +779,7 @@ pub mod func {
     pub const CEIL: u8 = 33;
     /// `floor(x)`
     pub const FLOOR: u8 = 34;
-    /// `round(x)`
+    /// `round(x [, precision [, mode]])`
     pub const ROUND: u8 = 35;
     /// `sign(x)`
     pub const SIGN: u8 = 36;
@@ -1007,6 +1007,29 @@ pub mod func {
             .iter()
             .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
             .map(|(_, code)| *code)
+    }
+
+    /// The accepted argument count of the scalar function `code` as
+    /// `(minimum, maximum)`; `None` as the maximum means variadic.
+    pub fn arity(code: u8) -> (usize, Option<usize>) {
+        match code {
+            RAND | RANDOM_UUID | PI | E => (0, Some(0)),
+            DATE | LOCALTIME | TIME | LOCAL_DATETIME | DATETIME => (0, Some(1)),
+            COALESCE => (1, None),
+            RANGE => (2, Some(3)),
+            SUBSTRING => (2, Some(3)),
+            ROUND => (1, Some(3)),
+            TRIM | BTRIM | LTRIM | RTRIM => (1, Some(2)),
+            REPLACE => (3, Some(3)),
+            DATE_TRUNCATE
+            | LOCALTIME_TRUNCATE
+            | TIME_TRUNCATE
+            | LOCAL_DATETIME_TRUNCATE
+            | DATETIME_TRUNCATE => (2, Some(3)),
+            SPLIT | LEFT | RIGHT | ATAN2 | DISTANCE | DATETIME_FROM_EPOCH | DURATION_BETWEEN
+            | DURATION_IN_MONTHS | DURATION_IN_DAYS | DURATION_IN_SECONDS | NULL_IF => (2, Some(2)),
+            _ => (1, Some(1)),
+        }
     }
 }
 
@@ -1404,7 +1427,7 @@ impl<'a> Executor<'a> {
                 let value = self.reg_value(*src)?;
                 let result = match op {
                     0 => match value {
-                        Value::Int(value) => Value::Int(value.wrapping_neg()),
+                        Value::Int(value) => checked_int(value.checked_neg())?,
                         Value::Float(value) => Value::Float(-value),
                         Value::Duration(value) => Value::Duration(-value),
                         Value::Null => Value::Null,
@@ -2927,11 +2950,7 @@ impl<'a> Executor<'a> {
             func::REPLACE => call_replace(args),
             func::ABS => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
-                Some(Value::Int(value)) => Ok(match value.checked_abs() {
-                    Some(value) => Value::Int(value),
-                    // `abs(i64::MIN)` overflows into float, like Neo4j.
-                    None => Value::Float((*value as f64).abs()),
-                }),
+                Some(Value::Int(value)) => checked_int(value.checked_abs()),
                 Some(Value::Float(value)) => Ok(Value::Float(value.abs())),
                 Some(other) => Err(invalid_argument("abs", other)),
             },
@@ -2951,7 +2970,7 @@ impl<'a> Executor<'a> {
             },
             func::CEIL => float_map(args, "ceil", f64::ceil),
             func::FLOOR => float_map(args, "floor", f64::floor),
-            func::ROUND => float_map(args, "round", f64::round),
+            func::ROUND => call_round(args),
             func::SQRT => float_map(args, "sqrt", f64::sqrt),
             func::EXP => float_map(args, "exp", f64::exp),
             func::LOG => float_map(args, "log", f64::ln),
@@ -3237,11 +3256,10 @@ impl Accumulator {
             }
             _ => {}
         }
-        self.step_value(spec, inputs[0].to_value());
-        Ok(())
+        self.step_value(spec, inputs[0].to_value())
     }
 
-    fn step_value(&mut self, spec: &AggSpec, value: Value) {
+    fn step_value(&mut self, spec: &AggSpec, value: Value) -> Result<()> {
         match self {
             Self::Count(count) => {
                 if spec.star || !value.is_null() {
@@ -3252,7 +3270,9 @@ impl Accumulator {
                 Value::Int(value) => {
                     *state = match std::mem::replace(state, SumState::Empty) {
                         SumState::Empty => SumState::Int(value),
-                        SumState::Int(previous) => SumState::Int(previous.wrapping_add(value)),
+                        SumState::Int(previous) => {
+                            SumState::Int(previous.checked_add(value).ok_or_else(integer_overflow)?)
+                        }
                         SumState::Float(previous) => SumState::Float(previous + value as f64),
                     };
                 }
@@ -3290,6 +3310,7 @@ impl Accumulator {
             // point.
             Self::PercentileCont { .. } | Self::PercentileDisc { .. } | Self::StDev { .. } => {}
         }
+        Ok(())
     }
 
     fn finish(self, _spec: &AggSpec) -> Value {
@@ -3417,10 +3438,11 @@ fn localdatetime_plus_duration(
 /// offset again for the resulting local time.
 fn datetime_plus_duration(datetime: &DateTime, duration: Duration) -> Result<DateTime> {
     let local = localdatetime_plus_duration(datetime.local(), duration)?;
-    let offset = match datetime.zone() {
-        Some(zone) => crate::temporal::construct::zone_offset(zone, local.date(), local.time())
-            .map_err(Error::type_error)?,
-        None => datetime.offset(),
+    let (local, offset) = match datetime.zone() {
+        Some(zone) => {
+            crate::temporal::zone::resolve_local(zone, local).map_err(Error::type_error)?
+        }
+        None => (local, datetime.offset()),
     };
     DateTime::new(local, offset, datetime.zone().map(Arc::<str>::from))
         .ok_or_else(|| Error::type_error("datetime arithmetic out of range"))
@@ -3615,25 +3637,25 @@ fn binary_op(op: u8, a: &Value, b: &Value) -> Result<Value> {
         },
         code::ADD => match temporal_add(a, b)? {
             Some(value) => Ok(value),
-            None => numeric_or_concat(a, b, |x, y| x + y, |x, y| x.wrapping_add(y)),
+            None => numeric_or_concat(a, b, |x, y| x + y, i64::checked_add),
         },
         code::SUB => match temporal_sub(a, b)? {
             Some(value) => Ok(value),
-            None => numeric(a, b, |x, y| x - y, |x, y| x.wrapping_sub(y)),
+            None => numeric(a, b, |x, y| x - y, i64::checked_sub),
         },
         code::MUL => match temporal_scale(a, b, false)? {
             Some(value) => Ok(value),
             None => match temporal_scale(b, a, false)? {
                 Some(value) => Ok(value),
-                None => numeric(a, b, |x, y| x * y, |x, y| x.wrapping_mul(y)),
+                None => numeric(a, b, |x, y| x * y, i64::checked_mul),
             },
         },
         code::DIV => match temporal_scale(a, b, true)? {
             Some(value) => Ok(value),
             None => match (a, b) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                (Value::Int(_), Value::Int(0)) => Ok(Value::Null),
-                (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_div(*y))),
+                (Value::Int(_), Value::Int(0)) => Err(division_by_zero()),
+                (Value::Int(x), Value::Int(y)) => checked_int(x.checked_div(*y)),
                 _ => match (a.as_number(), b.as_number()) {
                     (Some(x), Some(y)) => Ok(Value::Float(x / y)),
                     _ => Err(type_error("division", a, b)),
@@ -3642,7 +3664,9 @@ fn binary_op(op: u8, a: &Value, b: &Value) -> Result<Value> {
         },
         code::MOD => match (a, b) {
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-            (Value::Int(_), Value::Int(0)) => Ok(Value::Null),
+            (Value::Int(_), Value::Int(0)) => Err(division_by_zero()),
+            // `i64::MIN % -1` is mathematically 0 but overflows in hardware,
+            // so the wrapping form is the correct result here.
             (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_rem(*y))),
             _ => match (a.as_number(), b.as_number()) {
                 (Some(x), Some(y)) => Ok(Value::Float(x % y)),
@@ -3669,6 +3693,20 @@ fn binary_op(op: u8, a: &Value, b: &Value) -> Result<Value> {
     }
 }
 
+/// An integer result, or an overflow error when the checked operation
+/// produced `None`.
+fn checked_int(result: Option<i64>) -> Result<Value> {
+    result.map(Value::Int).ok_or_else(integer_overflow)
+}
+
+fn integer_overflow() -> Error {
+    Error::new(ErrorCode::Range, "ArithmeticError: integer overflow")
+}
+
+fn division_by_zero() -> Error {
+    Error::new(ErrorCode::Range, "ArithmeticError: / by zero")
+}
+
 fn bool_value(value: Option<bool>) -> Value {
     match value {
         Some(value) => Value::Bool(value),
@@ -3680,11 +3718,11 @@ fn numeric(
     a: &Value,
     b: &Value,
     float_op: impl Fn(f64, f64) -> f64,
-    int_op: impl Fn(i64, i64) -> i64,
+    int_op: impl Fn(i64, i64) -> Option<i64>,
 ) -> Result<Value> {
     match (a, b) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(int_op(*x, *y))),
+        (Value::Int(x), Value::Int(y)) => checked_int(int_op(*x, *y)),
         _ => match (a.as_number(), b.as_number()) {
             (Some(x), Some(y)) => Ok(Value::Float(float_op(x, y))),
             _ => Err(type_error("arithmetic", a, b)),
@@ -3696,7 +3734,7 @@ fn numeric_or_concat(
     a: &Value,
     b: &Value,
     float_op: impl Fn(f64, f64) -> f64,
-    int_op: impl Fn(i64, i64) -> i64,
+    int_op: impl Fn(i64, i64) -> Option<i64>,
 ) -> Result<Value> {
     // A string concatenates any scalar on either side, coercing the scalar
     // through its text form. Lists keep their append/prepend semantics.
@@ -3738,6 +3776,33 @@ fn numeric_or_concat(
     numeric(a, b, float_op, int_op)
 }
 
+/// Neo4j's (Java's) text form of a float: plain decimal for magnitudes in
+/// `[1e-3, 1e7)`, otherwise scientific with a capital `E` (`1.0E20`), and
+/// `NaN`/`Infinity` spelled out.
+fn float_text(value: f64) -> String {
+    if value.is_nan() {
+        return String::from("NaN");
+    }
+    if value.is_infinite() {
+        return String::from(if value > 0.0 { "Infinity" } else { "-Infinity" });
+    }
+    let magnitude = value.abs();
+    if magnitude == 0.0 || (1e-3..1e7).contains(&magnitude) {
+        let mut buffer = ryu::Buffer::new();
+        return buffer.format(value).to_owned();
+    }
+    // `{:e}` prints the shortest round-tripping digits, e.g. `1.5e-7`.
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("`{:e}` output always has an exponent");
+    if mantissa.contains('.') {
+        format!("{mantissa}E{exponent}")
+    } else {
+        format!("{mantissa}.0E{exponent}")
+    }
+}
+
 /// Text form of a scalar for `toString()` and string concatenation. Returns
 /// `None` for values without a text form (null, collections, entities); the
 /// caller decides between an error, a null result or another operator branch.
@@ -3745,10 +3810,7 @@ fn scalar_text(value: &Value) -> Option<Cow<'_, str>> {
     match value {
         Value::Int(value) => Some(Cow::Owned(value.to_string())),
         Value::Bool(value) => Some(Cow::Owned(value.to_string())),
-        Value::Float(value) => {
-            let mut buffer = ryu::Buffer::new();
-            Some(Cow::Owned(buffer.format(*value).to_owned()))
-        }
+        Value::Float(value) => Some(Cow::Owned(float_text(*value))),
         Value::Text(value) => Some(Cow::Borrowed(value)),
         Value::Date(_)
         | Value::LocalTime(_)
@@ -4489,20 +4551,15 @@ fn call_truncate(kind: TruncateKind, args: &[Value]) -> Result<Value> {
         }
         TruncateKind::LocalDateTime => Value::LocalDateTime(LocalDateTime::new(date, time)),
         TruncateKind::DateTime => {
-            let (offset, zone) = match construct::timezone_override(&overrides, date, time)
-                .map_err(|message| Error::type_error(format!("{name}(): {message}")))?
-            {
-                Some(pair) => pair,
-                None => match &zone {
-                    Some(zone) => (
-                        construct::zone_offset(zone, date, time)
-                            .map_err(|message| Error::type_error(format!("{name}(): {message}")))?,
-                        Some(zone.clone()),
-                    ),
-                    None => (offset, None),
-                },
-            };
             let local = LocalDateTime::new(date, time);
+            let (offset, zone) = construct::timezone_override(&overrides, date, time)
+                .map_err(|message| Error::type_error(format!("{name}(): {message}")))?
+                .unwrap_or((offset, zone));
+            let (local, offset) = match &zone {
+                Some(zone) => crate::temporal::zone::resolve_local(zone, local)
+                    .map_err(|message| Error::type_error(format!("{name}(): {message}")))?,
+                None => (local, offset),
+            };
             Value::DateTime(
                 DateTime::new(local, offset, zone)
                     .ok_or_else(|| Error::type_error("offset out of range"))?,
@@ -4790,6 +4847,55 @@ fn number_argument(name: &str, value: &Value) -> Result<f64> {
         Value::Float(number) => Ok(*number),
         other => Err(invalid_argument(name, other)),
     }
+}
+
+/// `round(value [, precision [, mode]])`: rounds half away from zero by
+/// default; `mode` is one of Neo4j's rounding mode names.
+fn call_round(args: &[Value]) -> Result<Value> {
+    if args.iter().any(Value::is_null) {
+        return Ok(Value::Null);
+    }
+    let value = match args.first() {
+        Some(value) => number_argument("round", value)?,
+        None => return Ok(Value::Null),
+    };
+    let precision = match args.get(1) {
+        Some(Value::Int(precision)) => i32::try_from(*precision)
+            .map_err(|_| Error::new(ErrorCode::Range, "round() precision is out of range"))?,
+        Some(other) => return Err(invalid_argument("round", other)),
+        None => 0,
+    };
+    let mode = match args.get(2) {
+        Some(Value::Text(mode)) => mode.to_ascii_uppercase(),
+        Some(other) => return Err(invalid_argument("round", other)),
+        None => String::from("HALF_UP"),
+    };
+    let scale = 10f64.powi(precision);
+    let scaled = value * scale;
+    let is_tie = scaled.fract().abs() == 0.5;
+    let rounded = match mode.as_str() {
+        "HALF_UP" => scaled.round(),
+        "HALF_DOWN" if is_tie => scaled.trunc(),
+        "HALF_DOWN" => scaled.round(),
+        "HALF_EVEN" => scaled.round_ties_even(),
+        "UP" => scaled.abs().ceil().copysign(scaled),
+        "DOWN" => scaled.trunc(),
+        "CEILING" => scaled.ceil(),
+        "FLOOR" => scaled.floor(),
+        other => {
+            return Err(Error::new(
+                ErrorCode::Range,
+                format!("round() does not know the rounding mode `{other}`"),
+            ));
+        }
+    };
+    // Dividing by an exact power of ten keeps `round(1.25, 1)` at `1.3`
+    // rather than the `1.3000000000000003` a multiply by 0.1 would give.
+    Ok(Value::Float(if precision == 0 {
+        rounded
+    } else {
+        rounded / scale
+    }))
 }
 
 /// Apply a float transformation: null propagates and integers are widened.

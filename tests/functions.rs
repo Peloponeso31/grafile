@@ -375,3 +375,92 @@ fn string_helpers_and_aliases() {
     );
     assert_eq!(rows, vec![vec!["true", "true", "null"]]);
 }
+
+#[test]
+fn round_honours_precision_and_mode() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN round(1.2345, 2), round(2.5), round(-2.5, 0, 'HALF_EVEN'), \
+         round(1.25, 1, 'HALF_DOWN'), round(1.21, 1, 'UP'), round(1234, -2)",
+    );
+    assert_eq!(rows, vec![vec!["1.23", "3", "-2", "1.2", "1.3", "1200"]]);
+    let err = conn
+        .query("RETURN round(1.5, 0, 'SIDEWAYS')", &Params::new())
+        .expect_err("unknown mode");
+    assert_eq!(err.code(), grafile::ErrorCode::Range);
+}
+
+#[test]
+fn function_calls_check_their_argument_count() {
+    let mut conn = connection();
+    for (source, message) in [
+        (
+            "RETURN sqrt(4, 5)",
+            "Too many parameters for function 'sqrt'",
+        ),
+        (
+            "RETURN toUpper()",
+            "Insufficient parameters for function 'toUpper'",
+        ),
+        (
+            "RETURN coalesce()",
+            "Insufficient parameters for function 'coalesce'",
+        ),
+    ] {
+        let err = conn.query(source, &Params::new()).expect_err(source);
+        assert_eq!(err.code(), grafile::ErrorCode::Syntax, "{source}");
+        assert!(err.message().contains(message), "{err}");
+    }
+    let rows = query(
+        &mut conn,
+        "RETURN substring('abc', 1), range(1, 5, 2), trim(' a ')",
+    );
+    assert_eq!(rows, vec![vec!["bc", "[1, 3, 5]", "a"]]);
+}
+
+#[test]
+fn integer_overflow_and_division_by_zero_are_errors() {
+    let mut conn = connection();
+    for source in [
+        "RETURN 9223372036854775807 + 1",
+        "RETURN -9223372036854775807 - 2",
+        "RETURN 4611686018427387904 * 2",
+        "RETURN -9223372036854775808 / -1",
+        "RETURN -(-9223372036854775808)",
+        "RETURN abs(-9223372036854775808)",
+        "UNWIND [9223372036854775807, 1] AS x RETURN sum(x)",
+        "RETURN 5 / 0",
+        "RETURN 5 % 0",
+    ] {
+        let err = conn.query(source, &Params::new()).expect_err(source);
+        assert!(
+            err.message().starts_with("ArithmeticError"),
+            "{source}: {err}"
+        );
+    }
+    let rows = query(&mut conn, "RETURN 5.0 / 0, -9223372036854775808 % -1");
+    assert_eq!(rows, vec![vec!["inf", "0"]]);
+}
+
+#[test]
+fn float_to_string_matches_neo4j() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN toString(1e20), toString(1e7), toString(1234567.5), toString(0.001), \
+         toString(-1.5e-7), toString(1.0 / 0), 'x' + 2.5",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "1.0E20",
+            "1.0E7",
+            "1234567.5",
+            "0.001",
+            "-1.5E-7",
+            "Infinity",
+            "x2.5"
+        ]]
+    );
+}

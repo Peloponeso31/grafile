@@ -1956,9 +1956,7 @@ impl Codegen {
                     ));
                 }
                 let func_code = scalar_function(name)?;
-                if func_code == func::RANDOM_UUID && !args.is_empty() {
-                    return Err(Error::syntax("randomUUID() takes no arguments"));
-                }
+                check_arity(name, func_code, args.len())?;
                 let arg_regs: Vec<u32> = args
                     .iter()
                     .map(|arg| self.compile_expr(arg, ctx))
@@ -2131,6 +2129,22 @@ fn scalar_function(name: &str) -> Result<u8> {
             crate::error::did_you_mean(name, func::FUNCTIONS.iter().map(|(name, _)| *name)),
         ))
     })
+}
+
+/// Reject a call to `name` with an argument count it does not accept.
+fn check_arity(name: &str, func_code: u8, count: usize) -> Result<()> {
+    let (minimum, maximum) = func::arity(func_code);
+    if count < minimum {
+        return Err(Error::syntax(format!(
+            "Insufficient parameters for function '{name}'"
+        )));
+    }
+    if maximum.is_some_and(|maximum| count > maximum) {
+        return Err(Error::syntax(format!(
+            "Too many parameters for function '{name}'"
+        )));
+    }
+    Ok(())
 }
 
 /// The value of a literal, or of a list or map built only from literals,

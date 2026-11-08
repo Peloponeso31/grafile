@@ -442,3 +442,26 @@ fn schema_procedures_describe_properties() {
         ]
     );
 }
+
+#[test]
+fn unique_constraints_compare_integers_and_floats_by_value() {
+    let mut conn = connection();
+    conn.execute("CREATE CONSTRAINT uid FOR (u:U) REQUIRE u.id IS UNIQUE")
+        .expect("constraint");
+    conn.execute("CREATE (:U {id: 2.0})").expect("float");
+    let err = conn
+        .execute("CREATE (:U {id: 2})")
+        .expect_err("equal integer");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    conn.execute("CREATE (:U {id: 2.5}), (:U {id: '2'}), (:U {id: 9223372036854775807})")
+        .expect("distinct values");
+
+    let mut backfill = connection();
+    backfill
+        .execute("CREATE (:V {k: 3}), (:V {k: 3.0})")
+        .expect("seed");
+    let err = backfill
+        .execute("CREATE CONSTRAINT vk FOR (v:V) REQUIRE v.k IS UNIQUE")
+        .expect_err("existing equal values");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+}

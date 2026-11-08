@@ -208,3 +208,25 @@ fn cross_temporal_ordering_is_an_error() {
     );
     assert_eq!(rows.len(), 2);
 }
+
+#[test]
+fn local_times_in_a_dst_gap_move_past_it() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "WITH datetime('2024-03-10T02:30:00[America/New_York]') AS gap \
+         RETURN toString(gap), gap.epochSeconds, \
+         toString(datetime({year: 2024, month: 3, day: 10, hour: 2, minute: 30, \
+                            timezone: 'America/New_York'})), \
+         toString(datetime('2024-03-09T02:30:00[America/New_York]') + duration('P1D'))",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "2024-03-10T03:30-04:00[America/New_York]",
+            "1710055800",
+            "2024-03-10T03:30-04:00[America/New_York]",
+            "2024-03-10T03:30-04:00[America/New_York]",
+        ]]
+    );
+}

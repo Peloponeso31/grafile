@@ -158,9 +158,11 @@ impl From<std::io::Error> for Error {
             std::io::ErrorKind::UnexpectedEof => ErrorCode::Corrupt,
             _ => ErrorCode::Io,
         };
+        // The message names the failure class only: the OS detail lives in
+        // the source, so a chained report (`{:#}`) does not print it twice.
         Self {
             code,
-            message: err.to_string(),
+            message: err.kind().to_string(),
             source: Some(Box::new(err)),
         }
     }

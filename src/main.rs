@@ -23,7 +23,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 use grafile::api::{Connection, Params, Rows};
 use grafile::cypher::lexer::{KEYWORDS, TokenClass, highlight_spans};
-use grafile::cypher::split_statements;
+use grafile::cypher::{Clause, Statement, StatementScanner, split_statements};
 use grafile::error::did_you_mean;
 use grafile::json::{JsonColors, JsonOptions, format_unix_utc, row_object_json, value_json};
 use grafile::planner::procedure_names;
@@ -589,6 +589,7 @@ fn repl(conn: &mut Connection, settings: &mut Settings) -> Result<()> {
         let _ = editor.load_history(path);
     }
     let mut buffer = String::new();
+    let mut scanner = StatementScanner::default();
     println!(
         "grafile {} (type .help for commands)",
         env!("CARGO_PKG_VERSION")
@@ -623,10 +624,15 @@ fn repl(conn: &mut Connection, settings: &mut Settings) -> Result<()> {
                         }
                     }
                 }
+                let line_start = buffer.len();
                 buffer.push_str(&line);
                 buffer.push('\n');
-                // Execute when terminated by ';' or an empty line.
-                if trimmed.ends_with(';') || trimmed.is_empty() {
+                scanner.feed(&buffer[line_start..], |_, _| {});
+                // Execute when terminated by ';' or an empty line, unless the
+                // text ends inside a string, quoted name or block comment.
+                if scanner.is_between_statements()
+                    || (trimmed.is_empty() && scanner.is_outside_literals())
+                {
                     let statements = split_statements(&buffer);
                     for statement in statements {
                         if statement.trim().is_empty() {
@@ -637,11 +643,13 @@ fn repl(conn: &mut Connection, settings: &mut Settings) -> Result<()> {
                         }
                     }
                     buffer.clear();
+                    scanner = StatementScanner::default();
                     *names.borrow_mut() = CompletionNames::of(conn, settings);
                 }
             }
             Err(ReadlineError::Interrupted) => {
                 buffer.clear();
+                scanner = StatementScanner::default();
                 println!("^C");
             }
             Err(ReadlineError::Eof) => break,
@@ -789,8 +797,17 @@ fn set_param(
         !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_'),
         "invalid parameter name `{name}`"
     );
+    let source = format!("RETURN {expression}");
+    // Check the text is one expression before running it, so input such as
+    // `1 AS a UNION CREATE (n) RETURN 2 AS a` cannot smuggle in a write.
+    let statement = grafile::cypher::parse_statement(&source)
+        .with_context(|| format!("cannot evaluate `{expression}`"))?;
+    anyhow::ensure!(
+        is_single_return_item(&statement),
+        "`{expression}` must produce exactly one value"
+    );
     let rows = conn
-        .query(&format!("RETURN {expression}"), &settings.params)
+        .query(&source, &settings.params)
         .with_context(|| format!("cannot evaluate `{expression}`"))?;
     let [row] = rows.rows() else {
         anyhow::bail!("`{expression}` must produce exactly one value");
@@ -800,6 +817,17 @@ fn set_param(
     };
     settings.params.insert(name, value.clone());
     Ok(())
+}
+
+/// Whether `statement` is a lone `RETURN` clause with one item.
+fn is_single_return_item(statement: &Statement) -> bool {
+    let Statement::Query(query) = statement else {
+        return false;
+    };
+    let [part] = query.parts.as_slice() else {
+        return false;
+    };
+    matches!(part.clauses.as_slice(), [Clause::Return { items, .. }] if items.len() == 1)
 }
 
 /// How [`run_script`] labels and reacts to its items.
@@ -828,11 +856,11 @@ fn script_items(text: &str) -> Vec<ScriptItem> {
     let mut items = Vec::new();
     let mut chunk_start = 0;
     let mut chunk_line = 1;
-    let mut between_statements = true;
+    let mut scanner = StatementScanner::default();
     let mut offset = 0;
     for (index, line) in text.split_inclusive('\n').enumerate() {
         let trimmed = line.trim();
-        if between_statements && trimmed.starts_with('.') {
+        if scanner.is_between_statements() && trimmed.starts_with('.') {
             push_statements(&mut items, &text[chunk_start..offset], chunk_line);
             items.push(ScriptItem {
                 line: index + 1,
@@ -841,8 +869,8 @@ fn script_items(text: &str) -> Vec<ScriptItem> {
             });
             chunk_start = offset + line.len();
             chunk_line = index + 2;
-        } else if !trimmed.is_empty() && !trimmed.starts_with("//") {
-            between_statements = trimmed.ends_with(';');
+        } else {
+            scanner.feed(line, |_, _| {});
         }
         offset += line.len();
     }

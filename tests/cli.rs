@@ -335,3 +335,62 @@ fn scripts_mix_dot_commands_and_keep_no_piped_history() {
     assert!(piped.wait_with_output().expect("wait").status.success());
     assert!(!history.exists(), "piped sessions keep no history");
 }
+
+#[test]
+fn dot_lines_inside_strings_and_comments_stay_cypher() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("literals.db");
+    let script = dir.path().join("literals.cypher");
+    std::fs::write(
+        &script,
+        "RETURN 'a;\n.headers off\n' AS x;\nRETURN 1 AS y /* note;\n.quit\n*/;\nRETURN 2 AS z;\n",
+    )
+    .expect("write script");
+    let output = run(
+        &[db.to_str().expect("path"), script.to_str().expect("path")],
+        None,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains(".headers off"), "{text}");
+    assert!(text.contains("| z |"), "{text}");
+}
+
+#[test]
+fn piped_input_waits_for_the_end_of_a_string() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("piped.db");
+    let output = run(
+        &[db.to_str().expect("path")],
+        Some("RETURN 'a;\nb' AS x;\nRETURN \"c\n\nd\" AS y;\n"),
+    );
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("| a; |"), "{text}");
+    assert!(text.contains("| c |"), "{text}");
+}
+
+#[test]
+fn parameters_cannot_smuggle_in_writes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = dir.path().join("params.db");
+    let db = db.to_str().expect("path");
+    let output = run(
+        &[
+            db,
+            "-p",
+            "x=1 AS a UNION CREATE (:Hacked) RETURN 2 AS a",
+            "-c",
+            "RETURN $x",
+        ],
+        None,
+    );
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("exactly one value"),
+        "{}",
+        stderr(&output)
+    );
+    let output = run(&[db, "-c", "MATCH (n) RETURN count(n) AS c"], None);
+    assert!(stdout(&output).contains("| 0 |"), "{}", stdout(&output));
+}

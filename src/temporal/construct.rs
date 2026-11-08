@@ -349,12 +349,9 @@ pub fn datetime_from_fields(fields: &[(String, Field)]) -> Result<DateTime, Stri
     let local = LocalDateTime::new(date, time);
     let timezone = timezone_part(fields)?;
     // A named base zone re-resolves its offset for the final civil datetime.
-    let base_offset = match &base.zone {
-        Some(zone_name) => zone::offset_for_civil(
-            zone_name,
-            zone::Civil::from_date_and_nanos(local.date(), local.time().nanos()),
-        )?,
-        None => base.offset,
+    let (local, base_offset) = match &base.zone {
+        Some(zone_name) => zone::resolve_local(zone_name, local)?,
+        None => (local, base.offset),
     };
     let (local, offset, zone) = match timezone {
         None => (
@@ -390,8 +387,7 @@ pub fn datetime_from_fields(fields: &[(String, Field)]) -> Result<DateTime, Stri
                 .ok_or_else(|| "shifted datetime out of range".to_owned())?;
                 (shifted, offset, Some(Arc::from(name.as_str())))
             } else {
-                let civil = zone::Civil::from_date_and_nanos(date, time.nanos());
-                let offset = zone::offset_for_civil(&name, civil)?;
+                let (local, offset) = zone::resolve_local(&name, local)?;
                 (local, offset, Some(Arc::from(name.as_str())))
             }
         }
