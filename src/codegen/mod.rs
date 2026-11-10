@@ -12,7 +12,7 @@ use hashbrown::HashMap;
 use crate::cypher::{Expr, QuantifierKind, SetItem};
 use crate::error::{Error, Result};
 use crate::planner::Prepared;
-use crate::planner::plan::{CreateItem, Plan};
+use crate::planner::plan::{CreateItem, Plan, SubqueryResult};
 use crate::record::Value;
 use crate::vdbe::{AggSpec, BuildPathPart, Op, Program, binary_code, func, unary_code};
 
@@ -604,25 +604,31 @@ impl Codegen {
                 cg.patch(jump, end)?;
                 Ok(())
             }),
-            Plan::PatternPredicate { input, inner, var } => {
-                self.compile(input, ctx, &mut |cg, outer_ctx| {
-                    let cursor = cg.alloc_cursor();
-                    cg.emit(Op::CollectOpen { cursor });
-                    cg.compile(inner, outer_ctx, &mut |cg, inner_ctx| {
-                        cg.emit(Op::CollectRow {
-                            cursor,
-                            start: inner_ctx.window_start,
-                            count: inner_ctx.window_len,
-                        });
-                        Ok(())
-                    })?;
-                    let dest = cg.alloc_reg();
-                    cg.emit(Op::CtxHasRows { cursor, dest });
-                    let mut out_ctx = outer_ctx.clone();
-                    out_ctx.vars.insert(var.clone(), dest);
-                    out(cg, &mut out_ctx)
-                })
-            }
+            Plan::PatternPredicate {
+                input,
+                inner,
+                var,
+                result,
+            } => self.compile(input, ctx, &mut |cg, outer_ctx| {
+                let cursor = cg.alloc_cursor();
+                cg.emit(Op::CollectOpen { cursor });
+                cg.compile(inner, outer_ctx, &mut |cg, inner_ctx| {
+                    cg.emit(Op::CollectRow {
+                        cursor,
+                        start: inner_ctx.window_start,
+                        count: inner_ctx.window_len,
+                    });
+                    Ok(())
+                })?;
+                let dest = cg.alloc_reg();
+                cg.emit(match result {
+                    SubqueryResult::Exists => Op::CtxHasRows { cursor, dest },
+                    SubqueryResult::Count => Op::CtxRowCount { cursor, dest },
+                });
+                let mut out_ctx = outer_ctx.clone();
+                out_ctx.vars.insert(var.clone(), dest);
+                out(cg, &mut out_ctx)
+            }),
             Plan::PatternComprehension {
                 input,
                 inner,
@@ -820,14 +826,19 @@ impl Codegen {
             }
             Plan::Distinct { input } => {
                 let cursor = self.alloc_cursor();
-                self.emit(Op::CollectOpen { cursor });
+                self.emit(Op::SorterOpen {
+                    cursor,
+                    dedup: true,
+                });
                 let mut produced: Option<Ctx> = None;
                 self.compile(input, ctx, &mut |cg, in_ctx| {
                     produced = Some(in_ctx.clone());
-                    cg.emit(Op::CollectRow {
+                    cg.emit(Op::SorterRow {
                         cursor,
                         start: in_ctx.window_start,
                         count: in_ctx.window_len,
+                        prefix: 0,
+                        ascending: vec![true; in_ctx.window_len as usize],
                     });
                     Ok(())
                 })?;
@@ -863,7 +874,10 @@ impl Codegen {
                         skip,
                         limit,
                     }),
-                    None => self.emit(Op::CollectOpen { cursor }),
+                    None => self.emit(Op::SorterOpen {
+                        cursor,
+                        dedup: false,
+                    }),
                 };
                 let mut produced: Option<(Ctx, u32)> = None;
                 self.compile(input, ctx, &mut |cg, in_ctx| {
@@ -890,10 +904,12 @@ impl Codegen {
                             prefix,
                             ascending: ascending.clone(),
                         }),
-                        None => cg.emit(Op::CollectRow {
+                        None => cg.emit(Op::SorterRow {
                             cursor,
                             start,
                             count,
+                            prefix,
+                            ascending: ascending.clone(),
                         }),
                     };
                     Ok(())
@@ -1151,8 +1167,8 @@ impl Codegen {
                                 });
                             }
                             SetItem::Replace { .. } | SetItem::Append { .. } => {
-                                return Err(Error::unsupported(
-                                    "REMOVE with whole-property replacement is not supported",
+                                return Err(Error::internal(
+                                    "the parser only builds property and label REMOVE items",
                                 ));
                             }
                         }
@@ -1764,9 +1780,9 @@ impl Codegen {
 
     fn compile_expr_into(&mut self, expr: &Expr, ctx: &Ctx, dest: u32) -> Result<()> {
         match expr {
-            Expr::ExistsSubquery(_) => {
-                return Err(Error::unsupported(
-                    "EXISTS subqueries are only supported in predicates",
+            Expr::ExistsSubquery(_) | Expr::CountSubquery(_) => {
+                return Err(Error::internal(
+                    "EXISTS and COUNT subqueries are planned before code generation",
                 ));
             }
             Expr::Literal(value) => {
@@ -1940,9 +1956,7 @@ impl Codegen {
                     ));
                 }
                 let func_code = scalar_function(name)?;
-                if func_code == func::RANDOM_UUID && !args.is_empty() {
-                    return Err(Error::syntax("randomUUID() takes no arguments"));
-                }
+                check_arity(name, func_code, args.len())?;
                 let arg_regs: Vec<u32> = args
                     .iter()
                     .map(|arg| self.compile_expr(arg, ctx))
@@ -1978,6 +1992,24 @@ impl Codegen {
                     pairs.push((key.clone(), reg));
                 }
                 self.emit(Op::BuildMap { dest, pairs });
+            }
+            Expr::MapProjection {
+                base,
+                all_properties,
+                entries,
+            } => {
+                let base = self.compile_expr(base, ctx)?;
+                let mut pairs = Vec::with_capacity(entries.len());
+                for (key, value) in entries {
+                    let reg = self.compile_expr(value, ctx)?;
+                    pairs.push((key.clone(), reg));
+                }
+                self.emit(Op::MapProjection {
+                    base,
+                    all_properties: *all_properties,
+                    pairs,
+                    dest,
+                });
             }
             Expr::Case {
                 subject,
@@ -2022,6 +2054,15 @@ impl Codegen {
                 for jump in end_jumps {
                     self.patch(jump, end)?;
                 }
+            }
+            Expr::TypeCheck { expr, negated, ty } => {
+                let src = self.compile_expr(expr, ctx)?;
+                self.emit(Op::TypeCheck {
+                    src,
+                    dest,
+                    negated: *negated,
+                    ty: ty.clone(),
+                });
             }
             Expr::IsNull { expr, negated } => {
                 let src = self.compile_expr(expr, ctx)?;
@@ -2081,95 +2122,29 @@ fn undefined(name: &str) -> Error {
 }
 
 fn scalar_function(name: &str) -> Result<u8> {
-    let lower = name.to_ascii_lowercase();
-    match lower.as_str() {
-        "id" => Ok(func::ID),
-        "labels" => Ok(func::LABELS),
-        "type" => Ok(func::TYPE),
-        "startnode" => Ok(func::START_NODE),
-        "endnode" => Ok(func::END_NODE),
-        "coalesce" => Ok(func::COALESCE),
-        "tostring" => Ok(func::TO_STRING),
-        "tointeger" => Ok(func::TO_INTEGER),
-        "tofloat" => Ok(func::TO_FLOAT),
-        "toboolean" => Ok(func::TO_BOOLEAN),
-        "size" => Ok(func::SIZE),
-        "properties" => Ok(func::PROPERTIES),
-        "keys" => Ok(func::KEYS),
-        "nodes" => Ok(func::NODES),
-        "relationships" => Ok(func::RELATIONSHIPS),
-        "length" => Ok(func::LENGTH),
-        "range" => Ok(func::RANGE),
-        "head" => Ok(func::HEAD),
-        "last" => Ok(func::LAST),
-        "tail" => Ok(func::TAIL),
-        "reverse" => Ok(func::REVERSE),
-        "split" => Ok(func::SPLIT),
-        "substring" => Ok(func::SUBSTRING),
-        "rand" => Ok(func::RAND),
-        "randomuuid" => Ok(func::RANDOM_UUID),
-        "toupper" => Ok(func::TO_UPPER),
-        "tolower" => Ok(func::TO_LOWER),
-        "trim" => Ok(func::TRIM),
-        "ltrim" => Ok(func::LTRIM),
-        "rtrim" => Ok(func::RTRIM),
-        "left" => Ok(func::LEFT),
-        "right" => Ok(func::RIGHT),
-        "replace" => Ok(func::REPLACE),
-        "abs" => Ok(func::ABS),
-        "ceil" => Ok(func::CEIL),
-        "floor" => Ok(func::FLOOR),
-        "round" => Ok(func::ROUND),
-        "sign" => Ok(func::SIGN),
-        "sqrt" => Ok(func::SQRT),
-        "exp" => Ok(func::EXP),
-        "log" => Ok(func::LOG),
-        "log10" => Ok(func::LOG10),
-        "sin" => Ok(func::SIN),
-        "cos" => Ok(func::COS),
-        "tan" => Ok(func::TAN),
-        "cot" => Ok(func::COT),
-        "asin" => Ok(func::ASIN),
-        "acos" => Ok(func::ACOS),
-        "atan" => Ok(func::ATAN),
-        "atan2" => Ok(func::ATAN2),
-        "degrees" => Ok(func::DEGREES),
-        "radians" => Ok(func::RADIANS),
-        "haversin" => Ok(func::HAVERSIN),
-        "pi" => Ok(func::PI),
-        "e" => Ok(func::E),
-        "date" => Ok(func::DATE),
-        "localtime" => Ok(func::LOCALTIME),
-        "time" => Ok(func::TIME),
-        "localdatetime" => Ok(func::LOCAL_DATETIME),
-        "datetime" => Ok(func::DATETIME),
-        "duration" => Ok(func::DURATION),
-        "point" => Ok(func::POINT),
-        "distance" => Ok(func::DISTANCE),
-        "date.truncate" => Ok(func::DATE_TRUNCATE),
-        "localtime.truncate" => Ok(func::LOCALTIME_TRUNCATE),
-        "time.truncate" => Ok(func::TIME_TRUNCATE),
-        "localdatetime.truncate" => Ok(func::LOCAL_DATETIME_TRUNCATE),
-        "datetime.truncate" => Ok(func::DATETIME_TRUNCATE),
-        "datetime.fromepoch" => Ok(func::DATETIME_FROM_EPOCH),
-        "duration.between" => Ok(func::DURATION_BETWEEN),
-        "duration.inmonths" => Ok(func::DURATION_IN_MONTHS),
-        "duration.indays" => Ok(func::DURATION_IN_DAYS),
-        "duration.inseconds" => Ok(func::DURATION_IN_SECONDS),
-        "datetime.fromepochmillis" => Ok(func::DATETIME_FROM_EPOCH_MILLIS),
-        "date.transaction" | "date.statement" | "date.realtime" => Ok(func::DATE),
-        "localtime.transaction" | "localtime.statement" | "localtime.realtime" => {
-            Ok(func::LOCALTIME)
-        }
-        "time.transaction" | "time.statement" | "time.realtime" => Ok(func::TIME),
-        "localdatetime.transaction" | "localdatetime.statement" | "localdatetime.realtime" => {
-            Ok(func::LOCAL_DATETIME)
-        }
-        "datetime.transaction" | "datetime.statement" | "datetime.realtime" => Ok(func::DATETIME),
-        other => Err(Error::syntax(format!(
-            "UnknownFunction: `{other}` is not a known function"
-        ))),
+    func::lookup(name).ok_or_else(|| {
+        Error::syntax(format!(
+            "UnknownFunction: `{}` is not a known function{}",
+            name.to_ascii_lowercase(),
+            crate::error::did_you_mean(name, func::FUNCTIONS.iter().map(|(name, _)| *name)),
+        ))
+    })
+}
+
+/// Reject a call to `name` with an argument count it does not accept.
+fn check_arity(name: &str, func_code: u8, count: usize) -> Result<()> {
+    let (minimum, maximum) = func::arity(func_code);
+    if count < minimum {
+        return Err(Error::syntax(format!(
+            "Insufficient parameters for function '{name}'"
+        )));
     }
+    if maximum.is_some_and(|maximum| count > maximum) {
+        return Err(Error::syntax(format!(
+            "Too many parameters for function '{name}'"
+        )));
+    }
+    Ok(())
 }
 
 /// The value of a literal, or of a list or map built only from literals,

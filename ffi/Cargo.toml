@@ -1,6 +1,6 @@
 [package]
 name = "grafile-ffi"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "C ABI for grafile, the single-file graph database"
 license = "Apache-2.0"
@@ -8,6 +8,8 @@ license = "Apache-2.0"
 [lib]
 name = "grafile"
 crate-type = ["cdylib", "staticlib"]
+# Shares the `grafile` lib name with the core crate; rustdoc cannot document both.
+doc = false
 
 [dependencies]
 grafile = { path = ".." }

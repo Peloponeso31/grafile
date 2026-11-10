@@ -54,6 +54,16 @@ impl Params {
     pub fn values(&self) -> &HashMap<String, Value> {
         &self.values
     }
+
+    /// Unbind a parameter, returning its value if it was bound.
+    pub fn remove(&mut self, name: &str) -> Option<Value> {
+        self.values.remove(name)
+    }
+
+    /// Unbind every parameter.
+    pub fn clear(&mut self) {
+        self.values.clear();
+    }
 }
 
 /// The pipeline stage that produced a query failure.
@@ -237,6 +247,13 @@ impl Connection {
         &mut self.db
     }
 
+    /// Set how many bytes of rows an unbounded `ORDER BY` or `DISTINCT`
+    /// buffers before spilling sorted runs to `<db>-sort-*` files (default
+    /// [`crate::engine::DEFAULT_SORT_MEMORY`]).
+    pub fn set_sort_memory(&mut self, bytes: usize) {
+        self.db.set_sort_memory(bytes);
+    }
+
     /// Run a Cypher query and return all result rows.
     pub fn query(&mut self, source: &str, params: &Params) -> Result<Rows> {
         self.query_with_phase(source, params)
@@ -264,6 +281,19 @@ impl Connection {
         let parsed = match cypher::parse_statement(source).map_err(compile)? {
             cypher::Statement::Query(parsed) => parsed,
             cypher::Statement::Ddl(ddl) => return self.execute_ddl(&ddl),
+            cypher::Statement::Explain(statement) => {
+                let plan = self
+                    .explain_statement(*statement, params.values())
+                    .map_err(compile)?;
+                return Ok(Rows {
+                    columns: vec!["plan".to_owned()],
+                    rows: plan
+                        .lines()
+                        .map(|line| vec![Value::Text(line.into())])
+                        .collect(),
+                    position: 0,
+                });
+            }
         };
         let prepared =
             planner::plan_query(&mut self.db, &parsed, params.values()).map_err(compile)?;
@@ -341,13 +371,24 @@ impl Connection {
         }
     }
 
-    /// Return the query plan as text (like `EXPLAIN QUERY PLAN`).
+    /// Return the query plan as text (like `EXPLAIN QUERY PLAN`). A
+    /// leading `EXPLAIN` in `source` is accepted and changes nothing.
     pub fn explain(&mut self, source: &str) -> Result<String> {
-        let parsed = match cypher::parse_statement(source)? {
+        self.explain_statement(cypher::parse_statement(source)?, &HashMap::new())
+    }
+
+    /// The plan of a parsed statement, planned with `params`.
+    fn explain_statement(
+        &mut self,
+        statement: cypher::Statement,
+        params: &HashMap<String, Value>,
+    ) -> Result<String> {
+        let parsed = match statement {
             cypher::Statement::Query(parsed) => parsed,
             cypher::Statement::Ddl(ddl) => return Ok(ddl.describe()),
+            cypher::Statement::Explain(inner) => return self.explain_statement(*inner, params),
         };
-        let prepared = planner::plan_query(&mut self.db, &parsed, &HashMap::new())?;
+        let prepared = planner::plan_query(&mut self.db, &parsed, params)?;
         let mut out = String::new();
         planner::explain(&prepared.plan, 0, &mut out);
         Ok(out)
@@ -355,8 +396,15 @@ impl Connection {
 
     /// Return the compiled VDBE program as text (like SQLite's `EXPLAIN`).
     pub fn explain_program(&mut self, source: &str) -> Result<String> {
-        let parsed = match cypher::parse_statement(source)? {
+        let statement = match cypher::parse_statement(source)? {
+            cypher::Statement::Explain(inner) => *inner,
+            other => other,
+        };
+        let parsed = match statement {
             cypher::Statement::Query(parsed) => parsed,
+            cypher::Statement::Explain(_) => {
+                return Err(Error::internal("the parser rejects nested EXPLAIN"));
+            }
             cypher::Statement::Ddl(_) => {
                 return Err(Error::unsupported(
                     "DDL statements have no VDBE program; use explain",
@@ -447,6 +495,46 @@ mod tests {
     fn connection() -> Connection {
         Connection::create_with_vfs(Arc::new(MemVfs::new()), Path::new("test.db"), 4096)
             .expect("create connection")
+    }
+
+    /// Every row of `source` under a sort budget of `budget` bytes, and the
+    /// number of runs the query spilled.
+    fn sorted_rows(conn: &mut Connection, source: &str, budget: usize) -> (Vec<Vec<Value>>, u64) {
+        use crate::vdbe::sorter::SPILLED_RUNS;
+        conn.set_sort_memory(budget);
+        let before = SPILLED_RUNS.with(std::cell::Cell::get);
+        let rows = conn.query(source, &Params::new()).expect("query");
+        let spilled = SPILLED_RUNS.with(std::cell::Cell::get) - before;
+        (rows.rows().to_vec(), spilled)
+    }
+
+    #[test]
+    fn spilled_order_by_and_distinct_match_in_memory_results() {
+        let vfs = Arc::new(MemVfs::new());
+        let mut conn = Connection::create_with_vfs(vfs.clone(), Path::new("sort.db"), 4096)
+            .expect("create connection");
+        conn.execute(
+            "UNWIND range(1, 20000) AS x \
+             CREATE (:N {k: x % 997, name: 'n' + toString(x), tags: [x % 3, x % 7]})",
+        )
+        .expect("seed");
+        for source in [
+            "MATCH (n:N) RETURN n, {p: n.k % 5, t: n.tags} AS m ORDER BY n.k DESC, m",
+            "MATCH (n:N) RETURN DISTINCT n.k, {t: n.tags} AS m",
+            "MATCH (n:N) WITH n ORDER BY n.k LIMIT 15000 RETURN n.name ORDER BY n.name",
+        ] {
+            let (in_memory, unspilled) = sorted_rows(&mut conn, source, usize::MAX);
+            let (spilled, runs) = sorted_rows(&mut conn, source, 64 << 10);
+            assert_eq!(unspilled, 0, "{source}");
+            assert!(runs > 1, "{source} did not spill");
+            assert_eq!(spilled, in_memory, "{source}");
+        }
+        let store = vfs.store().lock().expect("store");
+        assert!(
+            !store
+                .keys()
+                .any(|path| path.to_string_lossy().contains("-sort-"))
+        );
     }
 
     #[test]

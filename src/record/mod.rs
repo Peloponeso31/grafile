@@ -18,6 +18,8 @@ use crate::temporal::datetime::{DateTime, LocalDateTime, LocalTime, Time};
 use crate::temporal::duration::Duration;
 use crate::temporal::point::Point;
 
+pub mod types;
+
 /// A dynamically typed property or expression value.
 ///
 /// Strings, byte arrays and lists are reference-counted so cloning a value

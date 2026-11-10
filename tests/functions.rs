@@ -279,3 +279,188 @@ fn conversions_reject_incompatible_types() {
         assert_eq!(err.code(), grafile::ErrorCode::Type, "{source}");
     }
 }
+
+#[test]
+fn null_safe_and_list_conversions() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN toIntegerOrNull('7'), toIntegerOrNull([1]), toFloatOrNull({a: 1}), \
+         toStringOrNull(1.5), toStringOrNull([1]), toBooleanOrNull(1), toBooleanOrNull('TRUE'), \
+         toIntegerOrNull(null)",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "7", "null", "null", "1.5", "null", "null", "true", "null"
+        ]]
+    );
+    let rows = query(
+        &mut conn,
+        "RETURN toIntegerList(['1', 2.9, 'x', [3], null]), toFloatList([1, '2.5']), \
+         toStringList([1, true, {a: 1}]), toBooleanList(['false', 0, true]), \
+         toIntegerList(null)",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "[1, 2, null, null, null]",
+            "[1.0, 2.5]",
+            "[1, true, null]",
+            "[false, null, true]",
+            "null"
+        ]]
+    );
+    for source in ["RETURN toIntegerList('1')", "RETURN toStringList(5)"] {
+        conn.query(source, &Params::new())
+            .expect_err("list conversions require a list");
+    }
+}
+
+#[test]
+fn predicate_and_type_helpers() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN isEmpty(''), isEmpty([1]), isEmpty({}), isEmpty(null), \
+         isNaN(0.0 / 0.0), isNaN(1), isNaN(null), \
+         nullIf(1, 1), nullIf(1, 2), nullIf(null, 1)",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "true", "false", "true", "null", "true", "false", "null", "null", "1", "null"
+        ]]
+    );
+    let rows = query(
+        &mut conn,
+        "RETURN valueType(1), valueType(null), valueType([1, null]), valueType('a'), \
+         valueType(date('2026-11-07')), valueType({a: 1})",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "INTEGER NOT NULL",
+            "NULL",
+            "LIST<INTEGER> NOT NULL",
+            "STRING NOT NULL",
+            "DATE NOT NULL",
+            "MAP NOT NULL"
+        ]]
+    );
+    for source in ["RETURN isEmpty(1)", "RETURN isNaN('x')"] {
+        conn.query(source, &Params::new())
+            .expect_err("helpers reject other types");
+    }
+}
+
+#[test]
+fn string_helpers_and_aliases() {
+    let mut conn = connection();
+    seed(&mut conn);
+    let rows = query(
+        &mut conn,
+        "RETURN btrim('  a  '), btrim('xxaxx', 'x'), ltrim('xya', 'yx'), rtrim('ayx', 'xy'), \
+         btrim(null), btrim('a', null), char_length('héllo'), upper('a'), lower('B'), \
+         point.distance(point({x: 0, y: 0}), point({x: 3, y: 4}))",
+    );
+    assert_eq!(
+        rows,
+        vec![vec!["a", "a", "a", "a", "null", "null", "5", "A", "b", "5"]]
+    );
+    let rows = query(
+        &mut conn,
+        "MATCH (a:Person {name: 'alice'})-[r:KNOWS]->() \
+         RETURN elementId(a) = toString(id(a)), elementId(r) = toString(id(r)), elementId(null)",
+    );
+    assert_eq!(rows, vec![vec!["true", "true", "null"]]);
+}
+
+#[test]
+fn round_honours_precision_and_mode() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN round(1.2345, 2), round(2.5), round(-2.5, 0, 'HALF_EVEN'), \
+         round(1.25, 1, 'HALF_DOWN'), round(1.21, 1, 'UP'), round(1234, -2)",
+    );
+    assert_eq!(rows, vec![vec!["1.23", "3", "-2", "1.2", "1.3", "1200"]]);
+    let err = conn
+        .query("RETURN round(1.5, 0, 'SIDEWAYS')", &Params::new())
+        .expect_err("unknown mode");
+    assert_eq!(err.code(), grafile::ErrorCode::Range);
+}
+
+#[test]
+fn function_calls_check_their_argument_count() {
+    let mut conn = connection();
+    for (source, message) in [
+        (
+            "RETURN sqrt(4, 5)",
+            "Too many parameters for function 'sqrt'",
+        ),
+        (
+            "RETURN toUpper()",
+            "Insufficient parameters for function 'toUpper'",
+        ),
+        (
+            "RETURN coalesce()",
+            "Insufficient parameters for function 'coalesce'",
+        ),
+    ] {
+        let err = conn.query(source, &Params::new()).expect_err(source);
+        assert_eq!(err.code(), grafile::ErrorCode::Syntax, "{source}");
+        assert!(err.message().contains(message), "{err}");
+    }
+    let rows = query(
+        &mut conn,
+        "RETURN substring('abc', 1), range(1, 5, 2), trim(' a ')",
+    );
+    assert_eq!(rows, vec![vec!["bc", "[1, 3, 5]", "a"]]);
+}
+
+#[test]
+fn integer_overflow_and_division_by_zero_are_errors() {
+    let mut conn = connection();
+    for source in [
+        "RETURN 9223372036854775807 + 1",
+        "RETURN -9223372036854775807 - 2",
+        "RETURN 4611686018427387904 * 2",
+        "RETURN -9223372036854775808 / -1",
+        "RETURN -(-9223372036854775808)",
+        "RETURN abs(-9223372036854775808)",
+        "UNWIND [9223372036854775807, 1] AS x RETURN sum(x)",
+        "RETURN 5 / 0",
+        "RETURN 5 % 0",
+    ] {
+        let err = conn.query(source, &Params::new()).expect_err(source);
+        assert!(
+            err.message().starts_with("ArithmeticError"),
+            "{source}: {err}"
+        );
+    }
+    let rows = query(&mut conn, "RETURN 5.0 / 0, -9223372036854775808 % -1");
+    assert_eq!(rows, vec![vec!["inf", "0"]]);
+}
+
+#[test]
+fn float_to_string_matches_neo4j() {
+    let mut conn = connection();
+    let rows = query(
+        &mut conn,
+        "RETURN toString(1e20), toString(1e7), toString(1234567.5), toString(0.001), \
+         toString(-1.5e-7), toString(1.0 / 0), 'x' + 2.5",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "1.0E20",
+            "1.0E7",
+            "1234567.5",
+            "0.001",
+            "-1.5E-7",
+            "Infinity",
+            "x2.5"
+        ]]
+    );
+}

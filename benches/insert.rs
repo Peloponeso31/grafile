@@ -384,8 +384,45 @@ fn bench_sqlite_update_delete(c: &mut Criterion) {
     });
 }
 
+/// `CREATE FULLTEXT INDEX` over 50 000 existing nodes with six-word texts.
+fn bench_fulltext_backfill(c: &mut Criterion) {
+    const ROWS: u64 = 50_000;
+    let mut group = c.benchmark_group("fulltext_backfill_50k");
+    group.sample_size(10);
+    group.bench_function("grafile", |b| {
+        b.iter_batched(
+            || {
+                let mut conn = mem_connection("bench-fulltext.db");
+                conn.begin().expect("begin");
+                let db = conn.database_mut();
+                let product = db.ensure_label("Product").expect("label");
+                let text = db.ensure_property_key("text").expect("key");
+                for index in 0..ROWS {
+                    let words = format!(
+                        "item {index} colour {} size {} bundle",
+                        index % 17,
+                        index % 101
+                    );
+                    db.create_node(&[product], vec![(text, Value::from(words.as_str()))])
+                        .expect("create node");
+                }
+                conn.commit().expect("commit");
+                conn
+            },
+            |mut conn| {
+                conn.execute("CREATE FULLTEXT INDEX search FOR (n:Product) ON EACH [n.text]")
+                    .expect("fulltext index");
+                black_box(conn);
+            },
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_fulltext_backfill,
     bench_create_nodes,
     bench_create_edges,
     bench_cypher_unwind_create,

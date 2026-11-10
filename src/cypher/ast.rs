@@ -1,6 +1,7 @@
 //! Cypher abstract syntax tree.
 
 use crate::record::Value;
+use crate::record::types::CypherType;
 
 /// Unary operators.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +55,8 @@ pub enum BinaryOp {
     Contains,
     /// `=~`
     Regex,
+    /// `||` (string or list concatenation)
+    Concat,
 }
 
 /// A Cypher expression.
@@ -128,6 +131,8 @@ pub enum Expr {
     /// `exists { ... }` subquery: its clauses are only inspected for
     /// whether they match at least one row.
     ExistsSubquery(Box<QueryPart>),
+    /// `count { ... }` subquery: the number of rows its clauses produce.
+    CountSubquery(Box<QueryPart>),
     /// `[p = (a)-[:T]->(b) WHERE predicate | projection]` comprehension.
     PatternComprehension {
         /// Pattern matched for every input row.
@@ -168,6 +173,18 @@ pub enum Expr {
     List(Vec<Expr>),
     /// Map literal `{k: v}`.
     Map(Vec<(String, Expr)>),
+    /// Map projection `n{.key, .*, alias: expr, var}`: null when `base` is
+    /// null, otherwise `base`'s properties (with `.*`) overlaid by
+    /// `entries`. The parser expands `.key` to `key: base.key` and `var` to
+    /// `var: var`.
+    MapProjection {
+        /// The projected variable.
+        base: Box<Expr>,
+        /// Whether `.*` was written.
+        all_properties: bool,
+        /// Projected entries, in order.
+        entries: Vec<(String, Expr)>,
+    },
     /// `CASE` expression.
     Case {
         /// Optional subject for simple `CASE x WHEN ...`.
@@ -183,6 +200,15 @@ pub enum Expr {
         expr: Box<Expr>,
         /// Whether `NOT` was written.
         negated: bool,
+    },
+    /// `expr IS [NOT] :: TYPE` (also spelled `IS [NOT] TYPED TYPE`).
+    TypeCheck {
+        /// Tested expression.
+        expr: Box<Expr>,
+        /// Whether `NOT` was written.
+        negated: bool,
+        /// The type the value must (not) belong to.
+        ty: Box<CypherType>,
     },
     /// `expr:Label` predicate.
     LabelCheck {
@@ -512,6 +538,8 @@ pub enum Clause {
         args: Vec<Expr>,
         /// Yielded columns with optional aliases.
         yields: Vec<(String, Option<String>)>,
+        /// `WHERE` after `YIELD`, over the yielded columns.
+        where_clause: Option<Expr>,
     },
     /// `CALL { ... }` or `CALL (x, y) { ... }` subquery.
     CallSubquery {
@@ -550,6 +578,8 @@ pub enum Statement {
     Query(Query),
     /// A schema command (`CREATE INDEX`, `CREATE CONSTRAINT`, `DROP ...`).
     Ddl(DdlStatement),
+    /// `EXPLAIN <statement>`: describe the plan without running it.
+    Explain(Box<Statement>),
 }
 
 /// A schema DDL command.

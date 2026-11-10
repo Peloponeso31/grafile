@@ -236,6 +236,30 @@ fn bench_million_rows(c: &mut Criterion) {
     group.finish();
 }
 
+/// An unbounded `ORDER BY` over one million generated rows, with an
+/// unlimited sort budget (in memory) and a 16 MiB one (spilled runs and a
+/// merge).
+fn bench_sort_million(c: &mut Criterion) {
+    let mut conn =
+        Connection::create_with_vfs(Arc::new(MemVfs::new()), Path::new("bench-sort.db"), 8192)
+            .expect("connection");
+    let query = "UNWIND range(1, 1000000) AS x WITH x ORDER BY (x * 7919) % 1000003 \
+                 RETURN count(x)";
+    let mut group = c.benchmark_group("cypher_sort_1m");
+    group.throughput(Throughput::Elements(1_000_000));
+    group.sample_size(10);
+    for (label, budget) in [("in_memory", usize::MAX), ("spill_16mib", 16 << 20)] {
+        conn.set_sort_memory(budget);
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                let rows = conn.query(query, &Params::new()).expect("query");
+                black_box(rows.len());
+            });
+        });
+    }
+    group.finish();
+}
+
 /// `shortestPath` and `allShortestPaths` corner to corner across a directed
 /// 10x10 grid (edges right and down): 48 620 shortest paths of 18 hops.
 fn bench_shortest_path(c: &mut Criterion) {
@@ -296,6 +320,7 @@ criterion_group!(
     bench_variable_key_lookup,
     bench_multi_label_count,
     bench_million_rows,
+    bench_sort_million,
     bench_shortest_path,
     bench_update
 );

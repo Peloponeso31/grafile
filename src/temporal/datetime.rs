@@ -588,13 +588,11 @@ fn parse_datetime(text: &str) -> Result<DateTime, String> {
     };
     // A named zone without an explicit offset takes its offset from the
     // zone rules for that civil datetime (historical LMT offsets included).
-    let offset = match (offset, &zone) {
-        (Some(offset), _) => offset,
-        (None, Some(name)) => crate::temporal::zone::offset_for_civil(
-            name,
-            crate::temporal::zone::Civil::from_date_and_nanos(local.date(), local.time().nanos()),
-        )
-        .map_err(|_| invalid())?,
+    let (local, offset) = match (offset, &zone) {
+        (Some(offset), _) => (local, offset),
+        (None, Some(name)) => {
+            crate::temporal::zone::resolve_local(name, local).map_err(|_| invalid())?
+        }
         (None, None) => return Err(invalid()),
     };
     DateTime::new(local, offset, zone).ok_or_else(invalid)

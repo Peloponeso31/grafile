@@ -72,6 +72,15 @@ pub enum PathElement {
     },
 }
 
+/// What a pattern predicate or subquery binds for each input row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryResult {
+    /// Whether the inner plan produced a row (`EXISTS`, pattern predicates).
+    Exists,
+    /// How many rows the inner plan produced (`COUNT { ... }`).
+    Count,
+}
+
 /// An operator in the logical plan.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Plan {
@@ -245,8 +254,10 @@ pub enum Plan {
         input: Box<Plan>,
         /// Pattern plan, rooted at `Empty`, referencing input variables.
         inner: Box<Plan>,
-        /// Hidden boolean variable.
+        /// Hidden variable bound to the result.
         var: String,
+        /// What the hidden variable holds.
+        result: SubqueryResult,
     },
     /// Pattern comprehension: binds `var` to the projected list.
     PatternComprehension {
@@ -584,8 +595,13 @@ pub fn explain(plan: &Plan, indent: usize, out: &mut String) {
             explain(inner, indent + 1, out);
             explain(input, indent + 1, out);
         }
-        Plan::PatternPredicate { input, inner, var } => {
-            out.push_str(&format!("{pad}PatternPredicate {var}\n"));
+        Plan::PatternPredicate {
+            input,
+            inner,
+            var,
+            result,
+        } => {
+            out.push_str(&format!("{pad}PatternPredicate {var} ({result:?})\n"));
             explain(inner, indent + 1, out);
             explain(input, indent + 1, out);
         }

@@ -32,105 +32,128 @@ pub use parser::{parse, parse_statement};
 /// ```
 pub fn split_statements(text: &str) -> Vec<String> {
     let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut state = SplitState::Code;
-    let mut escaped = false;
-    let mut has_code = false;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match state {
-            SplitState::Code => match ch {
-                '/' if chars.peek() == Some(&'/') => {
-                    current.push(ch);
-                    current.push(chars.next().expect("peeked character"));
-                    state = SplitState::LineComment;
-                }
-                '/' if chars.peek() == Some(&'*') => {
-                    current.push(ch);
-                    current.push(chars.next().expect("peeked character"));
-                    state = SplitState::BlockComment;
-                }
-                '\'' => {
-                    has_code = true;
-                    current.push(ch);
-                    state = SplitState::SingleQuoted;
-                }
-                '"' => {
-                    has_code = true;
-                    current.push(ch);
-                    state = SplitState::DoubleQuoted;
-                }
-                '`' => {
-                    has_code = true;
-                    current.push(ch);
-                    state = SplitState::BacktickQuoted;
-                }
-                ';' => {
-                    if has_code {
-                        statements.push(std::mem::take(&mut current));
-                    } else {
-                        current.clear();
-                    }
-                    has_code = false;
-                }
-                _ => {
-                    if !ch.is_whitespace() {
-                        has_code = true;
-                    }
-                    current.push(ch);
-                }
-            },
-            SplitState::SingleQuoted => {
-                current.push(ch);
-                if escaped {
-                    escaped = false;
-                } else if ch == '\\' {
-                    escaped = true;
-                } else if ch == '\'' {
-                    state = SplitState::Code;
-                }
-            }
-            SplitState::DoubleQuoted => {
-                current.push(ch);
-                if escaped {
-                    escaped = false;
-                } else if ch == '\\' {
-                    escaped = true;
-                } else if ch == '"' {
-                    state = SplitState::Code;
-                }
-            }
-            SplitState::BacktickQuoted => {
-                current.push(ch);
-                if ch == '`' {
-                    state = SplitState::Code;
-                }
-            }
-            SplitState::LineComment => {
-                current.push(ch);
-                if ch == '\n' {
-                    state = SplitState::Code;
-                }
-            }
-            SplitState::BlockComment => {
-                current.push(ch);
-                if ch == '*' && chars.peek() == Some(&'/') {
-                    current.push(chars.next().expect("peeked character"));
-                    state = SplitState::Code;
-                }
-            }
+    let mut scanner = StatementScanner::default();
+    let mut start = 0;
+    scanner.feed(text, |semicolon, has_code| {
+        if has_code {
+            statements.push(text[start..semicolon].to_owned());
         }
-    }
-    if has_code {
-        statements.push(current);
+        start = semicolon + 1;
+    });
+    if scanner.has_code {
+        statements.push(text[start..].to_owned());
     }
     statements
 }
 
-/// Lexical context used by [`split_statements`].
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Incremental lexical scanner that finds top-level semicolons, so callers
+/// reading input line by line know whether they stand between statements.
+///
+/// Feed text in pieces that end at line breaks: comment and string markers
+/// never span a line break, so lookahead stays within one piece.
+///
+/// # Examples
+///
+/// ```
+/// use grafile::cypher::StatementScanner;
+///
+/// let mut scanner = StatementScanner::default();
+/// scanner.feed("RETURN 'a;\n", |_, _| {});
+/// assert!(!scanner.is_between_statements());
+/// scanner.feed("b';\n", |_, _| {});
+/// assert!(scanner.is_between_statements());
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct StatementScanner {
+    state: SplitState,
+    escaped: bool,
+    has_code: bool,
+}
+
+impl StatementScanner {
+    /// Scan `text`, calling `on_semicolon(offset, has_code)` for every
+    /// top-level semicolon with its byte offset in `text` and whether code
+    /// (anything but whitespace and comments) preceded it since the last one.
+    pub fn feed(&mut self, text: &str, mut on_semicolon: impl FnMut(usize, bool)) {
+        let mut chars = text.char_indices().peekable();
+        while let Some((offset, ch)) = chars.next() {
+            let next = chars.peek().map(|(_, next)| *next);
+            match self.state {
+                SplitState::Code => match ch {
+                    '/' if next == Some('/') => {
+                        chars.next();
+                        self.state = SplitState::LineComment;
+                    }
+                    '/' if next == Some('*') => {
+                        chars.next();
+                        self.state = SplitState::BlockComment;
+                    }
+                    '\'' | '"' | '`' => {
+                        self.has_code = true;
+                        self.state = match ch {
+                            '\'' => SplitState::SingleQuoted,
+                            '"' => SplitState::DoubleQuoted,
+                            _ => SplitState::BacktickQuoted,
+                        };
+                    }
+                    ';' => {
+                        on_semicolon(offset, self.has_code);
+                        self.has_code = false;
+                    }
+                    _ => self.has_code |= !ch.is_whitespace(),
+                },
+                SplitState::SingleQuoted | SplitState::DoubleQuoted => {
+                    let quote = if self.state == SplitState::SingleQuoted {
+                        '\''
+                    } else {
+                        '"'
+                    };
+                    if self.escaped {
+                        self.escaped = false;
+                    } else if ch == '\\' {
+                        self.escaped = true;
+                    } else if ch == quote {
+                        self.state = SplitState::Code;
+                    }
+                }
+                SplitState::BacktickQuoted => {
+                    if ch == '`' {
+                        self.state = SplitState::Code;
+                    }
+                }
+                SplitState::LineComment => {
+                    if ch == '\n' {
+                        self.state = SplitState::Code;
+                    }
+                }
+                SplitState::BlockComment => {
+                    if ch == '*' && next == Some('/') {
+                        chars.next();
+                        self.state = SplitState::Code;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether the text so far ends outside any string, identifier or block
+    /// comment, with no code after the last top-level semicolon.
+    pub fn is_between_statements(&self) -> bool {
+        !self.has_code && self.is_outside_literals()
+    }
+
+    /// Whether the text so far ends outside any string, quoted identifier or
+    /// block comment (a trailing `//` comment counts as outside).
+    pub fn is_outside_literals(&self) -> bool {
+        matches!(self.state, SplitState::Code | SplitState::LineComment)
+    }
+}
+
+/// Lexical context used by [`StatementScanner`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum SplitState {
     /// Ordinary Cypher text.
+    #[default]
     Code,
     /// Inside a single-quoted string.
     SingleQuoted,
@@ -146,7 +169,19 @@ enum SplitState {
 
 #[cfg(test)]
 mod tests {
-    use super::split_statements;
+    use super::{StatementScanner, split_statements};
+
+    #[test]
+    fn scanner_tracks_strings_and_comments_across_lines() {
+        let mut scanner = StatementScanner::default();
+        scanner.feed("RETURN 1 /* note;\n", |_, _| {});
+        assert!(!scanner.is_outside_literals());
+        scanner.feed("*/;\n", |_, _| {});
+        assert!(scanner.is_between_statements());
+        scanner.feed("RETURN 2 // done;\n", |_, _| {});
+        assert!(!scanner.is_between_statements());
+        assert!(scanner.is_outside_literals());
+    }
 
     #[test]
     fn splits_on_top_level_semicolons() {
