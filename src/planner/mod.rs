@@ -22,7 +22,7 @@ use crate::engine::Database;
 use crate::error::{Error, ErrorCode, Result};
 use crate::record::Value;
 use crate::vdbe::NO_KEY;
-use plan::{AggFn, AggItem, CreateItem, IndexSeek, PathElement, Plan};
+use plan::{AggFn, AggItem, CreateItem, IndexSeek, PathElement, Plan, SubqueryResult};
 
 pub use plan::explain;
 
@@ -195,6 +195,7 @@ impl<'a> Planner<'a> {
                     procedure,
                     args,
                     yields,
+                    where_clause,
                 } => {
                     let spec = procedure_spec(procedure)?;
                     if args.len() < spec.min_args || args.len() > spec.max_args {
@@ -243,6 +244,21 @@ impl<'a> Planner<'a> {
                         columns: outputs,
                         yields: yields.clone(),
                     };
+                    if let Some(predicate) = where_clause {
+                        let mut predicate = predicate.clone();
+                        self.extract_patterns(
+                            &mut predicate,
+                            &mut plan,
+                            &mut scope,
+                            PatternContext::Predicate,
+                        )?;
+                        validate_expr(&predicate, &scope)?;
+                        check_predicate_kind(&predicate, &scope)?;
+                        plan = Plan::Filter {
+                            input: Box::new(plan),
+                            predicate,
+                        };
+                    }
                     columns.clear();
                     columns.extend(yields.iter().map(|(_, alias)| alias.clone()));
                 }
@@ -382,6 +398,19 @@ impl<'a> Planner<'a> {
                     self.pattern_rels.clear();
                 }
             }
+        }
+        // A trailing `CALL ... YIELD a, b` returns only the yielded columns,
+        // not every procedure column the row window holds.
+        if let Some(Clause::Call { yields, .. }) = clauses.last()
+            && !yields.is_empty()
+        {
+            plan = Plan::Project {
+                input: Box::new(plan),
+                items: columns
+                    .iter()
+                    .map(|name| (Expr::Variable(name.clone()), name.clone()))
+                    .collect(),
+            };
         }
         Ok(PlannedPart {
             plan,
@@ -629,10 +658,14 @@ impl<'a> Planner<'a> {
             };
             return Ok(());
         }
-        if let Expr::ExistsSubquery(part) = expr {
+        let result = match expr {
+            Expr::CountSubquery(_) => SubqueryResult::Count,
+            _ => SubqueryResult::Exists,
+        };
+        if let Expr::ExistsSubquery(part) | Expr::CountSubquery(part) = expr {
             if context == PatternContext::Nested {
                 return Err(Error::unsupported(
-                    "EXISTS subqueries inside comprehensions are not supported",
+                    "EXISTS and COUNT subqueries inside comprehensions are not supported",
                 ));
             }
             // The subquery runs as a semi-join: its clauses build an inner
@@ -647,7 +680,8 @@ impl<'a> Planner<'a> {
                     | Clause::LoadCsv { .. } => {}
                     _ => {
                         return Err(Error::syntax(
-                            "InvalidClauseComposition: EXISTS only allows reading clauses",
+                            "InvalidClauseComposition: EXISTS and COUNT only allow reading \
+                             clauses",
                         ));
                     }
                 }
@@ -659,13 +693,14 @@ impl<'a> Planner<'a> {
                 input: Box::new(std::mem::replace(plan, Plan::Empty)),
                 inner: Box::new(inner),
                 var: hidden.clone(),
+                result,
             };
             *expr = Expr::Variable(hidden);
             return Ok(());
         }
         match expr {
-            Expr::ExistsSubquery(_) => Err(Error::internal(
-                "EXISTS subquery survived pattern extraction",
+            Expr::ExistsSubquery(_) | Expr::CountSubquery(_) => Err(Error::internal(
+                "EXISTS or COUNT subquery survived pattern extraction",
             )),
             Expr::Pattern(_) | Expr::PatternComprehension { .. } => {
                 if context == PatternContext::Nested {
@@ -794,9 +829,17 @@ impl<'a> Planner<'a> {
                 }
                 Ok(())
             }
+            Expr::MapProjection { base, entries, .. } => {
+                self.extract_patterns(base, plan, scope, context)?;
+                for (_, value) in entries.iter_mut() {
+                    self.extract_patterns(value, plan, scope, context)?;
+                }
+                Ok(())
+            }
             Expr::Unary { expr: inner, .. }
             | Expr::Property { base: inner, .. }
             | Expr::IsNull { expr: inner, .. }
+            | Expr::TypeCheck { expr: inner, .. }
             | Expr::LabelCheck { expr: inner, .. } => {
                 self.extract_patterns(inner, plan, scope, context)
             }
@@ -849,6 +892,7 @@ impl<'a> Planner<'a> {
             input: Box::new(std::mem::replace(plan, Plan::Empty)),
             inner: Box::new(inner),
             var: hidden.clone(),
+            result: SubqueryResult::Exists,
         };
         Ok(hidden)
     }
@@ -2495,7 +2539,10 @@ fn seekable_value(expr: &Expr, scope: &FastMap<String, VarKind>) -> bool {
         && !any_subexpr(expr, &mut |sub| {
             matches!(
                 sub,
-                Expr::Pattern(_) | Expr::ExistsSubquery(_) | Expr::PatternComprehension { .. }
+                Expr::Pattern(_)
+                    | Expr::ExistsSubquery(_)
+                    | Expr::CountSubquery(_)
+                    | Expr::PatternComprehension { .. }
             )
         })
 }
@@ -2705,43 +2752,97 @@ struct ProcedureSpec {
     node_columns: &'static [&'static str],
 }
 
-/// Description of a supported built-in procedure.
-fn procedure_spec(name: &str) -> Result<ProcedureSpec> {
-    match name {
-        "db.labels" => Ok(ProcedureSpec {
-            columns: &["label"],
-            min_args: 0,
-            max_args: 0,
-            node_columns: &[],
-        }),
-        "db.propertyKeys" => Ok(ProcedureSpec {
-            columns: &["propertyKey"],
-            min_args: 0,
-            max_args: 0,
-            node_columns: &[],
-        }),
-        "db.relationshipTypes" => Ok(ProcedureSpec {
-            columns: &["relationshipType"],
-            min_args: 0,
-            max_args: 0,
-            node_columns: &[],
-        }),
-        "db.awaitIndexes" => Ok(ProcedureSpec {
+/// Columns of `db.indexes()`, the procedure behind `SHOW INDEXES`.
+const INDEX_COLUMNS: &[&str] = &[
+    "id",
+    "name",
+    "state",
+    "type",
+    "entityType",
+    "labelsOrTypes",
+    "properties",
+    "owningConstraint",
+];
+
+/// Columns of `db.constraints()`, the procedure behind `SHOW CONSTRAINTS`.
+const CONSTRAINT_COLUMNS: &[&str] = &[
+    "id",
+    "name",
+    "type",
+    "entityType",
+    "labelsOrTypes",
+    "properties",
+    "ownedIndex",
+];
+
+/// A procedure without arguments that yields plain values.
+const fn listing(columns: &'static [&'static str]) -> ProcedureSpec {
+    ProcedureSpec {
+        columns,
+        min_args: 0,
+        max_args: 0,
+        node_columns: &[],
+    }
+}
+
+/// Every built-in procedure by its exact (case-sensitive) name.
+const PROCEDURES: &[(&str, ProcedureSpec)] = &[
+    ("db.labels", listing(&["label"])),
+    ("db.propertyKeys", listing(&["propertyKey"])),
+    ("db.relationshipTypes", listing(&["relationshipType"])),
+    ("db.indexes", listing(INDEX_COLUMNS)),
+    ("db.constraints", listing(CONSTRAINT_COLUMNS)),
+    (
+        "db.schema.nodeTypeProperties",
+        listing(&[
+            "nodeType",
+            "nodeLabels",
+            "propertyName",
+            "propertyTypes",
+            "mandatory",
+        ]),
+    ),
+    (
+        "db.schema.relTypeProperties",
+        listing(&["relType", "propertyName", "propertyTypes", "mandatory"]),
+    ),
+    (
+        "db.awaitIndexes",
+        ProcedureSpec {
             columns: &[],
             min_args: 0,
             max_args: 1,
             node_columns: &[],
-        }),
-        "db.index.fulltext.queryNodes" => Ok(ProcedureSpec {
+        },
+    ),
+    (
+        "db.index.fulltext.queryNodes",
+        ProcedureSpec {
             columns: &["node", "score"],
             min_args: 2,
             max_args: 2,
             node_columns: &["node"],
-        }),
-        _ => Err(Error::unsupported(format!(
-            "procedure `{name}` is not supported"
-        ))),
-    }
+        },
+    ),
+];
+
+/// Names of every built-in procedure, for completion and suggestions.
+pub fn procedure_names() -> impl Iterator<Item = &'static str> {
+    PROCEDURES.iter().map(|(name, _)| *name)
+}
+
+/// Description of a supported built-in procedure.
+fn procedure_spec(name: &str) -> Result<&'static ProcedureSpec> {
+    PROCEDURES
+        .iter()
+        .find(|(candidate, _)| *candidate == name)
+        .map(|(_, spec)| spec)
+        .ok_or_else(|| {
+            Error::unsupported(format!(
+                "procedure `{name}` is not supported{}",
+                crate::error::did_you_mean(name, procedure_names())
+            ))
+        })
 }
 
 /// Human-readable argument count for an arity error.
@@ -2834,7 +2935,7 @@ fn validate_expr(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
         )),
         // Rewritten into a pattern predicate before validation; a survivor
         // is boolean by construction.
-        Expr::ExistsSubquery(_) => Ok(()),
+        Expr::ExistsSubquery(_) | Expr::CountSubquery(_) => Ok(()),
         Expr::Unary { expr, .. } => validate_expr(expr, scope),
         Expr::Binary { left, right, .. } => {
             validate_expr(left, scope)?;
@@ -2858,6 +2959,13 @@ fn validate_expr(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
             }
             Ok(())
         }
+        Expr::MapProjection { base, entries, .. } => {
+            validate_expr(base, scope)?;
+            for (_, value) in entries {
+                validate_expr(value, scope)?;
+            }
+            Ok(())
+        }
         Expr::Case {
             subject,
             alternatives,
@@ -2875,8 +2983,9 @@ fn validate_expr(expr: &Expr, scope: &FastMap<String, VarKind>) -> Result<()> {
             }
             Ok(())
         }
-        Expr::IsNull { expr, .. } => validate_expr(expr, scope),
-        Expr::LabelCheck { expr, .. } => validate_expr(expr, scope),
+        Expr::IsNull { expr, .. }
+        | Expr::TypeCheck { expr, .. }
+        | Expr::LabelCheck { expr, .. } => validate_expr(expr, scope),
     }
 }
 
@@ -2941,6 +3050,7 @@ fn static_kind_with(
 ) -> Option<Kind> {
     match expr {
         Expr::ExistsSubquery(_) => Some(Kind::Boolean),
+        Expr::CountSubquery(_) => Some(Kind::Number),
         Expr::Literal(value) => Some(match value {
             Value::Null => Kind::Null,
             Value::Bool(_) => Kind::Boolean,
@@ -3009,6 +3119,19 @@ fn static_kind_with(
                     return None;
                 }
             }
+            BinaryOp::Concat => {
+                let (left, right) = (
+                    static_kind_with(left, scope, locals),
+                    static_kind_with(right, scope, locals),
+                );
+                if left == Some(Kind::List) || right == Some(Kind::List) {
+                    Kind::List
+                } else if left == Some(Kind::Text) || right == Some(Kind::Text) {
+                    Kind::Text
+                } else {
+                    return None;
+                }
+            }
             BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod | BinaryOp::Pow => {
                 Kind::Number
             }
@@ -3017,6 +3140,7 @@ fn static_kind_with(
         Expr::Function { name, args, .. } => static_function_kind(name, args, scope, locals),
         Expr::List(_) => Some(Kind::List),
         Expr::Map(_) => Some(Kind::Map),
+        Expr::MapProjection { .. } => None,
         Expr::Case {
             alternatives,
             default,
@@ -3037,7 +3161,9 @@ fn static_kind_with(
                 _ => None,
             }
         }
-        Expr::IsNull { .. } | Expr::LabelCheck { .. } => Some(Kind::Boolean),
+        Expr::IsNull { .. } | Expr::TypeCheck { .. } | Expr::LabelCheck { .. } => {
+            Some(Kind::Boolean)
+        }
         Expr::Pattern(_) => Some(Kind::Boolean),
     }
 }
@@ -3054,13 +3180,16 @@ fn static_function_kind(
         | "percentilecont" | "percentiledisc" | "tointeger" | "tofloat" | "distance" | "abs"
         | "sign" | "ceil" | "floor" | "round" | "sqrt" | "exp" | "log" | "log10" | "sin"
         | "cos" | "tan" | "cot" | "asin" | "acos" | "atan" | "atan2" | "degrees" | "radians"
-        | "haversin" | "pi" | "e" | "rand" => Kind::Number,
+        | "haversin" | "pi" | "e" | "rand" | "tointegerornull" | "tofloatornull"
+        | "char_length" | "character_length" => Kind::Number,
         "labels" | "keys" | "nodes" | "relationships" | "collect" | "range" | "tail"
-        | "reverse" | "split" => Kind::List,
+        | "reverse" | "split" | "tostringlist" | "tointegerlist" | "tofloatlist"
+        | "tobooleanlist" => Kind::List,
         "properties" => Kind::Map,
-        "type" | "tostring" | "substring" | "toupper" | "tolower" | "trim" | "ltrim" | "rtrim"
-        | "left" | "right" | "replace" | "randomuuid" => Kind::Text,
-        "toboolean" => Kind::Boolean,
+        "type" | "tostring" | "substring" | "toupper" | "tolower" | "upper" | "lower" | "trim"
+        | "ltrim" | "rtrim" | "btrim" | "left" | "right" | "replace" | "randomuuid"
+        | "tostringornull" | "valuetype" | "elementid" => Kind::Text,
+        "toboolean" | "tobooleanornull" | "isempty" | "isnan" => Kind::Boolean,
         "startnode" | "endnode" => Kind::Node,
         "date" | "localtime" | "time" | "localdatetime" | "datetime" | "duration" => Kind::Temporal,
         "point" => Kind::Point,
@@ -3203,6 +3332,9 @@ fn check_expr_kinds_with(
                 }
                 "length" => require(argument, &[Kind::List, Kind::Path, Kind::Null], name)?,
                 "size" => require(argument, &[Kind::List, Kind::Text, Kind::Null], name)?,
+                "char_length" | "character_length" => {
+                    require(argument, &[Kind::Text, Kind::Null], name)?
+                }
                 _ => {}
             }
         }
@@ -3286,6 +3418,14 @@ fn check_expr_kinds_with(
                     ));
                 }
             }
+            BinaryOp::Concat => {
+                let concatenable = |kind: Option<Kind>| {
+                    matches!(kind, None | Some(Kind::Text | Kind::List | Kind::Null))
+                };
+                if !concatenable(left_kind) || !concatenable(right_kind) {
+                    return Err(Error::syntax("`||` concatenates strings or lists"));
+                }
+            }
             _ => {}
         }
     }
@@ -3352,6 +3492,7 @@ fn default_name(expr: &Expr) -> String {
         Expr::Variable(name) => name.clone(),
         Expr::Pattern(_) => "pattern".to_owned(),
         Expr::ExistsSubquery(_) => "exists { ... }".to_owned(),
+        Expr::CountSubquery(_) => "count { ... }".to_owned(),
         Expr::PatternComprehension { projection, .. } => {
             format!("[pattern | {}]", default_name(projection))
         }
@@ -3437,6 +3578,11 @@ fn default_name(expr: &Expr) -> String {
             default_name(expr),
             if *negated { "NOT " } else { "" }
         ),
+        Expr::TypeCheck { expr, negated, ty } => format!(
+            "{} IS {}:: {ty}",
+            default_name(expr),
+            if *negated { "NOT " } else { "" }
+        ),
         Expr::List(items) => format!(
             "[{}]",
             items
@@ -3450,6 +3596,24 @@ fn default_name(expr: &Expr) -> String {
             entries
                 .iter()
                 .map(|(key, value)| format!("{key}: {}", default_name(value)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Expr::MapProjection {
+            base,
+            all_properties,
+            entries,
+        } => format!(
+            "{}{{{}}}",
+            default_name(base),
+            all_properties
+                .then(|| ".*".to_owned())
+                .into_iter()
+                .chain(
+                    entries
+                        .iter()
+                        .map(|(key, value)| format!("{key}: {}", default_name(value)))
+                )
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
@@ -3487,7 +3651,7 @@ fn op_precedence(op: BinaryOp) -> u8 {
         | BinaryOp::StartsWith
         | BinaryOp::EndsWith
         | BinaryOp::Contains => COMPARISON_PRECEDENCE,
-        BinaryOp::Add | BinaryOp::Sub => ADDITIVE_PRECEDENCE,
+        BinaryOp::Add | BinaryOp::Sub | BinaryOp::Concat => ADDITIVE_PRECEDENCE,
         BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => MULTIPLICATIVE_PRECEDENCE,
         BinaryOp::Pow => POWER_PRECEDENCE,
     }
@@ -3498,7 +3662,12 @@ fn op_precedence(op: BinaryOp) -> u8 {
 fn op_associative(op: BinaryOp) -> bool {
     matches!(
         op,
-        BinaryOp::Add | BinaryOp::Mul | BinaryOp::And | BinaryOp::Or | BinaryOp::Xor
+        BinaryOp::Add
+            | BinaryOp::Mul
+            | BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Xor
+            | BinaryOp::Concat
     )
 }
 
@@ -3513,7 +3682,9 @@ fn expr_precedence(expr: &Expr) -> u8 {
         Expr::Unary {
             op: UnaryOp::Neg, ..
         } => UNARY_PRECEDENCE,
-        Expr::IsNull { .. } | Expr::LabelCheck { .. } => COMPARISON_PRECEDENCE,
+        Expr::IsNull { .. } | Expr::TypeCheck { .. } | Expr::LabelCheck { .. } => {
+            COMPARISON_PRECEDENCE
+        }
         _ => ATOMIC_PRECEDENCE,
     }
 }
@@ -3594,6 +3765,7 @@ fn literal_text(value: &Value) -> String {
 fn binary_text(op: BinaryOp) -> &'static str {
     match op {
         BinaryOp::Add => "+",
+        BinaryOp::Concat => "||",
         BinaryOp::Sub => "-",
         BinaryOp::Mul => "*",
         BinaryOp::Div => "/",
@@ -3814,7 +3986,7 @@ fn rewrite_expr(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>) -
     }
     Ok(match expr {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => expr.clone(),
-        Expr::ExistsSubquery(_) => expr.clone(),
+        Expr::ExistsSubquery(_) | Expr::CountSubquery(_) => expr.clone(),
         Expr::Pattern(path) => Expr::Pattern(Box::new(rewrite_pattern(path, f)?)),
         Expr::PatternComprehension {
             path,
@@ -3923,6 +4095,18 @@ fn rewrite_expr(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>) -
                 .map(|(key, value)| Ok((key.clone(), rewrite_expr(value, f)?)))
                 .collect::<Result<_>>()?,
         ),
+        Expr::MapProjection {
+            base,
+            all_properties,
+            entries,
+        } => Expr::MapProjection {
+            base: Box::new(rewrite_expr(base, f)?),
+            all_properties: *all_properties,
+            entries: entries
+                .iter()
+                .map(|(key, value)| Ok((key.clone(), rewrite_expr(value, f)?)))
+                .collect::<Result<_>>()?,
+        },
         Expr::Case {
             subject,
             alternatives,
@@ -3947,6 +4131,15 @@ fn rewrite_expr(expr: &Expr, f: &mut dyn FnMut(&Expr) -> Result<Option<Expr>>) -
         } => Expr::IsNull {
             expr: Box::new(rewrite_expr(inner, f)?),
             negated: *negated,
+        },
+        Expr::TypeCheck {
+            expr: inner,
+            negated,
+            ty,
+        } => Expr::TypeCheck {
+            expr: Box::new(rewrite_expr(inner, f)?),
+            negated: *negated,
+            ty: ty.clone(),
         },
         Expr::LabelCheck {
             expr: inner,
@@ -4152,7 +4345,7 @@ fn hoist_walk(
     }
     Ok(match expr {
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => expr.clone(),
-        Expr::ExistsSubquery(_) => expr.clone(),
+        Expr::ExistsSubquery(_) | Expr::CountSubquery(_) => expr.clone(),
         Expr::Pattern(path) => {
             Expr::Pattern(Box::new(hoist_pattern(path, groups, aggs, scope, bound)?))
         }
@@ -4293,6 +4486,20 @@ fn hoist_walk(
                 })
                 .collect::<Result<_>>()?,
         ),
+        Expr::MapProjection {
+            base,
+            all_properties,
+            entries,
+        } => Expr::MapProjection {
+            base: Box::new(hoist_walk(base, groups, aggs, scope, bound)?),
+            all_properties: *all_properties,
+            entries: entries
+                .iter()
+                .map(|(key, value)| {
+                    Ok((key.clone(), hoist_walk(value, groups, aggs, scope, bound)?))
+                })
+                .collect::<Result<_>>()?,
+        },
         Expr::Case {
             subject,
             alternatives,
@@ -4322,6 +4529,15 @@ fn hoist_walk(
         } => Expr::IsNull {
             expr: Box::new(hoist_walk(inner, groups, aggs, scope, bound)?),
             negated: *negated,
+        },
+        Expr::TypeCheck {
+            expr: inner,
+            negated,
+            ty,
+        } => Expr::TypeCheck {
+            expr: Box::new(hoist_walk(inner, groups, aggs, scope, bound)?),
+            negated: *negated,
+            ty: ty.clone(),
         },
         Expr::LabelCheck {
             expr: inner,
@@ -4386,7 +4602,7 @@ fn has_aggregation_inside_comprehension(expr: &Expr) -> bool {
                 || contains_aggregation(projection)
         }
         Expr::Pattern(path) => pattern_has_aggregation(path),
-        Expr::ExistsSubquery(_) => false,
+        Expr::ExistsSubquery(_) | Expr::CountSubquery(_) => false,
         Expr::ListComprehension {
             list,
             predicate,
@@ -4435,6 +4651,12 @@ fn has_aggregation_inside_comprehension(expr: &Expr) -> bool {
         Expr::Map(entries) => entries
             .iter()
             .any(|(_, value)| has_aggregation_inside_comprehension(value)),
+        Expr::MapProjection { base, entries, .. } => {
+            has_aggregation_inside_comprehension(base)
+                || entries
+                    .iter()
+                    .any(|(_, value)| has_aggregation_inside_comprehension(value))
+        }
         Expr::Case {
             subject,
             alternatives,
@@ -4451,9 +4673,9 @@ fn has_aggregation_inside_comprehension(expr: &Expr) -> bool {
                     .as_deref()
                     .is_some_and(has_aggregation_inside_comprehension)
         }
-        Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => {
-            has_aggregation_inside_comprehension(expr)
-        }
+        Expr::IsNull { expr, .. }
+        | Expr::TypeCheck { expr, .. }
+        | Expr::LabelCheck { expr, .. } => has_aggregation_inside_comprehension(expr),
         Expr::Literal(_) | Expr::Parameter(_) | Expr::Variable(_) => false,
     }
 }
@@ -4461,7 +4683,7 @@ fn has_aggregation_inside_comprehension(expr: &Expr) -> bool {
 /// Call `f` on every direct child expression of `expr`.
 fn for_each_child(expr: &Expr, mut f: &mut dyn FnMut(&Expr)) {
     match expr {
-        Expr::ExistsSubquery(_) => {}
+        Expr::ExistsSubquery(_) | Expr::CountSubquery(_) => {}
         Expr::Function { args, .. } => args.iter().for_each(&mut f),
         Expr::Property { base, .. } | Expr::Unary { expr: base, .. } => f(base),
         Expr::Subscript { base, index } => {
@@ -4507,6 +4729,10 @@ fn for_each_child(expr: &Expr, mut f: &mut dyn FnMut(&Expr)) {
         }
         Expr::List(items) => items.iter().for_each(&mut f),
         Expr::Map(entries) => entries.iter().for_each(|(_, value)| f(value)),
+        Expr::MapProjection { base, entries, .. } => {
+            f(base);
+            entries.iter().for_each(|(_, value)| f(value));
+        }
         Expr::Case {
             subject,
             alternatives,
@@ -4523,7 +4749,9 @@ fn for_each_child(expr: &Expr, mut f: &mut dyn FnMut(&Expr)) {
                 f(part);
             }
         }
-        Expr::IsNull { expr, .. } | Expr::LabelCheck { expr, .. } => f(expr),
+        Expr::IsNull { expr, .. }
+        | Expr::TypeCheck { expr, .. }
+        | Expr::LabelCheck { expr, .. } => f(expr),
         Expr::Pattern(path) => pattern_properties(path).iter().for_each(|expr| f(expr)),
         Expr::PatternComprehension {
             path,
@@ -4636,9 +4864,14 @@ fn substitute_clause(clause: &mut Clause, params: &HashMap<String, Value>) -> Re
             }
             Ok(())
         }
-        Clause::Call { args, .. } => {
+        Clause::Call {
+            args, where_clause, ..
+        } => {
             for arg in args.iter_mut() {
                 substitute_expr(arg, params)?;
+            }
+            if let Some(predicate) = where_clause {
+                substitute_expr(predicate, params)?;
             }
             Ok(())
         }
@@ -4778,7 +5011,7 @@ fn substitute_pattern(path: &mut PatternPath, params: &HashMap<String, Value>) -
 
 fn substitute_expr(expr: &mut Expr, params: &HashMap<String, Value>) -> Result<()> {
     match expr {
-        Expr::ExistsSubquery(part) => {
+        Expr::ExistsSubquery(part) | Expr::CountSubquery(part) => {
             for clause in &mut part.clauses {
                 substitute_clause(clause, params)?;
             }
@@ -4875,6 +5108,13 @@ fn substitute_expr(expr: &mut Expr, params: &HashMap<String, Value>) -> Result<(
             }
             Ok(())
         }
+        Expr::MapProjection { base, entries, .. } => {
+            substitute_expr(base, params)?;
+            for (_, value) in entries {
+                substitute_expr(value, params)?;
+            }
+            Ok(())
+        }
         Expr::Case {
             subject,
             alternatives,
@@ -4892,8 +5132,9 @@ fn substitute_expr(expr: &mut Expr, params: &HashMap<String, Value>) -> Result<(
             }
             Ok(())
         }
-        Expr::IsNull { expr, .. } => substitute_expr(expr, params),
-        Expr::LabelCheck { expr, .. } => substitute_expr(expr, params),
+        Expr::IsNull { expr, .. }
+        | Expr::TypeCheck { expr, .. }
+        | Expr::LabelCheck { expr, .. } => substitute_expr(expr, params),
         Expr::Literal(_) | Expr::Variable(_) => Ok(()),
     }
 }

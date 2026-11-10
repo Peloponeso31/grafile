@@ -401,3 +401,55 @@ fn bounded_sort_reports_invalid_counts() {
         vec![vec!["3"], vec!["2"]]
     );
 }
+
+#[test]
+fn map_projections_select_overlay_and_propagate_null() {
+    let mut conn = connection();
+    seed(&mut conn);
+    let rows = query(
+        &mut conn,
+        "MATCH (n:Person {name: 'alice'}) WITH n, 7 AS bonus \
+         RETURN n{.name, years: n.age + 1, bonus}, n{.*, age: 0}, n{.missing}",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "{name: alice, years: 31, bonus: 7}",
+            "{name: alice, age: 0}",
+            "{missing: null}"
+        ]]
+    );
+    let rows = query(
+        &mut conn,
+        "OPTIONAL MATCH (n:Nobody) RETURN n{.name} AS projected",
+    );
+    assert_eq!(rows, vec![vec!["null"]]);
+    let rows = query(&mut conn, "WITH {a: 1, b: 2} AS m RETURN m{.a, .*, c: 3}");
+    assert_eq!(rows, vec![vec!["{a: 1, b: 2, c: 3}"]]);
+}
+
+#[test]
+fn count_subqueries_count_rows_per_outer_row() {
+    let mut conn = connection();
+    seed(&mut conn);
+    let rows = query(
+        &mut conn,
+        "MATCH (p:Person) \
+         RETURN p.name, COUNT { (p)-->() } AS out, \
+                count { MATCH (p)-[r:KNOWS]->(q) WHERE q.age > 26 RETURN q } AS older \
+         ORDER BY p.name",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["alice", "2", "0"],
+            vec!["bob", "1", "1"],
+            vec!["carol", "0", "0"],
+        ]
+    );
+    let rows = query(
+        &mut conn,
+        "MATCH (p:Person) WHERE COUNT { (p)--() } > 1 RETURN p.name ORDER BY p.name",
+    );
+    assert_eq!(rows, vec![vec!["alice"], vec!["bob"], vec!["carol"]]);
+}

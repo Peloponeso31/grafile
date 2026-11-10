@@ -333,3 +333,135 @@ fn bulk_backfill_agrees_with_label_scans() {
     assert_eq!(query(&mut conn, probe), scanned);
     assert_eq!(scanned.len(), 3, "{scanned:?}");
 }
+
+#[test]
+fn show_indexes_and_constraints_return_rows() {
+    let mut conn = connection();
+    seed(&mut conn);
+    for ddl in [
+        "CREATE INDEX person_age FOR (n:Person) ON (n.age)",
+        "CREATE CONSTRAINT person_name FOR (n:Person) REQUIRE n.name IS UNIQUE",
+        "CREATE CONSTRAINT knows_since FOR ()-[r:KNOWS]-() REQUIRE r.since IS NOT NULL",
+        "CREATE FULLTEXT INDEX person_text FOR (n:Person) ON EACH [n.name]",
+    ] {
+        conn.execute(ddl).expect(ddl);
+    }
+    let rows = query(
+        &mut conn,
+        "SHOW INDEXES YIELD name, type, entityType, labelsOrTypes, properties, owningConstraint",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec!["person_age", "RANGE", "NODE", "[Person]", "[age]", "null"],
+            vec![
+                "person_name",
+                "RANGE",
+                "NODE",
+                "[Person]",
+                "[name]",
+                "person_name"
+            ],
+            vec![
+                "person_text",
+                "FULLTEXT",
+                "NODE",
+                "[Person]",
+                "[name]",
+                "null"
+            ],
+        ]
+    );
+    let rows = query(
+        &mut conn,
+        "SHOW CONSTRAINTS YIELD name, type, ownedIndex WHERE type ENDS WITH 'EXISTENCE' \
+         RETURN name, type, ownedIndex",
+    );
+    assert_eq!(
+        rows,
+        vec![vec![
+            "knows_since",
+            "RELATIONSHIP_PROPERTY_EXISTENCE",
+            "null"
+        ]]
+    );
+    let rows = query(&mut conn, "SHOW INDEXES WHERE type = 'FULLTEXT'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1], "person_text");
+    let rows = query(&mut conn, "SHOW ALL CONSTRAINTS YIELD * RETURN count(*)");
+    assert_eq!(rows, vec![vec!["2"]]);
+    let rows = query(
+        &mut conn,
+        "CALL db.indexes() YIELD name WHERE name STARTS WITH 'person_a' RETURN name",
+    );
+    assert_eq!(rows, vec![vec!["person_age"]]);
+    let err = conn
+        .query("SHOW FUNCTIONS", &grafile::api::Params::new())
+        .expect_err("only indexes and constraints");
+    assert!(err.to_string().contains("SHOW INDEXES"), "{err}");
+}
+
+#[test]
+fn schema_procedures_describe_properties() {
+    let mut conn = connection();
+    seed(&mut conn);
+    conn.execute("CREATE (:Person:Admin {name: 'root', tags: ['a']}), (:Empty)")
+        .expect("extra nodes");
+    let rows = query(
+        &mut conn,
+        "CALL db.schema.nodeTypeProperties() \
+         YIELD nodeType, propertyName, propertyTypes, mandatory \
+         RETURN nodeType, propertyName, propertyTypes, mandatory \
+         ORDER BY nodeType, propertyName",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![":`Empty`", "null", "null", "false"],
+            vec![":`Person`", "age", "[INTEGER]", "true"],
+            vec![":`Person`", "name", "[STRING]", "true"],
+            vec![":`Person`:`Admin`", "name", "[STRING]", "true"],
+            vec![
+                ":`Person`:`Admin`",
+                "tags",
+                "[LIST<STRING NOT NULL>]",
+                "true"
+            ],
+        ]
+    );
+    let rows = query(
+        &mut conn,
+        "CALL db.schema.relTypeProperties() YIELD relType, propertyName, mandatory \
+         RETURN relType, propertyName, mandatory ORDER BY relType",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![":`KNOWS`", "since", "true"],
+            vec![":`LIKES`", "null", "false"],
+        ]
+    );
+}
+
+#[test]
+fn unique_constraints_compare_integers_and_floats_by_value() {
+    let mut conn = connection();
+    conn.execute("CREATE CONSTRAINT uid FOR (u:U) REQUIRE u.id IS UNIQUE")
+        .expect("constraint");
+    conn.execute("CREATE (:U {id: 2.0})").expect("float");
+    let err = conn
+        .execute("CREATE (:U {id: 2})")
+        .expect_err("equal integer");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+    conn.execute("CREATE (:U {id: 2.5}), (:U {id: '2'}), (:U {id: 9223372036854775807})")
+        .expect("distinct values");
+
+    let mut backfill = connection();
+    backfill
+        .execute("CREATE (:V {k: 3}), (:V {k: 3.0})")
+        .expect("seed");
+    let err = backfill
+        .execute("CREATE CONSTRAINT vk FOR (v:V) REQUIRE v.k IS UNIQUE")
+        .expect_err("existing equal values");
+    assert_eq!(err.code(), grafile::ErrorCode::Constraint);
+}

@@ -18,6 +18,7 @@ use crate::engine::Database;
 use crate::error::{Error, ErrorCode, Result};
 use crate::matrix::Direction;
 use crate::planner::plan::AggFn;
+use crate::record::types::CypherType;
 use crate::record::{Value, value_equals};
 use crate::temporal::between;
 use crate::temporal::civil::Date;
@@ -25,6 +26,10 @@ use crate::temporal::construct::{self, Field, TruncateUnit};
 use crate::temporal::datetime::{DateTime, LocalDateTime, LocalTime, Time};
 use crate::temporal::duration::Duration;
 use crate::temporal::point::Point;
+
+pub(crate) mod sorter;
+
+use sorter::{Merge, Sorted, Sorter, SpillTarget};
 
 /// A register value: a plain value or an entity reference.
 #[derive(Debug, Clone, PartialEq)]
@@ -227,6 +232,17 @@ pub enum Op {
         /// Destination register.
         dest: u32,
     },
+    /// `expr IS [NOT] :: TYPE`.
+    TypeCheck {
+        /// Source register.
+        src: u32,
+        /// Destination register.
+        dest: u32,
+        /// Whether `NOT` was written.
+        negated: bool,
+        /// The tested type.
+        ty: Box<CypherType>,
+    },
     /// Whether a node carries a label.
     HasLabel {
         /// Node register.
@@ -251,6 +267,18 @@ pub enum Op {
         dest: u32,
         /// Key names and value registers.
         pairs: Vec<(String, u32)>,
+    },
+    /// A map projection: null for a null base, otherwise the base's
+    /// properties (when `all_properties`) overlaid by the pairs.
+    MapProjection {
+        /// The projected value.
+        base: u32,
+        /// Whether `.*` was written.
+        all_properties: bool,
+        /// Key names and value registers, overriding properties.
+        pairs: Vec<(String, u32)>,
+        /// Destination register.
+        dest: u32,
     },
     /// Jump when the register is false or null.
     IfNot {
@@ -324,6 +352,27 @@ pub enum Op {
         /// Per-key sort direction.
         ascending: Vec<bool>,
     },
+    /// Open a spilling sort cursor for an unbounded `ORDER BY` or, with
+    /// `dedup`, a `DISTINCT`.
+    SorterOpen {
+        /// Cursor slot.
+        cursor: u32,
+        /// Drop rows whose sort keys equal the previous row's.
+        dedup: bool,
+    },
+    /// Buffer a register window in a spilling sort cursor.
+    SorterRow {
+        /// Cursor slot.
+        cursor: u32,
+        /// First register.
+        start: u32,
+        /// Number of registers.
+        count: u32,
+        /// Number of leading row columns before the sort keys.
+        prefix: u32,
+        /// Per-key sort direction.
+        ascending: Vec<bool>,
+    },
     /// Commit the current transaction and begin the next batch.
     BatchCommit {
         /// Input rows per transaction.
@@ -356,7 +405,7 @@ pub enum Op {
         /// Aggregations, in argument order.
         aggs: Vec<AggSpec>,
     },
-    /// Sort collected rows by their trailing key columns.
+    /// Finish a sort cursor: rows ordered by their trailing key columns.
     SortRows {
         /// Cursor slot.
         cursor: u32,
@@ -367,7 +416,8 @@ pub enum Op {
         /// Per-key sort direction.
         ascending: Vec<bool>,
     },
-    /// Sort by trailing key columns and drop duplicate key groups.
+    /// Finish a deduplicating sort cursor: rows ordered by their trailing
+    /// key columns with duplicate key groups dropped.
     DedupRows {
         /// Cursor slot.
         cursor: u32,
@@ -401,6 +451,13 @@ pub enum Op {
     },
     /// Test whether a row cursor holds any rows.
     CtxHasRows {
+        /// Cursor slot.
+        cursor: u32,
+        /// Destination register.
+        dest: u32,
+    },
+    /// Store the number of rows a row cursor collected.
+    CtxRowCount {
         /// Cursor slot.
         cursor: u32,
         /// Destination register.
@@ -722,7 +779,7 @@ pub mod func {
     pub const CEIL: u8 = 33;
     /// `floor(x)`
     pub const FLOOR: u8 = 34;
-    /// `round(x)`
+    /// `round(x [, precision [, mode]])`
     pub const ROUND: u8 = 35;
     /// `sign(x)`
     pub const SIGN: u8 = 36;
@@ -800,6 +857,180 @@ pub mod func {
     pub const DURATION_IN_SECONDS: u8 = 72;
     /// `randomUUID()`
     pub const RANDOM_UUID: u8 = 73;
+    /// `toStringOrNull(x)`
+    pub const TO_STRING_OR_NULL: u8 = 74;
+    /// `toIntegerOrNull(x)`
+    pub const TO_INTEGER_OR_NULL: u8 = 75;
+    /// `toFloatOrNull(x)`
+    pub const TO_FLOAT_OR_NULL: u8 = 76;
+    /// `toBooleanOrNull(x)`
+    pub const TO_BOOLEAN_OR_NULL: u8 = 77;
+    /// `toStringList(list)`
+    pub const TO_STRING_LIST: u8 = 78;
+    /// `toIntegerList(list)`
+    pub const TO_INTEGER_LIST: u8 = 79;
+    /// `toFloatList(list)`
+    pub const TO_FLOAT_LIST: u8 = 80;
+    /// `toBooleanList(list)`
+    pub const TO_BOOLEAN_LIST: u8 = 81;
+    /// `isEmpty(string|list|map)`
+    pub const IS_EMPTY: u8 = 82;
+    /// `isNaN(number)`
+    pub const IS_NAN: u8 = 83;
+    /// `nullIf(value, other)`
+    pub const NULL_IF: u8 = 84;
+    /// `valueType(x)`
+    pub const VALUE_TYPE: u8 = 85;
+    /// `btrim(string [, characters])`
+    pub const BTRIM: u8 = 86;
+    /// `elementId(entity)`
+    pub const ELEMENT_ID: u8 = 87;
+
+    /// Every scalar function by its canonical name. Lookups ignore ASCII
+    /// case; aliases share a code, and the clock variants of the temporal
+    /// constructors (`date.statement()`) evaluate like the constructors
+    /// because the statement time is fixed per statement.
+    pub const FUNCTIONS: &[(&str, u8)] = &[
+        ("id", ID),
+        ("elementId", ELEMENT_ID),
+        ("labels", LABELS),
+        ("type", TYPE),
+        ("startNode", START_NODE),
+        ("endNode", END_NODE),
+        ("coalesce", COALESCE),
+        ("nullIf", NULL_IF),
+        ("valueType", VALUE_TYPE),
+        ("toString", TO_STRING),
+        ("toInteger", TO_INTEGER),
+        ("toFloat", TO_FLOAT),
+        ("toBoolean", TO_BOOLEAN),
+        ("toStringOrNull", TO_STRING_OR_NULL),
+        ("toIntegerOrNull", TO_INTEGER_OR_NULL),
+        ("toFloatOrNull", TO_FLOAT_OR_NULL),
+        ("toBooleanOrNull", TO_BOOLEAN_OR_NULL),
+        ("toStringList", TO_STRING_LIST),
+        ("toIntegerList", TO_INTEGER_LIST),
+        ("toFloatList", TO_FLOAT_LIST),
+        ("toBooleanList", TO_BOOLEAN_LIST),
+        ("size", SIZE),
+        ("char_length", SIZE),
+        ("character_length", SIZE),
+        ("isEmpty", IS_EMPTY),
+        ("isNaN", IS_NAN),
+        ("properties", PROPERTIES),
+        ("keys", KEYS),
+        ("nodes", NODES),
+        ("relationships", RELATIONSHIPS),
+        ("length", LENGTH),
+        ("range", RANGE),
+        ("head", HEAD),
+        ("last", LAST),
+        ("tail", TAIL),
+        ("reverse", REVERSE),
+        ("split", SPLIT),
+        ("substring", SUBSTRING),
+        ("rand", RAND),
+        ("randomUUID", RANDOM_UUID),
+        ("toUpper", TO_UPPER),
+        ("upper", TO_UPPER),
+        ("toLower", TO_LOWER),
+        ("lower", TO_LOWER),
+        ("trim", TRIM),
+        ("btrim", BTRIM),
+        ("ltrim", LTRIM),
+        ("rtrim", RTRIM),
+        ("left", LEFT),
+        ("right", RIGHT),
+        ("replace", REPLACE),
+        ("abs", ABS),
+        ("ceil", CEIL),
+        ("floor", FLOOR),
+        ("round", ROUND),
+        ("sign", SIGN),
+        ("sqrt", SQRT),
+        ("exp", EXP),
+        ("log", LOG),
+        ("log10", LOG10),
+        ("sin", SIN),
+        ("cos", COS),
+        ("tan", TAN),
+        ("cot", COT),
+        ("asin", ASIN),
+        ("acos", ACOS),
+        ("atan", ATAN),
+        ("atan2", ATAN2),
+        ("degrees", DEGREES),
+        ("radians", RADIANS),
+        ("haversin", HAVERSIN),
+        ("pi", PI),
+        ("e", E),
+        ("date", DATE),
+        ("localtime", LOCALTIME),
+        ("time", TIME),
+        ("localdatetime", LOCAL_DATETIME),
+        ("datetime", DATETIME),
+        ("duration", DURATION),
+        ("point", POINT),
+        ("distance", DISTANCE),
+        ("point.distance", DISTANCE),
+        ("date.truncate", DATE_TRUNCATE),
+        ("localtime.truncate", LOCALTIME_TRUNCATE),
+        ("time.truncate", TIME_TRUNCATE),
+        ("localdatetime.truncate", LOCAL_DATETIME_TRUNCATE),
+        ("datetime.truncate", DATETIME_TRUNCATE),
+        ("datetime.fromEpoch", DATETIME_FROM_EPOCH),
+        ("datetime.fromEpochMillis", DATETIME_FROM_EPOCH_MILLIS),
+        ("duration.between", DURATION_BETWEEN),
+        ("duration.inMonths", DURATION_IN_MONTHS),
+        ("duration.inDays", DURATION_IN_DAYS),
+        ("duration.inSeconds", DURATION_IN_SECONDS),
+        ("date.transaction", DATE),
+        ("date.statement", DATE),
+        ("date.realtime", DATE),
+        ("localtime.transaction", LOCALTIME),
+        ("localtime.statement", LOCALTIME),
+        ("localtime.realtime", LOCALTIME),
+        ("time.transaction", TIME),
+        ("time.statement", TIME),
+        ("time.realtime", TIME),
+        ("localdatetime.transaction", LOCAL_DATETIME),
+        ("localdatetime.statement", LOCAL_DATETIME),
+        ("localdatetime.realtime", LOCAL_DATETIME),
+        ("datetime.transaction", DATETIME),
+        ("datetime.statement", DATETIME),
+        ("datetime.realtime", DATETIME),
+    ];
+
+    /// The code of the scalar function called `name`, ignoring ASCII case.
+    pub fn lookup(name: &str) -> Option<u8> {
+        FUNCTIONS
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .map(|(_, code)| *code)
+    }
+
+    /// The accepted argument count of the scalar function `code` as
+    /// `(minimum, maximum)`; `None` as the maximum means variadic.
+    pub fn arity(code: u8) -> (usize, Option<usize>) {
+        match code {
+            RAND | RANDOM_UUID | PI | E => (0, Some(0)),
+            DATE | LOCALTIME | TIME | LOCAL_DATETIME | DATETIME => (0, Some(1)),
+            COALESCE => (1, None),
+            RANGE => (2, Some(3)),
+            SUBSTRING => (2, Some(3)),
+            ROUND => (1, Some(3)),
+            TRIM | BTRIM | LTRIM | RTRIM => (1, Some(2)),
+            REPLACE => (3, Some(3)),
+            DATE_TRUNCATE
+            | LOCALTIME_TRUNCATE
+            | TIME_TRUNCATE
+            | LOCAL_DATETIME_TRUNCATE
+            | DATETIME_TRUNCATE => (2, Some(3)),
+            SPLIT | LEFT | RIGHT | ATAN2 | DISTANCE | DATETIME_FROM_EPOCH | DURATION_BETWEEN
+            | DURATION_IN_MONTHS | DURATION_IN_DAYS | DURATION_IN_SECONDS | NULL_IF => (2, Some(2)),
+            _ => (1, Some(1)),
+        }
+    }
 }
 
 /// A compiled VDBE program.
@@ -874,6 +1105,10 @@ enum Cursor {
     },
     /// Rows of a bounded sort.
     TopK(TopK),
+    /// Rows of an unbounded sort or `DISTINCT` being collected.
+    Sorter(Sorter),
+    /// A finished sort streaming from spilled runs.
+    Merge(Merge),
     /// A streaming variable-length expansion.
     VarExpand(Box<crate::engine::VarExpansion>),
 }
@@ -1192,7 +1427,7 @@ impl<'a> Executor<'a> {
                 let value = self.reg_value(*src)?;
                 let result = match op {
                     0 => match value {
-                        Value::Int(value) => Value::Int(value.wrapping_neg()),
+                        Value::Int(value) => checked_int(value.checked_neg())?,
                         Value::Float(value) => Value::Float(-value),
                         Value::Duration(value) => Value::Duration(-value),
                         Value::Null => Value::Null,
@@ -1435,6 +1670,15 @@ impl<'a> Executor<'a> {
                 let value = self.reg_value(*src)?;
                 self.regs[*dest as usize] = Reg::Value(Value::Bool(value.is_null()));
             }
+            Op::TypeCheck {
+                src,
+                dest,
+                negated,
+                ty,
+            } => {
+                let accepted = ty.accepts(&self.reg_value(*src)?);
+                self.regs[*dest as usize] = Reg::Value(Value::Bool(accepted != *negated));
+            }
             Op::HasLabel { node, label, dest } => {
                 let value = self.reg_value(*node)?;
                 let result = match value {
@@ -1489,6 +1733,35 @@ impl<'a> Executor<'a> {
                     ));
                 }
                 self.regs[*dest as usize] = Reg::Value(Value::Map(entries.into()));
+            }
+            Op::MapProjection {
+                base,
+                all_properties,
+                pairs,
+                dest,
+            } => {
+                let base = self.reg_value(*base)?;
+                let projected = if base.is_null() {
+                    Value::Null
+                } else {
+                    let mut entries: Vec<(Arc<str>, Value)> = if *all_properties {
+                        match self.call_function(func::PROPERTIES, &[base])? {
+                            Value::Map(properties) => properties.to_vec(),
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        Vec::with_capacity(pairs.len())
+                    };
+                    for (key, reg) in pairs {
+                        let value = self.reg_value(*reg)?;
+                        match entries.iter_mut().find(|(name, _)| **name == **key) {
+                            Some((_, slot)) => *slot = value,
+                            None => entries.push((Arc::from(key.as_str()), value)),
+                        }
+                    }
+                    Value::Map(entries.into())
+                };
+                self.regs[*dest as usize] = Reg::Value(projected);
             }
             Op::IfNot { reg, target } => match self.regs[*reg as usize].as_value().as_ref() {
                 Value::Bool(true) => {}
@@ -1626,46 +1899,38 @@ impl<'a> Executor<'a> {
                 let row = &self.regs[*start as usize..(*start + *count) as usize];
                 top.offer(row, *prefix as usize, ascending);
             }
+            Op::SorterOpen { cursor, dedup } => {
+                let target = SpillTarget {
+                    vfs: Arc::clone(self.db.vfs()),
+                    database: self.db.path().to_path_buf(),
+                };
+                self.cursors[*cursor as usize] =
+                    Cursor::Sorter(Sorter::new(target, self.db.sort_memory(), *dedup));
+            }
+            Op::SorterRow {
+                cursor,
+                start,
+                count,
+                prefix,
+                ascending,
+            } => {
+                let Cursor::Sorter(sorter) = &mut self.cursors[*cursor as usize] else {
+                    return Err(Error::internal("SorterRow on a non-sort cursor"));
+                };
+                let row = &self.regs[*start as usize..(*start + *count) as usize];
+                sorter.push(row, *prefix as usize, ascending)?;
+            }
             Op::SortRows {
                 cursor,
                 prefix,
                 ascending,
                 ..
-            } => {
-                let prefix = *prefix as usize;
-                let slot = &mut self.cursors[*cursor as usize];
-                if let Cursor::TopK(_) = slot {
-                    let Cursor::TopK(top) = std::mem::replace(slot, Cursor::Empty) else {
-                        unreachable!("matched a bounded cursor above");
-                    };
-                    *slot = Cursor::Rows {
-                        rows: top.finish(prefix, ascending),
-                        pos: 0,
-                    };
-                } else {
-                    let (rows, _) = self.rows_mut(*cursor)?;
-                    rows.sort_by(|a, b| compare_keys(&a[prefix..], &b[prefix..], ascending));
-                }
-            }
+            } => self.finish_sort(*cursor, *prefix as usize, ascending)?,
             Op::DedupRows {
                 cursor,
                 prefix,
                 keys,
-            } => {
-                let (rows, _) = self.rows_mut(*cursor)?;
-                let prefix = *prefix as usize;
-                let keys = *keys as usize;
-                rows.sort_by(|a, b| {
-                    for key in 0..keys {
-                        let ordering = a[prefix + key].cmp(&b[prefix + key]);
-                        if ordering != std::cmp::Ordering::Equal {
-                            return ordering;
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
-                rows.dedup_by(|a, b| (0..keys).all(|key| a[prefix + key] == b[prefix + key]));
-            }
+            } => self.finish_sort(*cursor, *prefix as usize, &vec![true; *keys as usize])?,
             Op::TruncateRows {
                 cursor,
                 skip,
@@ -1699,11 +1964,14 @@ impl<'a> Executor<'a> {
                 }
             }
             Op::CtxHasRows { cursor, dest } => {
-                let has_rows = match &self.cursors[*cursor as usize] {
-                    Cursor::Rows { rows, .. } => !rows.is_empty(),
-                    _ => return Err(Error::internal("CtxHasRows on a non-row cursor")),
-                };
+                let (rows, _) = self.rows_mut(*cursor)?;
+                let has_rows = !rows.is_empty();
                 self.regs[*dest as usize] = Reg::Value(Value::Bool(has_rows));
+            }
+            Op::CtxRowCount { cursor, dest } => {
+                let (rows, _) = self.rows_mut(*cursor)?;
+                let count = rows.len() as i64;
+                self.regs[*dest as usize] = Reg::Value(Value::Int(count));
             }
             Op::CtxToList { cursor, dest } => {
                 let values = match &self.cursors[*cursor as usize] {
@@ -1725,6 +1993,8 @@ impl<'a> Executor<'a> {
                         *pos = 0;
                         rows.is_empty()
                     }
+                    // A merge is rewound once, right after its sort finishes.
+                    Cursor::Merge(merge) => !merge.advance()?,
                     _ => return Err(Error::internal("CtxRewind on a non-row cursor")),
                 };
                 if empty {
@@ -1737,6 +2007,7 @@ impl<'a> Executor<'a> {
                         *pos += 1;
                         *pos >= rows.len()
                     }
+                    Cursor::Merge(merge) => !merge.advance()?,
                     _ => return Err(Error::internal("CtxNext on a non-row cursor")),
                 };
                 if exhausted {
@@ -1751,6 +2022,9 @@ impl<'a> Executor<'a> {
                 let row = match &self.cursors[*cursor as usize] {
                     Cursor::Rows { rows, pos } => rows
                         .get(*pos)
+                        .ok_or_else(|| Error::internal("CtxData on exhausted cursor"))?,
+                    Cursor::Merge(merge) => merge
+                        .current()
                         .ok_or_else(|| Error::internal("CtxData on exhausted cursor"))?,
                     _ => return Err(Error::internal("CtxData on a non-row cursor")),
                 };
@@ -2351,6 +2625,41 @@ impl<'a> Executor<'a> {
                 .map(|(node_id, score)| vec![Reg::Node(node_id), Reg::Value(Value::Float(score))])
                 .collect());
         }
+        match name {
+            "db.indexes" => return Ok(self.schema_object_rows(true)),
+            "db.constraints" => return Ok(self.schema_object_rows(false)),
+            "db.schema.nodeTypeProperties" => {
+                return Ok(self
+                    .db
+                    .node_type_properties()?
+                    .into_iter()
+                    .map(|row| {
+                        let node_type: String = row
+                            .type_names
+                            .iter()
+                            .map(|label| format!(":`{label}`"))
+                            .collect();
+                        let mut cells = vec![text_reg(&node_type), text_list_reg(&row.type_names)];
+                        cells.extend(property_cells(row));
+                        cells
+                    })
+                    .collect());
+            }
+            "db.schema.relTypeProperties" => {
+                return Ok(self
+                    .db
+                    .rel_type_properties()?
+                    .into_iter()
+                    .map(|row| {
+                        let rel_type = format!(":`{}`", row.type_names.concat());
+                        let mut cells = vec![text_reg(&rel_type)];
+                        cells.extend(property_cells(row));
+                        cells
+                    })
+                    .collect());
+            }
+            _ => {}
+        }
         let schema = self.db.schema();
         let mut values = Vec::new();
         let mut id = 1u32;
@@ -2374,6 +2683,60 @@ impl<'a> Executor<'a> {
             }
         }
         Ok(values.into_iter().map(|value| vec![value]).collect())
+    }
+
+    /// Rows of `db.indexes()` (`indexes`) or `db.constraints()`, in the
+    /// planner's `INDEX_COLUMNS` / `CONSTRAINT_COLUMNS` order.
+    fn schema_object_rows(&self, indexes: bool) -> Vec<Vec<Reg>> {
+        let schema = self.db.schema();
+        let objects = if indexes {
+            schema.index_objects()
+        } else {
+            schema.constraint_objects()
+        };
+        objects
+            .into_iter()
+            .map(|object| {
+                let mut cells = vec![
+                    Reg::Value(Value::Int(i64::from(object.id))),
+                    text_reg(&object.name),
+                ];
+                if indexes {
+                    cells.push(text_reg("ONLINE"));
+                }
+                cells.extend([
+                    text_reg(object.kind),
+                    text_reg(object.entity_type()),
+                    object
+                        .labels_or_types
+                        .as_deref()
+                        .map_or(Reg::Value(Value::Null), text_list_reg),
+                    text_list_reg(&object.properties),
+                    object
+                        .companion
+                        .as_deref()
+                        .map_or(Reg::Value(Value::Null), text_reg),
+                ]);
+                cells
+            })
+            .collect()
+    }
+
+    /// Finish a bounded or spilling sort cursor into a row cursor or merge.
+    fn finish_sort(&mut self, cursor: u32, prefix: usize, ascending: &[bool]) -> Result<()> {
+        let slot = &mut self.cursors[cursor as usize];
+        *slot = match std::mem::replace(slot, Cursor::Empty) {
+            Cursor::TopK(top) => Cursor::Rows {
+                rows: top.finish(prefix, ascending),
+                pos: 0,
+            },
+            Cursor::Sorter(sorter) => match sorter.finish(prefix, ascending)? {
+                Sorted::Rows(rows) => Cursor::Rows { rows, pos: 0 },
+                Sorted::Merge(merge) => Cursor::Merge(merge),
+            },
+            _ => return Err(Error::internal("finishing a sort on a non-sort cursor")),
+        };
+        Ok(())
     }
 
     fn rows_mut(&mut self, cursor: u32) -> Result<(&mut Vec<Vec<Reg>>, usize)> {
@@ -2453,46 +2816,61 @@ impl<'a> Executor<'a> {
                 .find(|value| !value.is_null())
                 .cloned()
                 .unwrap_or(Value::Null)),
-            func::TO_STRING => match args.first() {
+            func::TO_STRING | func::TO_INTEGER | func::TO_FLOAT | func::TO_BOOLEAN => {
+                convert(func, args.first().unwrap_or(&Value::Null))
+            }
+            func::TO_STRING_OR_NULL
+            | func::TO_INTEGER_OR_NULL
+            | func::TO_FLOAT_OR_NULL
+            | func::TO_BOOLEAN_OR_NULL => Ok(convert_or_null(
+                strict_conversion(func),
+                args.first().unwrap_or(&Value::Null),
+            )),
+            func::TO_STRING_LIST
+            | func::TO_INTEGER_LIST
+            | func::TO_FLOAT_LIST
+            | func::TO_BOOLEAN_LIST => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
-                Some(Value::Text(value)) => Ok(Value::Text(value.clone())),
-                Some(value) => match scalar_text(value) {
-                    Some(text) => Ok(Value::Text(Arc::from(text.into_owned()))),
-                    None => Err(invalid_argument("toString", value)),
-                },
-            },
-            func::TO_INTEGER => match args.first() {
-                Some(Value::Null) | None => Ok(Value::Null),
-                Some(Value::Int(value)) => Ok(Value::Int(*value)),
-                Some(Value::Float(value)) => Ok(truncate_to_int(*value)
-                    .map(Value::Int)
-                    .unwrap_or(Value::Null)),
-                Some(Value::Bool(value)) => Ok(Value::Int(i64::from(*value))),
-                Some(Value::Text(text)) => {
-                    Ok(text_to_integer(text).map(Value::Int).unwrap_or(Value::Null))
+                Some(Value::List(items)) => {
+                    let code = strict_conversion(func);
+                    Ok(Value::List(
+                        items
+                            .iter()
+                            .map(|item| convert_or_null(code, item))
+                            .collect(),
+                    ))
                 }
-                Some(other) => Err(invalid_argument("toInteger", other)),
+                Some(other) => Err(invalid_argument(conversion_name(func), other)),
             },
-            func::TO_FLOAT => match args.first() {
+            func::IS_EMPTY => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
-                Some(Value::Int(value)) => Ok(Value::Float(*value as f64)),
-                Some(Value::Float(value)) => Ok(Value::Float(*value)),
-                Some(Value::Text(text)) => Ok(text
-                    .trim()
-                    .parse::<f64>()
-                    .map(Value::Float)
-                    .unwrap_or(Value::Null)),
-                Some(other) => Err(invalid_argument("toFloat", other)),
+                Some(Value::Text(text)) => Ok(Value::Bool(text.is_empty())),
+                Some(Value::List(items)) => Ok(Value::Bool(items.is_empty())),
+                Some(Value::Map(entries)) => Ok(Value::Bool(entries.is_empty())),
+                Some(other) => Err(invalid_argument("isEmpty", other)),
             },
-            func::TO_BOOLEAN => match args.first() {
+            func::IS_NAN => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
-                Some(Value::Bool(value)) => Ok(Value::Bool(*value)),
-                Some(Value::Text(text)) => Ok(match text.to_ascii_lowercase().as_str() {
-                    "true" => Value::Bool(true),
-                    "false" => Value::Bool(false),
-                    _ => Value::Null,
-                }),
-                Some(other) => Err(invalid_argument("toBoolean", other)),
+                Some(Value::Float(value)) => Ok(Value::Bool(value.is_nan())),
+                Some(Value::Int(_)) => Ok(Value::Bool(false)),
+                Some(other) => Err(invalid_argument("isNaN", other)),
+            },
+            func::NULL_IF => match args {
+                [value, other] if value_equals(value, other) == Some(true) => Ok(Value::Null),
+                [value, _] => Ok(value.clone()),
+                _ => Err(Error::syntax("nullIf() takes two arguments")),
+            },
+            func::VALUE_TYPE => Ok(Value::Text(Arc::from(
+                CypherType::of(args.first().unwrap_or(&Value::Null))
+                    .to_string()
+                    .as_str(),
+            ))),
+            func::ELEMENT_ID => match args.first() {
+                Some(Value::Node(id)) | Some(Value::Edge(id)) => {
+                    Ok(Value::Text(Arc::from(id.to_string().as_str())))
+                }
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(other) => Err(invalid_argument("elementId", other)),
             },
             func::SIZE => Ok(match args.first() {
                 Some(Value::List(items)) => Value::Int(items.len() as i64),
@@ -2565,18 +2943,14 @@ impl<'a> Executor<'a> {
             ))),
             func::TO_UPPER => text_map(args, "toUpper", |text| text.to_uppercase()),
             func::TO_LOWER => text_map(args, "toLower", |text| text.to_lowercase()),
-            func::TRIM => text_map(args, "trim", |text| text.trim().to_owned()),
-            func::LTRIM => text_map(args, "ltrim", |text| text.trim_start().to_owned()),
-            func::RTRIM => text_map(args, "rtrim", |text| text.trim_end().to_owned()),
+            func::TRIM | func::BTRIM => call_trim(args, "btrim", Trim::Both),
+            func::LTRIM => call_trim(args, "ltrim", Trim::Leading),
+            func::RTRIM => call_trim(args, "rtrim", Trim::Trailing),
             func::LEFT | func::RIGHT => call_left_right(func, args),
             func::REPLACE => call_replace(args),
             func::ABS => match args.first() {
                 Some(Value::Null) | None => Ok(Value::Null),
-                Some(Value::Int(value)) => Ok(match value.checked_abs() {
-                    Some(value) => Value::Int(value),
-                    // `abs(i64::MIN)` overflows into float, like Neo4j.
-                    None => Value::Float((*value as f64).abs()),
-                }),
+                Some(Value::Int(value)) => checked_int(value.checked_abs()),
                 Some(Value::Float(value)) => Ok(Value::Float(value.abs())),
                 Some(other) => Err(invalid_argument("abs", other)),
             },
@@ -2596,7 +2970,7 @@ impl<'a> Executor<'a> {
             },
             func::CEIL => float_map(args, "ceil", f64::ceil),
             func::FLOOR => float_map(args, "floor", f64::floor),
-            func::ROUND => float_map(args, "round", f64::round),
+            func::ROUND => call_round(args),
             func::SQRT => float_map(args, "sqrt", f64::sqrt),
             func::EXP => float_map(args, "exp", f64::exp),
             func::LOG => float_map(args, "log", f64::ln),
@@ -2882,11 +3256,10 @@ impl Accumulator {
             }
             _ => {}
         }
-        self.step_value(spec, inputs[0].to_value());
-        Ok(())
+        self.step_value(spec, inputs[0].to_value())
     }
 
-    fn step_value(&mut self, spec: &AggSpec, value: Value) {
+    fn step_value(&mut self, spec: &AggSpec, value: Value) -> Result<()> {
         match self {
             Self::Count(count) => {
                 if spec.star || !value.is_null() {
@@ -2897,7 +3270,9 @@ impl Accumulator {
                 Value::Int(value) => {
                     *state = match std::mem::replace(state, SumState::Empty) {
                         SumState::Empty => SumState::Int(value),
-                        SumState::Int(previous) => SumState::Int(previous.wrapping_add(value)),
+                        SumState::Int(previous) => {
+                            SumState::Int(previous.checked_add(value).ok_or_else(integer_overflow)?)
+                        }
                         SumState::Float(previous) => SumState::Float(previous + value as f64),
                     };
                 }
@@ -2935,6 +3310,7 @@ impl Accumulator {
             // point.
             Self::PercentileCont { .. } | Self::PercentileDisc { .. } | Self::StDev { .. } => {}
         }
+        Ok(())
     }
 
     fn finish(self, _spec: &AggSpec) -> Value {
@@ -3062,10 +3438,11 @@ fn localdatetime_plus_duration(
 /// offset again for the resulting local time.
 fn datetime_plus_duration(datetime: &DateTime, duration: Duration) -> Result<DateTime> {
     let local = localdatetime_plus_duration(datetime.local(), duration)?;
-    let offset = match datetime.zone() {
-        Some(zone) => crate::temporal::construct::zone_offset(zone, local.date(), local.time())
-            .map_err(Error::type_error)?,
-        None => datetime.offset(),
+    let (local, offset) = match datetime.zone() {
+        Some(zone) => {
+            crate::temporal::zone::resolve_local(zone, local).map_err(Error::type_error)?
+        }
+        None => (local, datetime.offset()),
     };
     DateTime::new(local, offset, datetime.zone().map(Arc::<str>::from))
         .ok_or_else(|| Error::type_error("datetime arithmetic out of range"))
@@ -3208,6 +3585,8 @@ pub mod binary_code {
     pub const CONTAINS: u8 = 18;
     /// `=~`
     pub const REGEX: u8 = 19;
+    /// `||`
+    pub const CONCAT: u8 = 20;
 
     /// Encode a binary operator.
     pub const fn encode(op: BinaryOp) -> u8 {
@@ -3232,6 +3611,7 @@ pub mod binary_code {
             BinaryOp::EndsWith => ENDS_WITH,
             BinaryOp::Contains => CONTAINS,
             BinaryOp::Regex => REGEX,
+            BinaryOp::Concat => CONCAT,
         }
     }
 }
@@ -3247,27 +3627,35 @@ pub const fn unary_code(op: UnaryOp) -> u8 {
 fn binary_op(op: u8, a: &Value, b: &Value) -> Result<Value> {
     use binary_code as code;
     match op {
+        code::CONCAT => match (a, b) {
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (Value::Text(x), Value::Text(y)) => Ok(Value::Text(format!("{x}{y}").into())),
+            (Value::List(x), Value::List(y)) => {
+                Ok(Value::List(x.iter().chain(y.iter()).cloned().collect()))
+            }
+            _ => Err(type_error("||", a, b)),
+        },
         code::ADD => match temporal_add(a, b)? {
             Some(value) => Ok(value),
-            None => numeric_or_concat(a, b, |x, y| x + y, |x, y| x.wrapping_add(y)),
+            None => numeric_or_concat(a, b, |x, y| x + y, i64::checked_add),
         },
         code::SUB => match temporal_sub(a, b)? {
             Some(value) => Ok(value),
-            None => numeric(a, b, |x, y| x - y, |x, y| x.wrapping_sub(y)),
+            None => numeric(a, b, |x, y| x - y, i64::checked_sub),
         },
         code::MUL => match temporal_scale(a, b, false)? {
             Some(value) => Ok(value),
             None => match temporal_scale(b, a, false)? {
                 Some(value) => Ok(value),
-                None => numeric(a, b, |x, y| x * y, |x, y| x.wrapping_mul(y)),
+                None => numeric(a, b, |x, y| x * y, i64::checked_mul),
             },
         },
         code::DIV => match temporal_scale(a, b, true)? {
             Some(value) => Ok(value),
             None => match (a, b) {
                 (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-                (Value::Int(_), Value::Int(0)) => Ok(Value::Null),
-                (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_div(*y))),
+                (Value::Int(_), Value::Int(0)) => Err(division_by_zero()),
+                (Value::Int(x), Value::Int(y)) => checked_int(x.checked_div(*y)),
                 _ => match (a.as_number(), b.as_number()) {
                     (Some(x), Some(y)) => Ok(Value::Float(x / y)),
                     _ => Err(type_error("division", a, b)),
@@ -3276,7 +3664,9 @@ fn binary_op(op: u8, a: &Value, b: &Value) -> Result<Value> {
         },
         code::MOD => match (a, b) {
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-            (Value::Int(_), Value::Int(0)) => Ok(Value::Null),
+            (Value::Int(_), Value::Int(0)) => Err(division_by_zero()),
+            // `i64::MIN % -1` is mathematically 0 but overflows in hardware,
+            // so the wrapping form is the correct result here.
             (Value::Int(x), Value::Int(y)) => Ok(Value::Int(x.wrapping_rem(*y))),
             _ => match (a.as_number(), b.as_number()) {
                 (Some(x), Some(y)) => Ok(Value::Float(x % y)),
@@ -3303,6 +3693,20 @@ fn binary_op(op: u8, a: &Value, b: &Value) -> Result<Value> {
     }
 }
 
+/// An integer result, or an overflow error when the checked operation
+/// produced `None`.
+fn checked_int(result: Option<i64>) -> Result<Value> {
+    result.map(Value::Int).ok_or_else(integer_overflow)
+}
+
+fn integer_overflow() -> Error {
+    Error::new(ErrorCode::Range, "ArithmeticError: integer overflow")
+}
+
+fn division_by_zero() -> Error {
+    Error::new(ErrorCode::Range, "ArithmeticError: / by zero")
+}
+
 fn bool_value(value: Option<bool>) -> Value {
     match value {
         Some(value) => Value::Bool(value),
@@ -3314,11 +3718,11 @@ fn numeric(
     a: &Value,
     b: &Value,
     float_op: impl Fn(f64, f64) -> f64,
-    int_op: impl Fn(i64, i64) -> i64,
+    int_op: impl Fn(i64, i64) -> Option<i64>,
 ) -> Result<Value> {
     match (a, b) {
         (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-        (Value::Int(x), Value::Int(y)) => Ok(Value::Int(int_op(*x, *y))),
+        (Value::Int(x), Value::Int(y)) => checked_int(int_op(*x, *y)),
         _ => match (a.as_number(), b.as_number()) {
             (Some(x), Some(y)) => Ok(Value::Float(float_op(x, y))),
             _ => Err(type_error("arithmetic", a, b)),
@@ -3330,7 +3734,7 @@ fn numeric_or_concat(
     a: &Value,
     b: &Value,
     float_op: impl Fn(f64, f64) -> f64,
-    int_op: impl Fn(i64, i64) -> i64,
+    int_op: impl Fn(i64, i64) -> Option<i64>,
 ) -> Result<Value> {
     // A string concatenates any scalar on either side, coercing the scalar
     // through its text form. Lists keep their append/prepend semantics.
@@ -3372,6 +3776,33 @@ fn numeric_or_concat(
     numeric(a, b, float_op, int_op)
 }
 
+/// Neo4j's (Java's) text form of a float: plain decimal for magnitudes in
+/// `[1e-3, 1e7)`, otherwise scientific with a capital `E` (`1.0E20`), and
+/// `NaN`/`Infinity` spelled out.
+fn float_text(value: f64) -> String {
+    if value.is_nan() {
+        return String::from("NaN");
+    }
+    if value.is_infinite() {
+        return String::from(if value > 0.0 { "Infinity" } else { "-Infinity" });
+    }
+    let magnitude = value.abs();
+    if magnitude == 0.0 || (1e-3..1e7).contains(&magnitude) {
+        let mut buffer = ryu::Buffer::new();
+        return buffer.format(value).to_owned();
+    }
+    // `{:e}` prints the shortest round-tripping digits, e.g. `1.5e-7`.
+    let scientific = format!("{value:e}");
+    let (mantissa, exponent) = scientific
+        .split_once('e')
+        .expect("`{:e}` output always has an exponent");
+    if mantissa.contains('.') {
+        format!("{mantissa}E{exponent}")
+    } else {
+        format!("{mantissa}.0E{exponent}")
+    }
+}
+
 /// Text form of a scalar for `toString()` and string concatenation. Returns
 /// `None` for values without a text form (null, collections, entities); the
 /// caller decides between an error, a null result or another operator branch.
@@ -3379,10 +3810,7 @@ fn scalar_text(value: &Value) -> Option<Cow<'_, str>> {
     match value {
         Value::Int(value) => Some(Cow::Owned(value.to_string())),
         Value::Bool(value) => Some(Cow::Owned(value.to_string())),
-        Value::Float(value) => {
-            let mut buffer = ryu::Buffer::new();
-            Some(Cow::Owned(buffer.format(*value).to_owned()))
-        }
+        Value::Float(value) => Some(Cow::Owned(float_text(*value))),
         Value::Text(value) => Some(Cow::Borrowed(value)),
         Value::Date(_)
         | Value::LocalTime(_)
@@ -4123,20 +4551,15 @@ fn call_truncate(kind: TruncateKind, args: &[Value]) -> Result<Value> {
         }
         TruncateKind::LocalDateTime => Value::LocalDateTime(LocalDateTime::new(date, time)),
         TruncateKind::DateTime => {
-            let (offset, zone) = match construct::timezone_override(&overrides, date, time)
-                .map_err(|message| Error::type_error(format!("{name}(): {message}")))?
-            {
-                Some(pair) => pair,
-                None => match &zone {
-                    Some(zone) => (
-                        construct::zone_offset(zone, date, time)
-                            .map_err(|message| Error::type_error(format!("{name}(): {message}")))?,
-                        Some(zone.clone()),
-                    ),
-                    None => (offset, None),
-                },
-            };
             let local = LocalDateTime::new(date, time);
+            let (offset, zone) = construct::timezone_override(&overrides, date, time)
+                .map_err(|message| Error::type_error(format!("{name}(): {message}")))?
+                .unwrap_or((offset, zone));
+            let (local, offset) = match &zone {
+                Some(zone) => crate::temporal::zone::resolve_local(zone, local)
+                    .map_err(|message| Error::type_error(format!("{name}(): {message}")))?,
+                None => (local, offset),
+            };
             Value::DateTime(
                 DateTime::new(local, offset, zone)
                     .ok_or_else(|| Error::type_error("offset out of range"))?,
@@ -4426,6 +4849,55 @@ fn number_argument(name: &str, value: &Value) -> Result<f64> {
     }
 }
 
+/// `round(value [, precision [, mode]])`: rounds half away from zero by
+/// default; `mode` is one of Neo4j's rounding mode names.
+fn call_round(args: &[Value]) -> Result<Value> {
+    if args.iter().any(Value::is_null) {
+        return Ok(Value::Null);
+    }
+    let value = match args.first() {
+        Some(value) => number_argument("round", value)?,
+        None => return Ok(Value::Null),
+    };
+    let precision = match args.get(1) {
+        Some(Value::Int(precision)) => i32::try_from(*precision)
+            .map_err(|_| Error::new(ErrorCode::Range, "round() precision is out of range"))?,
+        Some(other) => return Err(invalid_argument("round", other)),
+        None => 0,
+    };
+    let mode = match args.get(2) {
+        Some(Value::Text(mode)) => mode.to_ascii_uppercase(),
+        Some(other) => return Err(invalid_argument("round", other)),
+        None => String::from("HALF_UP"),
+    };
+    let scale = 10f64.powi(precision);
+    let scaled = value * scale;
+    let is_tie = scaled.fract().abs() == 0.5;
+    let rounded = match mode.as_str() {
+        "HALF_UP" => scaled.round(),
+        "HALF_DOWN" if is_tie => scaled.trunc(),
+        "HALF_DOWN" => scaled.round(),
+        "HALF_EVEN" => scaled.round_ties_even(),
+        "UP" => scaled.abs().ceil().copysign(scaled),
+        "DOWN" => scaled.trunc(),
+        "CEILING" => scaled.ceil(),
+        "FLOOR" => scaled.floor(),
+        other => {
+            return Err(Error::new(
+                ErrorCode::Range,
+                format!("round() does not know the rounding mode `{other}`"),
+            ));
+        }
+    };
+    // Dividing by an exact power of ten keeps `round(1.25, 1)` at `1.3`
+    // rather than the `1.3000000000000003` a multiply by 0.1 would give.
+    Ok(Value::Float(if precision == 0 {
+        rounded
+    } else {
+        rounded / scale
+    }))
+}
+
 /// Apply a float transformation: null propagates and integers are widened.
 fn float_map(args: &[Value], name: &str, f: impl FnOnce(f64) -> f64) -> Result<Value> {
     match args.first() {
@@ -4436,6 +4908,129 @@ fn float_map(args: &[Value], name: &str, f: impl FnOnce(f64) -> f64) -> Result<V
 
 /// Apply a string transformation, propagating nulls and rejecting other
 /// types.
+fn text_reg(text: &str) -> Reg {
+    Reg::Value(Value::Text(Arc::from(text)))
+}
+
+fn text_list_reg(items: &[String]) -> Reg {
+    Reg::Value(Value::List(
+        items
+            .iter()
+            .map(|item| Value::Text(Arc::from(item.as_str())))
+            .collect(),
+    ))
+}
+
+/// The `propertyName`, `propertyTypes` and `mandatory` cells of a schema
+/// properties row.
+fn property_cells(row: crate::engine::TypeProperty) -> [Reg; 3] {
+    let types = if row.property.is_some() {
+        text_list_reg(&row.types)
+    } else {
+        Reg::Value(Value::Null)
+    };
+    [
+        row.property
+            .as_deref()
+            .map_or(Reg::Value(Value::Null), text_reg),
+        types,
+        Reg::Value(Value::Bool(row.mandatory)),
+    ]
+}
+
+/// Which ends `trim`, `ltrim`, `rtrim` and `btrim` strip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Trim {
+    Leading,
+    Trailing,
+    Both,
+}
+
+/// Strip whitespace, or with a second argument every character in that
+/// string, from the chosen ends.
+fn call_trim(args: &[Value], name: &str, ends: Trim) -> Result<Value> {
+    let characters = match args.get(1) {
+        None => None,
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(Value::Text(characters)) => Some(characters),
+        Some(other) => return Err(invalid_argument(name, other)),
+    };
+    text_map(args, name, |text| {
+        let strip = |c: char| match characters {
+            Some(characters) => characters.contains(c),
+            None => c.is_whitespace(),
+        };
+        let text = match ends {
+            Trim::Leading => text.trim_start_matches(strip),
+            Trim::Trailing => text.trim_end_matches(strip),
+            Trim::Both => text.trim_matches(strip),
+        };
+        text.to_owned()
+    })
+}
+
+/// The strict conversion (`toInteger`, ...) behind an `OrNull` or list
+/// conversion code.
+fn strict_conversion(code: u8) -> u8 {
+    match code {
+        func::TO_STRING_OR_NULL | func::TO_STRING_LIST => func::TO_STRING,
+        func::TO_INTEGER_OR_NULL | func::TO_INTEGER_LIST => func::TO_INTEGER,
+        func::TO_FLOAT_OR_NULL | func::TO_FLOAT_LIST => func::TO_FLOAT,
+        _ => func::TO_BOOLEAN,
+    }
+}
+
+fn conversion_name(code: u8) -> &'static str {
+    match code {
+        func::TO_STRING_LIST => "toStringList",
+        func::TO_INTEGER_LIST => "toIntegerList",
+        func::TO_FLOAT_LIST => "toFloatList",
+        _ => "toBooleanList",
+    }
+}
+
+/// `toString`, `toInteger`, `toFloat` or `toBoolean`: values without a
+/// conversion are a `TypeError`, unparsable strings null.
+fn convert(code: u8, value: &Value) -> Result<Value> {
+    match (code, value) {
+        (_, Value::Null) => Ok(Value::Null),
+        (func::TO_STRING, Value::Text(text)) => Ok(Value::Text(text.clone())),
+        (func::TO_STRING, value) => match scalar_text(value) {
+            Some(text) => Ok(Value::Text(Arc::from(text.into_owned()))),
+            None => Err(invalid_argument("toString", value)),
+        },
+        (func::TO_INTEGER, Value::Int(value)) => Ok(Value::Int(*value)),
+        (func::TO_INTEGER, Value::Float(value)) => Ok(truncate_to_int(*value)
+            .map(Value::Int)
+            .unwrap_or(Value::Null)),
+        (func::TO_INTEGER, Value::Bool(value)) => Ok(Value::Int(i64::from(*value))),
+        (func::TO_INTEGER, Value::Text(text)) => {
+            Ok(text_to_integer(text).map(Value::Int).unwrap_or(Value::Null))
+        }
+        (func::TO_INTEGER, other) => Err(invalid_argument("toInteger", other)),
+        (func::TO_FLOAT, Value::Int(value)) => Ok(Value::Float(*value as f64)),
+        (func::TO_FLOAT, Value::Float(value)) => Ok(Value::Float(*value)),
+        (func::TO_FLOAT, Value::Text(text)) => Ok(text
+            .trim()
+            .parse::<f64>()
+            .map(Value::Float)
+            .unwrap_or(Value::Null)),
+        (func::TO_FLOAT, other) => Err(invalid_argument("toFloat", other)),
+        (_, Value::Bool(value)) => Ok(Value::Bool(*value)),
+        (_, Value::Text(text)) => Ok(match text.to_ascii_lowercase().as_str() {
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => Value::Null,
+        }),
+        (_, other) => Err(invalid_argument("toBoolean", other)),
+    }
+}
+
+/// A conversion that yields null instead of a `TypeError`.
+fn convert_or_null(code: u8, value: &Value) -> Value {
+    convert(code, value).unwrap_or(Value::Null)
+}
+
 fn text_map(args: &[Value], name: &str, f: impl FnOnce(&str) -> String) -> Result<Value> {
     match args.first() {
         Some(Value::Null) | None => Ok(Value::Null),
@@ -5049,27 +5644,36 @@ mod tests {
         let mut db = test_db();
         let program = program(
             vec![
-                Op::CollectOpen { cursor: 0 },
+                Op::SorterOpen {
+                    cursor: 0,
+                    dedup: true,
+                },
                 Op::Constant { dest: 0, value: 0 },
                 Op::Constant { dest: 1, value: 1 },
-                Op::CollectRow {
+                Op::SorterRow {
                     cursor: 0,
                     start: 0,
                     count: 2,
+                    prefix: 0,
+                    ascending: vec![true],
                 },
                 Op::Constant { dest: 0, value: 2 },
                 Op::Constant { dest: 1, value: 3 },
-                Op::CollectRow {
+                Op::SorterRow {
                     cursor: 0,
                     start: 0,
                     count: 2,
+                    prefix: 0,
+                    ascending: vec![true],
                 },
                 Op::Constant { dest: 0, value: 4 },
                 Op::Constant { dest: 1, value: 5 },
-                Op::CollectRow {
+                Op::SorterRow {
                     cursor: 0,
                     start: 0,
                     count: 2,
+                    prefix: 0,
+                    ascending: vec![true],
                 },
                 Op::DedupRows {
                     cursor: 0,

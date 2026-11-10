@@ -240,6 +240,9 @@ pub enum Token {
     /// `|`
     #[token("|")]
     Pipe,
+    /// `||` (string and list concatenation)
+    #[token("||")]
+    DoublePipe,
     /// `!` (label expression negation)
     #[token("!")]
     Bang,
@@ -283,6 +286,86 @@ pub struct Spanned {
     /// Byte offset one past the last character.
     pub end: usize,
 }
+
+/// Every Cypher keyword, for shell completion: the reserved words the lexer
+/// tokenizes plus the contextual words the parser matches by text (`INDEX`,
+/// `SHOW`, `EXPLAIN`, ...).
+pub const KEYWORDS: &[&str] = &[
+    "MATCH",
+    "OPTIONAL",
+    "WHERE",
+    "RETURN",
+    "WITH",
+    "UNWIND",
+    "FOREACH",
+    "CALL",
+    "YIELD",
+    "CREATE",
+    "MERGE",
+    "SET",
+    "REMOVE",
+    "DELETE",
+    "DETACH",
+    "ORDER",
+    "BY",
+    "SKIP",
+    "LIMIT",
+    "AS",
+    "AND",
+    "OR",
+    "XOR",
+    "NOT",
+    "IN",
+    "IS",
+    "NULL",
+    "TRUE",
+    "FALSE",
+    "DISTINCT",
+    "STARTS",
+    "ENDS",
+    "CONTAINS",
+    "ASC",
+    "ASCENDING",
+    "DESC",
+    "DESCENDING",
+    "ON",
+    "CASE",
+    "WHEN",
+    "THEN",
+    "ELSE",
+    "END",
+    "UNION",
+    "ALL",
+    "LOAD",
+    "CSV",
+    "HEADERS",
+    "FROM",
+    "FIELDTERMINATOR",
+    "INDEX",
+    "INDEXES",
+    "CONSTRAINT",
+    "CONSTRAINTS",
+    "FULLTEXT",
+    "DROP",
+    "IF",
+    "EXISTS",
+    "FOR",
+    "REQUIRE",
+    "UNIQUE",
+    "KEY",
+    "NODE",
+    "EACH",
+    "SHOW",
+    "EXPLAIN",
+    "TRANSACTIONS",
+    "ROWS",
+    "OF",
+    "TYPED",
+    "BOTH",
+    "LEADING",
+    "TRAILING",
+    "COUNT",
+];
 
 /// Lex `source` into tokens, returning the source position of the first
 /// invalid character as an error.
@@ -455,9 +538,8 @@ fn classify(token: Token, tokens: &[(usize, usize, Token)], index: usize) -> Tok
         }
         EscapedIdent => context_class(tokens, index),
         PlusEquals | Plus | Minus | Star | Slash | Percent | Caret | Equals | Less | Greater
-        | NotEquals | LessEquals | GreaterEquals | RegexMatch | ArrowRight | ArrowLeft | DotDot => {
-            TokenClass::Operator
-        }
+        | NotEquals | LessEquals | GreaterEquals | RegexMatch | ArrowRight | ArrowLeft | DotDot
+        | DoublePipe => TokenClass::Operator,
         LParen | RParen | LBracket | RBracket | LBrace | RBrace | Comma | Semicolon | Colon
         | Pipe | Bang | Amp | Dot => TokenClass::Punctuation,
         other => {
@@ -489,6 +571,19 @@ mod tests {
             .into_iter()
             .map(|spanned| spanned.token)
             .collect()
+    }
+
+    #[test]
+    fn keyword_list_covers_every_reserved_word() {
+        let listed: Vec<Token> = KEYWORDS
+            .iter()
+            .flat_map(|word| tokens(word))
+            .filter(|token| token.is_keyword())
+            .collect();
+        assert_eq!(listed.len(), 45, "{listed:?}");
+        for word in KEYWORDS {
+            assert_eq!(tokens(word).len(), 1, "{word} is one token");
+        }
     }
 
     #[test]

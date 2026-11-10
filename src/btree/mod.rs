@@ -903,7 +903,8 @@ mod tests {
         fn bulk_build_matches_its_sorted_input(
             keys in proptest::collection::btree_set(
                 proptest::collection::vec(any::<u8>(), 1..=1019), 0..1500),
-            later in proptest::collection::vec(proptest::collection::vec(any::<u8>(), 1..40), 0..50),
+            later in proptest::collection::btree_set(
+                proptest::collection::vec(any::<u8>(), 1..40), 0..50),
         ) {
             let mut pager = test_pager();
             pager.begin_write().expect("begin");

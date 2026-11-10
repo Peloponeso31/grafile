@@ -82,5 +82,5 @@ fn random_uuid_returns_distinct_v4_strings() {
     let err = conn
         .query("RETURN randomUUID(1)", &Params::new())
         .expect_err("randomUUID takes no arguments");
-    assert!(err.to_string().contains("takes no arguments"), "{err}");
+    assert!(err.to_string().contains("Too many parameters"), "{err}");
 }

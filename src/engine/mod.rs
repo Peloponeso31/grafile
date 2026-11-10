@@ -10,6 +10,7 @@ mod integrity;
 #[cfg(test)]
 mod model_tests;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -29,6 +30,7 @@ use crate::fulltext::{
 };
 use crate::matrix::{ANY_TYPE, Direction, FragmentKey, FragmentStore};
 use crate::pager::{DatabaseHeader, Pager};
+use crate::record::types::CypherType;
 use crate::record::{EdgeRecord, NodeRecord, Value, encode_index_key};
 use crate::vfs::{OpenMode, Vfs};
 
@@ -48,7 +50,12 @@ pub struct Database {
     /// Edges deleted by the statement in progress, with their type so
     /// `type()` can still answer.
     deleted_edges: std::collections::HashMap<u64, u32>,
+    /// Bytes an unbounded sort or `DISTINCT` buffers before spilling a run.
+    sort_memory: usize,
 }
+
+/// Default sort budget: 256 MiB of buffered rows before spilling.
+pub const DEFAULT_SORT_MEMORY: usize = 256 << 20;
 
 /// One variable-length expansion: the relationships in traversal order and
 /// the nodes they connect (one more node than edges).
@@ -170,6 +177,7 @@ impl Database {
             fragments,
             deleted_nodes: std::collections::HashSet::new(),
             deleted_edges: std::collections::HashMap::new(),
+            sort_memory: DEFAULT_SORT_MEMORY,
         })
     }
 
@@ -199,6 +207,7 @@ impl Database {
             fragments,
             deleted_nodes: std::collections::HashSet::new(),
             deleted_edges: std::collections::HashMap::new(),
+            sort_memory: DEFAULT_SORT_MEMORY,
         })
     }
 
@@ -215,6 +224,28 @@ impl Database {
     /// Path of the database file.
     pub fn path(&self) -> &Path {
         self.pager.path()
+    }
+
+    /// The VFS the database file was opened through; sort spill files use
+    /// it too.
+    pub fn vfs(&self) -> &Arc<dyn Vfs> {
+        self.pager.vfs()
+    }
+
+    /// Bytes an unbounded `ORDER BY` or `DISTINCT` buffers before it writes
+    /// a sorted run to a spill file next to the database.
+    pub fn sort_memory(&self) -> usize {
+        self.sort_memory
+    }
+
+    /// Set the sort budget (see [`Database::sort_memory`]).
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Approximate bytes of buffered rows per sort before
+    ///   spilling; values below one row still spill one row at a time
+    pub fn set_sort_memory(&mut self, bytes: usize) {
+        self.sort_memory = bytes;
     }
 
     /// The catalog (for id lookups and DDL).
@@ -276,8 +307,18 @@ impl Database {
         self.pager.end_read()
     }
 
-    /// Commit the active write transaction, persisting tree roots.
+    /// Commit the active write transaction, persisting tree roots. A failed
+    /// commit rolls the transaction back before returning its error, so the
+    /// file and the lock are never left mid-transaction.
     pub fn commit(&mut self) -> Result<()> {
+        let committed = self.commit_inner();
+        if committed.is_err() && self.pager.in_write_txn() {
+            let _ = self.rollback();
+        }
+        committed
+    }
+
+    fn commit_inner(&mut self) -> Result<()> {
         // Flush cached fragments first: the flush may split the fragment
         // B+tree and move its root.
         self.fragments.flush(&mut self.pager)?;
@@ -1534,7 +1575,12 @@ impl Database {
     }
 
     /// Index every node carrying a new fulltext index's label.
+    /// Fill an empty fulltext index from every node with its label: records
+    /// are read serially (every page read goes through the pager), then
+    /// analyzed and sorted on every core and bulk-built bottom-up.
     fn backfill_fulltext_index(&mut self, index_id: u32) -> Result<()> {
+        use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+
         let Some(def) = self
             .schema()
             .fulltext_indexes
@@ -1550,15 +1596,37 @@ impl Database {
             ProgressStyle::with_template("{spinner:.green} {msg} {pos}/{len} [{elapsed_precise}]")
                 .expect("valid fulltext backfill template"),
         );
-        progress.set_message(format!("backfilling fulltext index `{}`", def.name));
+        progress.set_message(format!("reading nodes for fulltext index `{}`", def.name));
+        let mut records = Vec::with_capacity(node_ids.len());
         for node_id in node_ids {
             if let Some(record) = self.get_node(node_id)? {
-                self.fulltext_update(index_id, &record, node_id, true)?;
+                records.push((node_id, record));
             }
             progress.inc(1);
         }
         progress.finish_and_clear();
-        Ok(())
+        // `fold` builds one buffer per rayon task and `reduce` concatenates
+        // them, so analysis runs on every core without shared state.
+        let mut postings = records
+            .par_iter()
+            .fold(IndexKeys::default, |mut postings, (node_id, record)| {
+                let texts = def
+                    .key_ids
+                    .iter()
+                    .filter_map(|key_id| record.get(*key_id).and_then(Value::as_text));
+                for (term, positions) in document_terms(texts) {
+                    postings.push_entry(
+                        &term_prefix(&term),
+                        *node_id,
+                        &encode_positions(&positions),
+                    );
+                }
+                postings
+            })
+            .reduce(IndexKeys::default, IndexKeys::append);
+        postings.sort();
+        Btree::from_root(def.root, TreeKind::Index)
+            .build_sorted(&mut self.pager, postings.entries())
     }
 
     /// Search a fulltext index.
@@ -1679,6 +1747,7 @@ impl Database {
             return Ok(());
         };
         let mut keys = IndexKeys::default();
+        let mut seen = UniqueValues::new(def.unique());
         let mut cursor = self.nodes.cursor();
         let mut ok = cursor.first(&mut self.pager)?;
         while ok {
@@ -1687,19 +1756,17 @@ impl Database {
             if (def.label_id == 0 || record.labels.contains(&def.label_id))
                 && let Some(prefix) = node_index_prefix(&record, &def)
             {
+                if !seen.insert(def.key_ids.iter().filter_map(|key| record.get(*key))) {
+                    return Err(Error::constraint(format!(
+                        "unique index {} violated by node {node_id}",
+                        def.id
+                    )));
+                }
                 keys.push(&prefix, node_id);
             }
             ok = cursor.next(&mut self.pager)?;
         }
         keys.sort();
-        if def.unique()
-            && let Some(node_id) = keys.first_duplicate()
-        {
-            return Err(Error::constraint(format!(
-                "unique index {} violated by node {node_id}",
-                def.id
-            )));
-        }
         Btree::from_root(def.root, TreeKind::Index).build_sorted(&mut self.pager, keys.entries())
     }
 
@@ -1716,6 +1783,7 @@ impl Database {
             return Ok(());
         };
         let mut keys = IndexKeys::default();
+        let mut seen = UniqueValues::new(def.unique());
         let mut cursor = self.edges.cursor();
         let mut ok = cursor.first(&mut self.pager)?;
         while ok {
@@ -1724,19 +1792,17 @@ impl Database {
             if (def.type_id == 0 || record.edge_type == def.type_id)
                 && let Some(prefix) = edge_index_prefix(&record, &def)
             {
+                if !seen.insert(def.key_ids.iter().filter_map(|key| record.get(*key))) {
+                    return Err(Error::constraint(format!(
+                        "unique index {} violated by edge {edge_id}",
+                        def.id
+                    )));
+                }
                 keys.push(&prefix, edge_id);
             }
             ok = cursor.next(&mut self.pager)?;
         }
         keys.sort();
-        if def.unique()
-            && let Some(edge_id) = keys.first_duplicate()
-        {
-            return Err(Error::constraint(format!(
-                "unique index {} violated by edge {edge_id}",
-                def.id
-            )));
-        }
         Btree::from_root(def.root, TreeKind::Index).build_sorted(&mut self.pager, keys.entries())
     }
 
@@ -1754,6 +1820,65 @@ impl Database {
             ok = cursor.next(&mut self.pager)?;
         }
         Ok(ids)
+    }
+
+    /// Property statistics per label set, for
+    /// `db.schema.nodeTypeProperties()`: one scan of the node table.
+    ///
+    /// # Errors
+    ///
+    /// Propagates storage and record decoding errors.
+    pub fn node_type_properties(&mut self) -> Result<Vec<TypeProperty>> {
+        let mut groups: BTreeMap<Vec<u32>, PropertyStats> = BTreeMap::new();
+        let mut cursor = self.nodes.cursor();
+        let mut ok = cursor.first(&mut self.pager)?;
+        while ok {
+            let record = NodeRecord::decode(&cursor.value(&mut self.pager)?)?;
+            groups
+                .entry(record.labels)
+                .or_default()
+                .observe(&record.props);
+            ok = cursor.next(&mut self.pager)?;
+        }
+        let schema = self.schema();
+        Ok(groups
+            .into_iter()
+            .flat_map(|(labels, stats)| {
+                let names = labels
+                    .iter()
+                    .map(|label| schema.label_name(*label).unwrap_or("?").to_owned())
+                    .collect();
+                stats.rows(names, schema)
+            })
+            .collect())
+    }
+
+    /// Property statistics per relationship type, for
+    /// `db.schema.relTypeProperties()`: one scan of the edge table.
+    ///
+    /// # Errors
+    ///
+    /// Propagates storage and record decoding errors.
+    pub fn rel_type_properties(&mut self) -> Result<Vec<TypeProperty>> {
+        let mut groups: BTreeMap<u32, PropertyStats> = BTreeMap::new();
+        let mut cursor = self.edges.cursor();
+        let mut ok = cursor.first(&mut self.pager)?;
+        while ok {
+            let record = EdgeRecord::decode(&cursor.value(&mut self.pager)?)?;
+            groups
+                .entry(record.edge_type)
+                .or_default()
+                .observe(&record.props);
+            ok = cursor.next(&mut self.pager)?;
+        }
+        let schema = self.schema();
+        Ok(groups
+            .into_iter()
+            .flat_map(|(edge_type, stats)| {
+                let name = schema.edge_type_name(edge_type).unwrap_or("?").to_owned();
+                stats.rows(vec![name], schema)
+            })
+            .collect())
     }
 
     /// All edge ids in ascending order.
@@ -2050,16 +2175,16 @@ impl Database {
             return Ok(());
         };
         let mut tree = Btree::from_root(def.root, TreeKind::Index);
-        if def.unique() {
-            // Index keys embed the entity id, so key uniqueness cannot
-            // enforce value uniqueness: probe the value prefix instead.
-            let mut cursor = tree.cursor();
-            if cursor.seek_ge(&mut self.pager, &prefix)? && cursor.key().starts_with(&prefix) {
-                return Err(Error::constraint(format!(
-                    "unique index {} violated by node {node_id}",
-                    def.id
-                )));
-            }
+        // Index keys embed the entity id, so key uniqueness cannot enforce
+        // value uniqueness: probe the value prefixes instead.
+        if def.unique()
+            && self
+                .any_prefix_present(&tree, def.key_ids.iter().filter_map(|key| record.get(*key)))?
+        {
+            return Err(Error::constraint(format!(
+                "unique index {} violated by node {node_id}",
+                def.id
+            )));
         }
         let mut key = prefix;
         key.extend_from_slice(&node_id.to_be_bytes());
@@ -2190,19 +2315,35 @@ impl Database {
             return Ok(());
         };
         let mut tree = Btree::from_root(def.root, TreeKind::Index);
-        if def.unique() {
-            let mut cursor = tree.cursor();
-            if cursor.seek_ge(&mut self.pager, &prefix)? && cursor.key().starts_with(&prefix) {
-                return Err(Error::constraint(format!(
-                    "unique index {} violated by edge {edge_id}",
-                    def.id
-                )));
-            }
+        if def.unique()
+            && self
+                .any_prefix_present(&tree, def.key_ids.iter().filter_map(|key| record.get(*key)))?
+        {
+            return Err(Error::constraint(format!(
+                "unique index {} violated by edge {edge_id}",
+                def.id
+            )));
         }
         let mut key = prefix;
         key.extend_from_slice(&edge_id.to_be_bytes());
         tree.insert(&mut self.pager, &key, &[])?;
         self.replace_edge_index_root(index_id, tree.root())
+    }
+
+    /// Whether `tree` holds an entry whose values equal `values` under
+    /// Cypher equality (so `1` matches an entry stored for `1.0`).
+    fn any_prefix_present<'v>(
+        &mut self,
+        tree: &Btree,
+        values: impl Iterator<Item = &'v Value>,
+    ) -> Result<bool> {
+        let mut cursor = tree.cursor();
+        for prefix in equal_value_prefixes(values) {
+            if cursor.seek_ge(&mut self.pager, &prefix)? && cursor.key().starts_with(&prefix) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn delete_edge_index_entry(
@@ -2426,7 +2567,79 @@ fn edge_index_prefix(record: &EdgeRecord, def: &crate::catalog::EdgeIndexDef) ->
     Some(prefix)
 }
 
-/// Prefix shared by all index entries with `value`.
+/// The other numeric value equal to `value` under Cypher equality: the
+/// float of an integer it represents exactly, or the integer of an
+/// integral float in range.
+fn numeric_twin(value: &Value) -> Option<Value> {
+    match value {
+        Value::Int(integer) => {
+            let float = *integer as f64;
+            // Compare in i128: `i64::MAX as f64` rounds up to 2^63, which an
+            // `as i64` cast would saturate back to `i64::MAX`.
+            (float as i128 == i128::from(*integer)).then_some(Value::Float(float))
+        }
+        Value::Float(float) => {
+            const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
+            (float.fract() == 0.0 && (-TWO_POW_63..TWO_POW_63).contains(float))
+                .then_some(Value::Int(*float as i64))
+        }
+        _ => None,
+    }
+}
+
+/// Every encoded index prefix whose values equal `values` under Cypher
+/// equality: each numeric value also appears as its [`numeric_twin`].
+fn equal_value_prefixes<'v>(values: impl Iterator<Item = &'v Value>) -> Vec<Vec<u8>> {
+    let mut prefixes = vec![Vec::new()];
+    for value in values {
+        let twin = numeric_twin(value);
+        let twin_prefixes = twin.as_ref().map(|_| prefixes.clone());
+        for prefix in &mut prefixes {
+            encode_index_key(prefix, value);
+        }
+        if let (Some(twin), Some(mut twin_prefixes)) = (twin, twin_prefixes) {
+            for prefix in &mut twin_prefixes {
+                encode_index_key(prefix, &twin);
+            }
+            prefixes.extend(twin_prefixes);
+        }
+    }
+    prefixes
+}
+
+/// Value tuples seen while backfilling a unique index, compared under Cypher
+/// equality by encoding integral floats as integers.
+struct UniqueValues {
+    seen: Option<HashSet<Vec<u8>>>,
+}
+
+impl UniqueValues {
+    /// A tracker that checks values only when `unique` is set.
+    fn new(unique: bool) -> Self {
+        Self {
+            seen: unique.then(HashSet::new),
+        }
+    }
+
+    /// Record `values`; `false` when an equal tuple was already recorded.
+    fn insert<'v>(&mut self, values: impl Iterator<Item = &'v Value>) -> bool {
+        let Some(seen) = &mut self.seen else {
+            return true;
+        };
+        let mut canonical = Vec::new();
+        for value in values {
+            match value {
+                Value::Float(_) => match numeric_twin(value) {
+                    Some(integer) => encode_index_key(&mut canonical, &integer),
+                    None => encode_index_key(&mut canonical, value),
+                },
+                _ => encode_index_key(&mut canonical, value),
+            }
+        }
+        seen.insert(canonical)
+    }
+}
+
 /// The id in an 8-byte big-endian record table key.
 fn table_key_id(key: &[u8], what: &str) -> Result<u64> {
     let bytes: [u8; 8] = key
@@ -2435,50 +2648,127 @@ fn table_key_id(key: &[u8], what: &str) -> Result<u64> {
     Ok(u64::from_be_bytes(bytes))
 }
 
-/// Index keys gathered for a bulk build: one flat byte buffer plus the span
-/// of each key, so millions of keys cost two allocations rather than one
-/// each. Every key is a value prefix followed by an 8-byte entity id.
+/// One row of `db.schema.nodeTypeProperties()` or `relTypeProperties()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeProperty {
+    /// Sorted label names, or the relationship type name.
+    pub type_names: Vec<String>,
+    /// The property, or `None` for a label set or type without properties.
+    pub property: Option<String>,
+    /// Types the property's values have (`STRING`, `LIST<INTEGER>`, ...).
+    pub types: Vec<String>,
+    /// Whether every node or relationship of the group has the property.
+    pub mandatory: bool,
+}
+
+/// Running property statistics for one label set or relationship type.
+#[derive(Debug, Default)]
+struct PropertyStats {
+    entities: u64,
+    /// Key id to (entities with the key, the value types seen).
+    keys: BTreeMap<u32, (u64, std::collections::BTreeSet<String>)>,
+}
+
+impl PropertyStats {
+    fn observe(&mut self, props: &[(u32, Value)]) {
+        self.entities += 1;
+        for (key_id, value) in props {
+            let (count, types) = self.keys.entry(*key_id).or_default();
+            *count += 1;
+            // Stored values are never null, so the nullable spelling drops
+            // the redundant `NOT NULL` (`mandatory` says it instead).
+            types.insert(CypherType::of(value).nullable().to_string());
+        }
+    }
+
+    fn rows(self, type_names: Vec<String>, schema: &Schema) -> Vec<TypeProperty> {
+        if self.keys.is_empty() {
+            return vec![TypeProperty {
+                type_names,
+                property: None,
+                types: Vec::new(),
+                mandatory: false,
+            }];
+        }
+        self.keys
+            .into_iter()
+            .map(|(key_id, (count, types))| TypeProperty {
+                type_names: type_names.clone(),
+                property: Some(schema.property_key_name(key_id).unwrap_or("?").to_owned()),
+                types: types.into_iter().collect(),
+                mandatory: count == self.entities,
+            })
+            .collect()
+    }
+}
+
+/// Index entries gathered for a bulk build: one flat byte buffer plus the
+/// spans of each entry, so millions of entries cost two allocations rather
+/// than one each. Every key is a value prefix followed by an 8-byte entity
+/// id; property index entries carry an empty value, fulltext postings their
+/// encoded positions.
 #[derive(Debug, Default)]
 struct IndexKeys {
     bytes: Vec<u8>,
-    spans: Vec<std::ops::Range<usize>>,
+    spans: Vec<EntrySpan>,
+}
+
+/// Where one entry lives in [`IndexKeys::bytes`]: the key, then its value
+/// up to `value_end`.
+#[derive(Debug, Clone)]
+struct EntrySpan {
+    key: std::ops::Range<usize>,
+    value_end: usize,
 }
 
 impl IndexKeys {
     fn push(&mut self, prefix: &[u8], id: u64) {
+        self.push_entry(prefix, id, &[]);
+    }
+
+    fn push_entry(&mut self, prefix: &[u8], id: u64, value: &[u8]) {
         let start = self.bytes.len();
         self.bytes.extend_from_slice(prefix);
         self.bytes.extend_from_slice(&id.to_be_bytes());
-        self.spans.push(start..self.bytes.len());
+        let key_end = self.bytes.len();
+        self.bytes.extend_from_slice(value);
+        self.spans.push(EntrySpan {
+            key: start..key_end,
+            value_end: self.bytes.len(),
+        });
     }
 
-    fn key(&self, span: &std::ops::Range<usize>) -> &[u8] {
-        &self.bytes[span.clone()]
+    /// Move every entry of `other` to the end of `self` (the reduce step of
+    /// a parallel gather).
+    fn append(mut self, other: Self) -> Self {
+        let offset = self.bytes.len();
+        self.bytes.extend_from_slice(&other.bytes);
+        self.spans
+            .extend(other.spans.into_iter().map(|span| EntrySpan {
+                key: span.key.start + offset..span.key.end + offset,
+                value_end: span.value_end + offset,
+            }));
+        self
     }
 
-    /// Order the keys, sorting on every core (keys are unique because they
-    /// end in the entity id, so an unstable sort is deterministic).
+    fn key(&self, span: &EntrySpan) -> &[u8] {
+        &self.bytes[span.key.clone()]
+    }
+
+    /// Order the entries by key, sorting on every core (keys are unique
+    /// because they end in the entity id, so an unstable sort is
+    /// deterministic).
     fn sort(&mut self) {
         use rayon::slice::ParallelSliceMut;
         let bytes = &self.bytes;
         self.spans
-            .par_sort_unstable_by(|a, b| bytes[a.clone()].cmp(&bytes[b.clone()]));
-    }
-
-    /// After [`Self::sort`]: the id of the second entity found sharing a
-    /// value with its predecessor.
-    fn first_duplicate(&self) -> Option<u64> {
-        self.spans.windows(2).find_map(|pair| {
-            let (left, right) = (self.key(&pair[0]), self.key(&pair[1]));
-            let (left_value, _) = left.split_at(left.len() - 8);
-            let (right_value, id) = right.split_at(right.len() - 8);
-            (left_value == right_value)
-                .then(|| u64::from_be_bytes(id.try_into().expect("8-byte id suffix")))
-        })
+            .par_sort_unstable_by(|a, b| bytes[a.key.clone()].cmp(&bytes[b.key.clone()]));
     }
 
     fn entries(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
-        self.spans.iter().map(|span| (self.key(span), &[][..]))
+        self.spans
+            .iter()
+            .map(|span| (self.key(span), &self.bytes[span.key.end..span.value_end]))
     }
 }
 

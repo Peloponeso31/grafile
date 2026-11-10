@@ -58,6 +58,31 @@ fn backfills_and_answers_term_phrase_and_boolean_queries() {
 }
 
 #[test]
+fn backfill_matches_incremental_maintenance() {
+    const SEED: &str = "UNWIND range(1, 3000) AS x \
+        CREATE (:Post {title: 'post ' + toString(x % 37), \
+                       body: 'graph ' + toString(x % 11) + ' hot take number ' + toString(x)})";
+    let mut incremental = connection();
+    incremental.execute(POST_INDEX).expect("create index");
+    incremental.execute(SEED).expect("seed");
+    let mut backfilled = connection();
+    backfilled.execute(SEED).expect("seed");
+    backfilled.execute(POST_INDEX).expect("create index");
+
+    for text in ["graph", "\"hot take\" AND post", "7 OR 3", "number"] {
+        let source = format!(
+            "CALL db.index.fulltext.queryNodes('post_text', '{text}') YIELD node, score \
+             RETURN id(node), score"
+        );
+        assert_eq!(
+            query(&mut backfilled, &source),
+            query(&mut incremental, &source),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn yields_node_and_descending_score() {
     let mut conn = connection();
     conn.execute(POST_INDEX).expect("create index");
