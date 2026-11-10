@@ -70,8 +70,8 @@ header (`include/grafile.h`) and pkg-config metadata.
 **Debian/Ubuntu and Fedora/RHEL** (x86_64 and aarch64 packages are released):
 
 ```console
-$ sudo dpkg -i grafile_0.3.0-1_amd64.deb
-$ sudo rpm -i grafile-0.3.0-1.x86_64.rpm
+$ sudo dpkg -i grafile_0.4.0-1_amd64.deb
+$ sudo rpm -i grafile-0.4.0-1.x86_64.rpm
 ```
 
 **Windows**, once the manifest is merged into the winget community
